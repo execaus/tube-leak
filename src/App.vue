@@ -3,26 +3,29 @@
  * Служебный экран проверки sidecar (Ф-9, Н-6, TL-8), предварённый экраном
  * подготовки yt-dlp при первом запуске (TL-17).
  *
- * # Порядок вызовов — критично (см. ревью TL-12, #18)
+ * # Порядок вызовов — критично (см. ревью TL-12/TL-17, #18)
  *
  * `check_sidecar` не вызывается, пока не разрешился промис `prepare_ytdlp`
  * — ни при каком сценарии, включая повторную проверку по кнопке. Во время
  * подготовки резолв пути к yt-dlp честно возвращает `notFound`, и
  * `check_sidecar` показал бы «Не нашли файл yt-dlp по ожидаемому пути» —
  * ложное утверждение при совершенно нормальном первом запуске. Поэтому обе
- * команды идут строго последовательно в {@link runPrepareAndCheckSidecar},
- * а не параллельно с гонкой на отрисовку.
+ * команды идут строго последовательно в {@link runPrepareAndCheckSidecar}
+ * — единственном месте, откуда вообще вызывается `check()`, — а не
+ * параллельно с гонкой на отрисовку.
  *
  * # Поднятие экрана подготовки
  *
  * Экран поднимается по приходу первого события `ytdlp://prepare`
  * (`stage` становится `unpacking` или `warmingUp`), а не по факту вызова
  * `prepare_ytdlp` — на тёплом запуске (обычный случай) событий нет вовсе,
- * и промис резолвится за доли секунды: показывать экран подготовки в этом
- * случае было бы обманом, он бы мигнул зря. Пока промис ещё не разрешился
- * и ни одного события не пришло (сверхкороткое окно между вызовом команды
- * и первым событием либо самим разрешением), экран показывает нейтральное
- * «Запускаем…» — не пустое окно, но и не утверждение о конкретном этапе.
+ * и промис резолвится за доли секунды. Пока подготовка идёт, но событий
+ * ещё не было (тёплый запуск целиком, либо сверхкороткое окно до первого
+ * события на холодном), экран не «Запускаем…», а сразу тот же служебный
+ * экран, что и после готовности: шапка с версией и обе строки sidecar в
+ * состоянии «Проверяем…» — это устраивает и критерий приёмки 2 (служебный
+ * экран сразу), и исходный дизайн E1 (Ф-9, Н-6, обе строки к t ≤ 3 с), и
+ * не требует четвёртой раскладки только ради доли секунды ожидания.
  */
 import { computed, onMounted } from 'vue'
 
@@ -48,30 +51,22 @@ const {
 
 const { report, isLoading, check } = useSidecarCheck()
 
-/** Узкий тип этапа, для которого показывается прогресс (терминальные — вне этого экрана). */
-const preparingStage = computed<'unpacking' | 'warmingUp' | undefined>(() => {
-  return stage.value === 'unpacking' || stage.value === 'warmingUp' ? stage.value : undefined
-})
-
-type ScreenState = 'starting' | 'preparing' | 'prepareError' | 'ready'
-
-const screenState = computed<ScreenState>(() => {
-  if (prepareError.value) return 'prepareError'
-  // `preparingStage` — это последнее полученное событие, а не признак того,
-  // что подготовка ещё идёт: после разрешения промиса `prepare()` событие
-  // остаётся тем же (`ready` может не прийти вовсе), поэтому без проверки
-  // `isPreparing` экран подготовки завис бы навсегда даже после успеха.
-  if (isPreparing.value && preparingStage.value) return 'preparing'
-  if (isPreparing.value) return 'starting'
-  return 'ready'
-})
+/**
+ * `stage` (composable) уже не бывает терминальным (`ready`/`failed`
+ * игнорируются на уровне `useYtDlpPrepare`) — значит, «идёт подготовка» и
+ * «есть что показать на экране подготовки» совпадают: не нужно отдельно
+ * держать в уме, что означает `stage.value` после разрешения промиса.
+ */
+const showPrepareScreen = computed(() => isPreparing.value && stage.value !== undefined)
+const showPrepareError = computed(() => prepareError.value !== undefined)
 
 /**
  * Кнопка «Повторить проверку» — одна на весь экран (Ф-9 — одна команда на
  * оба бинарника сразу). Показывается тогда и только тогда, когда отчёт уже
- * пришёл и хотя бы одна из строк не в состоянии «в порядке». Достижима
- * только из состояния `ready`, то есть после того как `prepare_ytdlp` уже
- * разрешился, — повторный клик снова зовёт только `check_sidecar`.
+ * пришёл и хотя бы одна из строк не в состоянии «в порядке». Отчёт
+ * появляется только после того, как `prepare_ytdlp` уже разрешился (см.
+ * {@link runPrepareAndCheckSidecar}), так что достижимость кнопки не нужно
+ * охранять отдельно.
  */
 const showRetry = computed(() => {
   const r = report.value
@@ -96,31 +91,27 @@ onMounted(() => {
   <main class="screen">
     <header>
       <h1>tube-leak</h1>
-      <p
-        v-if="screenState === 'ready'"
-        class="version"
-      >
+      <!--
+        Версия — известна локально, sidecar не нужен, дизайн E1 держит её
+        видимой к t ≤ 3 с независимо от того, идёт ли ещё 40-секундная
+        подготовка (ревью TL-17, #18): раньше пряталась на время экрана
+        подготовки — больше не прячется.
+      -->
+      <p class="version">
         версия {{ APP_VERSION }}
       </p>
     </header>
 
     <YtDlpPrepareScreen
-      v-if="screenState === 'preparing'"
-      :stage="preparingStage!"
+      v-if="showPrepareScreen"
+      :stage="stage!"
       :percent="percent"
       :eta-secs="etaSecs"
     />
 
-    <p
-      v-else-if="screenState === 'starting'"
-      class="starting"
-    >
-      Запускаем…
-    </p>
-
     <YtDlpPrepareError
-      v-else-if="screenState === 'prepareError' && prepareError"
-      :error="prepareError"
+      v-else-if="showPrepareError"
+      :error="prepareError!"
       @retry="runPrepareAndCheckSidecar"
     />
 
@@ -166,10 +157,6 @@ onMounted(() => {
 
 .version {
   margin: 0 0 1rem;
-  color: #555;
-}
-
-.starting {
   color: #555;
 }
 

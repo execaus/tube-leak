@@ -117,28 +117,35 @@ describe('App — order of calls (TL-17, #18)', () => {
     expect(invokeMock).toHaveBeenCalledWith('check_sidecar')
   })
 
-  it('subscribes to ytdlp://prepare before invoking prepare_ytdlp', async () => {
-    const order: string[] = []
+  it('does not invoke prepare_ytdlp until the ytdlp://prepare subscription actually settles', async () => {
+    // Ревью TL-17 (#18, «Обязательно»): версия этого теста, разрешавшая
+    // `listen()` синхронно, фиксировала лишь порядок синхронных вызовов —
+    // гонку между «подписка подтверждена» и «команда вызвана» она не
+    // сторожила. Здесь подписка отложена по-настоящему.
+    let resolveListen: (fn: typeof unlistenMock) => void = () => {}
     listenMock.mockImplementationOnce((_event, handler) => {
-      order.push('listen')
       capturedHandler = handler
-      return Promise.resolve(unlistenMock)
+      return new Promise<typeof unlistenMock>((resolve) => {
+        resolveListen = resolve
+      })
     })
     routeInvoke({
-      prepare_ytdlp: () => {
-        order.push('prepare_ytdlp')
-        return Promise.resolve(preparedWarm)
-      },
-      check_sidecar: () => {
-        order.push('check_sidecar')
-        return Promise.resolve(okReport)
-      },
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
     })
 
     mount(App)
     await flushPromises()
 
-    expect(order).toEqual(['listen', 'prepare_ytdlp', 'check_sidecar'])
+    expect(listenMock).toHaveBeenCalledTimes(1)
+    expect(invokeMock).not.toHaveBeenCalledWith('prepare_ytdlp')
+    expect(invokeMock).not.toHaveBeenCalledWith('check_sidecar')
+
+    resolveListen(unlistenMock)
+    await flushPromises()
+
+    expect(invokeMock).toHaveBeenCalledWith('prepare_ytdlp')
+    expect(invokeMock).toHaveBeenCalledWith('check_sidecar')
   })
 })
 
@@ -161,7 +168,11 @@ describe('App — warm start (no prepare events)', () => {
 })
 
 describe('App — first-run preparation (unpacking → warmingUp → ready)', () => {
-  it('shows a non-empty state before the first event, then progress per stage, then the service screen', async () => {
+  it('shows the service screen (checking) before the first event, then progress per stage, then the service screen again', async () => {
+    // Композиция «starting = ready» — решение ревью TL-17 (#18,
+    // «Композиция тёплого старта»): до первого события экран — та же
+    // раскладка, что и после готовности (шапка с версией, обе строки
+    // sidecar «Проверяем…»), а не отдельная надпись-заглушка.
     let resolvePrepare: (value: YtDlpPrepared) => void = () => {}
     routeInvoke({
       prepare_ytdlp: () =>
@@ -174,14 +185,19 @@ describe('App — first-run preparation (unpacking → warmingUp → ready)', ()
     const wrapper = mount(App)
     await flushPromises()
 
-    // До первого события — не пустое окно и не «зависшая» надпись.
-    expect(wrapper.text().trim().length).toBeGreaterThan(0)
-    expect(wrapper.text()).toContain('Запускаем…')
+    // До первого события — не пустое окно: версия и обе строки sidecar
+    // видны сразу (Ф-9/Н-6), check_sidecar при этом ещё не вызван (см.
+    // блок «order of calls»).
+    expect(wrapper.text()).toContain('версия 0.1.0')
+    expect(wrapper.text().match(/Проверяем…/g)).toHaveLength(2)
 
     capturedHandler?.({ payload: { stage: 'unpacking', percent: 4, etaSecs: 1 } })
     await wrapper.vm.$nextTick()
     expect(wrapper.text()).toContain('Распаковываем yt-dlp')
     expect(wrapper.text()).toContain('4%')
+    // Версия остаётся видимой даже во время экрана подготовки (ревью TL-17,
+    // #18, «Версия приложения — всегда в шапке»).
+    expect(wrapper.text()).toContain('версия 0.1.0')
 
     capturedHandler?.({ payload: { stage: 'warmingUp', percent: 60, etaSecs: 14 } })
     await wrapper.vm.$nextTick()
@@ -189,12 +205,47 @@ describe('App — first-run preparation (unpacking → warmingUp → ready)', ()
     expect(wrapper.text()).toContain('60%')
     expect(wrapper.text()).toContain('осталось ~14 с')
 
+    // Событие `ready`, пришедшее чуть раньше разрешения промиса, не должно
+    // ронять экран обратно в служебный раньше времени (ревью TL-17, #18,
+    // «мигание в конце ожидания»).
+    capturedHandler?.({ payload: { stage: 'ready', percent: 100, version: '2026.08.20' } })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.text()).toContain('Готовим yt-dlp к первому запуску')
+    // Версия по-прежнему видна — и на экране подготовки её не прячут
+    // (ревью TL-17, #18), и заодно не мигает служебным экраном раньше
+    // времени из-за события `ready`, пришедшего раньше промиса.
+    expect(wrapper.text()).toContain('версия 0.1.0')
+
     resolvePrepare(preparedCold)
     await flushPromises()
 
     expect(wrapper.text()).not.toContain('Распаковываем')
     expect(wrapper.text()).not.toContain('Готовим yt-dlp')
     expect(wrapper.text()).toContain('версия 0.1.0')
+    expect(wrapper.text()).toContain('2026.08.20')
+  })
+
+  it('shows the prepare screen for the "OS forgot the signature cache" scenario, which starts at warmingUp with no unpacking', async () => {
+    let resolvePrepare: (value: YtDlpPrepared) => void = () => {}
+    routeInvoke({
+      prepare_ytdlp: () =>
+        new Promise<YtDlpPrepared>((resolve) => {
+          resolvePrepare = resolve
+        }),
+      check_sidecar: () => Promise.resolve(okReport),
+    })
+
+    const wrapper = mount(App)
+    await flushPromises()
+
+    capturedHandler?.({ payload: { stage: 'warmingUp', percent: 30, etaSecs: 25 } })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.text()).toContain('Готовим yt-dlp к первому запуску')
+    expect(wrapper.text()).not.toContain('Распаковываем')
+
+    resolvePrepare(preparedCold)
+    await flushPromises()
     expect(wrapper.text()).toContain('2026.08.20')
   })
 })
@@ -236,6 +287,50 @@ describe('App — preparation failure', () => {
     expect(wrapper.text()).not.toContain('Не удалось подготовить yt-dlp')
     expect(wrapper.text()).toContain('версия 0.1.0')
     expect(wrapper.text()).toContain('2026.08.20')
+  })
+
+  it('stays on the error screen (with a working retry) when the retry attempt fails again', async () => {
+    // Ревью TL-17 (#18, «Тесты, которых нет»): раньше проверялось только
+    // рассуждением, что второй провал не ломает и не подвешивает экран.
+    routeInvoke({
+      prepare_ytdlp: () => Promise.reject(warmupFailedError),
+      check_sidecar: () => Promise.resolve(okReport),
+    })
+
+    const wrapper = mount(App)
+    await flushPromises()
+    expect(wrapper.text()).toContain('Не удалось подготовить yt-dlp')
+
+    const dataDirError: YtDlpPrepareError = {
+      kind: 'dataDirUnavailable',
+      message: 'app_data_dir() failed: read-only volume',
+    }
+    routeInvoke({
+      prepare_ytdlp: () => Promise.reject(dataDirError),
+      check_sidecar: () => Promise.resolve(okReport),
+    })
+
+    const firstRetryButton = wrapper.findAll('button').find((b) => b.text().includes('Повторить'))
+    await firstRetryButton?.trigger('click')
+    await flushPromises()
+
+    // Другой отказ — другое объяснение, экран ошибки никуда не делся.
+    expect(wrapper.text()).toContain('Не удалось подготовить yt-dlp')
+    expect(wrapper.text()).toContain('рабочий каталог приложения')
+    expect(invokeMock).not.toHaveBeenCalledWith('check_sidecar')
+
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+    })
+
+    const secondRetryButton = wrapper.findAll('button').find((b) => b.text().includes('Повторить'))
+    await secondRetryButton?.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('Не удалось подготовить yt-dlp')
+    expect(wrapper.text()).toContain('2026.08.20')
+    expect(invokeMock).toHaveBeenCalledWith('check_sidecar')
   })
 })
 
