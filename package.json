@@ -11,7 +11,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint .",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "fetch-binaries": "node scripts/fetch-binaries/index.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

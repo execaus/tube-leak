@@ -1,0 +1,76 @@
+{
+  "_readme": [
+    "Файл пина версий sidecar-бинарников (yt-dlp, ffmpeg) для scripts/fetch-binaries.",
+    "Смена версии — отдельным коммитом (см. CLAUDE.md/epics/E1). Каждая запись:",
+    "url — прямая ссылка на официальный релизный ассет; sha256 — контрольная",
+    "сумма СКАЧИВАЕМОГО файла (архива или сырого бинарника), проверяется до",
+    "распаковки; binaryName — итоговое имя в src-tauri/binaries/, которое",
+    "резолвит Tauri из externalBin (суффикс -<target-triple>[.exe] уже внутри",
+    "имени, Tauri его не добавляет сам для уже засуффиксованных имён — здесь",
+    "мы задаём полное имя явно, поэтому суффикс должен совпадать с реальной",
+    "target triple)."
+  ],
+  "ytDlp": {
+    "version": "2026.08.19",
+    "_source": "GitHub Releases yt-dlp/yt-dlp (официальный апстрим), тег версии — неизменяемые ассеты.",
+    "targets": {
+      "x86_64-pc-windows-msvc": {
+        "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.exe",
+        "sha256": "66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a",
+        "binaryName": "yt-dlp-x86_64-pc-windows-msvc.exe"
+      },
+      "x86_64-apple-darwin": {
+        "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos",
+        "sha256": "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202",
+        "binaryName": "yt-dlp-x86_64-apple-darwin",
+        "_note": "yt-dlp_macos — universal2-бинарник (x86_64 + arm64 в одном файле), поэтому используется тот же ассет и та же контрольная сумма, что и для aarch64-apple-darwin."
+      },
+      "aarch64-apple-darwin": {
+        "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos",
+        "sha256": "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202",
+        "binaryName": "yt-dlp-aarch64-apple-darwin",
+        "_note": "Тот же universal2-ассет, что и для x86_64-apple-darwin — см. примечание там."
+      },
+      "x86_64-unknown-linux-gnu": {
+        "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_linux",
+        "sha256": "58162f9bfdc27458ea47bfcb311cf47028f17d8154a8bf7d689861d46399230a",
+        "binaryName": "yt-dlp-x86_64-unknown-linux-gnu"
+      }
+    }
+  },
+  "ffmpeg": {
+    "version": "9.0.1",
+    "_source": "Смешанные официальные/полу-официальные статические сборки — версия 9.0.1 согласована по всем таргетам, где это было возможно. См. per-target _source/_note.",
+    "targets": {
+      "x86_64-pc-windows-msvc": {
+        "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.1-essentials_build.zip",
+        "sha256": "fec81ae03971d9dd4be3ebe02e263bd2ec1d789483f931bdba5f5715e65da2e9",
+        "archive": { "type": "zip", "member": "ffmpeg.exe" },
+        "binaryName": "ffmpeg-x86_64-pc-windows-msvc.exe",
+        "_source": "gyan.dev — рекомендован официальной ffmpeg.org Download-страницей для Windows. URL версионирован (packages/ffmpeg-<version>-essentials_build.zip, архивная директория, не перезаписывается новыми версиями); sha256 взята из официального ffmpeg-9.0.1-essentials_build.zip.sha256, публикуемого рядом с самим архивом на том же хосте. Тот же билд зеркалится автором на GitHub (GyanD/codexffmpeg, тег 9.0.1, идентичный content-length) — можно использовать как запасной источник при недоступности gyan.dev."
+      },
+      "x86_64-apple-darwin": {
+        "url": "https://evermeet.cx/ffmpeg/ffmpeg-9.0.1.zip",
+        "sha256": "8a8c9e549983409fe6604b9aa665648b7a5def9407fe814c39c8b2ea7f64a48f",
+        "archive": { "type": "zip", "member": "ffmpeg" },
+        "binaryName": "ffmpeg-x86_64-apple-darwin",
+        "_source": "evermeet.cx — рекомендован официальной ffmpeg.org Download-страницей для macOS, URL версионирован (ffmpeg-<version>.zip), исторически стабилен."
+      },
+      "aarch64-apple-darwin": {
+        "url": "https://evermeet.cx/ffmpeg/ffmpeg-9.0.1.zip",
+        "sha256": "8a8c9e549983409fe6604b9aa665648b7a5def9407fe814c39c8b2ea7f64a48f",
+        "archive": { "type": "zip", "member": "ffmpeg" },
+        "binaryName": "ffmpeg-aarch64-apple-darwin",
+        "_note": "ИЗВЕСТНЫЙ КОМПРОМИСС: evermeet.cx публикует только x86_64-сборку ffmpeg (в отличие от yt-dlp_macos, который universal2). На Apple Silicon этот бинарник выполняется под Rosetta 2 — работает, но не нативно. Заменить на нативную arm64-сборку (например, с osxexperts.net) отдельной задачей, если Rosetta-зависимость станет проблемой; на момент TL-6 это принятый интерим-трейдофф, а не блокер."
+      },
+      "x86_64-unknown-linux-gnu": {
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-24-13-10/ffmpeg-n9.0.1-6-g9d4ca21220-linux64-gpl-9.0.tar.xz",
+        "sha256": "05feaaec285559f0f9b0f5f163d3526b728ccf6e481a0d9179203d68c48cf8d6",
+        "archive": { "type": "tar.xz", "member": "ffmpeg" },
+        "binaryName": "ffmpeg-x86_64-unknown-linux-gnu",
+        "_source": "BtbN/FFmpeg-Builds — статическая GPL-сборка ffmpeg 9.0.1 из автоматических билдов на GitHub Actions; sha256 взята из официального checksums.sha256 того же релиза.",
+        "_note": "ИЗВЕСТНЫЙ РИСК: датированный тег релиза (autobuild-YYYY-MM-DD-HH-MM) хранится у BtbN не вечно — по их политике retention хранятся только последние ~14 ежедневных билдов, плюс последний билд каждого месяца — 2 года. Если этот URL перестанет резолвиться (404), это ожидаемо: нужно перепиновать на актуальный тег отдельным коммитом (обычная процедура смены версии, не поломка скрипта). Скрипт в этом случае явно падает с ошибкой сети/HTTP, а не молча использует старый файл."
+      }
+    }
+  }
+}
