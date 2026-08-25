@@ -73,7 +73,14 @@ fn main() {
     let source = manifest_dir.join("binaries").join(&pin.archive_name);
     println!("cargo:rerun-if-changed={}", source.display());
 
-    place_archive(&source, &manifest_dir.join(RESOURCE_RELATIVE_PATH));
+    // Цель тоже под наблюдением: без этого удалённый или подменённый
+    // `resources/yt-dlp.zip` не восстанавливался бы до следующей правки
+    // пина или ассета, и в бандл поехало бы то, что лежит по имени
+    // ресурса сейчас.
+    let destination = manifest_dir.join(RESOURCE_RELATIVE_PATH);
+    println!("cargo:rerun-if-changed={}", destination.display());
+
+    place_archive(&source, &destination);
 
     tauri_build::build()
 }

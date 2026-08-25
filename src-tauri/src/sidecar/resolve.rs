@@ -31,8 +31,9 @@ use std::path::PathBuf;
 use super::error::SidecarError;
 use crate::types::LaunchFailedReason;
 
-/// Возвращает путь к sidecar-бинарнику `name` (`"yt-dlp"` или `"ffmpeg"`,
-/// без суффикса target triple — он уже учтён на этапе сборки).
+/// Возвращает путь к sidecar-бинарнику `name` — после TL-12 это `"ffmpeg"`
+/// и только он (см. шапку модуля), без суффикса target triple: он уже
+/// учтён на этапе сборки.
 ///
 /// Существование файла по возвращённому пути не проверяется здесь: это
 /// делает попытка запуска (`crate::sidecar::process::run`), которая
