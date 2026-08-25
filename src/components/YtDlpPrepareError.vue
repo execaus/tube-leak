@@ -5,15 +5,23 @@
  * ошибки (CLAUDE.md, «Ошибки типизированные, не строки»), `message` —
  * диагностика в свёрнутом по умолчанию блоке «Подробнее», не для решения.
  *
+ * `error` — не обязательно контрактный {@link YtDlpPrepareError}: реджект
+ * может оказаться неконтрактным (паника команды, отказ IPC при подписке
+ * на событие), и тогда `kind` не заполнен ({@link PrepareFailure} из
+ * `useYtDlpPrepare`). Для таких случаев ниже есть отдельное общее
+ * объяснение — молчаливый пустой текст был бы хуже честного «не удалось
+ * разобрать причину» (ревью TL-17, #18, «Обязательно»).
+ *
  * Только отображает то, что передали props, и сообщает о клике «Повторить»
  * наверх — сам `invoke` не вызывает.
  */
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 
-import type { YtDlpPrepareError } from '@/types/ytdlp'
+import type { PrepareFailure } from '@/composables/useYtDlpPrepare'
+import type { YtDlpPrepareErrorKind } from '@/types/ytdlp'
 
 const props = defineProps<{
-  error: YtDlpPrepareError
+  error: PrepareFailure
 }>()
 
 defineEmits<{
@@ -26,7 +34,7 @@ function toggleDetails(): void {
   detailsOpen.value = !detailsOpen.value
 }
 
-const explanations: Record<YtDlpPrepareError['kind'], string> = {
+const explanations: Record<YtDlpPrepareErrorKind, string> = {
   dataDirUnavailable:
     'Не удалось создать рабочий каталог приложения. Проверьте, что диск, на котором установлен ' +
     'tube-leak, доступен для записи, и что права доступа не ограничены, затем попробуйте снова.',
@@ -44,6 +52,20 @@ const explanations: Record<YtDlpPrepareError['kind'], string> = {
     'yt-dlp распаковался, но не запускается. Попробуйте ещё раз; если не поможет — ' +
     'переустановите tube-leak.',
 }
+
+/**
+ * Фоллбэк для всего, что не подошло под контрактные шесть причин: реджект
+ * не по контракту не должен рендерить пустую строку (ревью TL-17, #18).
+ */
+const FALLBACK_EXPLANATION =
+  'Не удалось разобрать причину отказа. Попробуйте ещё раз; если не поможет — переустановите tube-leak.'
+
+const explanation = computed(() => {
+  const kind = props.error.kind
+  return kind !== undefined ? explanations[kind] : FALLBACK_EXPLANATION
+})
+
+const kindLabel = computed(() => props.error.kind ?? 'неизвестно (не по контракту)')
 </script>
 
 <template>
@@ -56,7 +78,7 @@ const explanations: Record<YtDlpPrepareError['kind'], string> = {
       Не удалось подготовить yt-dlp
     </p>
     <p class="prepare-error__explanation">
-      {{ explanations[props.error.kind] }}
+      {{ explanation }}
     </p>
 
     <div class="prepare-error__actions">
@@ -82,7 +104,7 @@ const explanations: Record<YtDlpPrepareError['kind'], string> = {
       class="prepare-error__details"
     >
       <dt>Код</dt>
-      <dd>{{ props.error.kind }}</dd>
+      <dd>{{ kindLabel }}</dd>
       <dt>Сообщение</dt>
       <dd>{{ props.error.message }}</dd>
     </dl>
