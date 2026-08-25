@@ -1,7 +1,12 @@
 //! Разрешение пути к sidecar-бинарнику (Ф-5 эпика E1).
 //!
+//! После TL-12 sidecar остался один — ffmpeg. yt-dlp резолвится иначе, в
+//! каталоге данных приложения (см. `crate::ytdlp`), потому что его
+//! onedir-дерево туда распаковывается при первом запуске; этот модуль про
+//! него ничего не знает.
+//!
 //! `tauri.conf.json` объявляет sidecar-бинарники через `bundle.externalBin`
-//! (`binaries/yt-dlp`, `binaries/ffmpeg`); физические файлы лежат в
+//! (`binaries/ffmpeg`); физические файлы лежат в
 //! `src-tauri/binaries/<name>-<target-triple>[.exe]` (см. `binaries.lock.json`,
 //! задача TL-6). На этапе `cargo build`/`cargo test` `tauri-build` находит
 //! файл, соответствующий текущей target triple, отрезает суффикс триплета
@@ -86,7 +91,7 @@ mod tests {
 
     #[test]
     fn resolves_next_to_the_compiled_test_binary() {
-        let path = resolve_sidecar_path("yt-dlp").expect("resolution must not fail");
+        let path = resolve_sidecar_path("ffmpeg").expect("resolution must not fail");
 
         let expected_dir = std::env::current_exe()
             .expect("current_exe must resolve in a test binary")
@@ -97,17 +102,6 @@ mod tests {
             .to_path_buf();
 
         assert_eq!(path.parent(), Some(expected_dir.as_path()));
-    }
-
-    #[test]
-    fn resolves_an_existing_yt_dlp_sidecar_copied_by_tauri_build() {
-        let path = resolve_sidecar_path("yt-dlp").expect("resolution must not fail");
-
-        assert!(
-            path.exists(),
-            "expected tauri-build to have copied the yt-dlp sidecar to {path:?} \
-             (see src-tauri/binaries/yt-dlp-<target-triple>)"
-        );
     }
 
     #[test]

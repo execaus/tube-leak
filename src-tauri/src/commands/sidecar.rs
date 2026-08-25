@@ -1,5 +1,5 @@
-//! `#[tauri::command]` для служебного экрана: проверка sidecar-бинарников
-//! (Ф-9, Н-6 эпика E1).
+//! `#[tauri::command]` для служебного экрана: проверка исполняемых
+//! файлов yt-dlp и ffmpeg (Ф-9, Н-6 эпика E1).
 //!
 //! Тонкий слой над `crate::sidecar`: резолвит путь к каждому бинарнику,
 //! запускает его с аргументом версии и конвертирует
@@ -7,14 +7,22 @@
 //! [`crate::types::SidecarCheckResult`]. Обе проверки (yt-dlp, ffmpeg)
 //! идут параллельно (`tokio::join!`, Н-6 «Экономия вызовов» — общее время
 //! ожидания близко к максимуму из двух проверок, а не к их сумме).
+//!
+//! Резолв у бинарников разный (TL-12): ffmpeg — sidecar рядом с
+//! исполняемым файлом приложения, yt-dlp — распакованное дерево в каталоге
+//! данных, см. [`crate::ytdlp`]. Отсюда предусловие: команда `prepare_ytdlp`
+//! должна отработать раньше, иначе yt-dlp честно окажется `notFound` —
+//! дерева ещё нет.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
+use crate::clock::now_iso8601;
 use crate::sidecar::{self, ChildRegistry, SidecarError};
 use crate::types::{LaunchFailedReason, SidecarCheckReport, SidecarCheckResult, SidecarStatus};
+use crate::ytdlp;
 
 /// Верхняя граница времени служебного экрана по Н-2: версия должна
 /// появиться не позже, чем через 10 секунд после старта. Обе проверки идут
@@ -48,29 +56,32 @@ const CHECK_TIMEOUT_SECS: u64 = SERVICE_SCREEN_BUDGET_SECS - SERVICE_SCREEN_RESE
 const _: () = assert!(CHECK_TIMEOUT_SECS > 0 && CHECK_TIMEOUT_SECS <= SERVICE_SCREEN_BUDGET_SECS);
 
 /// Таймаут проверки yt-dlp. Калибровка К-4 по фактическим замерам TL-12
-/// (Apple Silicon, macOS 26.6, APFS/NVMe; все цифры — `/usr/bin/time -p`,
-/// `real`):
+/// (Apple Silicon, macOS 26.6, APFS/NVMe; `/usr/bin/time -p`, `real`).
 ///
-/// | поставка yt-dlp                                      | первый запуск | повторные   |
-/// |------------------------------------------------------|---------------|-------------|
-/// | onefile `yt-dlp_macos` (текущая)                      | 25,2–39,4 с   | 25,2–34,0 с |
-/// | onedir `yt-dlp_macos.zip`, каталог сам по себе        | 27,8–39,1 с   | 0,41–0,58 с |
-/// | onedir внутри подписанного `.app` (`codesign` bundle) | 2,39–3,87 с   | 0,36–1,24 с |
+/// Служебный экран видит yt-dlp **после** подготовки
+/// (`prepare_ytdlp`, см. [`crate::ytdlp`]), то есть уже распакованное и
+/// прогретое onedir-дерево в каталоге данных:
 ///
-/// Ключевое: у onefile-поставки «повторные» не отличаются от «первого» —
-/// бутлоадер PyInstaller распаковывает 128 файлов (103 из них Mach-O) в
-/// новый `$TMPDIR/_MEIxxxxxx` на каждом запуске, а macOS берёт
-/// ~0,42 с за первую загрузку каждого только что созданного Mach-O-файла
-/// (проверка подписи в `dyld4::Loader::mapSegments` → `fcntl`, обслуживает
-/// `syspolicyd`). Одни и те же inode во второй раз стоят 0,08 с на все 84
-/// файла — разница в ~490 раз. Подробности замеров — в отчёте по TL-12.
+/// | состояние дерева                                      | `--version`  |
+/// |-------------------------------------------------------|--------------|
+/// | прогретое, 11 запусков подряд                          | 0,30–0,35 с  |
+/// | прогретое, сразу после detach/attach тома              | 1,27 с       |
+/// | холодное — на экран не попадает, его берёт подготовка   | 24,6–36,4 с  |
 ///
-/// Отсюда значение: любое число, при котором текущая onefile-поставка
-/// успевает, больше бюджета Н-2 в 3–4 раза, то есть требование всё равно
-/// нарушено. Поэтому таймаут задаётся не «чтобы успевало», а как
-/// исполнение Н-2: бюджет минус запас. При поставке, укладывающейся в Н-2
-/// (onedir внутри подписанного бандла, худший замер 3,87 с), это даёт
-/// запас 2,3×.
+/// Прежняя однофайловая поставка платила 25–39 с на **каждом** запуске:
+/// бутлоадер PyInstaller распаковывал 130 файлов в новый `$TMPDIR/_MEI…`,
+/// а macOS берёт ~0,42 с за первую загрузку каждого только что созданного
+/// Mach-O (регистрация подписи `dyld4::Loader::mapSegments` → `fcntl`,
+/// обслуживает `syspolicyd`, кэш по inode). Именно поэтому поставка
+/// сменилась на onedir в каталоге данных — таймаут эту цену не лечил и не
+/// мог вылечить.
+///
+/// Значение — [`CHECK_TIMEOUT_SECS`], то есть бюджет Н-2 минус запас, а не
+/// «замер плюс коэффициент». К худшему измеренному тёплому запуску
+/// (1,27 с) это запас в семь раз. Брать меньше нечего: экран всё равно
+/// ждёт максимум из двух параллельных проверок, и более короткий таймаут
+/// у yt-dlp не ускорил бы экран ни на миллисекунду, а на машине медленнее
+/// эталонной добавил бы ложное «не отвечает».
 const YT_DLP_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
 
 /// Таймаут проверки ffmpeg. Калибровка К-4 по фактическим замерам TL-12 на
@@ -108,13 +119,37 @@ const STDERR_TAIL_MAX_CHARS: usize = 1000;
 /// промис `invoke("check_sidecar")` всегда резолвится тем же отчётом, что
 /// и раньше, и никогда не реджектится.
 #[tauri::command]
-pub async fn check_sidecar(registry: State<'_, ChildRegistry>) -> Result<SidecarCheckReport, ()> {
+pub async fn check_sidecar(
+    app: AppHandle,
+    registry: State<'_, ChildRegistry>,
+) -> Result<SidecarCheckReport, ()> {
     Ok(check_report(
-        sidecar::resolve_sidecar_path("yt-dlp"),
+        resolve_ytdlp_path(&app),
         sidecar::resolve_sidecar_path("ffmpeg"),
         &registry,
     )
     .await)
+}
+
+/// Путь к yt-dlp — в каталоге данных, а не рядом с приложением (TL-12).
+///
+/// Любая причина, по которой готовой установки нет (подготовка ещё не
+/// выполнялась, дерево не сошлось с манифестом, каталог данных
+/// недоступен), для служебного экрана означает одно и то же: запускать
+/// нечего. Поэтому все они схлопываются в [`SidecarError::NotFound`] —
+/// тот же статус, что у отсутствующего sidecar-файла, с той же подсказкой
+/// пользователю. Подробную причину знает и показывает экран подготовки
+/// (`prepare_ytdlp`), дублировать её здесь незачем.
+fn resolve_ytdlp_path(app: &AppHandle) -> Result<PathBuf, SidecarError> {
+    let data_dir = app.path().app_data_dir().map_err(|err| {
+        eprintln!("yt-dlp: каталог данных приложения не определяется: {err}");
+        SidecarError::NotFound
+    })?;
+
+    ytdlp::installed_executable(&data_dir).map_err(|err| {
+        eprintln!("yt-dlp: готовой установки нет: {err}");
+        SidecarError::NotFound
+    })
 }
 
 /// Собирает отчёт по уже резолвленным (или неуспешно резолвленным) путям —
@@ -314,52 +349,6 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Текущее время в UTC, отформатированное как RFC 3339
-/// (`2026-08-25T09:15:30.123Z`), без внешних зависимостей — только
-/// `std::time` плюс алгоритм перевода дней с эпохи Unix в календарную дату
-/// Говарда Хайнанта (`civil_from_days`, общественное достояние, см.
-/// http://howardhinnant.github.io/date_algorithms.html). Добавлять `chrono`
-/// или `time` ради одного поля лога — решение о новой зависимости, не
-/// принимается на уровне этой задачи (см. CLAUDE.md, «owner-level
-/// questions»).
-fn now_iso8601() -> String {
-    let since_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format_unix_timestamp(since_epoch)
-}
-
-fn format_unix_timestamp(since_epoch: Duration) -> String {
-    let total_secs = since_epoch.as_secs();
-    let millis = since_epoch.subsec_millis();
-    let days = (total_secs / 86_400) as i64;
-    let secs_of_day = total_secs % 86_400;
-
-    let (year, month, day) = civil_from_days(days);
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    let second = secs_of_day % 60;
-
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
-}
-
-/// Переводит число дней с эпохи Unix (1970-01-01) в григорианскую дату
-/// `(год, месяц 1..=12, день 1..=31)`. Алгоритм Говарда Хайнанта, корректен
-/// для всего диапазона дат, поддерживаемых `i64`, включая años до эпохи.
-fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
-    let z = days_since_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    let year = if month <= 2 { y + 1 } else { y };
-    (year, month, day)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,23 +363,6 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(mode))
             .expect("failed to chmod fixture script");
         path
-    }
-
-    #[test]
-    fn formats_the_unix_epoch_as_rfc3339() {
-        assert_eq!(
-            format_unix_timestamp(Duration::from_secs(0)),
-            "1970-01-01T00:00:00.000Z"
-        );
-    }
-
-    #[test]
-    fn formats_a_known_date_with_milliseconds() {
-        // 2000-01-01T00:00:00Z == 946684800 (справочная точка).
-        assert_eq!(
-            format_unix_timestamp(Duration::new(946_684_800, 123_000_000)),
-            "2000-01-01T00:00:00.123Z"
-        );
     }
 
     #[tokio::test]
