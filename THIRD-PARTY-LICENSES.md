@@ -19,31 +19,30 @@ tube-leak поставляется вместе со статическими с
 | Платформа | Источник сборки |
 |---|---|
 | Windows (x86_64) | gyan.dev, `packages/ffmpeg-9.0.1-essentials_build.zip` |
-| macOS (x86_64) | evermeet.cx, `ffmpeg-9.0.1.zip` |
+| macOS (x86_64, Intel) | ffmpeg.martin-riedl.de, `download/macos/amd64/1787081194_9.0.1/ffmpeg.zip` |
 | macOS (aarch64, нативная arm64) | ffmpeg.martin-riedl.de, `download/macos/arm64/1787073674_9.0.1/ffmpeg.zip` |
 | Linux (x86_64) | BtbN/FFmpeg-Builds, `ffmpeg-n9.0.1-6-g9d4ca21220-linux64-gpl-9.0.tar.xz` |
 
 Точные URL и SHA256 — в `src-tauri/binaries.lock.json`.
 
-**Все четыре сборки распространяются под GNU GPL версии 3**, а не версии 2.
-Это не предположение — вот откуда взят вывод по каждому источнику:
+Четыре сборки приходят от трёх билдеров: оба macOS-таргета собирает один
+и тот же сервер одним пайплайном. **Все четыре распространяются под GNU
+GPL версии 3**, а не версии 2. Это не предположение — вот откуда взят
+вывод по каждому источнику:
 
 - **gyan.dev**: страница сборок (https://www.gyan.dev/ffmpeg/builds/)
   прямым текстом говорит: «All builds are 64-bit, static and licensed as
   GPLv3».
-- **evermeet.cx**: строка `configuration` в метаданных сборки
-  (https://evermeet.cx/ffmpeg/info/ffmpeg/9.0.1, а также страница
-  https://evermeet.cx/ffmpeg/) содержит одновременно флаги
-  `--enable-gpl` и `--enable-version3`. По документации самого ffmpeg
-  (`./configure --help`) флаг `--enable-version3` переводит лицензию
-  сборки с GPL v2+ на GPL v3+ (или с LGPL v2.1+ на LGPL v3+, если GPL не
-  включён) — присутствие обоих флагов вместе однозначно означает GPLv3.
-- **ffmpeg.martin-riedl.de**: строка `configuration` в выводе
-  `ffmpeg -version` вложенного бинарника (она же — в `versions.txt` рядом
-  с архивом на сервере сборки) содержит одновременно `--enable-gpl` и
-  `--enable-version3`; тот же вывод даёт публичный build-script
-  (https://git.martin-riedl.de/ffmpeg/build-script). По тому же правилу
-  `./configure --help`, что и выше, это GPLv3.
+- **ffmpeg.martin-riedl.de** (обе macOS-сборки, Intel и Apple Silicon):
+  строка `configuration` в выводе `ffmpeg -version` вложенного бинарника
+  (она же — в `versions.txt` рядом с архивом на сервере сборки) содержит
+  одновременно `--enable-gpl` и `--enable-version3`; тот же вывод даёт
+  публичный build-script
+  (https://git.martin-riedl.de/ffmpeg/build-script). По документации
+  самого ffmpeg (`./configure --help`) флаг `--enable-version3` переводит
+  лицензию сборки с GPL v2+ на GPL v3+ (или с LGPL v2.1+ на LGPL v3+,
+  если GPL не включён) — присутствие обоих флагов вместе однозначно
+  означает GPLv3. У обеих macOS-сборок набор флагов совпадает дословно.
 - **BtbN/FFmpeg-Builds**: вариант `gpl` для линуксовых сборок собирается
   со скриптом `variants/defaults-gpl.sh`
   (https://github.com/BtbN/FFmpeg-Builds), который задаёт
@@ -92,10 +91,10 @@ ffmpeg 9.0.1 **плюс** исходники каждой вложенной б�
 До тех пор считать раздел исчерпывающим нельзя.
 
 Часть материала уже доступна публично: скрипты сборки двух источников
-открыты — https://git.martin-riedl.de/ffmpeg/build-script (macOS/arm64) и
-https://github.com/BtbN/FFmpeg-Builds (Linux), а точные версии вложенных
-библиотек для macOS/arm64 перечислены в `versions.txt` рядом с архивом
-сборки на сервере билдера.
+открыты — https://git.martin-riedl.de/ffmpeg/build-script (обе сборки под
+macOS) и https://github.com/BtbN/FFmpeg-Builds (Linux), а точные версии
+вложенных библиотек для каждой из двух macOS-сборок перечислены в
+`versions.txt` рядом с соответствующим архивом на сервере билдера.
 
 Если у вас нет доступа к интернету — письменный запрос исходников можно
 направить через issues репозитория проекта:
