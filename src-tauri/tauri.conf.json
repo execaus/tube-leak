@@ -3,12 +3,25 @@
   "productName": "tube-leak",
   "version": "0.1.0",
   "identifier": "dev.execaus.tubeleak",
-  "build": {},
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
   "app": {
-    "windows": []
+    "windows": [
+      {
+        "title": "tube-leak"
+      }
+    ]
   },
   "bundle": {
     "active": false,
-    "icon": []
+    "icon": [],
+    "externalBin": [
+      "binaries/yt-dlp",
+      "binaries/ffmpeg"
+    ]
   }
 }
