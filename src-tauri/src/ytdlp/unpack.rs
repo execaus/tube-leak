@@ -16,6 +16,16 @@
 //! ловит ту же порчу дешевле — по мере распаковки, без второго прохода по
 //! 54 МиБ.
 //!
+//! **Этот вывод верен только для поставки архива внутри бандла и не
+//! переносится в E6 как есть.** Он опирается ровно на одну посылку: за
+//! архивом стоит подпись приложения, проверенная до запуска. У архива,
+//! скачанного на рантайме (обновление yt-dlp отдельным контуром), такой
+//! подписи нет, а CRC32 средством защиты не является вовсе — атакующий,
+//! подменивший содержимое, пересчитает контрольные суммы записей вместе с
+//! ним. Значит, переиспользуя этот модуль в E6, сверку sha256 скачанного
+//! архива с доверенным источником надо делать **до** вызова [`unpack`], и
+//! отсутствие такой сверки здесь не считать решённым вопросом.
+//!
 //! # Безопасность путей
 //!
 //! Имена внутри архива — недоверенный ввод (CLAUDE.md: «Ни один компонент
@@ -24,6 +34,18 @@
 //! прочие попытки выйти за каталог назначения; запись с таким именем — не
 //! повод «почистить» путь и продолжить, а повод отказаться от архива
 //! целиком.
+//!
+//! Записи-символические ссылки отвергаются тем же способом и по той же
+//! причине: распакованная ссылка — это путь, по которому потом пройдёт
+//! запись следующей записи архива, то есть обход проверки имён. Отказ
+//! здесь явный (`ZipFile::is_symlink`), а не следствие того, что ссылка
+//! записалась бы обычным файлом: апстримный ассет ссылок не содержит,
+//! поэтому терять нечего, а неявная защита сломается при первой же
+//! переделке цикла распаковки.
+//!
+//! Права на распакованные файлы **выводятся**, а не переносятся из
+//! архива: единственное, что берётся из его метаданных, — бит выполнения
+//! (см. [`apply_mode`]).
 
 use std::fs::{self, File};
 use std::io;
@@ -96,6 +118,19 @@ pub fn unpack(
             .map_err(|err| PrepareError::ArchiveCorrupted {
                 reason: format!("запись {index}: {err}"),
             })?;
+
+        // Отказ всего архива, а не пропуск записи: ссылка в дереве, которое
+        // мы сами же и собрали, означает, что архив не тот, за который себя
+        // выдаёт, и распаковывать из него остальное незачем.
+        if entry.is_symlink() {
+            return Err(PrepareError::ArchiveCorrupted {
+                reason: format!(
+                    "запись {index} — символическая ссылка ({}), \
+                     а в дереве yt-dlp ссылок не бывает",
+                    entry.name()
+                ),
+            });
+        }
 
         let Some(relative) = entry.enclosed_name() else {
             return Err(PrepareError::ArchiveCorrupted {
@@ -222,13 +257,23 @@ fn classify_copy_error(target: &Path, err: io::Error) -> PrepareError {
     }
 }
 
-/// Переносит права из архива на распакованный файл.
+/// Ставит распакованному файлу права, выведенные из одного бита архива.
 ///
-/// Без этого исполняемый файл yt-dlp и сотня `.so` внутри дерева
-/// оказались бы неисполняемыми, и подготовка «успешно» оставляла бы
-/// нерабочую установку. На Windows прав в этом смысле нет, и архив
-/// апстрима их не несёт (создан на FAT-совместимой системе — `unix_mode`
-/// там `None`), поэтому шаг применим только к Unix.
+/// Бит выполнения перенести необходимо: без него исполняемый файл yt-dlp и
+/// сотня `.so` внутри дерева оказались бы незапускаемыми, и подготовка
+/// «успешно» оставляла бы нерабочую установку. Всё остальное из архива не
+/// берётся: его метаданные — недоверенный ввод, и объявленный в них
+/// `0o777` дал бы world-writable файлы в каталоге данных, которые потом
+/// `dlopen`'ит yt-dlp. Поэтому режим не копируется, а выводится —
+/// [`EXECUTABLE_MODE`] или [`REGULAR_MODE`].
+///
+/// Поведение на реальных ассетах от этого не меняется: во всех трёх
+/// апстримных onedir-архивах (macOS, Linux, Windows) встречаются ровно
+/// `0o755` и `0o644` — проверено при ревью TL-12.
+///
+/// На Windows прав в этом смысле нет, и архив апстрима их не несёт
+/// (создан на FAT-совместимой системе — `unix_mode` там `None`), поэтому
+/// шаг применим только к Unix.
 #[cfg(unix)]
 fn apply_mode(path: &Path, mode: Option<u32>) -> Result<(), PrepareError> {
     use std::os::unix::fs::PermissionsExt;
@@ -237,11 +282,26 @@ fn apply_mode(path: &Path, mode: Option<u32>) -> Result<(), PrepareError> {
         return Ok(());
     };
 
-    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777)).map_err(|err| {
+    fs::set_permissions(path, fs::Permissions::from_mode(derived_mode(mode))).map_err(|err| {
         PrepareError::UnpackFailed {
             reason: format!("права {}: {err}", path.display()),
         }
     })
+}
+
+/// Права запускаемого файла: владельцу — запись, всем — чтение и запуск.
+const EXECUTABLE_MODE: u32 = 0o755;
+
+/// Права обычного файла: владельцу — запись, всем — чтение.
+const REGULAR_MODE: u32 = 0o644;
+
+/// Единственное, что берётся из недоверенных метаданных записи.
+fn derived_mode(archive_mode: u32) -> u32 {
+    if archive_mode & 0o111 != 0 {
+        EXECUTABLE_MODE
+    } else {
+        REGULAR_MODE
+    }
 }
 
 #[cfg(not(unix))]
@@ -449,6 +509,111 @@ mod tests {
             !dir.path().join("escaped.txt").exists(),
             "файл не должен появиться за пределами каталога назначения"
         );
+    }
+
+    #[test]
+    fn refuses_an_archive_containing_a_symlink_entry() {
+        // Ссылка в архиве — способ обойти проверку имён: следующая запись
+        // пишется «внутрь» каталога назначения, а физически уходит туда,
+        // куда ведёт ссылка. Поэтому отказ всего архива, а не пропуск
+        // записи, и поэтому же тест кладёт в фикстуру настоящую запись
+        // с `S_IFLNK`, а не файл с путём в содержимом.
+        let dir = tempdir().expect("tempdir");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).expect("mkdir");
+
+        let archive = dir.path().join("symlinked.zip");
+        {
+            let file = File::create(&archive).expect("create");
+            let mut zip = ZipWriter::new(file);
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zip.start_file("yt-dlp_macos", stored.unix_permissions(0o755))
+                .expect("start_file");
+            zip.write_all(b"#!/bin/sh\n").expect("write");
+            zip.add_symlink("_internal", outside.to_str().expect("utf-8 path"), stored)
+                .expect("add_symlink");
+            zip.start_file("_internal/planted.txt", stored.unix_permissions(0o644))
+                .expect("start_file");
+            zip.write_all(b"pwned").expect("write");
+            zip.finish().expect("finish");
+        }
+
+        let dest = dir.path().join("staging");
+        let error = unpack_fixture(&archive, &dest).expect_err("ссылки в архиве недопустимы");
+
+        assert!(
+            matches!(error, PrepareError::ArchiveCorrupted { .. }),
+            "{error}"
+        );
+        assert!(
+            !outside.join("planted.txt").exists(),
+            "запись сквозь ссылку не должна была состояться"
+        );
+        assert!(
+            !dest.join("_internal").exists(),
+            "сама ссылка не должна была появиться в дереве"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derives_permissions_instead_of_copying_them_from_the_archive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Архив объявляет world-writable права и setuid — распакованное
+        // дерево не обязано им верить: из метаданных берётся только бит
+        // выполнения.
+        let dir = tempdir().expect("tempdir");
+        let archive = dir.path().join("greedy.zip");
+        {
+            let file = File::create(&archive).expect("create");
+            let mut zip = ZipWriter::new(file);
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zip.start_file("yt-dlp_macos", stored.unix_permissions(0o4777))
+                .expect("start_file");
+            zip.write_all(b"#!/bin/sh\n").expect("write");
+            zip.start_file("_internal/data.txt", stored.unix_permissions(0o666))
+                .expect("start_file");
+            zip.write_all(b"plain data").expect("write");
+            zip.finish().expect("finish");
+        }
+
+        let dest = dir.path().join("staging");
+        unpack_fixture(&archive, &dest).expect("распаковка обязана пройти");
+
+        let mode = |relative: &str| {
+            fs::metadata(dest.join(relative))
+                .expect("файл обязан существовать")
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+
+        assert_eq!(mode("yt-dlp_macos"), EXECUTABLE_MODE);
+        assert_eq!(mode("_internal/data.txt"), REGULAR_MODE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derived_permissions_are_never_writable_by_anyone_but_the_owner() {
+        for archive_mode in [0o777, 0o666, 0o755, 0o644, 0o000, 0o4755, 0o2777, 0o1777] {
+            let derived = derived_mode(archive_mode);
+            assert_eq!(
+                derived & 0o022,
+                0,
+                "режим {archive_mode:o} дал бы {derived:o} — запись вне владельца"
+            );
+            assert_eq!(
+                derived & 0o7000,
+                0,
+                "режим {archive_mode:o} дал бы {derived:o} — setuid/setgid/sticky"
+            );
+            assert_eq!(
+                derived & 0o111 != 0,
+                archive_mode & 0o111 != 0,
+                "бит выполнения — единственное, что переносится из архива"
+            );
+        }
     }
 
     #[test]
