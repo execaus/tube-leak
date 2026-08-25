@@ -7,13 +7,23 @@ rust-version = "1.77"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# Читает src-tauri/binaries.lock.json в build.rs: версия и sha256 вложенного
+# onedir-архива yt-dlp объявлены в пине один раз и пробрасываются в код
+# через cargo:rustc-env, а не дублируются Rust-константами (TL-12).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dependencies]
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["process", "time", "io-util", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["process", "time", "io-util", "macros", "rt-multi-thread", "sync"] }
+# Распаковка onedir-архива yt-dlp в каталог данных при первом запуске
+# (TL-12) и — тем же кодом — распаковка обновлений yt-dlp в E6. Только
+# чтение и только deflate: остальные кодеки апстрим не использует, а
+# deflate-flate2 берёт чистый Rust-бэкенд (miniz_oxide), без C-зависимостей.
+zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
 tempfile = "3"

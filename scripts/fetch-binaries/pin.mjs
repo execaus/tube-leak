@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises'
 import { KNOWN_TARGETS } from './targets.mjs'
 
 const BINARY_NAMES = Object.freeze(['ytDlp', 'ffmpeg'])
+/** Допустимые значения `kind` у записи пина; см. entryKind(). */
+export const ENTRY_KINDS = Object.freeze(['binary', 'archive'])
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/
 
 /**
@@ -84,6 +86,17 @@ function validateEntry(entry, label, pinPath) {
     throw new Error(`pin file ${pinPath}: "${label}.binaryName" must be a non-empty string`)
   }
 
+  // `kind` описывает, ЧЕМ является итоговый файл в src-tauri/binaries/:
+  // исполняемым файлом (externalBin Tauri) или архивом, который приложение
+  // распаковывает само на рантайме (yt-dlp после TL-12). Отсутствие поля —
+  // "binary": так записаны все прежние entries, и молчаливая смена смысла
+  // существующего пина недопустима.
+  if (entry.kind !== undefined && !ENTRY_KINDS.includes(entry.kind)) {
+    throw new Error(
+      `pin file ${pinPath}: "${label}.kind" must be one of ${ENTRY_KINDS.join(', ')} when present`,
+    )
+  }
+
   if (entry.archive !== undefined) {
     if (typeof entry.archive !== 'object' || entry.archive === null) {
       throw new Error(`pin file ${pinPath}: "${label}.archive" must be an object when present`)
@@ -98,4 +111,14 @@ function validateEntry(entry, label, pinPath) {
       )
     }
   }
+}
+
+/**
+ * Возвращает `kind` записи пина с подстановкой умолчания.
+ *
+ * @param {{ kind?: string }} entry
+ * @returns {'binary' | 'archive'}
+ */
+export function entryKind(entry) {
+  return entry.kind ?? 'binary'
 }

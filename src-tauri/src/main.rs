@@ -1,15 +1,28 @@
+mod clock;
 mod commands;
 mod sidecar;
 mod types;
+mod ytdlp;
 
-use commands::check_sidecar;
+use commands::{check_sidecar, prepare_ytdlp, start_ytdlp_preparation, PreparationLock};
 use sidecar::ChildRegistry;
 use tauri::{Manager, RunEvent};
 
 fn main() {
     let app = tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![check_sidecar])
+        .invoke_handler(tauri::generate_handler![check_sidecar, prepare_ytdlp])
         .manage(ChildRegistry::new())
+        .manage(PreparationLock::new())
+        // Подготовка yt-dlp (TL-12) стартует, не дожидаясь фронтенда:
+        // приложение без yt-dlp неработоспособно, и готовить его —
+        // обязанность ядра. Фронтенд подписывается на события
+        // `ytdlp://prepare` и забирает итог командой `prepare_ytdlp`;
+        // повторной работы это не создаёт — подготовка идемпотентна и
+        // сериализована мьютексом (см. `commands::ytdlp`).
+        .setup(|app| {
+            start_ytdlp_preparation(app.handle());
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .unwrap_or_else(|err| {
             eprintln!("error while building tauri application: {err}");

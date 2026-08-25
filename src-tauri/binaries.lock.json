@@ -4,37 +4,50 @@
     "Смена версии — отдельным коммитом (см. CLAUDE.md/epics/E1). Каждая запись:",
     "url — прямая ссылка на официальный релизный ассет; sha256 — контрольная",
     "сумма СКАЧИВАЕМОГО файла (архива или сырого бинарника), проверяется до",
-    "распаковки; binaryName — итоговое имя в src-tauri/binaries/, которое",
-    "резолвит Tauri из externalBin (суффикс -<target-triple>[.exe] уже внутри",
-    "имени, Tauri его не добавляет сам для уже засуффиксованных имён — здесь",
-    "мы задаём полное имя явно, поэтому суффикс должен совпадать с реальной",
-    "target triple)."
+    "распаковки; binaryName — итоговое имя файла в src-tauri/binaries/ (суффикс",
+    "-<target-triple>[.exe] уже внутри имени, Tauri не добавляет его сам для уже",
+    "засуффиксованных имён — здесь мы задаём полное имя явно, поэтому суффикс",
+    "должен совпадать с реальной target triple).",
+    "kind — что именно кладётся под этим именем: \"binary\" (по умолчанию) —",
+    "исполняемый файл, который резолвит Tauri из externalBin, скрипт помечает",
+    "его как исполняемый; \"archive\" — архив, который кладётся как есть и",
+    "распаковывается уже приложением на рантайме (yt-dlp после TL-12, см.",
+    "src-tauri/src/ytdlp), поэтому бит выполнения ему не ставится.",
+    "Не путать с archive — это извлечение ОДНОГО файла ИЗ скачанного архива",
+    "(ffmpeg); kind описывает, чем является итоговый файл в binaries/."
   ],
   "ytDlp": {
     "version": "2026.08.19",
     "_source": "GitHub Releases yt-dlp/yt-dlp (официальный апстрим), тег версии — неизменяемые ассеты.",
+    "_note": "TL-12: onedir-ассеты (*.zip) вместо однофайловых сборок PyInstaller. Причина — дефект #13: onefile-бутлоадер распаковывает ~130 файлов в новый $TMPDIR/_MEIxxxxxx на КАЖДОМ запуске, а macOS берёт ~0,42 с за первую загрузку каждого только что созданного Mach-O (регистрация подписи в dyld4::Loader::mapSegments → fcntl, обслуживает syspolicyd; результат кэшируется по inode, а inode всегда новые). Из-за этого любой вызов yt-dlp стоил 25–39 с. Onedir-дерево распаковывается один раз в каталог данных приложения (см. src-tauri/src/ytdlp), inode стабильны, и повторные запуски укладываются в 0,4–0,6 с. Архив кладётся в src-tauri/binaries/ как есть (kind: archive) и попадает в бандл ресурсом — см. src-tauri/build.rs.",
     "targets": {
       "x86_64-pc-windows-msvc": {
-        "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.exe",
-        "sha256": "66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a",
-        "binaryName": "yt-dlp-x86_64-pc-windows-msvc.exe"
+        "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_win.zip",
+        "sha256": "30b4c14aafab6082becff7881e41b76df46dc43ea7633479410a91e29da492bf",
+        "kind": "archive",
+        "binaryName": "yt-dlp-x86_64-pc-windows-msvc.zip",
+        "_note": "ЖИВЬЁМ НЕ ПРОВЕРЕНО (Р-6, машины нет): пин сверен с апстримным SHA2-256SUMS релиза, фактическая загрузка и распаковка под Windows в E1 не выполнялись."
       },
       "x86_64-apple-darwin": {
-        "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos",
-        "sha256": "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202",
-        "binaryName": "yt-dlp-x86_64-apple-darwin",
-        "_note": "yt-dlp_macos — universal2-бинарник (x86_64 + arm64 в одном файле), поэтому используется тот же ассет и та же контрольная сумма, что и для aarch64-apple-darwin."
+        "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos.zip",
+        "sha256": "07e54b0865303c864006925913bce2604f8ee8cc6f18699bac9c309f9328a6d8",
+        "kind": "archive",
+        "binaryName": "yt-dlp-x86_64-apple-darwin.zip",
+        "_note": "yt-dlp_macos.zip — тот же universal2-набор (x86_64 + arm64), что и однофайловый yt-dlp_macos, поэтому используется один ассет и одна контрольная сумма на оба macOS-таргета."
       },
       "aarch64-apple-darwin": {
-        "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos",
-        "sha256": "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202",
-        "binaryName": "yt-dlp-aarch64-apple-darwin",
+        "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos.zip",
+        "sha256": "07e54b0865303c864006925913bce2604f8ee8cc6f18699bac9c309f9328a6d8",
+        "kind": "archive",
+        "binaryName": "yt-dlp-aarch64-apple-darwin.zip",
         "_note": "Тот же universal2-ассет, что и для x86_64-apple-darwin — см. примечание там."
       },
       "x86_64-unknown-linux-gnu": {
-        "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_linux",
-        "sha256": "58162f9bfdc27458ea47bfcb311cf47028f17d8154a8bf7d689861d46399230a",
-        "binaryName": "yt-dlp-x86_64-unknown-linux-gnu"
+        "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_linux.zip",
+        "sha256": "32e72032766bef9199d99d15beb69fd52e46df8f8b06f0d8745db59e04d339e9",
+        "kind": "archive",
+        "binaryName": "yt-dlp-x86_64-unknown-linux-gnu.zip",
+        "_note": "ЖИВЬЁМ НЕ ПРОВЕРЕНО (Р-6, машины нет): пин сверен с апстримным SHA2-256SUMS релиза, фактическая загрузка и распаковка под Linux в E1 не выполнялись."
       }
     }
   },

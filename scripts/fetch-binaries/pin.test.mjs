@@ -4,7 +4,7 @@ import { join } from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { loadPin } from './pin.mjs'
+import { entryKind, loadPin } from './pin.mjs'
 import { KNOWN_TARGETS } from './targets.mjs'
 
 const VALID_SHA = 'a'.repeat(64)
@@ -121,5 +121,34 @@ describe('loadPin', () => {
     const path = await writePin(pin)
 
     await expect(loadPin(path)).resolves.toStrictEqual(pin)
+  })
+
+  it('rejects an entry with an unknown kind', async () => {
+    const pin = makeValidPin()
+    pin.ytDlp.targets['aarch64-apple-darwin'] = makeEntry({ kind: 'directory' })
+    const path = await writePin(pin)
+
+    await expect(loadPin(path)).rejects.toThrow(/kind.* must be one of binary, archive/)
+  })
+
+  it('accepts an entry declared as an archive delivered as-is', async () => {
+    const pin = makeValidPin()
+    pin.ytDlp.targets['aarch64-apple-darwin'] = makeEntry({
+      kind: 'archive',
+      binaryName: 'yt-dlp-aarch64-apple-darwin.zip',
+    })
+    const path = await writePin(pin)
+
+    await expect(loadPin(path)).resolves.toStrictEqual(pin)
+  })
+})
+
+describe('entryKind', () => {
+  it('defaults to binary for entries written before TL-12 introduced the field', () => {
+    expect(entryKind(makeEntry())).toBe('binary')
+  })
+
+  it('returns the declared kind when present', () => {
+    expect(entryKind(makeEntry({ kind: 'archive' }))).toBe('archive')
   })
 })

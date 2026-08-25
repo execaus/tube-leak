@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -96,6 +96,27 @@ describe('installBinary — archive entries', () => {
     const finalPath = await installBinary(entry, outDir, { fetchImpl })
 
     await expect(readFile(finalPath, 'utf8')).resolves.toBe(memberContent)
+  })
+
+  it('places an archive entry as-is, without the executable bit and without extracting it', async () => {
+    // yt-dlp после TL-12 поставляется onedir-архивом: скрипт кладёт архив
+    // целиком, распаковывает его уже приложение при первом запуске
+    // (см. src-tauri/src/ytdlp).
+    const archiveBytes = await buildZipFixture('pretend-yt-dlp-tree\n')
+    const entry = {
+      url: 'https://example.invalid/yt-dlp_macos.zip',
+      sha256: sha256Of(archiveBytes),
+      kind: 'archive',
+      binaryName: 'yt-dlp-aarch64-apple-darwin.zip',
+    }
+    const fetchImpl = async () => new Response(archiveBytes)
+
+    const finalPath = await installBinary(entry, outDir, { fetchImpl })
+
+    expect(finalPath).toBe(join(outDir, entry.binaryName))
+    await expect(readFile(finalPath)).resolves.toStrictEqual(archiveBytes)
+    const mode = (await stat(finalPath)).mode & 0o777
+    expect(mode & 0o111).toBe(0)
   })
 
   it('does not leave the downloaded archive or a partial file behind on sha256 mismatch', async () => {

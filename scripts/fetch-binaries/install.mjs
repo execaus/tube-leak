@@ -3,6 +3,7 @@ import { join } from 'node:path'
 
 import { extractMember } from './archive.mjs'
 import { downloadToFile, sha256File } from './download.mjs'
+import { entryKind } from './pin.mjs'
 
 /**
  * Скачивает, проверяет по SHA-256 и раскладывает один sidecar-бинарник по
@@ -15,7 +16,20 @@ import { downloadToFile, sha256File } from './download.mjs'
  *   проверки/распаковки — на диске никогда не видно частично записанного
  *   результата под именем sidecar-бинарника.
  *
- * @param {object} entry запись из пина: `{ url, sha256, binaryName, archive? }`
+ * `entry.kind` (см. pin.mjs) различает два вида итогового файла:
+ * - `binary` (умолчание) — исполняемый файл, который резолвит Tauri из
+ *   `externalBin`; на Unix ему ставится бит выполнения;
+ * - `archive` — архив, который кладётся как есть и распаковывается уже
+ *   приложением на рантайме (yt-dlp после TL-12, см. `src-tauri/src/ytdlp`);
+ *   бит выполнения ему не ставится — исполнять предстоит не его, а файлы
+ *   внутри распакованного дерева.
+ *
+ * Не путать `entry.kind` с `entry.archive`: второе — указание извлечь ОДИН
+ * файл ИЗ скачанного архива (так поставляется ffmpeg). Комбинация
+ * `kind: 'archive'` + `archive: {...}` осмысленна и допустима (архив внутри
+ * архива), но в текущем пине не встречается.
+ *
+ * @param {object} entry запись из пина: `{ url, sha256, binaryName, kind?, archive? }`
  * @param {string} outDir каталог назначения (`src-tauri/binaries`)
  * @param {{ fetchImpl?: typeof fetch }} [deps] точки подмены для тестов
  * @returns {Promise<string>} абсолютный путь к готовому бинарнику
@@ -50,7 +64,7 @@ export async function installBinary(entry, outDir, deps = {}) {
   }
 
   if (process.platform !== 'win32') {
-    await chmod(finalPath, 0o755)
+    await chmod(finalPath, entryKind(entry) === 'archive' ? 0o644 : 0o755)
   }
 
   return finalPath

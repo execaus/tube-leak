@@ -1,5 +1,7 @@
 node_modules/
 src-tauri/target/
 src-tauri/binaries/
+# Готовится src-tauri/build.rs из binaries/yt-dlp-<triple>.zip под тройку сборки (TL-12).
+src-tauri/resources/
 src-tauri/gen/
 dist/
