@@ -40,7 +40,7 @@
   },
   "ffmpeg": {
     "version": "9.0.1",
-    "_source": "Смешанные официальные/полу-официальные статические сборки — версия 9.0.1 согласована по всем таргетам, где это было возможно. См. per-target _source/_note.",
+    "_source": "Смешанные официальные/полу-официальные статические сборки — версия 9.0.1 согласована по всем таргетам. Все четыре собраны с --enable-gpl --enable-version3, то есть GPLv3 (см. THIRD-PARTY-LICENSES.md). См. per-target _source/_note.",
     "targets": {
       "x86_64-pc-windows-msvc": {
         "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.1-essentials_build.zip",
@@ -57,11 +57,12 @@
         "_source": "evermeet.cx — рекомендован официальной ffmpeg.org Download-страницей для macOS, URL версионирован (ffmpeg-<version>.zip), исторически стабилен."
       },
       "aarch64-apple-darwin": {
-        "url": "https://evermeet.cx/ffmpeg/ffmpeg-9.0.1.zip",
-        "sha256": "8a8c9e549983409fe6604b9aa665648b7a5def9407fe814c39c8b2ea7f64a48f",
+        "url": "https://ffmpeg.martin-riedl.de/download/macos/arm64/1787073674_9.0.1/ffmpeg.zip",
+        "sha256": "8287a1b2229e05eb41859f073e18e6c52c60a778f2f5e6881070fe51b79407fe",
         "archive": { "type": "zip", "member": "ffmpeg" },
         "binaryName": "ffmpeg-aarch64-apple-darwin",
-        "_note": "ИЗВЕСТНЫЙ КОМПРОМИСС: evermeet.cx публикует только x86_64-сборку ffmpeg (в отличие от yt-dlp_macos, который universal2). На Apple Silicon этот бинарник выполняется под Rosetta 2 — работает, но не нативно. Заменить на нативную arm64-сборку (например, с osxexperts.net) отдельной задачей, если Rosetta-зависимость станет проблемой; на момент TL-6 это принятый интерим-трейдофф, а не блокер."
+        "_source": "ffmpeg.martin-riedl.de — публичный build-сервер (build-script открыт: https://git.martin-riedl.de/ffmpeg/build-script), единственный из просмотренных, кто публикует НАТИВНУЮ arm64-сборку именно релиза 9.0.1. URL версионирован и неизменяем (download/macos/arm64/<unix-ts>_<version>/ffmpeg.zip); история сборок на сервере хранится с 2022 года. sha256 взята из ffmpeg.zip.sha256, публикуемого рядом с архивом, и подтверждена локально после скачивания. Configure содержит --enable-gpl и --enable-version3 — лицензия GPLv3, та же, что у остальных трёх таргетов (Р-3 не меняется). Бинарник подписан Developer ID Application: Martin Riedl (KU3N25YGLU) с hardened runtime.",
+        "_note": "TL-11: заменяет прежний evermeet.cx-ассет, который был x86_64-only и на Apple Silicon шёл через Rosetta 2 (уведомление macOS про Intel-компонент, ffmpeg -version 8.8–11 с при таймауте 5 с). lipo -archs на этой сборке даёт arm64. Строка версии содержит extra-version билдера: `ffmpeg version 9.0.1-https://www.martin-riedl.de` — parse_ffmpeg_version отдаёт её целиком, как и для gyan.dev-сборки под Windows."
       },
       "x86_64-unknown-linux-gnu": {
         "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-24-13-10/ffmpeg-n9.0.1-6-g9d4ca21220-linux64-gpl-9.0.tar.xz",

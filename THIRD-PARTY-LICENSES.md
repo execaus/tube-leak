@@ -18,12 +18,13 @@ tube-leak поставляется вместе со статическими с
 | Платформа | Источник сборки |
 |---|---|
 | Windows (x86_64) | gyan.dev, `packages/ffmpeg-9.0.1-essentials_build.zip` |
-| macOS (x86_64 и aarch64 через Rosetta 2) | evermeet.cx, `ffmpeg-9.0.1.zip` |
+| macOS (x86_64) | evermeet.cx, `ffmpeg-9.0.1.zip` |
+| macOS (aarch64, нативная arm64) | ffmpeg.martin-riedl.de, `download/macos/arm64/1787073674_9.0.1/ffmpeg.zip` |
 | Linux (x86_64) | BtbN/FFmpeg-Builds, `ffmpeg-n9.0.1-6-g9d4ca21220-linux64-gpl-9.0.tar.xz` |
 
 Точные URL и SHA256 — в `src-tauri/binaries.lock.json`.
 
-**Все три сборки распространяются под GNU GPL версии 3**, а не версии 2.
+**Все четыре сборки распространяются под GNU GPL версии 3**, а не версии 2.
 Это не предположение — вот откуда взят вывод по каждому источнику:
 
 - **gyan.dev**: страница сборок (https://www.gyan.dev/ffmpeg/builds/)
@@ -36,6 +37,12 @@ tube-leak поставляется вместе со статическими с
   (`./configure --help`) флаг `--enable-version3` переводит лицензию
   сборки с GPL v2+ на GPL v3+ (или с LGPL v2.1+ на LGPL v3+, если GPL не
   включён) — присутствие обоих флагов вместе однозначно означает GPLv3.
+- **ffmpeg.martin-riedl.de**: строка `configuration` в выводе
+  `ffmpeg -version` вложенного бинарника (она же — в `versions.txt` рядом
+  с архивом на сервере сборки) содержит одновременно `--enable-gpl` и
+  `--enable-version3`; тот же вывод даёт публичный build-script
+  (https://git.martin-riedl.de/ffmpeg/build-script). По тому же правилу
+  `./configure --help`, что и выше, это GPLv3.
 - **BtbN/FFmpeg-Builds**: вариант `gpl` для линуксовых сборок собирается
   со скриптом `variants/defaults-gpl.sh`
   (https://github.com/BtbN/FFmpeg-Builds), который задаёт
@@ -46,7 +53,7 @@ tube-leak поставляется вместе со статическими с
 ### Исходный код ffmpeg 9.0.1
 
 Условия GPLv3 требуют предложить доступ к исходному коду. Официальный
-исходный код версии 9.0.1, из которого собраны все три сборки выше,
+исходный код версии 9.0.1, из которого собраны все четыре сборки выше,
 доступен по адресам:
 
 - https://ffmpeg.org/download.html#get-sources — страница получения
@@ -54,6 +61,19 @@ tube-leak поставляется вместе со статическими с
 - https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz — прямая ссылка на
   архив исходников релиза 9.0.1 (также доступны `.tar.bz2`/`.tar.gz` и
   подписи `.asc` там же, в https://ffmpeg.org/releases/).
+
+Все четыре сборки сделаны из этого апстримного дерева без патчей: они
+отличаются от релиза 9.0.1 только набором флагов `./configure` (какие
+внешние кодеки влинкованы) и строкой `--extra-version`, которую билдер
+дописывает к номеру версии в выводе `ffmpeg -version` — например,
+`9.0.1-https://www.martin-riedl.de` для macOS/arm64. Поэтому исходный
+код, соответствующий вложенным бинарникам, — это и есть апстримный
+`ffmpeg-9.0.1.tar.xz` по ссылкам выше. Для двух источников это можно
+проверить самостоятельно: скрипты сборки открыты —
+https://git.martin-riedl.de/ffmpeg/build-script (macOS/arm64) и
+https://github.com/BtbN/FFmpeg-Builds (Linux); для остальных двух
+полная строка `configuration` видна в выводе `ffmpeg -version` самого
+вложенного бинарника.
 
 Если у вас нет доступа к интернету — письменный запрос исходников можно
 направить через issues репозитория проекта:

@@ -24,9 +24,10 @@ pub fn parse_ytdlp_version(raw: &str) -> Option<String> {
 ///
 /// Первая строка имеет вид `ffmpeg version <версия> Copyright ...`, где
 /// `<версия>` — не обязательно чистый semver: сборки со сторонних
-/// зеркал (gyan.dev для Windows, evermeet.cx для macOS — см.
-/// `binaries.lock.json`) дописывают через дефис имя сборки
-/// (`6.0-full_build-www.gyan.dev`), которое возвращается как есть.
+/// зеркал (gyan.dev для Windows, martin-riedl.de для macOS/arm64,
+/// evermeet.cx для macOS/x86_64 — см. `binaries.lock.json`) дописывают
+/// через дефис свой `--extra-version` (`6.0-full_build-www.gyan.dev`,
+/// `9.0.1-https://www.martin-riedl.de`), который возвращается как есть.
 pub fn parse_ffmpeg_version(raw: &str) -> Option<String> {
     let mut tokens = raw.lines().next()?.split_whitespace();
 
@@ -83,12 +84,30 @@ mod tests {
 
     #[test]
     fn parses_ffmpeg_version_pinned_by_binaries_lock_json() {
-        // Версия из src-tauri/binaries.lock.json (TL-6): 9.0.1, собрано
-        // evermeet.cx — реальный формат первой строки этого зеркала.
+        // Версия из src-tauri/binaries.lock.json: 9.0.1, сборка
+        // evermeet.cx (таргет x86_64-apple-darwin) — реальный формат
+        // первой строки этого зеркала.
         let raw = "ffmpeg version 9.0.1 Copyright (c) 2000-2025 the FFmpeg developers\n\
                     built with Apple clang version 16.0.0 (clang-1600.0.26.6)\n";
 
         assert_eq!(parse_ffmpeg_version(raw), Some("9.0.1".to_string()));
+    }
+
+    #[test]
+    fn parses_ffmpeg_version_of_arm64_macos_build() {
+        // TL-11: нативная arm64-сборка ffmpeg.martin-riedl.de, вложенная в
+        // aarch64-apple-darwin. Дословный вывод `ffmpeg -version` этого
+        // бинарника: билдер дописывает свой --extra-version через дефис,
+        // и в нём есть `://` — токен всё равно берётся целиком, до
+        // первого пробела.
+        let raw = "ffmpeg version 9.0.1-https://www.martin-riedl.de Copyright (c) 2000-2026 \
+                    the FFmpeg developers\n\
+                    built with Apple clang version 14.0.0 (clang-1400.0.29.102)\n";
+
+        assert_eq!(
+            parse_ffmpeg_version(raw),
+            Some("9.0.1-https://www.martin-riedl.de".to_string())
+        );
     }
 
     #[test]
