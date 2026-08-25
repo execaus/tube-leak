@@ -1,0 +1,89 @@
+name: build
+
+# Сборка инсталлятора под все целевые платформы (Windows, macOS, Linux —
+# см. CLAUDE.md/Стек). Живой прогон в рамках эпика E1 не обязателен (Р-6);
+# конфигурация должна существовать и корректно описывать сборку для всех
+# трёх ОС (issue TL-9, критерий приёмки).
+#
+# macOS покрыта двумя джобами: macos-latest (Apple Silicon, arm64 — раннеры
+# GitHub Actions сейчас на этой архитектуре) и macos-13 (Intel, x86_64) —
+# чтобы обе целевые архитектуры macOS (см. CLAUDE.md/Стек) имели рабочую
+# конфигурацию сборки, а не только хостовую архитектуру раннера.
+#
+# Linux собирается только как AppImage (см. CLAUDE.md, «Два независимых
+# контура обновления» — .deb/.rpm обновляются системным пакетным
+# менеджером, не плагином updater) — этот инвариант закреплён в
+# src-tauri/tauri.conf.json (bundle.targets), здесь ничего дополнительно
+# не ограничивается.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Tauri 2 Linux-зависимости для сборки AppImage (webkit2gtk, indicator,
+      # rsvg и т.п.) — см. официальные Tauri v2 Linux prerequisites.
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Доставка sidecar-бинарников (yt-dlp, ffmpeg) под тройку джоба — по
+      # пину версия+SHA256, см. scripts/fetch-binaries (TL-6). Обязательно
+      # до `tauri build`: externalBin резолвит их из src-tauri/binaries/.
+      - name: Fetch sidecar binaries (yt-dlp, ffmpeg)
+        run: node scripts/fetch-binaries/index.mjs --target ${{ matrix.target }}
+
+      - name: Build installer
+        run: npm run tauri build -- --target ${{ matrix.target }}
