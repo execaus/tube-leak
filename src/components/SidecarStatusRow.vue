@@ -137,10 +137,12 @@ const details = computed<DetailEntry[]>(() => {
 
 const isTimeout = computed(() => props.result?.status === 'timeout')
 
-// TODO(TL-7): заменить на реальный раздел документации про обход
-// блокировок антивирусом (Windows) / Gatekeeper (macOS) при первом запуске
-// sidecar-процесса.
-const instructionsUrl = 'https://github.com/execaus/tube-leak#docs'
+// Раздел README про обход блокировок антивирусом (Windows) / Gatekeeper
+// (macOS) при первом запуске sidecar-процесса. Якорь — явный HTML-анкор
+// в README.md (не автосгенерированный GitHub-слаг заголовка), чтобы
+// ссылка не ломалась при правках текста заголовка.
+const instructionsUrl =
+  'https://github.com/execaus/tube-leak#sidecar-blocked-by-av-gatekeeper'
 
 function toggleDetails(): void {
   detailsOpen.value = !detailsOpen.value
