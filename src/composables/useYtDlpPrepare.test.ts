@@ -79,22 +79,32 @@ describe('useYtDlpPrepare', () => {
     expect(result.isPending.value).toBe(false)
   })
 
-  it('awaits the event subscription before invoking prepare_ytdlp (order of calls)', async () => {
-    const callOrder: string[] = []
+  it('does not invoke prepare_ytdlp until the event subscription actually settles (order of calls)', async () => {
+    // Ревью TL-17 (#18, «Обязательно»): предыдущая версия этого теста
+    // разрешала `listen()` синхронно, поэтому фиксировала лишь порядок
+    // *синхронных* вызовов — гонка, ради которой была построена вся
+    // конструкция, тестом не сторожилась. Здесь подписка отложена по-настоящему.
+    let resolveListen: (fn: typeof unlistenMock) => void = () => {}
     listenMock.mockImplementationOnce((_event, handler) => {
-      callOrder.push('listen')
       capturedHandler = handler
-      return Promise.resolve(unlistenMock)
+      return new Promise<typeof unlistenMock>((resolve) => {
+        resolveListen = resolve
+      })
     })
-    invokeMock.mockImplementationOnce(() => {
-      callOrder.push('invoke')
-      return Promise.resolve(preparedFixture)
-    })
+    invokeMock.mockResolvedValueOnce(preparedFixture)
 
     const { result } = withSetup(() => useYtDlpPrepare())
-    await result.prepare()
+    const pending = result.prepare()
+    await Promise.resolve()
+    await Promise.resolve()
 
-    expect(callOrder).toEqual(['listen', 'invoke'])
+    expect(listenMock).toHaveBeenCalledTimes(1)
+    expect(invokeMock).not.toHaveBeenCalled()
+
+    resolveListen(unlistenMock)
+    await pending
+
+    expect(invokeMock).toHaveBeenCalledExactlyOnceWith('prepare_ytdlp')
   })
 
   it('sets isPending during the call and clears it once prepare_ytdlp resolves', async () => {
@@ -143,6 +153,29 @@ describe('useYtDlpPrepare', () => {
     // `etaSecs` отсутствует в полезной нагрузке, а не приходит `null` (контракт TL-12).
     capturedHandler?.({ payload: { stage: 'warmingUp', percent: 90 } })
     expect(result.etaSecs.value).toBeUndefined()
+  })
+
+  it('ignores terminal stages (ready/failed) from events — final state comes from the command promise, not from events', async () => {
+    // Ревью TL-17 (#18, «Стоит поправить», «мигание в конце ожидания»):
+    // ядро эмитит `ready`/`failed` непосредственно перед разрешением
+    // промиса, и порядок «доставка события» vs «ответ IPC» не гарантирован.
+    // Если бы `stage` буквально копировал событие, `ready`, пришедший чуть
+    // раньше промиса, на мгновение убрал бы экран подготовки из-под
+    // прогресса — видимый откат назад в последний момент 40-секундного
+    // ожидания.
+    invokeMock.mockReturnValueOnce(new Promise<YtDlpPrepared>(() => {}))
+
+    const { result } = withSetup(() => useYtDlpPrepare())
+    void result.prepare()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    capturedHandler?.({ payload: { stage: 'warmingUp', percent: 92, etaSecs: 2 } })
+    expect(result.stage.value).toBe('warmingUp')
+
+    capturedHandler?.({ payload: { stage: 'ready', percent: 100, version: '2026.08.20' } })
+    expect(result.stage.value).toBe('warmingUp')
+    expect(result.percent.value).toBe(100)
   })
 
   it('captures a typed YtDlpPrepareError on rejection, without touching result', async () => {
@@ -197,5 +230,93 @@ describe('useYtDlpPrepare', () => {
     expect(unlistenMock).not.toHaveBeenCalled()
     unmount()
     expect(unlistenMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('unsubscribes even when unmount happens before listen() has resolved (unsubscribe race)', async () => {
+    // Ревью TL-17 (#18, «Стоит поправить»): `unlisten` присваивается только
+    // после разрешения `listen()`; unmount, случившийся раньше, не должен
+    // оставить слушателя висеть навсегда.
+    let resolveListen: (fn: typeof unlistenMock) => void = () => {}
+    listenMock.mockImplementationOnce((_event, handler) => {
+      capturedHandler = handler
+      return new Promise<typeof unlistenMock>((resolve) => {
+        resolveListen = resolve
+      })
+    })
+    invokeMock.mockReturnValueOnce(new Promise<YtDlpPrepared>(() => {}))
+
+    const { result, unmount } = withSetup(() => useYtDlpPrepare())
+    void result.prepare()
+    await Promise.resolve()
+
+    unmount()
+    expect(unlistenMock).not.toHaveBeenCalled()
+
+    resolveListen(unlistenMock)
+    // Цепочка `listen().then(...).catch(...)` внутри `ensureListening`, а
+    // затем ещё один `.then()` в `onUnmounted` — несколько хопов
+    // микрозадач, а не один.
+    for (let i = 0; i < 5; i += 1) {
+      await Promise.resolve()
+    }
+
+    expect(unlistenMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not get stuck loading forever if the event subscription itself is rejected (blocker, TL-17 #18)', async () => {
+    // Раньше `await ensureListening()` стоял вне `try`: отказ `listen()`
+    // (тот же IPC-вызов `plugin:event|listen`, тоже может не пройти) не
+    // ловился, `finally` не выполнялся, `isPending` навсегда оставался
+    // `true`, `error` не заполнялся — экран подготовки не поднимался и не
+    // опускался, вечное «Запускаем…», `check_sidecar` не вызывался никогда.
+    const listenFailure = new Error('plugin:event|listen failed')
+    listenMock.mockRejectedValueOnce(listenFailure)
+
+    const { result } = withSetup(() => useYtDlpPrepare())
+    await result.prepare()
+
+    expect(result.isPending.value).toBe(false)
+    expect(result.error.value).toStrictEqual({ message: listenFailure.message })
+    expect(invokeMock).not.toHaveBeenCalled()
+  })
+
+  it('lets a retry re-subscribe after the subscription itself failed on the previous attempt', async () => {
+    listenMock.mockRejectedValueOnce(new Error('plugin:event|listen failed'))
+
+    const { result } = withSetup(() => useYtDlpPrepare())
+    await result.prepare()
+    expect(result.error.value).toBeDefined()
+
+    listenMock.mockImplementationOnce((_event, handler) => {
+      capturedHandler = handler
+      return Promise.resolve(unlistenMock)
+    })
+    invokeMock.mockResolvedValueOnce(preparedFixture)
+
+    await result.prepare()
+
+    expect(listenMock).toHaveBeenCalledTimes(2)
+    expect(result.error.value).toBeUndefined()
+    expect(result.result.value).toStrictEqual(preparedFixture)
+  })
+
+  it('falls back to a message-only failure for a non-contractual rejection (no kind), instead of an empty explanation', async () => {
+    invokeMock.mockRejectedValueOnce('yt-dlp panicked')
+
+    const { result } = withSetup(() => useYtDlpPrepare())
+    await result.prepare()
+
+    expect(result.error.value).toStrictEqual({ message: 'yt-dlp panicked' })
+  })
+
+  it('falls back to a generic message when the rejection has no usable text at all', async () => {
+    invokeMock.mockRejectedValueOnce({ some: 'unexpected shape' })
+
+    const { result } = withSetup(() => useYtDlpPrepare())
+    await result.prepare()
+
+    expect(result.error.value).toStrictEqual({
+      message: 'Подготовка yt-dlp не удалась по нераспознанной причине.',
+    })
   })
 })

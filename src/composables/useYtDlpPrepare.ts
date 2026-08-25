@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type Event as TauriEvent, type UnlistenFn } from '@tauri-apps/api/event'
 import { onUnmounted, ref, type Ref } from 'vue'
 
-import type { YtDlpPrepareError, YtDlpPrepareEvent, YtDlpPrepared, YtDlpPrepareStage } from '@/types/ytdlp'
+import type { YtDlpPrepareError, YtDlpPrepareErrorKind, YtDlpPrepareEvent, YtDlpPrepared } from '@/types/ytdlp'
 
 const PREPARE_YTDLP_COMMAND = 'prepare_ytdlp'
 
@@ -25,17 +25,61 @@ export async function prepareYtDlp(): Promise<YtDlpPrepared> {
   return invoke<YtDlpPrepared>(PREPARE_YTDLP_COMMAND)
 }
 
+/**
+ * То, что реально может оказаться в `error` composable'а. Контрактный путь
+ * честный ({@link YtDlpPrepareError}), но неконтрактный отказ существует и
+ * должен быть учтён без каста вслепую (ревью TL-17, #18, «Обязательно»):
+ * паника внутри команды, отказ самого IPC-вызова `plugin:event|listen` при
+ * попытке подписаться, и т.п. приходят как что угодно — строка, `Error`,
+ * произвольный объект. В этих случаях `kind` не заполняется: показывать
+ * пользователю какую-то из шести конкретных причин было бы неправдой,
+ * а не диагностикой. `message` — лучшее, что удалось извлечь, для блока
+ * «Подробнее»; при полном отсутствии текста используется общая заглушка.
+ */
+export type PrepareFailure = YtDlpPrepareError | { kind?: undefined; message: string }
+
+const KNOWN_ERROR_KINDS: readonly YtDlpPrepareErrorKind[] = [
+  'dataDirUnavailable',
+  'archiveMissing',
+  'archiveCorrupted',
+  'unpackFailed',
+  'layoutUnexpected',
+  'warmupFailed',
+]
+
+function isYtDlpPrepareError(value: unknown): value is YtDlpPrepareError {
+  if (typeof value !== 'object' || value === null) return false
+  const candidate = value as Record<string, unknown>
+  return (
+    typeof candidate.kind === 'string' &&
+    (KNOWN_ERROR_KINDS as readonly string[]).includes(candidate.kind) &&
+    typeof candidate.message === 'string'
+  )
+}
+
+/** Настоящее сужение типа реджекта, а не `as YtDlpPrepareError` вслепую. */
+function toPrepareFailure(err: unknown): PrepareFailure {
+  if (isYtDlpPrepareError(err)) return err
+  if (err instanceof Error) return { message: err.message }
+  if (typeof err === 'string' && err.length > 0) return { message: err }
+  return { message: 'Подготовка yt-dlp не удалась по нераспознанной причине.' }
+}
+
 export interface UseYtDlpPrepareReturn {
-  /** Последний этап из события `ytdlp://prepare`; `undefined` — событий ещё не было. */
-  stage: Ref<YtDlpPrepareStage | undefined>
+  /**
+   * Последний нетерминальный этап из события `ytdlp://prepare`;
+   * `undefined` — событий ещё не было. Терминальные значения (`ready`,
+   * `failed`) сюда намеренно не попадают — см. doc {@link useYtDlpPrepare}.
+   */
+  stage: Ref<'unpacking' | 'warmingUp' | undefined>
   /** Сквозной прогресс подготовки (0..100), из последнего полученного события. */
   percent: Ref<number>
   etaSecs: Ref<number | undefined>
   /** Итог успешной подготовки — заполняется по разрешению промиса команды. */
   result: Ref<YtDlpPrepared | undefined>
-  /** Типизированная ошибка подготовки — заполняется по реджекту промиса команды. */
-  error: Ref<YtDlpPrepareError | undefined>
-  /** `true` пока промис текущего вызова `prepare()` не разрешился. */
+  /** Ошибка подготовки — заполняется по реджекту промиса команды или подписки. */
+  error: Ref<PrepareFailure | undefined>
+  /** `true` пока текущий вызов `prepare()` не разрешился. */
   isPending: Ref<boolean>
   prepare: () => Promise<void>
 }
@@ -58,30 +102,51 @@ export interface UseYtDlpPrepareReturn {
  * Подписка живёт от первого вызова `prepare()` до размонтирования
  * компонента, использующего composable (`onUnmounted` снимает слушатель) —
  * повторные вызовы (retry по кнопке после ошибки) переиспользуют её, а не
- * создают новую при каждой попытке.
+ * создают новую при каждой попытке. Если сама подписка не удалась (отказ
+ * IPC `listen`), memoized-промис сбрасывается, чтобы следующий `prepare()`
+ * не был навечно привязан к уже отклонённому промису (блокер ревью TL-17).
+ *
+ * # Почему терминальные `stage` игнорируются
+ *
+ * Ядро эмитит `stage: 'ready'`/`'failed'` непосредственно перед тем, как
+ * разрешить промис `prepare_ytdlp`, но порядок «доставка события в
+ * webview» и «ответ команды» не гарантирован. Если брать `stage` из
+ * события буквально, возможен видимый откат экрана назад в последний
+ * момент 40-секундного ожидания. Терминальное состояние экрана вместо
+ * этого берётся из `result`/`error` — из промиса, а не из события.
  */
 export function useYtDlpPrepare(): UseYtDlpPrepareReturn {
-  const stage = ref<YtDlpPrepareStage>()
+  const stage = ref<'unpacking' | 'warmingUp'>()
   const percent = ref(0)
   const etaSecs = ref<number>()
   const result = ref<YtDlpPrepared>()
-  const error = ref<YtDlpPrepareError>()
+  const error = ref<PrepareFailure>()
   const isPending = ref(false)
 
   let unlisten: UnlistenFn | undefined
   let listening: Promise<void> | undefined
 
   function handleEvent(event: TauriEvent<YtDlpPrepareEvent>): void {
-    stage.value = event.payload.stage
     percent.value = event.payload.percent
     etaSecs.value = event.payload.etaSecs
+    if (event.payload.stage === 'unpacking' || event.payload.stage === 'warmingUp') {
+      stage.value = event.payload.stage
+    }
   }
 
   function ensureListening(): Promise<void> {
     if (!listening) {
-      listening = listen<YtDlpPrepareEvent>(PREPARE_EVENT_NAME, handleEvent).then((fn) => {
-        unlisten = fn
-      })
+      listening = listen<YtDlpPrepareEvent>(PREPARE_EVENT_NAME, handleEvent)
+        .then((fn) => {
+          unlisten = fn
+        })
+        .catch((err: unknown) => {
+          // Сбрасываем memoization: следующий prepare() (например, retry по
+          // кнопке) должен снова попытаться подписаться, а не унаследовать
+          // уже отклонённый промис навсегда.
+          listening = undefined
+          throw err
+        })
     }
     return listening
   }
@@ -93,23 +158,34 @@ export function useYtDlpPrepare(): UseYtDlpPrepareReturn {
     percent.value = 0
     etaSecs.value = undefined
 
-    // Ждём подтверждения подписки, прежде чем звать команду (см. doc выше) —
-    // это и есть гарантия «check_sidecar не раньше разрешения prepare_ytdlp»
-    // на уровне пропуска событий: без неё возможен пропуск unpacking на
-    // самом первом запуске.
-    await ensureListening()
-
     try {
+      // Ждём подтверждения подписки, прежде чем звать команду (см. doc
+      // выше) — это и есть гарантия «check_sidecar не раньше разрешения
+      // prepare_ytdlp» на уровне пропуска событий: без неё возможен
+      // пропуск unpacking на самом первом запуске. Внутри try: отказ самой
+      // подписки — тоже отказ подготовки, а не забытый вечный «Запускаем…»
+      // (блокер ревью TL-17, #18).
+      await ensureListening()
       result.value = await prepareYtDlp()
     } catch (err) {
-      error.value = err as YtDlpPrepareError
+      error.value = toPrepareFailure(err)
     } finally {
       isPending.value = false
     }
   }
 
   onUnmounted(() => {
-    unlisten?.()
+    if (unlisten) {
+      // Подписка уже подтверждена — снимаем сразу и синхронно.
+      unlisten()
+    } else if (listening) {
+      // `listen()` мог ещё не успеть разрешиться (unmount раньше, чем
+      // подтвердилась подписка) — цепляемся к тому же промису вместо того,
+      // чтобы полагаться на уже присвоенное значение (гонка отписки, ревью
+      // TL-17, #18, «Стоит поправить»). Если подписка в итоге отклонится,
+      // отписывать нечего — `.catch` молча игнорирует.
+      void listening.then(() => unlisten?.()).catch(() => {})
+    }
   })
 
   return { stage, percent, etaSecs, result, error, isPending, prepare }
