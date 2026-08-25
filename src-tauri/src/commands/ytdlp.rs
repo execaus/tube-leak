@@ -45,6 +45,17 @@ impl PreparationLock {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Занимает право на подготовку до конца жизни возвращённого guard'а.
+    ///
+    /// Метод, а не прямой доступ к полю: единственное, что разводит две
+    /// двери в подготовку (команду фронтенда и автозапуск в `setup`), — этот
+    /// мьютекс, и его поведение проверяется тестом
+    /// `two_preparations_started_at_once_do_the_work_once`
+    /// в `crate::ytdlp::prepare`, который живёт вне этого модуля.
+    pub async fn acquire(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.lock().await
+    }
 }
 
 /// Готовит yt-dlp к работе: при необходимости распаковывает вложенное
@@ -79,7 +90,7 @@ pub fn start_ytdlp_preparation(app: &AppHandle) {
 /// Общая реализация обоих входов.
 async fn prepare_now(app: &AppHandle) -> Result<YtDlpPrepared, YtDlpPrepareError> {
     let lock = app.state::<PreparationLock>();
-    let _guard = lock.0.lock().await;
+    let _guard = lock.acquire().await;
 
     let archive_path = app
         .path()

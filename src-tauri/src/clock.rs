@@ -23,6 +23,34 @@ pub fn now_iso8601() -> String {
     format_unix_timestamp(since_epoch)
 }
 
+/// Текущее время в секундах с эпохи Unix.
+///
+/// Отдельно от [`now_iso8601`], потому что по нему считают, а не читают:
+/// «сколько прошло с прошлой попытки» (`crate::ytdlp::layout::RepairLog`)
+/// из отформатированной строки не вывести, не разбирая её обратно.
+pub fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Текущее время в наносекундах с эпохи Unix, усечённое до `u64`
+/// (переполнение — 2554 год).
+///
+/// Нужно там, где от времени требуется не точка на календаре, а различие
+/// между двумя соседними вызовами: суффикс каталога распаковки
+/// (`crate::ytdlp::layout`).
+pub fn now_unix_nanos() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
 fn format_unix_timestamp(since_epoch: Duration) -> String {
     let total_secs = since_epoch.as_secs();
     let millis = since_epoch.subsec_millis();
@@ -39,7 +67,7 @@ fn format_unix_timestamp(since_epoch: Duration) -> String {
 
 /// Переводит число дней с эпохи Unix (1970-01-01) в григорианскую дату
 /// `(год, месяц 1..=12, день 1..=31)`. Алгоритм Говарда Хайнанта, корректен
-/// для всего диапазона дат, поддерживаемых `i64`, включая años до эпохи.
+/// для всего диапазона дат, поддерживаемых `i64`, включая годы до эпохи.
 fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     let z = days_since_epoch + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -73,6 +101,26 @@ mod tests {
             format_unix_timestamp(Duration::new(946_684_800, 123_000_000)),
             "2000-01-01T00:00:00.123Z"
         );
+    }
+
+    #[test]
+    fn unix_seconds_agree_with_the_formatted_timestamp() {
+        // Обе функции обязаны читать одни и те же часы: по одной считают
+        // остывание счётчика починки, по другой его читают в логе.
+        let secs = now_unix_secs();
+        assert!(secs > 1_700_000_000, "часы явно не идут от эпохи Unix");
+        assert_eq!(
+            format_unix_timestamp(Duration::from_secs(secs))[..10],
+            now_iso8601()[..10]
+        );
+    }
+
+    #[test]
+    fn unix_nanoseconds_move_between_calls() {
+        // От суффикса каталога распаковки требуется различие соседних
+        // значений, а не точность.
+        assert_ne!(now_unix_nanos(), 0);
+        assert!(now_unix_nanos() <= now_unix_nanos());
     }
 
     #[test]

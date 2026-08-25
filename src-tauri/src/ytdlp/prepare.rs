@@ -11,6 +11,8 @@
 //!    нужна, ни одного события не отправлено, экран подготовки не
 //!    показывается.
 //! 4. Иначе — прогреть: один прогон `--version` с длинным таймаутом.
+//! 5. Если дерево сходится с манифестом, но не запускается — переустановить
+//!    и прогреть заново, но не бесконечно: см. «Починка не повторяется вечно».
 //!
 //! # Почему «прогрев» вообще существует
 //!
@@ -34,6 +36,27 @@
 //! таймаут вместо честного этапа подготовки. Проверка запуском стоит
 //! 0,30–0,35 с на обычном старте и самостоятельно возвращает приложение в
 //! рабочее состояние в любом случае, когда кэш пропал.
+//!
+//! # Починка не повторяется вечно
+//!
+//! Дерево, которое сошлось с манифестом, но не запускается, лечится
+//! переустановкой — она стоит 124 МиБ записи и ~35 с прогрева. Если
+//! переустановка не помогла, повторять её на каждом запуске приложения
+//! незачем: причина не в содержимом дерева, а во внешнем по отношению к
+//! нему обстоятельстве (снятые права на каталог данных, чужой антивирус,
+//! несовместимая ОС), и ещё один заход даст тот же исход, отняв те же
+//! полминуты. Поэтому факт безуспешной попытки записывается рядом с
+//! установкой ([`super::layout::RepairLog`]) и переживает перезапуск, а
+//! после [`MAX_REPAIR_ATTEMPTS`] попыток подготовка отвечает отказом сразу
+//! — за доли секунды вместо тридцати пяти.
+//!
+//! Терминальное состояние не вечно, иначе оно поймало бы в ловушку любого,
+//! кто устранил причину: счётчик обнуляется удачным запуском, не
+//! действует для другого build id (обновление yt-dlp или приложения) и
+//! остывает сам через [`REPAIR_COOLDOWN`]. Отдельного `kind` у отказа нет
+//! намеренно: снаружи это по-прежнему `warmupFailed` — «дерево на месте, но
+//! yt-dlp не запускается», — и контракт с фронтендом не меняется, меняется
+//! только цена повторного выяснения этого факта.
 //!
 //! # Замеры на собранном дистрибутиве
 //!
@@ -68,7 +91,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 use super::error::PrepareError;
-use super::layout::{self, Installed, Layout};
+use super::layout::{self, Installed, Layout, RepairLog};
 use super::unpack;
 use crate::sidecar::{self, ChildRegistry, SidecarError};
 use crate::types::{YtDlpPrepareEvent, YtDlpPrepareStage, YtDlpPrepared};
@@ -149,6 +172,42 @@ const WARMUP_MS_PER_FILE: u64 = 250;
 /// чтобы не занимать WebView отрисовкой вместо ожидания.
 const WARMUP_TICK: Duration = Duration::from_millis(500);
 
+/// Сколько раз переустанавливать дерево, которое сходится с манифестом, но
+/// не запускается.
+///
+/// Два — это «один настоящий шанс и один на всякий случай»: первая
+/// переустановка чинит порчу, которую не поймала дешёвая сверка с
+/// манифестом, вторая покрывает случай, когда первая сама попала на
+/// временную помеху. Третья и дальше — уже гарантированные тридцать пять
+/// секунд впустую при каждом старте.
+const MAX_REPAIR_ATTEMPTS: u32 = 2;
+
+/// Через сколько счётчик безуспешных переустановок остывает.
+///
+/// Сутки выбраны как срок, за который обстоятельство снаружи дерева могло
+/// измениться (обновление ОС, возвращённые права, отключённый антивирус), а
+/// цена ошибки — один лишний прогрев в сутки, а не при каждом запуске.
+const REPAIR_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Таймауты подготовки одним значением.
+///
+/// Существует ради тестов: ветку «дерево цело, но ОС забыла кэш» иначе
+/// пришлось бы воспроизводить пятисекундным ожиданием в каждом прогоне
+/// `cargo test`. Боевой код всегда берёт [`Timeouts::DEFAULT`], то есть
+/// константы выше.
+#[derive(Debug, Clone, Copy)]
+struct Timeouts {
+    probe: Duration,
+    warmup: Duration,
+}
+
+impl Timeouts {
+    const DEFAULT: Self = Self {
+        probe: PROBE_TIMEOUT,
+        warmup: WARMUP_TIMEOUT,
+    };
+}
+
 /// Куда уходят события хода подготовки.
 ///
 /// Абстракция ровно ради тестов: домейн-логику подготовки нельзя
@@ -187,8 +246,18 @@ pub async fn prepare(
     registry: &ChildRegistry,
     sink: &dyn ProgressSink,
 ) -> Result<YtDlpPrepared, PrepareError> {
+    prepare_with(archive_path, data_dir, registry, sink, Timeouts::DEFAULT).await
+}
+
+async fn prepare_with(
+    archive_path: &Path,
+    data_dir: &Path,
+    registry: &ChildRegistry,
+    sink: &dyn ProgressSink,
+    timeouts: Timeouts,
+) -> Result<YtDlpPrepared, PrepareError> {
     let started = Instant::now();
-    let result = prepare_inner(archive_path, data_dir, registry, sink, started).await;
+    let result = prepare_inner(archive_path, data_dir, registry, sink, started, timeouts).await;
 
     match &result {
         Ok(prepared) if prepared.prepared => sink.emit(YtDlpPrepareEvent {
@@ -217,6 +286,7 @@ async fn prepare_inner(
     registry: &ChildRegistry,
     sink: &dyn ProgressSink,
     started: Instant,
+    timeouts: Timeouts,
 ) -> Result<YtDlpPrepared, PrepareError> {
     let layout = Layout::new(data_dir);
     layout.create_root()?;
@@ -234,22 +304,34 @@ async fn prepare_inner(
         unpack::remove_dir_if_exists(&stale)?;
     }
 
+    let repair_path = layout.repair_path(&build_id);
+
     match layout::validate(&layout, &build_id) {
         Ok(installed) => {
-            match probe(&installed, registry).await {
-                Probe::Warm(version) => Ok(YtDlpPrepared {
-                    version,
-                    path: installed.executable.display().to_string(),
-                    prepared: false,
-                    duration_ms: elapsed_ms(started),
-                }),
+            match probe(&installed, registry, timeouts.probe).await {
+                Probe::Warm(version) => {
+                    RepairLog::clear(&repair_path);
+                    Ok(YtDlpPrepared {
+                        version,
+                        path: installed.executable.display().to_string(),
+                        prepared: false,
+                        duration_ms: elapsed_ms(started),
+                    })
+                }
                 Probe::Cold => {
                     // Дерево на месте и цело, но ОС забыла результат
                     // проверки подписей — распаковывать заново незачем,
                     // достаточно прогреть.
-                    let version =
-                        warm_up(&installed, registry, sink, count_tree_files(&installed), 0)
-                            .await?;
+                    let version = warm_up(
+                        &installed,
+                        registry,
+                        sink,
+                        count_tree_files(&installed),
+                        0,
+                        timeouts.warmup,
+                    )
+                    .await?;
+                    RepairLog::clear(&repair_path);
                     Ok(YtDlpPrepared {
                         version,
                         path: installed.executable.display().to_string(),
@@ -260,21 +342,137 @@ async fn prepare_inner(
                 Probe::Broken(reason) => {
                     // Дерево прошло сверку с манифестом, но не
                     // запускается. Сверка дешёвая и не ловит порчу «файл
-                    // того же размера», поэтому единственное осмысленное
-                    // действие — переустановить и попробовать ещё раз.
-                    // Повторов внутри одного вызова не бывает: если после
-                    // переустановки не заработало, ошибка уходит наверх.
-                    eprintln!("yt-dlp: установка не запускается ({reason}), переустанавливаю");
-                    install_and_warm(archive_path, &layout, &build_id, registry, sink, started)
-                        .await
+                    // того же размера», поэтому осмысленное действие —
+                    // переустановить и попробовать ещё раз. Повторов
+                    // внутри одного вызова не бывает, а между запусками их
+                    // считает `repair`.
+                    repair(
+                        &reason,
+                        archive_path,
+                        &layout,
+                        &build_id,
+                        registry,
+                        sink,
+                        started,
+                        timeouts,
+                    )
+                    .await
                 }
             }
         }
         Err(invalid) => {
             eprintln!("yt-dlp: установка непригодна ({invalid}), распаковываю заново");
-            install_and_warm(archive_path, &layout, &build_id, registry, sink, started).await
+            let prepared = install_and_warm(
+                archive_path,
+                &layout,
+                &build_id,
+                registry,
+                sink,
+                started,
+                timeouts,
+            )
+            .await?;
+            RepairLog::clear(&repair_path);
+            Ok(prepared)
         }
     }
+}
+
+/// Переустановка дерева, которое сходится с манифестом, но не запускается —
+/// с памятью о том, что это уже пробовали.
+///
+/// Порядок именно такой: сначала проверить исчерпание, потом **записать
+/// попытку**, и только потом работать. Запись до работы, а не после,
+/// потому что самый неприятный исход — не отказ, а зависание: если
+/// приложение убьют посреди тридцатипятисекундного прогрева, попытка всё
+/// равно должна оказаться засчитанной, иначе цикл «запустил — не дождался —
+/// убил» повторяется вечно.
+///
+/// Откат счётчика при не-прогревной ошибке — не педантизм: «на диске нет
+/// места» и «дерево не запускается» приводят к разным решениям
+/// пользователя, и первое не должно приближать нас к отказу чинить второе.
+// Восемь аргументов — это ровно то, что нужно переустановке, плюс причина,
+// по которой она затеяна: заворачивать их в структуру-контекст значило бы
+// переписать соседние функции ради формы, а не ради смысла.
+#[allow(clippy::too_many_arguments)]
+async fn repair(
+    reason: &str,
+    archive_path: &Path,
+    layout: &Layout,
+    build_id: &str,
+    registry: &ChildRegistry,
+    sink: &dyn ProgressSink,
+    started: Instant,
+    timeouts: Timeouts,
+) -> Result<YtDlpPrepared, PrepareError> {
+    let repair_path = layout.repair_path(build_id);
+    let history = RepairLog::read(&repair_path);
+    let now = crate::clock::now_unix_secs();
+
+    if repair_exhausted(&history, now) {
+        eprintln!(
+            "yt-dlp: установка не запускается ({reason}), но переустановка уже \
+             выполнялась {} раз(а) и не помогла — отказываюсь повторять",
+            history.attempts
+        );
+        return Err(PrepareError::WarmupFailed {
+            reason: format!(
+                "yt-dlp не запускается ({reason}); переустановка дерева выполнялась {} раз(а) \
+                 и не помогла, последняя — {}. Повторять её бессмысленно: переустановите \
+                 приложение или удалите каталог {}",
+                history.attempts,
+                history.last_attempt_at,
+                layout.root().display()
+            ),
+        });
+    }
+
+    eprintln!("yt-dlp: установка не запускается ({reason}), переустанавливаю");
+    let attempted = history.with_attempt(reason, now);
+    if let Err(err) = attempted.write_atomic(&repair_path) {
+        // Счётчик — страховка, а не условие работы: не записался — чиним
+        // всё равно, просто в следующий раз посчитаем заново.
+        eprintln!("yt-dlp: не удалось записать историю починки: {err}");
+    }
+
+    let outcome = install_and_warm(
+        archive_path,
+        layout,
+        build_id,
+        registry,
+        sink,
+        started,
+        timeouts,
+    )
+    .await;
+
+    match &outcome {
+        Ok(_) => RepairLog::clear(&repair_path),
+        Err(PrepareError::WarmupFailed { .. }) => {}
+        Err(_) => {
+            if history.attempts == 0 {
+                RepairLog::clear(&repair_path);
+            } else if let Err(err) = history.write_atomic(&repair_path) {
+                eprintln!("yt-dlp: не удалось откатить историю починки: {err}");
+            }
+        }
+    }
+
+    outcome
+}
+
+/// Исчерпаны ли попытки починки на момент `now_unix`.
+fn repair_exhausted(history: &RepairLog, now_unix: u64) -> bool {
+    if history.attempts < MAX_REPAIR_ATTEMPTS {
+        return false;
+    }
+
+    // Часы могли отойти назад (правка времени, переезд через часовой
+    // пояс в BIOS): отрицательного «прошло времени» не бывает, и такой
+    // случай считается «только что», то есть отказ сохраняется. Ошибка в
+    // эту сторону стоит пользователю одного явного сообщения, в обратную —
+    // тридцати пяти секунд на каждом старте.
+    now_unix.saturating_sub(history.last_attempt_unix) < REPAIR_COOLDOWN.as_secs()
 }
 
 /// Распаковывает дерево заново и прогревает его.
@@ -285,10 +483,19 @@ async fn install_and_warm(
     registry: &ChildRegistry,
     sink: &dyn ProgressSink,
     started: Instant,
+    timeouts: Timeouts,
 ) -> Result<YtDlpPrepared, PrepareError> {
     let installed = install(archive_path, layout, build_id, sink)?;
     let file_count = count_tree_files(&installed);
-    let version = warm_up(&installed, registry, sink, file_count, UNPACK_PERCENT_SHARE).await?;
+    let version = warm_up(
+        &installed,
+        registry,
+        sink,
+        file_count,
+        UNPACK_PERCENT_SHARE,
+        timeouts.warmup,
+    )
+    .await?;
 
     Ok(YtDlpPrepared {
         version,
@@ -305,14 +512,17 @@ fn install(
     build_id: &str,
     sink: &dyn ProgressSink,
 ) -> Result<Installed, PrepareError> {
-    let staging = layout.staging_dir(build_id);
     let install_dir = layout.install_dir(build_id);
     let manifest_path = layout.manifest_path(build_id);
+
+    // Каталог распаковки создаётся здесь и под непредсказуемым именем
+    // (см. doc `super::layout`), поэтому «убрать прежний staging» не
+    // требуется: своего у нас ещё нет, а чужой — не наш.
+    let staging = layout.create_staging_dir(build_id)?;
 
     // Прежняя установка этого же build id могла остаться непригодной
     // (`validate` уже сказала, что она не годится) — переименование в
     // занятый путь не пройдёт, поэтому её надо убрать до распаковки.
-    unpack::remove_dir_if_exists(&staging)?;
     unpack::remove_dir_if_exists(&install_dir)?;
     let _ = std::fs::remove_file(&manifest_path);
 
@@ -349,8 +559,8 @@ enum Probe {
     Broken(String),
 }
 
-async fn probe(installed: &Installed, registry: &ChildRegistry) -> Probe {
-    match sidecar::run(&installed.executable, WARMUP_ARGS, PROBE_TIMEOUT, registry).await {
+async fn probe(installed: &Installed, registry: &ChildRegistry, timeout: Duration) -> Probe {
+    match sidecar::run(&installed.executable, WARMUP_ARGS, timeout, registry).await {
         Ok(output) => Probe::Warm(parse_version(&output.stdout, &installed.version)),
         Err(SidecarError::Timeout { .. }) => Probe::Cold,
         Err(error) => Probe::Broken(error.to_string()),
@@ -368,12 +578,13 @@ async fn warm_up(
     sink: &dyn ProgressSink,
     file_count: u64,
     base_percent: u8,
+    timeout: Duration,
 ) -> Result<String, PrepareError> {
     let expected = Duration::from_millis(file_count.saturating_mul(WARMUP_MS_PER_FILE));
     let started = Instant::now();
     sink.emit(warming_event(started, expected, base_percent));
 
-    let run = sidecar::run(&installed.executable, WARMUP_ARGS, WARMUP_TIMEOUT, registry);
+    let run = sidecar::run(&installed.executable, WARMUP_ARGS, timeout, registry);
     tokio::pin!(run);
 
     let mut ticker = tokio::time::interval(WARMUP_TICK);
@@ -558,6 +769,14 @@ mod tests {
     const EXECUTABLE_NAME: &str = "yt-dlp_fake";
     const PRINTS_VERSION: &str = "#!/bin/sh\necho 2026.08.19\n";
 
+    /// «yt-dlp», который не запускается, **того же размера**, что рабочий.
+    ///
+    /// Размер совпадает не для красоты: дешёвая сверка с манифестом
+    /// (`layout::validate`) считает файлы и байты, и подмена другой длины
+    /// была бы поймана ею, не дойдя до запуска. Именно эта — «дерево цело
+    /// по манифесту, но не работает» — и есть ветка `Probe::Broken`.
+    const EXITS_NONZERO: &str = "#!/bin/sh\nexit 3         \n";
+
     struct Fixture {
         _dir: TempDir,
         archive: PathBuf,
@@ -581,7 +800,47 @@ mod tests {
 
     impl Fixture {
         async fn prepare(&self, sink: &RecordingSink) -> Result<YtDlpPrepared, PrepareError> {
-            prepare(&self.archive, &self.data_dir, &self.registry, sink).await
+            self.prepare_with(sink, Timeouts::DEFAULT).await
+        }
+
+        async fn prepare_with(
+            &self,
+            sink: &RecordingSink,
+            timeouts: Timeouts,
+        ) -> Result<YtDlpPrepared, PrepareError> {
+            prepare_with(
+                &self.archive,
+                &self.data_dir,
+                &self.registry,
+                sink,
+                timeouts,
+            )
+            .await
+        }
+
+        /// Портит установленный исполняемый файл, сохраняя размер дерева.
+        fn break_installed_executable(&self) {
+            let path = self.install_dir().join(EXECUTABLE_NAME);
+            // `write` усекает файл, но не трогает права: бит выполнения
+            // остаётся, иначе `validate` отвергла бы дерево раньше пробы.
+            fs::write(&path, EXITS_NONZERO).expect("подменить исполняемый файл");
+        }
+
+        /// Заменяет вложенный архив на такой же по форме, но с неработающим
+        /// yt-dlp внутри: так выглядит починка, которой нечем чинить.
+        fn replace_archive(&self, body: &str) {
+            write_fake_ytdlp_zip(&self.archive, body);
+        }
+
+        fn repair_path(&self) -> PathBuf {
+            self.layout().repair_path(&layout::bundled_build_id())
+        }
+
+        fn manifest_modified(&self) -> std::time::SystemTime {
+            fs::metadata(self.manifest_path())
+                .expect("манифест обязан существовать")
+                .modified()
+                .expect("время изменения обязано быть доступно")
         }
 
         fn layout(&self) -> Layout {
@@ -647,6 +906,285 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cold_tree_is_only_warmed_up_and_never_unpacked_again() {
+        // Ветка, ради которой перезагрузка машины стоит секунд, а не
+        // минут: дерево на месте и цело, но ОС забыла результат проверки
+        // подписей. Проба этого не переживает — она упирается в таймаут, —
+        // а распаковывать заново нечего.
+        let fixture = fixture(PRINTS_VERSION);
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("первая подготовка");
+        let manifest_written_at = fixture.manifest_modified();
+
+        let sink = RecordingSink::default();
+        let prepared = fixture
+            .prepare_with(
+                &sink,
+                Timeouts {
+                    // «ОС забыла кэш» на настоящем дереве выглядит как
+                    // проба, не уложившаяся в отведённое время; здесь то же
+                    // самое достигается заведомо коротким таймаутом, чтобы
+                    // не ждать пять секунд в каждом прогоне тестов.
+                    probe: Duration::from_millis(1),
+                    ..Timeouts::DEFAULT
+                },
+            )
+            .await
+            .expect("прогрев обязан пройти");
+
+        assert!(
+            prepared.prepared,
+            "прогрев — это работа, а не её отсутствие"
+        );
+        assert_eq!(prepared.version, "2026.08.19");
+
+        let stages = sink.stages();
+        assert_eq!(
+            stages.first(),
+            Some(&YtDlpPrepareStage::WarmingUp),
+            "у этой ветки другой порядок событий: сразу warmingUp, без unpacking — \
+             экран подготовки (TL-17) обязан это учитывать: {stages:?}"
+        );
+        assert!(
+            !stages.contains(&YtDlpPrepareStage::Unpacking),
+            "целое дерево распаковывать заново незачем: {stages:?}"
+        );
+        assert_eq!(stages.last(), Some(&YtDlpPrepareStage::Ready));
+
+        let percents: Vec<u8> = sink.events().iter().map(|event| event.percent).collect();
+        assert_eq!(
+            percents.first(),
+            Some(&0),
+            "без распаковки прогрев занимает всю шкалу с нуля: {percents:?}"
+        );
+        assert!(percents.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        assert_eq!(
+            fixture.manifest_modified(),
+            manifest_written_at,
+            "манифест переписан — значит дерево всё-таки переустановили"
+        );
+        assert!(
+            unpack::stale_staging_dirs(fixture.layout().root()).is_empty(),
+            "распаковки не было, каталогов распаковки быть не может"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tree_that_passes_the_manifest_but_does_not_run_is_reinstalled() {
+        let fixture = fixture(PRINTS_VERSION);
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("первая подготовка");
+        fixture.break_installed_executable();
+
+        // Дешёвая сверка такой порчи не видит — иначе ветки `Broken` не
+        // существовало бы вовсе.
+        assert!(
+            layout::validate(&fixture.layout(), &layout::bundled_build_id()).is_ok(),
+            "подмена обязана быть незаметной для сверки с манифестом"
+        );
+
+        let sink = RecordingSink::default();
+        let prepared = fixture
+            .prepare(&sink)
+            .await
+            .expect("переустановка обязана вылечить дерево");
+
+        assert!(prepared.prepared);
+        assert_eq!(prepared.version, "2026.08.19");
+        assert!(
+            sink.stages().contains(&YtDlpPrepareStage::Unpacking),
+            "лечение непригодного дерева — это распаковка заново: {:?}",
+            sink.stages()
+        );
+        assert_eq!(sink.stages().last(), Some(&YtDlpPrepareStage::Ready));
+        assert!(
+            !fixture.repair_path().exists(),
+            "удачная подготовка обязана забыть, что дерево чинили"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reinstall_that_does_not_help_is_not_repeated_at_every_start() {
+        // Дерево не запускается, и переустанавливать его нечем: в архиве
+        // такой же нерабочий yt-dlp. Без счётчика это 124 МиБ записи и
+        // полминуты прогрева при каждом запуске приложения, всегда с тем же
+        // исходом.
+        let fixture = fixture(PRINTS_VERSION);
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("первая подготовка");
+        fixture.replace_archive(EXITS_NONZERO);
+        fixture.break_installed_executable();
+
+        for attempt in 1..=MAX_REPAIR_ATTEMPTS {
+            let sink = RecordingSink::default();
+            let error = fixture
+                .prepare(&sink)
+                .await
+                .expect_err("нерабочее дерево не может подготовиться");
+
+            assert!(
+                matches!(error, PrepareError::WarmupFailed { .. }),
+                "попытка {attempt}: {error}"
+            );
+            assert!(
+                sink.stages().contains(&YtDlpPrepareStage::Unpacking),
+                "попытка {attempt} обязана быть настоящей переустановкой: {:?}",
+                sink.stages()
+            );
+            assert_eq!(
+                RepairLog::read(&fixture.repair_path()).attempts,
+                attempt,
+                "попытка {attempt} обязана быть записана рядом с установкой"
+            );
+        }
+
+        let sink = RecordingSink::default();
+        let error = fixture
+            .prepare(&sink)
+            .await
+            .expect_err("исчерпав попытки, подготовка обязана отказать");
+
+        assert!(
+            matches!(error, PrepareError::WarmupFailed { .. }),
+            "отказ остаётся тем же по типу, меняется только его цена: {error}"
+        );
+        assert!(
+            error.to_string().contains("переустановка"),
+            "сообщение обязано объяснять, почему попытки прекращены: {error}"
+        );
+        assert!(
+            !sink.stages().contains(&YtDlpPrepareStage::Unpacking),
+            "переустановки быть не должно: {:?}",
+            sink.stages()
+        );
+        assert_eq!(sink.stages().last(), Some(&YtDlpPrepareStage::Failed));
+    }
+
+    #[tokio::test]
+    async fn the_memory_of_failed_repairs_survives_a_restart_and_a_success_clears_it() {
+        let fixture = fixture(PRINTS_VERSION);
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("первая подготовка");
+        fixture.replace_archive(EXITS_NONZERO);
+        fixture.break_installed_executable();
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect_err("нерабочее дерево не может подготовиться");
+
+        // Ничего, кроме файла в каталоге данных, между «запусками
+        // приложения» не переживает: `prepare` состояния в памяти не
+        // держит, а `Fixture` — только пути.
+        assert_eq!(RepairLog::read(&fixture.repair_path()).attempts, 1);
+
+        fixture.replace_archive(PRINTS_VERSION);
+        let prepared = fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("рабочий архив обязан вылечить дерево");
+
+        assert!(prepared.prepared);
+        assert_eq!(
+            RepairLog::read(&fixture.repair_path()).attempts,
+            0,
+            "удачный запуск обязан сбрасывать счётчик"
+        );
+        assert!(!fixture.repair_path().exists());
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_is_not_about_the_tree_does_not_count_as_a_repair_attempt() {
+        // «Архив непригоден» и «дерево не запускается» — разные беды с
+        // разными действиями пользователя, и первая не должна приближать
+        // отказ чинить вторую.
+        let fixture = fixture(PRINTS_VERSION);
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("первая подготовка");
+        fixture.break_installed_executable();
+        fs::write(&fixture.archive, b"not a zip at all").expect("испортить архив");
+
+        let error = fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect_err("чинить нечем");
+
+        assert!(
+            matches!(error, PrepareError::ArchiveCorrupted { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            RepairLog::read(&fixture.repair_path()).attempts,
+            0,
+            "попытка, сорвавшаяся не на дереве, обязана быть откачена"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_preparations_started_at_once_do_the_work_once() {
+        // Автозапуск при старте приложения и вызов команды с фронтенда —
+        // две двери в одну и ту же подготовку, и разводит их единственный
+        // мьютекс (`crate::commands::ytdlp::PreparationLock`). Без него оба
+        // входа распаковывали бы дерево одновременно и дрались за
+        // переименование в один и тот же каталог.
+        let fixture = fixture(PRINTS_VERSION);
+        let lock = crate::commands::PreparationLock::new();
+        let first_sink = RecordingSink::default();
+        let second_sink = RecordingSink::default();
+
+        let (first, second) = tokio::join!(
+            async {
+                let _guard = lock.acquire().await;
+                fixture.prepare(&first_sink).await
+            },
+            async {
+                let _guard = lock.acquire().await;
+                fixture.prepare(&second_sink).await
+            }
+        );
+
+        let first = first.expect("первый вход обязан завершиться");
+        let second = second.expect("второй вход обязан завершиться");
+
+        assert_eq!(first.version, second.version);
+        assert_eq!(first.path, second.path);
+        assert_ne!(
+            first.prepared, second.prepared,
+            "работу обязан выполнить ровно один вход, второй — застать готовое"
+        );
+
+        let (worked, idle) = if first.prepared {
+            (&first_sink, &second_sink)
+        } else {
+            (&second_sink, &first_sink)
+        };
+        assert!(
+            worked.stages().contains(&YtDlpPrepareStage::Unpacking),
+            "кто-то один обязан был распаковать дерево: {:?}",
+            worked.stages()
+        );
+        assert!(
+            idle.events().is_empty(),
+            "вошедшему вторым показывать нечего: {:?}",
+            idle.stages()
+        );
+        assert!(
+            unpack::stale_staging_dirs(fixture.layout().root()).is_empty(),
+            "второй вход не должен оставить своего каталога распаковки"
+        );
+    }
+
+    #[tokio::test]
     async fn an_interrupted_unpack_is_detected_and_redone() {
         // Так выглядит подготовка, прерванная между переименованием дерева
         // и записью манифеста: дерево есть, манифеста нет.
@@ -699,7 +1237,9 @@ mod tests {
         let fixture = fixture(PRINTS_VERSION);
         let layout = fixture.layout();
         layout.create_root().expect("создать корень");
-        let stale = layout.staging_dir("2000.01.01-deadbeefdead");
+        let stale = layout
+            .create_staging_dir("2000.01.01-deadbeefdead")
+            .expect("создать каталог распаковки");
         fs::create_dir_all(stale.join("_internal")).expect("создать мусор");
         fs::write(stale.join("half-written"), b"...").expect("записать мусор");
 
@@ -820,6 +1360,36 @@ mod tests {
         assert_eq!(overdue.percent, 99);
         assert_eq!(overdue.eta_secs, Some(0));
         assert_eq!(overdue.stage, YtDlpPrepareStage::WarmingUp);
+    }
+
+    #[test]
+    fn repair_attempts_are_exhausted_only_until_they_cool_down() {
+        let exhausted = (0..MAX_REPAIR_ATTEMPTS).fold(RepairLog::empty(), |log, _| {
+            log.with_attempt("не запускается", 1_000)
+        });
+
+        assert!(
+            !repair_exhausted(&RepairLog::empty(), 1_000),
+            "первую попытку никто не отменял"
+        );
+        assert!(!repair_exhausted(
+            &RepairLog::empty().with_attempt("не запускается", 1_000),
+            1_000
+        ));
+        assert!(repair_exhausted(&exhausted, 1_000));
+        assert!(repair_exhausted(
+            &exhausted,
+            1_000 + REPAIR_COOLDOWN.as_secs() - 1
+        ));
+        assert!(
+            !repair_exhausted(&exhausted, 1_000 + REPAIR_COOLDOWN.as_secs()),
+            "счётчик обязан остывать: иначе устранённая причина никогда не \
+             выпустит пользователя из отказа"
+        );
+        assert!(
+            repair_exhausted(&exhausted, 0),
+            "часы, отошедшие назад, не повод считать попытку давней"
+        );
     }
 
     #[test]

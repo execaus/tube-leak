@@ -5,11 +5,12 @@
 //!
 //! ```text
 //! <app_data>/yt-dlp/
-//!   2026.08.19-07e54b086530/          дерево ровно как в архиве
-//!     yt-dlp_macos                    исполняемый файл (имя зависит от ОС)
+//!   2026.08.19-07e54b086530/            дерево ровно как в архиве
+//!     yt-dlp_macos                      исполняемый файл (имя зависит от ОС)
 //!     _internal/…
-//!   2026.08.19-07e54b086530.json      манифест этой установки
-//!   .staging-2026.08.19-07e54b086530/ временный каталог распаковки
+//!   2026.08.19-07e54b086530.json        манифест этой установки
+//!   2026.08.19-07e54b086530.repair.json счётчик безуспешных переустановок
+//!   .staging-2026.08.19-07e54b086530-1f3c…/ временный каталог распаковки
 //! ```
 //!
 //! Имя каталога — версия плюс первые 12 символов sha256 архива. Версии
@@ -22,6 +23,17 @@
 //! Каталог установки — точная копия содержимого архива, и это свойство
 //! используется при проверке: число файлов и суммарный размер сверяются с
 //! записанными. Файл манифеста внутри каталога ломал бы сверку сам собой.
+//!
+//! # Почему у `.staging-*` случайный суффикс
+//!
+//! Имя каталога распаковки не выводится из build id: [`Layout::create_staging_dir`]
+//! добавляет к нему случайный суффикс и создаёт каталог `create_dir`, то
+//! есть отказом, если путь уже занят. Предсказуемое имя означало бы, что
+//! между уборкой остатков и созданием каталога любой процесс того же
+//! пользователя может подложить туда символическую ссылку, и распаковка
+//! ушла бы по ней наружу. Суффикс стоит ноль, а попутно снимает вопрос
+//! столкновения двух экземпляров приложения на одном каталоге данных
+//! (полное решение межпроцессной гонки — отдельная задача).
 //!
 //! # Что гарантирует манифест
 //!
@@ -59,6 +71,29 @@ const INSTALL_ROOT_DIR: &str = "yt-dlp";
 
 /// Префикс каталога, в который идёт распаковка до атомарного переименования.
 const STAGING_PREFIX: &str = ".staging-";
+
+/// Суффикс файла со счётчиком безуспешных переустановок.
+const REPAIR_SUFFIX: &str = ".repair.json";
+
+/// Сколько имён каталога распаковки пробовать, прежде чем сдаться.
+const STAGING_NAME_ATTEMPTS: u8 = 4;
+
+/// Непредсказуемый суффикс имени каталога распаковки.
+///
+/// `RandomState` берёт ключи SipHash из системного источника случайности
+/// один раз на процесс и меняет их от экземпляра к экземпляру, поэтому
+/// значения различаются и между запусками, и между вызовами. Криптостойкость
+/// здесь не требуется — требуется невозможность подготовить путь заранее;
+/// ради этого тащить в зависимости генератор случайных чисел незачем.
+fn random_suffix() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_usize(std::process::id() as usize);
+    hasher.write_u64(crate::clock::now_unix_nanos());
+    hasher.finish()
+}
 
 /// Версия формата манифеста. Растёт, когда меняется смысл полей: чужую
 /// версию проще переустановить (30 секунд), чем угадывать её семантику.
@@ -104,9 +139,44 @@ impl Layout {
         self.root.join(format!("{build_id}.json"))
     }
 
-    /// Каталог, в который идёт распаковка до атомарного переименования.
-    pub fn staging_dir(&self, build_id: &str) -> PathBuf {
-        self.root.join(format!("{STAGING_PREFIX}{build_id}"))
+    /// Файл со счётчиком безуспешных переустановок этой установки.
+    ///
+    /// Лежит рядом с манифестом, а не внутри каталога установки: каталог
+    /// сносится на каждой переустановке, а счётчик обязан её пережить —
+    /// в этом весь его смысл.
+    pub fn repair_path(&self, build_id: &str) -> PathBuf {
+        self.root.join(format!("{build_id}{REPAIR_SUFFIX}"))
+    }
+
+    /// Создаёт каталог, в который пойдёт распаковка, под именем, которое
+    /// нельзя предугадать, и возвращает его путь.
+    ///
+    /// Создание — `create_dir`, а не `create_dir_all`: занятый путь здесь
+    /// не «уже готово», а чужой объект по имени, которое мы считали
+    /// своим, и распаковываться в него нельзя. Вместе со случайным
+    /// суффиксом это и есть гарантия «каталог распаковки создали мы»
+    /// (см. doc модуля).
+    pub fn create_staging_dir(&self, build_id: &str) -> Result<PathBuf, PrepareError> {
+        let mut last_error = None;
+
+        // Несколько попыток — не про вероятность столкнуться суффиксами
+        // (она исчезающе мала), а про то, чтобы единичный отказ не ронял
+        // подготовку целиком.
+        for _ in 0..STAGING_NAME_ATTEMPTS {
+            let candidate = self.root.join(format!(
+                "{STAGING_PREFIX}{build_id}-{suffix:016x}",
+                suffix = random_suffix()
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => return Ok(candidate),
+                Err(err) => last_error = Some((candidate, err)),
+            }
+        }
+
+        let (path, err) = last_error.expect("цикл выполняется хотя бы раз");
+        Err(PrepareError::UnpackFailed {
+            reason: format!("каталог распаковки {}: {err}", path.display()),
+        })
     }
 
     /// Создаёт корневой каталог установок.
@@ -144,31 +214,120 @@ impl Manifest {
     /// `rename`. Половина JSON под именем манифеста означала бы «установка
     /// готова» при неполном дереве.
     pub fn write_atomic(&self, path: &Path) -> Result<(), PrepareError> {
-        let json = serde_json::to_vec_pretty(self).map_err(|err| PrepareError::UnpackFailed {
-            reason: format!("сериализация манифеста: {err}"),
-        })?;
-
-        let temp_path = path.with_extension("json.tmp");
-        let write = || -> io::Result<()> {
-            fs::write(&temp_path, &json)?;
-            fs::rename(&temp_path, path)
-        };
-
-        write().map_err(|err| {
-            let _ = fs::remove_file(&temp_path);
-            PrepareError::UnpackFailed {
-                reason: format!("запись манифеста {}: {err}", path.display()),
-            }
-        })
+        write_json_atomic(path, self, "манифеста")
     }
 
     /// Читает манифест. `None` — файла нет либо он не разбирается: и то,
     /// и другое означает «готовой установки нет», разница между ними
     /// ни на что не влияет.
     pub fn read(path: &Path) -> Option<Self> {
-        let raw = fs::read(path).ok()?;
-        serde_json::from_slice(&raw).ok()
+        read_json(path)
     }
+}
+
+/// Память о том, что переустановка этой установки уже выполнялась и не
+/// помогла.
+///
+/// Нужна ровно против одного сценария: дерево сходится с манифестом, но
+/// принципиально не запускается. Без счётчика приложение переустанавливало
+/// бы 124 МиБ и грело их ~35 с **при каждом запуске**, каждый раз с тем же
+/// исходом. Файл лежит рядом с манифестом ([`Layout::repair_path`]),
+/// поэтому переживает и переустановку дерева, и перезапуск приложения;
+/// удачный запуск его убирает ([`RepairLog::clear`]).
+///
+/// Запись адресована конкретному build id: другая версия yt-dlp или другой
+/// архив — другое имя файла и, значит, чистая история. Это же и первый
+/// выход из терминального состояния, второй — остывание по времени
+/// (см. `super::prepare`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairLog {
+    pub schema_version: u32,
+    /// Сколько переустановок уже выполнено и не помогло.
+    pub attempts: u32,
+    /// Время последней попытки, секунды с эпохи Unix. В числе, а не
+    /// строкой, потому что по нему считается остывание.
+    pub last_attempt_unix: u64,
+    /// То же время в RFC 3339 — только для чтения человеком в логе.
+    pub last_attempt_at: String,
+    /// Чем установка была признана нерабочей в последний раз.
+    pub last_reason: String,
+}
+
+impl RepairLog {
+    /// Пустая история: так выглядит установка, которую ещё не чинили.
+    pub fn empty() -> Self {
+        Self {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            attempts: 0,
+            last_attempt_unix: 0,
+            last_attempt_at: String::new(),
+            last_reason: String::new(),
+        }
+    }
+
+    /// Читает историю. Нечитаемая или чужая по версии формата запись —
+    /// то же самое, что её отсутствие: счётчик не то состояние, ради
+    /// которого стоит отказывать в работе.
+    pub fn read(path: &Path) -> Self {
+        read_json(path)
+            .filter(|log: &Self| log.schema_version == MANIFEST_SCHEMA_VERSION)
+            .unwrap_or_else(Self::empty)
+    }
+
+    /// Возвращает историю с ещё одной учтённой попыткой.
+    pub fn with_attempt(&self, reason: &str, now_unix: u64) -> Self {
+        Self {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            attempts: self.attempts.saturating_add(1),
+            last_attempt_unix: now_unix,
+            last_attempt_at: crate::clock::now_iso8601(),
+            last_reason: reason.to_string(),
+        }
+    }
+
+    /// Записывает историю атомарно.
+    pub fn write_atomic(&self, path: &Path) -> Result<(), PrepareError> {
+        write_json_atomic(path, self, "истории починки")
+    }
+
+    /// Убирает историю: установка запустилась, помнить нечего.
+    ///
+    /// Отсутствие файла — не ошибка и обычное дело: на исправной машине
+    /// этот файл не появляется никогда.
+    pub fn clear(path: &Path) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Пишет JSON через временный файл рядом и `rename`.
+///
+/// Половина JSON под рабочим именем — это либо «установка готова» при
+/// неполном дереве (манифест), либо нечитаемый счётчик (история починки);
+/// первое опаснее, но чинится одинаково.
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T, what: &str) -> Result<(), PrepareError> {
+    let json = serde_json::to_vec_pretty(value).map_err(|err| PrepareError::UnpackFailed {
+        reason: format!("сериализация {what}: {err}"),
+    })?;
+
+    let temp_path = path.with_extension("json.tmp");
+    let write = || -> io::Result<()> {
+        fs::write(&temp_path, &json)?;
+        fs::rename(&temp_path, path)
+    };
+
+    write().map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        PrepareError::UnpackFailed {
+            reason: format!("запись {what} {}: {err}", path.display()),
+        }
+    })
+}
+
+/// Читает JSON. `None` — файла нет либо он не разбирается.
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let raw = fs::read(path).ok()?;
+    serde_json::from_slice(&raw).ok()
 }
 
 /// Готовая к запуску установка yt-dlp.
@@ -402,14 +561,157 @@ mod tests {
 
     #[test]
     fn staging_and_install_directories_never_collide() {
-        let layout = Layout::new(Path::new("/data"));
+        let dir = tempdir().expect("tempdir");
+        let layout = Layout::new(dir.path());
+        layout.create_root().expect("root must be creatable");
+
+        let staging = layout
+            .create_staging_dir("build")
+            .expect("staging must be creatable");
+
         assert_ne!(
-            layout.staging_dir("build"),
+            staging,
             layout.install_dir("build"),
             "распаковка идёт рядом с целевым каталогом, а не в него"
         );
         assert_eq!(layout.install_dir("build").parent(), Some(layout.root()));
-        assert_eq!(layout.staging_dir("build").parent(), Some(layout.root()));
+        assert_eq!(staging.parent(), Some(layout.root()));
+        assert!(staging.is_dir(), "каталог распаковки обязан быть создан");
+    }
+
+    #[test]
+    fn every_staging_directory_gets_a_name_that_cannot_be_guessed() {
+        // Предсказуемое имя позволяло бы подложить по нему символическую
+        // ссылку между уборкой остатков и созданием каталога.
+        let dir = tempdir().expect("tempdir");
+        let layout = Layout::new(dir.path());
+        layout.create_root().expect("root must be creatable");
+
+        let names: std::collections::HashSet<String> = (0..8)
+            .map(|_| {
+                layout
+                    .create_staging_dir("build")
+                    .expect("staging must be creatable")
+                    .file_name()
+                    .expect("staging path has a file name")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(names.len(), 8, "имена обязаны различаться: {names:?}");
+        assert!(
+            names
+                .iter()
+                .all(|name| name.starts_with(&format!("{STAGING_PREFIX}build-"))),
+            "уборка остатков ищет их по префиксу: {names:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_staging_path_that_is_already_taken() {
+        // Единственный способ, которым занятый путь может встретиться, —
+        // кто-то его подложил; распаковываться в него нельзя.
+        let dir = tempdir().expect("tempdir");
+        let layout = Layout::new(dir.path());
+
+        let error = layout
+            .create_staging_dir("build")
+            .expect_err("без корневого каталога создавать негде");
+
+        assert!(
+            matches!(error, PrepareError::UnpackFailed { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_repair_log_lives_next_to_the_manifest_and_not_inside_the_tree() {
+        let layout = Layout::new(Path::new("/data"));
+        let repair = layout.repair_path("build");
+
+        assert_eq!(repair.parent(), Some(layout.root()));
+        assert!(
+            !repair.starts_with(layout.install_dir("build")),
+            "иначе переустановка стирала бы память о своих же неудачах"
+        );
+        assert_ne!(repair, layout.manifest_path("build"));
+    }
+
+    #[test]
+    fn the_repair_log_counts_attempts_and_survives_a_round_trip() {
+        let dir = tempdir().expect("tempdir");
+        let (layout, build_id) = install_fixture(dir.path());
+        let path = layout.repair_path(&build_id);
+
+        assert_eq!(
+            RepairLog::read(&path),
+            RepairLog::empty(),
+            "у нетронутой установки истории починки нет"
+        );
+
+        let first = RepairLog::empty().with_attempt("не запускается", 1_000);
+        first.write_atomic(&path).expect("write");
+        assert_eq!(RepairLog::read(&path), first);
+        assert_eq!(first.attempts, 1);
+
+        let second = RepairLog::read(&path).with_attempt("снова не запускается", 2_000);
+        second.write_atomic(&path).expect("write");
+        let read_back = RepairLog::read(&path);
+        assert_eq!(read_back.attempts, 2);
+        assert_eq!(read_back.last_attempt_unix, 2_000);
+        assert_eq!(read_back.last_reason, "снова не запускается");
+
+        RepairLog::clear(&path);
+        assert_eq!(RepairLog::read(&path).attempts, 0);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_unreadable_repair_log_is_treated_as_no_history() {
+        // Счётчик — страховка, а не условие работы: испорченный файл не
+        // повод отказывать в подготовке.
+        let dir = tempdir().expect("tempdir");
+        let (layout, build_id) = install_fixture(dir.path());
+        let path = layout.repair_path(&build_id);
+        fs::write(&path, b"{ not json").expect("write");
+
+        assert_eq!(RepairLog::read(&path), RepairLog::empty());
+    }
+
+    #[test]
+    fn a_repair_log_from_another_schema_version_is_ignored() {
+        let dir = tempdir().expect("tempdir");
+        let (layout, build_id) = install_fixture(dir.path());
+        let path = layout.repair_path(&build_id);
+        let mut log = RepairLog::empty().with_attempt("причина", 1_000);
+        log.schema_version = MANIFEST_SCHEMA_VERSION + 1;
+        log.write_atomic(&path).expect("write");
+
+        assert_eq!(RepairLog::read(&path).attempts, 0);
+    }
+
+    #[test]
+    fn writing_the_repair_log_leaves_no_temporary_file_behind() {
+        let dir = tempdir().expect("tempdir");
+        let (layout, build_id) = install_fixture(dir.path());
+        let path = layout.repair_path(&build_id);
+        RepairLog::empty()
+            .with_attempt("причина", 1_000)
+            .write_atomic(&path)
+            .expect("write");
+
+        let leftovers: Vec<_> = fs::read_dir(layout.root())
+            .expect("root must be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+
+        assert!(
+            leftovers.is_empty(),
+            "остались временные файлы: {leftovers:?}"
+        );
     }
 
     #[test]
