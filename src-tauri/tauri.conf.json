@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "tube-leak",
+  "version": "0.1.0",
+  "identifier": "dev.execaus.tubeleak",
+  "build": {},
+  "app": {
+    "windows": []
+  },
+  "bundle": {
+    "active": false,
+    "icon": []
+  }
+}
