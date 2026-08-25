@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 
 use super::error::SidecarError;
+use super::registry::{group_kill_command, ChildRegistry};
 use crate::types::LaunchFailedReason;
 
 /// Захваченный вывод успешно завершившегося (`exit code == 0`) процесса.
@@ -56,10 +57,25 @@ pub struct RunOutput {
 /// `timeout` — параметр вызывающего кода (TL-5 подставляет реальные лимиты
 /// для yt-dlp/ffmpeg — см. `crate::commands::sidecar`), здесь не
 /// захардкожен.
+///
+/// `registry` — реестр PID выполняющихся процессов (TL-10, см. doc
+/// [`super::registry`]): `run` регистрирует спавненный процесс сразу после
+/// `spawn` и снимает регистрацию на любом собственном пути завершения
+/// (успех, ошибка запуска, таймаут — после явного убийства всей группы).
+/// Если приложение выходит, пока `run` ещё не вернул управление, PID
+/// остаётся в реестре, и `RunEvent::Exit` в `main.rs` синхронно убивает его
+/// группу — единственная надёжная точка после того, как Tauri/tao
+/// завершают процесс через `std::process::exit`, обходя Rust `Drop`.
+///
+/// На Unix процесс спавнится как лидер новой группы (`process_group(0)`) —
+/// это то, что делает возможным убийство по группе, а не только по одному
+/// PID (см. doc [`super::registry::group_kill_command`], почему одного PID
+/// недостаточно для PyInstaller-сборок `yt-dlp`).
 pub async fn run(
     program: &Path,
     args: &[&str],
     timeout: Duration,
+    registry: &ChildRegistry,
 ) -> Result<RunOutput, SidecarError> {
     let mut command = Command::new(program);
     command
@@ -68,8 +84,21 @@ pub async fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
 
     let mut child = command.spawn().map_err(classify_spawn_error)?;
+    let pid = child.id();
+    if let Some(pid) = pid {
+        registry.register(pid);
+    }
+    // Снимает регистрацию на любом пути возврата из `run` ниже (успех,
+    // ошибка, таймаут) — см. doc параметра `registry` выше. Не имеет
+    // отношения к абрупт-завершению самого процесса приложения: в этом
+    // случае `run` вообще не успевает вернуться, `Drop` этого guard'а не
+    // выполняется, и PID остаётся в реестре ровно для того, чтобы его
+    // подхватил `RunEvent::Exit`.
+    let _unregister_on_return = pid.map(|pid| UnregisterGuard { registry, pid });
 
     let stdout_pipe = child.stdout.take().expect("stdout must be piped");
     let stderr_pipe = child.stderr.take().expect("stderr must be piped");
@@ -97,11 +126,32 @@ pub async fn run(
             })
         }
         Err(_elapsed) => {
-            // Процесс пережил `timeout` — убиваем явно (в отличие от
-            // прежней реализации, `child` живёт в этой функции, а не внутри
-            // упавшего таймаутом future, так что `kill_on_drop` здесь не
-            // сработает сам по себе).
-            let _ = child.start_kill();
+            // Процесс пережил `timeout` — убиваем явно всю его группу, а не
+            // только прямой потомок: одиночный `child.start_kill()`
+            // (SIGKILL напрямую в PyInstaller-bootloader) не даёт ему
+            // шанса переслать сигнал уже форкнутому потомку (см. doc
+            // `super::registry::group_kill_command`). На Windows группы нет
+            // (`process_group` недоступен вне `cfg(unix)`), но
+            // `group_kill_command` там же откатывается на `taskkill /T`,
+            // убивающий дерево процессов через собственный учёт ОС — прямой
+            // `start_kill()` избыточен в обоих случаях и убран, чтобы не
+            // дублировать источники истины.
+            if let Some(pid) = pid {
+                let (kill_program, kill_args) = group_kill_command(pid);
+                // stdout/stderr подавлены — см. аналогичный комментарий в
+                // `ChildRegistry::kill_all`.
+                let _ = Command::new(kill_program)
+                    .args(&kill_args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
+            } else {
+                // Практически недостижимо: `pid` берётся сразу после
+                // успешного `spawn`, до этой точки не пройти без него.
+                let _ = child.start_kill();
+            }
 
             // Снимаем то, что читающая задача уже накопила в общем буфере —
             // без ожидания EOF (см. doc `run`): к моменту истечения
@@ -116,6 +166,23 @@ pub async fn run(
                 stderr,
             })
         }
+    }
+}
+
+/// RAII-хэлпер: снимает регистрацию `pid` из [`ChildRegistry`] при любом
+/// штатном выходе из области видимости `run` (успех, ошибка, ранний
+/// `return`) — то есть во всех случаях, где `run` продолжает быть частью
+/// обычного потока управления приложения. Не защищает от абрупт-завершения
+/// самого процесса приложения (`std::process::exit`) — для этого и
+/// существует сам реестр, см. doc [`super::registry`].
+struct UnregisterGuard<'a> {
+    registry: &'a ChildRegistry,
+    pid: u32,
+}
+
+impl Drop for UnregisterGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.unregister(self.pid);
     }
 }
 
@@ -298,12 +365,17 @@ mod tests {
             "#!/bin/sh\necho hello-sidecar\nexit 0\n",
             0o755,
         );
+        let registry = ChildRegistry::new();
 
-        let output = run(&script, &[], Duration::from_secs(20))
+        let output = run(&script, &[], Duration::from_secs(20), &registry)
             .await
             .expect("script must succeed");
 
         assert_eq!(output.stdout.trim(), "hello-sidecar");
+        assert!(
+            registry.is_empty(),
+            "run must unregister the pid once it returns"
+        );
     }
 
     #[tokio::test]
@@ -316,7 +388,8 @@ mod tests {
             0o755,
         );
 
-        let output = run(&script, &["--version"], Duration::from_secs(20))
+        let registry = ChildRegistry::new();
+        let output = run(&script, &["--version"], Duration::from_secs(20), &registry)
             .await
             .expect("script must succeed");
 
@@ -327,8 +400,9 @@ mod tests {
     async fn returns_not_found_when_the_binary_does_not_exist() {
         let dir = tempdir().expect("failed to create temp dir");
         let missing = dir.path().join("does-not-exist");
+        let registry = ChildRegistry::new();
 
-        let result = run(&missing, &[], Duration::from_secs(20)).await;
+        let result = run(&missing, &[], Duration::from_secs(20), &registry).await;
 
         assert_eq!(result, Err(SidecarError::NotFound));
     }
@@ -337,8 +411,9 @@ mod tests {
     async fn returns_permission_denied_when_the_binary_is_not_executable() {
         let dir = tempdir().expect("failed to create temp dir");
         let script = write_script(&dir, "not-executable.sh", "#!/bin/sh\nexit 0\n", 0o644);
+        let registry = ChildRegistry::new();
 
-        let result = run(&script, &[], Duration::from_secs(20)).await;
+        let result = run(&script, &[], Duration::from_secs(20), &registry).await;
 
         assert_eq!(
             result,
@@ -360,8 +435,9 @@ mod tests {
         // ядро откатывается на shell-фолбэк, который проваливается с
         // кодом 126.
         let script = write_script(&dir, "garbage", "not a real executable\x00\x01\x02", 0o755);
+        let registry = ChildRegistry::new();
 
-        let result = run(&script, &[], Duration::from_secs(20)).await;
+        let result = run(&script, &[], Duration::from_secs(20), &registry).await;
 
         // Здесь процесс успевает стартовать (shell-фолбэк), поэтому в
         // отличие от EACCES/ENOENT-случаев stderr в принципе достижим —
@@ -384,8 +460,9 @@ mod tests {
         // по сигналу до вызова `exit`; на Unix `ExitStatus::code()` в этом
         // случае возвращает `None`.
         let script = write_script(&dir, "self-signal.sh", "#!/bin/sh\nkill -SEGV $$\n", 0o755);
+        let registry = ChildRegistry::new();
 
-        let result = run(&script, &[], Duration::from_secs(20)).await;
+        let result = run(&script, &[], Duration::from_secs(20), &registry).await;
 
         assert_eq!(
             result,
@@ -401,8 +478,9 @@ mod tests {
     async fn returns_non_zero_exit_when_the_process_fails() {
         let dir = tempdir().expect("failed to create temp dir");
         let script = write_script(&dir, "fail.sh", "#!/bin/sh\nexit 3\n", 0o755);
+        let registry = ChildRegistry::new();
 
-        let result = run(&script, &[], Duration::from_secs(20)).await;
+        let result = run(&script, &[], Duration::from_secs(20), &registry).await;
 
         assert_eq!(
             result,
@@ -422,8 +500,9 @@ mod tests {
             "#!/bin/sh\necho 'error: unsupported URL' >&2\nexit 1\n",
             0o755,
         );
+        let registry = ChildRegistry::new();
 
-        let result = run(&script, &[], Duration::from_secs(20)).await;
+        let result = run(&script, &[], Duration::from_secs(20), &registry).await;
 
         assert_eq!(
             result,
@@ -447,9 +526,10 @@ mod tests {
             &format!("#!/bin/sh\nsleep 1\ntouch '{}'\n", marker.display()),
             0o755,
         );
+        let registry = ChildRegistry::new();
 
         let started = Instant::now();
-        let result = run(&script, &[], Duration::from_millis(100)).await;
+        let result = run(&script, &[], Duration::from_millis(100), &registry).await;
         let elapsed = started.elapsed();
 
         assert_eq!(
@@ -473,6 +553,10 @@ mod tests {
             "process must have been killed by the timeout instead of running to completion, \
              found marker at {marker:?}"
         );
+        assert!(
+            registry.is_empty(),
+            "run must unregister the pid even on the timeout path, after killing it"
+        );
     }
 
     /// См. doc [`captures_stderr_written_before_the_process_is_killed_by_a_timeout`]
@@ -482,7 +566,8 @@ mod tests {
     /// завершается сам — прогрев принудительно убивает его коротким
     /// собственным таймаутом, не дожидаясь EOF.
     async fn warm_up(script: &Path) {
-        let _ = run(script, &[], Duration::from_secs(20)).await;
+        let registry = ChildRegistry::new();
+        let _ = run(script, &[], Duration::from_secs(20), &registry).await;
     }
 
     #[tokio::test]
@@ -520,8 +605,9 @@ mod tests {
         // до того, как процесс успеет выполнить `echo`.
         warm_up(&script).await;
 
+        let registry = ChildRegistry::new();
         let timeout = Duration::from_millis(300);
-        let result = run(&script, &[], timeout).await;
+        let result = run(&script, &[], timeout, &registry).await;
 
         assert_eq!(
             result,

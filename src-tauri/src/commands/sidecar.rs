@@ -11,7 +11,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::sidecar::{self, SidecarError};
+use tauri::State;
+
+use crate::sidecar::{self, ChildRegistry, SidecarError};
 use crate::types::{LaunchFailedReason, SidecarCheckReport, SidecarCheckResult, SidecarStatus};
 
 /// Таймаут проверки yt-dlp — зафиксирован в дизайне эпика E1.
@@ -25,13 +27,30 @@ const FFMPEG_TIMEOUT: Duration = Duration::from_secs(5);
 const STDERR_TAIL_MAX_CHARS: usize = 1000;
 
 /// Возвращает результат проверки обоих sidecar-бинарников (yt-dlp, ffmpeg).
+///
+/// `registry` — реестр PID выполняющихся процессов (TL-10), внедряется
+/// Tauri автоматически из состояния, управляемого в `main.rs`
+/// (`app.manage(ChildRegistry::new())`); не часть JS-видимого контракта
+/// команды — фронтенд по-прежнему вызывает `invoke("check_sidecar")` без
+/// аргументов.
+///
+/// Возвращает `Result`, хотя сама проверка не может завершиться ошибкой на
+/// этом уровне (все ошибки уже
+/// конвертированы в поля [`SidecarCheckReport`], `Err` здесь никогда не
+/// конструируется) — это требование самого Tauri: async-команда,
+/// принимающая ссылки (`State<'_, T>`), обязана возвращать `Result`,
+/// иначе сгенерированный future не может быть `'static`
+/// (`AsyncCommandMustReturnResult`). На JS-стороне это не меняет поведение:
+/// промис `invoke("check_sidecar")` всегда резолвится тем же отчётом, что
+/// и раньше, и никогда не реджектится.
 #[tauri::command]
-pub async fn check_sidecar() -> SidecarCheckReport {
-    check_report(
+pub async fn check_sidecar(registry: State<'_, ChildRegistry>) -> Result<SidecarCheckReport, ()> {
+    Ok(check_report(
         sidecar::resolve_sidecar_path("yt-dlp"),
         sidecar::resolve_sidecar_path("ffmpeg"),
+        &registry,
     )
-    .await
+    .await)
 }
 
 /// Собирает отчёт по уже резолвленным (или неуспешно резолвленным) путям —
@@ -41,6 +60,7 @@ pub async fn check_sidecar() -> SidecarCheckReport {
 async fn check_report(
     yt_dlp_path: Result<PathBuf, SidecarError>,
     ffmpeg_path: Result<PathBuf, SidecarError>,
+    registry: &ChildRegistry,
 ) -> SidecarCheckReport {
     let (yt_dlp, ffmpeg) = tokio::join!(
         check_binary(
@@ -49,6 +69,7 @@ async fn check_report(
             &["--version"],
             YT_DLP_TIMEOUT,
             sidecar::parse_ytdlp_version,
+            registry,
         ),
         check_binary(
             "ffmpeg",
@@ -56,6 +77,7 @@ async fn check_report(
             &["-version"],
             FFMPEG_TIMEOUT,
             sidecar::parse_ffmpeg_version,
+            registry,
         ),
     );
 
@@ -78,6 +100,7 @@ async fn check_binary(
     args: &[&str],
     timeout: Duration,
     parse_version: fn(&str) -> Option<String>,
+    registry: &ChildRegistry,
 ) -> SidecarCheckResult {
     let checked_at = now_iso8601();
     let started = Instant::now();
@@ -92,7 +115,7 @@ async fn check_binary(
     let path_string = path.display().to_string();
 
     let run_result: Result<sidecar::RunOutput, SidecarError> =
-        sidecar::run(&path, args, timeout).await;
+        sidecar::run(&path, args, timeout, registry).await;
     let duration_ms = elapsed_ms(started);
 
     match run_result {
@@ -299,12 +322,14 @@ mod tests {
             0o755,
         );
 
+        let registry = ChildRegistry::new();
         let result = check_binary(
             "yt-dlp",
             Ok(script.clone()),
             &["--version"],
             Duration::from_secs(5),
             sidecar::parse_ytdlp_version,
+            &registry,
         )
         .await;
 
@@ -326,12 +351,14 @@ mod tests {
         let dir = tempdir().expect("failed to create temp dir");
         let missing = dir.path().join("does-not-exist");
 
+        let registry = ChildRegistry::new();
         let result = check_binary(
             "ffmpeg",
             Ok(missing.clone()),
             &["-version"],
             Duration::from_secs(5),
             sidecar::parse_ffmpeg_version,
+            &registry,
         )
         .await;
 
@@ -346,12 +373,14 @@ mod tests {
         let dir = tempdir().expect("failed to create temp dir");
         let script = write_script(&dir, "not-executable.sh", "#!/bin/sh\nexit 0\n", 0o644);
 
+        let registry = ChildRegistry::new();
         let result = check_binary(
             "yt-dlp",
             Ok(script),
             &["--version"],
             Duration::from_secs(5),
             sidecar::parse_ytdlp_version,
+            &registry,
         )
         .await;
 
@@ -367,12 +396,14 @@ mod tests {
         let dir = tempdir().expect("failed to create temp dir");
         let script = write_script(&dir, "garbage", "not a real executable\x00\x01\x02", 0o755);
 
+        let registry = ChildRegistry::new();
         let result = check_binary(
             "ffmpeg",
             Ok(script),
             &["-version"],
             Duration::from_secs(5),
             sidecar::parse_ffmpeg_version,
+            &registry,
         )
         .await;
 
@@ -391,12 +422,14 @@ mod tests {
             0o755,
         );
 
+        let registry = ChildRegistry::new();
         let result = check_binary(
             "yt-dlp",
             Ok(script),
             &["--version"],
             Duration::from_secs(5),
             sidecar::parse_ytdlp_version,
+            &registry,
         )
         .await;
 
@@ -414,22 +447,29 @@ mod tests {
         let dir = tempdir().expect("failed to create temp dir");
         let script = write_script(&dir, "slow.sh", "#!/bin/sh\nsleep 5\n", 0o755);
 
+        let registry = ChildRegistry::new();
         let result = check_binary(
             "ffmpeg",
             Ok(script),
             &["-version"],
             Duration::from_millis(150),
             sidecar::parse_ffmpeg_version,
+            &registry,
         )
         .await;
 
         assert_eq!(result.status, SidecarStatus::Timeout);
         assert_eq!(result.timeout_ms, Some(150));
         assert!(result.version.is_none());
+        assert!(
+            registry.is_empty(),
+            "check_binary must not leave a pid registered after the timeout kill"
+        );
     }
 
     #[tokio::test]
     async fn converts_a_resolve_failure_into_launch_failed_status_using_the_binary_name_as_path() {
+        let registry = ChildRegistry::new();
         let result = check_binary(
             "yt-dlp",
             Err(SidecarError::LaunchFailed {
@@ -439,6 +479,7 @@ mod tests {
             &["--version"],
             Duration::from_secs(5),
             sidecar::parse_ytdlp_version,
+            &registry,
         )
         .await;
 
@@ -461,12 +502,14 @@ mod tests {
             0o755,
         );
 
+        let registry = ChildRegistry::new();
         let result = check_binary(
             "yt-dlp",
             Ok(script),
             &["--version"],
             Duration::from_secs(5),
             sidecar::parse_ytdlp_version,
+            &registry,
         )
         .await;
 
@@ -486,12 +529,14 @@ mod tests {
     /// выполнением. Второй и последующие запуски того же файла эту
     /// надбавку уже не платят.
     async fn warm_up(script: &std::path::Path) {
+        let registry = ChildRegistry::new();
         let _ = check_binary(
             "warm-up",
             Ok(script.to_path_buf()),
             &["--version"],
             Duration::from_secs(20),
             sidecar::parse_ytdlp_version,
+            &registry,
         )
         .await;
     }
@@ -506,8 +551,9 @@ mod tests {
         warm_up(&yt_dlp_script).await;
         warm_up(&ffmpeg_script).await;
 
+        let registry = ChildRegistry::new();
         let started = Instant::now();
-        let report = check_report(Ok(yt_dlp_script), Ok(ffmpeg_script)).await;
+        let report = check_report(Ok(yt_dlp_script), Ok(ffmpeg_script), &registry).await;
         let elapsed = started.elapsed();
 
         assert_eq!(report.yt_dlp.status, SidecarStatus::Ok);

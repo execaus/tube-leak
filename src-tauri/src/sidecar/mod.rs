@@ -6,20 +6,25 @@
 //! - [`resolve`] — путь к бинарнику по имени (`externalBin`/target triple);
 //! - [`process`] — запуск с аргументами, захват stdout, таймаут, классификация
 //!   ошибок ОС в типизированные [`error::SidecarError`];
+//! - [`registry`] — реестр PID ещё выполняющихся sidecar-процессов и их
+//!   синхронное массовое убийство на выходе из приложения (TL-10);
 //! - [`version`] — разбор строки версии `yt-dlp --version` / `ffmpeg -version`.
 //!
 //! Композиция этих частей в команду `check_sidecar` (проверка обоих
 //! бинарников параллельно, конвертация в `crate::types::SidecarCheckReport`,
 //! конкретные значения таймаута) реализована в `crate::commands::sidecar`
 //! (TL-5), которая и является единственным потребителем публичного API
-//! этого модуля.
+//! этого модуля. [`ChildRegistry`] дополнительно управляется как
+//! Tauri-состояние в `main.rs` (TL-10).
 
 mod error;
 mod process;
+mod registry;
 mod resolve;
 mod version;
 
 pub use error::SidecarError;
 pub use process::{run, RunOutput};
+pub use registry::ChildRegistry;
 pub use resolve::resolve_sidecar_path;
 pub use version::{parse_ffmpeg_version, parse_ytdlp_version};
