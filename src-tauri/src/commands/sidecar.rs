@@ -99,7 +99,7 @@ async fn check_binary(
     resolved_path: Result<PathBuf, SidecarError>,
     args: &[&str],
     timeout: Duration,
-    parse_version: fn(&str) -> Option<String>,
+    parse_version: fn(&str) -> Option<sidecar::SidecarVersion>,
     registry: &ChildRegistry,
 ) -> SidecarCheckResult {
     let checked_at = now_iso8601();
@@ -120,8 +120,25 @@ async fn check_binary(
 
     match run_result {
         Ok(output) => {
-            let version =
-                parse_version(&output.stdout).unwrap_or_else(|| output.stdout.trim().to_string());
+            let version = match parse_version(&output.stdout) {
+                Some(parsed) => {
+                    // Полная строка сборки в DTO не уходит: `version` в
+                    // контракте один, и новое поле потянуло бы за собой
+                    // TS-зеркало и область ui. На экране — нормализованный
+                    // semver, полная строка пишется в лог, чтобы по ней можно
+                    // было опознать сборку при разборе бага постобработки.
+                    if parsed.is_normalized() {
+                        eprintln!(
+                            "sidecar {name}: версия сборки {raw}, на служебном экране показывается {display}",
+                            name = name,
+                            raw = parsed.raw,
+                            display = parsed.display,
+                        );
+                    }
+                    parsed.display
+                }
+                None => output.stdout.trim().to_string(),
+            };
 
             SidecarCheckResult {
                 name: name.to_string(),
