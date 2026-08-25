@@ -36,10 +36,12 @@ pub fn resolve_sidecar_path(name: &str) -> Result<PathBuf, SidecarError> {
     let exe_path =
         tauri::utils::platform::current_exe().map_err(|_| SidecarError::LaunchFailed {
             reason: LaunchFailedReason::Other,
+            stderr: String::new(),
         })?;
 
     let exe_dir = exe_path.parent().ok_or(SidecarError::LaunchFailed {
         reason: LaunchFailedReason::Other,
+        stderr: String::new(),
     })?;
 
     // `cargo test` кладёт тестовые бинарники в `target/<profile>/deps/`;

@@ -10,12 +10,9 @@
 //!
 //! Композиция этих частей в команду `check_sidecar` (проверка обоих
 //! бинарников параллельно, конвертация в `crate::types::SidecarCheckReport`,
-//! конкретные значения таймаута) — задача TL-5, здесь не реализуется.
-//!
-//! Публичное API этого модуля пока не вызывается из `commands::sidecar`
-//! (там всё ещё stub из TL-3) — допуски ниже временные, до TL-5, по
-//! аналогии с `#[allow(dead_code)]` на контрактных enum в `types.rs`.
-#![allow(dead_code, unused_imports)]
+//! конкретные значения таймаута) реализована в `crate::commands::sidecar`
+//! (TL-5), которая и является единственным потребителем публичного API
+//! этого модуля.
 
 mod error;
 mod process;
@@ -23,6 +20,6 @@ mod resolve;
 mod version;
 
 pub use error::SidecarError;
-pub use process::run;
+pub use process::{run, RunOutput};
 pub use resolve::resolve_sidecar_path;
 pub use version::{parse_ffmpeg_version, parse_ytdlp_version};

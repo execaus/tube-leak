@@ -73,8 +73,14 @@ pub struct SidecarCheckReport {
     pub ffmpeg: SidecarCheckResult,
 }
 
-/// Фиксированные stub-данные: реальный запуск и разбор бинарников — задачи
-/// TL-4/TL-5, здесь только форма ответа для TS-зеркала (TL-2).
+/// Фиксированные stub-данные: реальный запуск и разбор бинарников теперь
+/// реализованы (`crate::commands::sidecar::check_sidecar`, TL-5), эта
+/// функция больше не используется как продакшен-заглушка — оставлена ради
+/// собственных тестов ниже (форма ответа для TS-зеркала, TL-2) и как
+/// готовый фикстурный `SidecarCheckReport` для будущих тестов на стороне
+/// вызывающего кода, если понадобится. `#[allow(dead_code)]` — не контракт,
+/// а именно эта функция вне `#[cfg(test)]`.
+#[allow(dead_code)]
 pub fn stub_report() -> SidecarCheckReport {
     let ok = |name: &str, path: &str| SidecarCheckResult {
         name: name.to_string(),
