@@ -27,4 +27,4 @@ pub use error::SidecarError;
 pub use process::{run, RunOutput};
 pub use registry::ChildRegistry;
 pub use resolve::resolve_sidecar_path;
-pub use version::{parse_ffmpeg_version, parse_ytdlp_version};
+pub use version::{parse_ffmpeg_version, parse_ytdlp_version, SidecarVersion};
