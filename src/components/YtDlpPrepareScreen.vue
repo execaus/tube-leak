@@ -51,18 +51,19 @@ const etaText = computed(() => (props.etaSecs !== undefined ? formatEta(props.et
 </script>
 
 <template>
-  <section
-    class="prepare-screen"
-    role="status"
-    aria-live="polite"
-  >
-    <p class="prepare-screen__label">
+  <section class="prepare-screen">
+    <p
+      class="prepare-screen__label"
+      role="status"
+      aria-live="polite"
+    >
       {{ label }}
     </p>
 
     <div
       class="prepare-screen__bar"
       role="progressbar"
+      :aria-label="label"
       :aria-valuenow="percent"
       aria-valuemin="0"
       aria-valuemax="100"
@@ -73,6 +74,12 @@ const etaText = computed(() => (props.etaSecs !== undefined ? formatEta(props.et
       />
     </div>
 
+    <!--
+      Проценты и ETA — вне живой области нарочно: ядро шлёт события ~раз в
+      500 мс, и если бы вся секция была `aria-live`, VoiceOver тараторил бы
+      числа все 35 секунд подряд. Живая область — только `__label`, он
+      меняется всего пару раз за всю подготовку (ревью TL-17, #18).
+    -->
     <p class="prepare-screen__percent">
       {{ percent }}%
       <span v-if="etaText"> · {{ etaText }}</span>
