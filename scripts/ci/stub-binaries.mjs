@@ -23,9 +23,17 @@
 // Имена файлов берутся из того же пина, что и у настоящей доставки, —
 // переименование в пине не разъедется с заглушками молча.
 //
+// Заглушка архива yt-dlp не проходит сверку с sha256 из пина, которую
+// делает src-tauri/build.rs (TL-25): иначе она молча уехала бы в бандл,
+// собранный на этой же машине следом за тестами, и развалилась бы у
+// пользователя на распаковке. Поэтому cargo после этого скрипта нужно
+// запускать с TUBE_LEAK_ALLOW_STUB_YTDLP=1 — переменная действует только
+// вне профиля release, то есть `npm run tauri build` ею не открыть.
+//
 // Использование:
 //   node scripts/ci/stub-binaries.mjs                 # хост-тройка
 //   node scripts/ci/stub-binaries.mjs --target x86_64-unknown-linux-gnu
+//   TUBE_LEAK_ALLOW_STUB_YTDLP=1 cargo test           # дальше — так
 
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
@@ -39,10 +47,10 @@ const REPO_ROOT = resolve(__dirname, '..', '..')
 const PIN_PATH = join(REPO_ROOT, 'src-tauri', 'binaries.lock.json')
 const OUT_DIR = join(REPO_ROOT, 'src-tauri', 'binaries')
 
-// Содержимое заглушки. Непустое намеренно: build.rs падает на пустом
-// архиве yt-dlp (пустой архив в бандле — гарантированно нерабочий
-// дистрибутив, ловится на сборке). Текст объясняет находку тому, кто
-// наткнётся на такой файл в target/ или в случайно собранном бандле.
+// Содержимое заглушки. Текст, а не пустой файл: объясняет находку тому,
+// кто наткнётся на такой файл в src-tauri/binaries/ или в target/.
+// Содержимое роли не играет — build.rs сверяет архив yt-dlp с sha256 из
+// пина, и заглушка не пройдёт сверку при любом наполнении.
 const STUB_CONTENT =
   'tube-leak CI stub, not a real binary (scripts/ci/stub-binaries.mjs)\n'
 
@@ -77,6 +85,8 @@ async function main() {
   const pin = await loadPin(PIN_PATH)
   await mkdir(OUT_DIR, { recursive: true })
 
+  let stubbed = false
+
   for (const binaryName of ['ytDlp', 'ffmpeg']) {
     const { binaryName: fileName } = pin[binaryName].targets[target]
     const path = join(OUT_DIR, fileName)
@@ -90,6 +100,16 @@ async function main() {
 
     await writeFile(path, STUB_CONTENT, { mode: 0o755 })
     console.log(`STUB  ${fileName}`)
+    stubbed = true
+  }
+
+  if (stubbed) {
+    console.log(
+      '\nЗаглушки не совпадают с sha256 из пина, и src-tauri/build.rs это проверяет.\n' +
+        'Дальше запускайте cargo с TUBE_LEAK_ALLOW_STUB_YTDLP=1, например:\n' +
+        '  TUBE_LEAK_ALLOW_STUB_YTDLP=1 cargo test --manifest-path src-tauri/Cargo.toml\n' +
+        'В профиле release переменная не действует: бандл с заглушкой собрать нельзя.',
+    )
   }
 }
 

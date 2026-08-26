@@ -12,6 +12,10 @@ tauri-build = { version = "2", features = [] }
 # через cargo:rustc-env, а не дублируются Rust-константами (TL-12).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Сверка вложенного архива yt-dlp с sha256 из пина перед укладкой в ресурсы
+# бандла (TL-25). Новых крейтов в сборку не добавляет: sha2 уже есть в графе
+# на host-стороне (tauri-codegen), а build-зависимости резолвятся туда же.
+sha2 = "0.10"
 
 [dependencies]
 tauri = { version = "2", features = [] }
