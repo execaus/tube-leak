@@ -28,6 +28,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Ни один шаг ничего не пишет ни в репозиторий, ни в релизы: и сборка, и
+# проверки только читают. Явное ограничение снимает у GITHUB_TOKEN всё
+# остальное — если когда-нибудь понадобится запись (публикация релиза),
+# её придётся разрешить осознанно, джобу и точечно.
+permissions:
+  contents: read
+
 # Новый пуш в ветку PR отменяет незавершённые прогоны предыдущего: четыре
 # сборки бандла на пуш — дорого, а результат по устаревшему коммиту всё
 # равно никому не нужен. Пуши в main не отменяются: там прогон привязан к
@@ -201,10 +208,14 @@ jobs:
         run: cargo fmt --check
         working-directory: src-tauri
 
+      # `--locked` у clippy и test: PR, правящий Cargo.toml без обновления
+      # Cargo.lock, иначе молча обновил бы lock в CI и позеленел — та же
+      # дисциплина, что `npm ci` даёт фронтенду. У `cargo fmt` этого флага
+      # нет (cargo-fmt его не принимает), но fmt и не резолвит зависимости.
       - name: Lint Rust (clippy)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
         working-directory: src-tauri
 
       - name: Run Rust tests
-        run: cargo test
+        run: cargo test --locked
         working-directory: src-tauri
