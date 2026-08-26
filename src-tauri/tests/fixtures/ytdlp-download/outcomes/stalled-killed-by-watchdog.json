@@ -1,0 +1,31 @@
+{
+  "_capture": {
+    "note": "С-8: поток замер, явного обрыва нет. СМОДЕЛИРОВАНО: тот же прокси перестал передавать данные, не закрывая сокеты (ни RST, ни FIN — то, что видит клиент при выключенном Wi-Fi), а попытку убил сторож — `kill -9 -<pgid>`, ровно как реестр E1, через 20 с после последнего принятого байта. Итог: кода завершения нет (сигнал), в stderr ни одной строки ERROR, а в stdout — две строки «Read timed out … Retrying», напечатанные при НУЛЕВОМ движении байт.",
+    "reality": "modelled",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "--proxy",
+      "http://127.0.0.1:8897",
+      "--limit-rate",
+      "300K",
+      "--socket-timeout",
+      "10",
+      "-f",
+      "134",
+      "-o",
+      "%(title)s.%(ext)s",
+      "-P",
+      "temp:.",
+      "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": null,
+  "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=aqz-KE-bpKQ\n[youtube] aqz-KE-bpKQ: Downloading webpage\n[youtube] aqz-KE-bpKQ: Downloading visionos player API JSON\n[youtube] aqz-KE-bpKQ: Downloading m3u8 information\n[info] aqz-KE-bpKQ: Downloading 1 format(s): 134\n[download] Destination: ./Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film.mp4\n@tl-progress|downloading|1024|18294110|NA|27012.882607847947|677|NA|NA|134\n@tl-progress|downloading|3072|18294110|NA|78291.49990278047|233|NA|NA|134\n@tl-progress|downloading|7168|18294110|NA|178797.3301932798|102|NA|NA|134\n@tl-progress|downloading|15360|18294110|NA|288883.6001650135|63|NA|NA|134\n@tl-progress|downloading|31744|18294110|NA|145490.61035166282|125|NA|NA|134\n@tl-progress|downloading|64512|18294110|NA|180069.42336751052|101|NA|NA|134\n@tl-progress|downloading|130048|18294110|NA|80652.6318439151|225|NA|NA|134\n[download] Got error: HTTPSConnectionPool(host='rr2---sn-p5qs7nd7.googlevideo.com', port=443): Read timed out.. Retrying (1/10)...\n[download] Got error: HTTPSConnectionPool(host='rr2---sn-p5qs7nd7.googlevideo.com', port=443): Read timed out. (read timeout=10.0). Retrying (2/10)...\n",
+  "stderr": "WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one\n"
+}

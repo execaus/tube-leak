@@ -5,8 +5,10 @@
 //! строк и агрегация) двумя копиями кода — гарантированное расхождение,
 //! поэтому конверт и его сверка живут в одном месте.
 //!
-//! Формат конверта и правила пересъёмки — в
-//! `tests/fixtures/ytdlp-download/progress/README.md`.
+//! Наборов два, и конверты у них разные: `progress/` — stdout идущей
+//! загрузки (TL-41), `outcomes/` — код завершения и stderr законченной
+//! попытки (TL-43). Формат каждого конверта и правила пересъёмки — в
+//! README рядом с ним.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,6 +29,23 @@ pub const PROGRESS_FIXTURES: &[&str] = &[
     "already-downloaded.json",
 ];
 
+/// Все фикстуры исходов запуска (TL-43). Порядок — от успеха к частному.
+///
+/// Отдельный набор, а не продолжение [`PROGRESS_FIXTURES`], потому что в
+/// нём другой конверт и другой предмет: там stdout идущей загрузки, здесь
+/// код завершения и stderr законченной попытки.
+pub const OUTCOME_FIXTURES: &[&str] = &[
+    "success-audio-only.json",
+    "disk-full.json",
+    "stale-format.json",
+    "destination-read-only.json",
+    "video-unavailable.json",
+    "sign-in-required.json",
+    "ytdlp-failure-outdated.json",
+    "connection-lost-mid-download.json",
+    "stalled-killed-by-watchdog.json",
+];
+
 /// Обстоятельства съёмки — всё, что нужно, чтобы фикстуру можно было
 /// повторить и чтобы её нельзя было тихо оставить протухшей.
 #[derive(Debug, Deserialize)]
@@ -42,6 +61,33 @@ pub struct Capture {
     pub yt_dlp_version: String,
     #[allow(dead_code)]
     pub captured_at: String,
+    /// `live` — исход снят как есть; `modelled` — обстоятельства
+    /// воспроизведены (см. [`Capture::is_live`]).
+    #[serde(default)]
+    reality: Option<String>,
+}
+
+impl Capture {
+    /// Снят ли исход живьём.
+    ///
+    /// Поле есть только у фикстур исходов (TL-43) и отсутствует у фикстур
+    /// прогресса (TL-41), снятых раньше: там все до одной живые, и
+    /// приписывать им признак задним числом значило бы править чужой
+    /// снятый материал. Отсюда `Option` — и отсюда же тест, требующий,
+    /// чтобы у **исхода** признак был обязательно: молчание здесь
+    /// означало бы «неизвестно», а неизвестного происхождения фикстур в
+    /// этом проекте не бывает.
+    #[allow(dead_code)]
+    pub fn is_live(&self) -> bool {
+        match self.reality.as_deref() {
+            Some("live") => true,
+            Some("modelled") => false,
+            other => panic!(
+                "у фикстуры исхода обязано быть поле _capture.reality со \
+                 значением live или modelled, а не {other:?}"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +95,47 @@ struct Envelope {
     #[serde(rename = "_capture")]
     capture: Capture,
     stdout: String,
+}
+
+/// Снятый исход одной попытки скачивания.
+#[derive(Debug)]
+pub struct Outcome {
+    pub capture: Capture,
+    /// Код завершения; `None` — процесс убит сигналом.
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OutcomeEnvelope {
+    #[serde(rename = "_capture")]
+    capture: Capture,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+/// Снятый исход запуска: конверт `outcomes/<имя>.json`.
+pub fn outcome(name: &str) -> Outcome {
+    let path = outcomes_dir().join(name);
+    let raw = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("фикстура {} не читается: {err}", path.display()));
+    let envelope: OutcomeEnvelope = serde_json::from_str(&raw)
+        .unwrap_or_else(|err| panic!("фикстура {} — не тот конверт: {err}", path.display()));
+
+    Outcome {
+        capture: envelope.capture,
+        exit_code: envelope.exit_code,
+        stdout: envelope.stdout,
+        stderr: envelope.stderr,
+    }
+}
+
+/// Имена файлов, реально лежащих в каталоге фикстур исходов, по алфавиту.
+pub fn outcome_files_on_disk() -> Vec<String> {
+    json_files_in(&outcomes_dir())
 }
 
 fn read(name: &str) -> Envelope {
@@ -109,8 +196,11 @@ pub fn pinned_yt_dlp_version() -> String {
 /// которой [`PROGRESS_FIXTURES`] не знает, выглядела бы покрытым случаем,
 /// не будучи им.
 pub fn files_on_disk() -> Vec<String> {
-    let dir = progress_dir();
-    let mut names: Vec<String> = fs::read_dir(&dir)
+    json_files_in(&progress_dir())
+}
+
+fn json_files_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
         .unwrap_or_else(|err| panic!("каталог {} не читается: {err}", dir.display()))
         .map(|entry| {
             entry
@@ -135,4 +225,8 @@ fn fixtures_root() -> PathBuf {
 
 fn progress_dir() -> PathBuf {
     fixtures_root().join("ytdlp-download").join("progress")
+}
+
+fn outcomes_dir() -> PathBuf {
+    fixtures_root().join("ytdlp-download").join("outcomes")
 }

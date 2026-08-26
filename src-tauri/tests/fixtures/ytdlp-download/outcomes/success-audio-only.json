@@ -1,0 +1,25 @@
+{
+  "_capture": {
+    "note": "Контрольный успех: поток скачан целиком, код 0. В stderr при этом не пусто — предупреждение про JS-рантайм yt-dlp печатает в КАЖДОМ запуске по ролику YouTube, и классификация обязана не принять его за отказ.",
+    "reality": "live",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "-f",
+      "139",
+      "-o",
+      "%(title)s.%(ext)s",
+      "-P",
+      "temp:.",
+      "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 0,
+  "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=aqz-KE-bpKQ\n[youtube] aqz-KE-bpKQ: Downloading webpage\n[youtube] aqz-KE-bpKQ: Downloading visionos player API JSON\n[youtube] aqz-KE-bpKQ: Downloading m3u8 information\n[info] aqz-KE-bpKQ: Downloading 1 format(s): 139\n[download] Destination: ./Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film.m4a\n@tl-progress|downloading|1024|3871021|NA|6843.860470230175|565|NA|NA|139\n@tl-progress|downloading|3072|3871021|NA|20353.140959803623|190|NA|NA|139\n@tl-progress|downloading|7168|3871021|NA|47180.185382740696|81|NA|NA|139\n@tl-progress|downloading|15360|3871021|NA|100229.64617148618|38|NA|NA|139\n@tl-progress|downloading|31744|3871021|NA|95037.06804076322|40|NA|NA|139\n@tl-progress|downloading|64512|3871021|NA|33001.332289973405|115|NA|NA|139\n@tl-progress|downloading|84729|3871021|NA|43301.458508278505|87|NA|NA|139\n@tl-progress|downloading|125163|3871021|NA|57980.54372250538|64|NA|NA|139\n@tl-progress|downloading|206031|3871021|NA|88156.68882126901|41|NA|NA|139\n@tl-progress|downloading|367767|3871021|NA|65823.23623729206|53|NA|NA|139\n@tl-progress|downloading|448635|3871021|NA|71811.01264506417|47|NA|NA|139\n@tl-progress|downloading|571116|3871021|NA|76493.8301347676|43|NA|NA|139\n@tl-progress|downloading|671614|3871021|NA|89779.07373664534|35|NA|NA|139\n@tl-progress|downloading|872610|3871021|NA|97684.94981984692|30|NA|NA|139\n@tl-progress|downloading|1011021|3871021|NA|103685.67875575506|27|NA|NA|139\n@tl-progress|downloading|1180243|3871021|NA|108415.41972796594|24|NA|NA|139\n@tl-progress|downloading|1329274|3871021|NA|109826.28741969807|23|NA|NA|139\n@tl-progress|downloading|1451719|3871021|NA|110317.75590630528|21|NA|NA|139\n@tl-progress|downloading|1567669|3871021|NA|110206.59742438637|20|NA|NA|139\n@tl-progress|downloading|1676502|3871021|NA|111493.93876185354|19|NA|NA|139\n@tl-progress|downloading|1810550|3871021|NA|108899.14434264427|18|NA|NA|139\n@tl-progress|downloading|1894898|3871021|NA|110806.3469687777|17|NA|NA|139\n@tl-progress|downloading|2063594|3871021|NA|111042.035429547|16|NA|NA|139\n@tl-progress|downloading|2177354|3871021|NA|111476.60297907976|15|NA|NA|139\n@tl-progress|downloading|2297349|3871021|NA|112541.3060907703|13|NA|NA|139\n@tl-progress|downloading|2433482|3871021|NA|112121.07069974717|12|NA|NA|139\n@tl-progress|downloading|2538956|3871021|NA|112127.0686917239|11|NA|NA|139\n@tl-progress|downloading|2651221|3871021|NA|111837.9438030574|10|NA|NA|139\n@tl-progress|downloading|2756896|3871021|NA|110496.14290729849|10|NA|NA|139\n@tl-progress|downloading|2841827|3871021|NA|107687.92326109779|9|NA|NA|139\n@tl-progress|downloading|2900835|3871021|NA|104366.22156497044|9|NA|NA|139\n@tl-progress|downloading|2942824|3871021|NA|101907.3360386214|9|NA|NA|139\n@tl-progress|downloading|2981606|3871021|NA|103244.5227141654|8|NA|NA|139\n@tl-progress|downloading|3059170|3871021|NA|102157.5651378544|7|NA|NA|139\n@tl-progress|downloading|3131895|3871021|NA|101978.52786269269|7|NA|NA|139\n@tl-progress|downloading|3226871|3871021|NA|102524.50708833379|6|NA|NA|139\n@tl-progress|downloading|3351376|3871021|NA|102919.9704286834|5|NA|NA|139\n@tl-progress|downloading|3465727|3871021|NA|103768.47292341075|3|NA|NA|139\n@tl-progress|downloading|3602556|3871021|NA|104925.3424178638|2|NA|NA|139\n@tl-progress|downloading|3748769|3871021|NA|103516.7599683393|1|NA|NA|139\n@tl-progress|downloading|3826556|3871021|NA|103185.70724873694|0|NA|NA|139\n@tl-progress|downloading|3871021|3871021|NA|104057.44732817497|0|NA|NA|139\n@tl-progress|finished|3871021|3871021|NA|102130.0967978163|NA|NA|NA|139\n[FixupM4a] Correcting container of \"./Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film.m4a\"\n",
+  "stderr": "WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one\n"
+}

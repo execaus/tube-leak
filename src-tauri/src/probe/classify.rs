@@ -169,7 +169,8 @@ fn is_live(metadata: &Value) -> bool {
 ///
 /// Остальные пары порядка на снятом выводе **не проверяются ничем**:
 /// каждая живая фикстура совпадает ровно с одной группой, и перестановка
-/// шагов 3–6 между собой не изменила бы на наборе ни одного исхода.
+/// шагов 3–6 между собой (включая порядок внутри
+/// [`shared_failure_class`]) не изменила бы на наборе ни одного исхода.
 /// Тесты вроде `a_gone_recording_of_a_broadcast_is_unavailable_and_not_live`
 /// проверяют **состав** маркеров (что общее слово не попало в чужую
 /// группу), а не их очерёдность, и прошли бы при любой перестановке.
@@ -204,40 +205,93 @@ fn failure_from_stderr(stderr: &str, details: ProbeErrorDetails) -> ProbeFailure
         return ProbeFailure::LiveUnsupported { details };
     }
 
-    // 4. Регион — строго перед «ролик недоступен»: YouTube формулирует
-    //    региональную блокировку как частный случай недоступности
-    //    («Video unavailable. This video is not available in your
-    //    country»), и общий маркер съел бы частный.
-    if contains_any(&text, &REGION_MARKERS) {
-        return ProbeFailure::RegionBlocked { details };
-    }
-
-    // 5. Нужен вход: возрастное ограничение, приватный ролик, ролик для
-    //    подписчиков канала. Тоже перед «ролик недоступен» и по тому же
-    //    правилу: «video unavailable» — такая же общая обёртка, как и
-    //    «Video unavailable. …in your country», и формулировка вида
-    //    «This video is unavailable. Sign in…» уехала бы в класс, у
-    //    которого действия нет вовсе, вместо класса, у которого действие
-    //    появится в E8. Сегодня такого текста в снятом выводе нет —
-    //    порядок стоит на будущее, а не на наблюдении.
-    if contains_any(&text, &SIGN_IN_MARKERS) {
-        return ProbeFailure::SignInRequired { details };
-    }
-
-    // 6. Ролик недоступен: удалён, снят, не существует.
-    if contains_any(&text, &UNAVAILABLE_MARKERS) {
-        return ProbeFailure::VideoUnavailable { details };
+    // 4–6. Регион → вход → «ролик недоступен». Три класса, общие с
+    //    эпиком скачивания, и порядок между ними тоже общий — он живёт в
+    //    [`shared_failure_class`], а не здесь.
+    if let Some(shared) = shared_failure_class(&text) {
+        return match shared {
+            SharedFailureClass::RegionBlocked => ProbeFailure::RegionBlocked { details },
+            SharedFailureClass::SignInRequired => ProbeFailure::SignInRequired { details },
+            SharedFailureClass::VideoUnavailable => ProbeFailure::VideoUnavailable { details },
+        };
     }
 
     // 7. Всё остальное — сбой yt-dlp; под-причина меняет только текст
     //    пояснения на экране, но не класс.
     ProbeFailure::YtDlpFailure {
-        reason: if contains_any(&text, &OUTDATED_MARKERS) {
-            YtDlpFailureReason::Outdated
-        } else {
-            YtDlpFailureReason::Generic
-        },
+        reason: yt_dlp_failure_reason(&text),
         details,
+    }
+}
+
+/// Класс отказа, который эпик скачивания (E3) переиспользует у разбора
+/// ссылки (E2) без изменений.
+///
+/// Три значения, а не четыре: «сбой yt-dlp» тоже общий, но у него нет
+/// собственных маркеров — он остаток после всех проверок, и остаток у
+/// каждого вызывающего свой (у скачивания перед ним стоят ещё «нет места»
+/// и «формат недоступен»). Общее у этого класса — только под-причина, и
+/// её отдаёт [`yt_dlp_failure_reason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedFailureClass {
+    RegionBlocked,
+    SignInRequired,
+    VideoUnavailable,
+}
+
+/// Класс по тексту отказа — тот, который на проводе одинаков у разбора
+/// ссылки и у скачивания.
+///
+/// `text` обязан быть результатом [`fatal_text`]: маркеры записаны в
+/// нижнем регистре и сравниваются подстрокой.
+///
+/// Порядок внутри нагружен и переезжает к вызывающим целиком:
+///
+/// 1. **Регион — строго перед «ролик недоступен»**: YouTube формулирует
+///    региональную блокировку как частный случай недоступности («Video
+///    unavailable. This video is not available in your country»), и общий
+///    маркер съел бы частный.
+/// 2. **Вход — тоже перед «ролик недоступен»** и по тому же правилу:
+///    «video unavailable» — такая же общая обёртка, и формулировка вида
+///    «This video is unavailable. Sign in…» уехала бы в класс, у которого
+///    действия нет вовсе, вместо класса, у которого действие появится в
+///    E8. Живого текста с обоими признаками сразу в снятом выводе нет —
+///    порядок стоит на будущее, а не на наблюдении (см. тест
+///    `the_order_of_the_groups_decides_when_two_of_them_match_at_once`).
+/// 3. **Ролик недоступен**: удалён, снят, не существует.
+pub(crate) fn shared_failure_class(text: &str) -> Option<SharedFailureClass> {
+    if contains_any(text, &REGION_MARKERS) {
+        return Some(SharedFailureClass::RegionBlocked);
+    }
+    if contains_any(text, &SIGN_IN_MARKERS) {
+        return Some(SharedFailureClass::SignInRequired);
+    }
+    if contains_any(text, &UNAVAILABLE_MARKERS) {
+        return Some(SharedFailureClass::VideoUnavailable);
+    }
+    None
+}
+
+/// Транспортный сбой: до YouTube не доехал запрос.
+///
+/// У разбора ссылки это класс «нет сети», у скачивания — не класс вовсе,
+/// а повод уйти в цикл повторов (С-6): маркеры одни, решение по ним
+/// разное, поэтому функция отвечает фактом, а не классом.
+pub(crate) fn is_transport_failure(text: &str) -> bool {
+    contains_any(text, &NETWORK_MARKERS) || contains_any(text, &NETWORK_MARKERS_OTHER_OS)
+}
+
+/// Под-причина класса «сбой yt-dlp»: опознан ли в тексте признак того,
+/// что yt-dlp не понимает ответ YouTube.
+///
+/// Общая для обоих эпиков ровно потому, что признак один и тот же:
+/// [`crate::types::YtDlpFailureReason::Outdated`] меняет только текст
+/// пояснения на экране, но не класс.
+pub(crate) fn yt_dlp_failure_reason(text: &str) -> YtDlpFailureReason {
+    if contains_any(text, &OUTDATED_MARKERS) {
+        YtDlpFailureReason::Outdated
+    } else {
+        YtDlpFailureReason::Generic
     }
 }
 
@@ -247,11 +301,42 @@ fn failure_from_stderr(stderr: &str, details: ProbeErrorDetails) -> ProbeFailure
 /// Если ни одной строки `ERROR:` нет (процесс убит, упал до вывода,
 /// сказал всё предупреждениями) — берётся весь stderr: лучше решать по
 /// шумному тексту, чем не решать вовсе.
-fn fatal_text(stderr: &str) -> String {
-    let errors: Vec<&str> = stderr
-        .lines()
-        .filter(|line| line.trim_start().starts_with("ERROR:"))
-        .collect();
+///
+/// # Перенос текста на следующую строку
+///
+/// Пустая `ERROR:` забирает себе следующую строку. Правило появилось не
+/// из осторожности, а из снятого вывода **скачивания** (E3, фикстура
+/// `connection-lost-mid-download`): когда полоса прогресса уже что-то
+/// напечатала, yt-dlp закрывает её переводом строки, и отказ выезжает
+/// двумя строками — пустой `ERROR:` и текст под ней:
+///
+/// ```text
+/// ERROR:
+/// [download] Got error: ('Unable to connect to proxy', …). Giving up after 10 retries
+/// ```
+///
+/// Без переноса от такого отказа остаётся строка `error:`, в которой нет
+/// ни одного маркера, и транспортный сбой уезжает в «сбой yt-dlp» — то
+/// есть в класс, у которого нет ни повторов, ни объяснения. На выводе
+/// разбора ссылки (`-J`, полосы нет) правило не меняет ничего: во всех
+/// девятнадцати снятых исходах E2 текст стоит на той же строке.
+pub(crate) fn fatal_text(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().collect();
+    let mut errors: Vec<&str> = Vec::new();
+
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("ERROR:") else {
+            continue;
+        };
+
+        errors.push(line);
+        if rest.trim().is_empty() {
+            if let Some(continuation) = lines.get(index + 1) {
+                errors.push(continuation);
+            }
+        }
+    }
 
     if errors.is_empty() {
         stderr.to_lowercase()

@@ -1,0 +1,27 @@
+{
+  "_capture": {
+    "note": "Под-причина «устарел» на пути скачивания. Воспроизведена тем же приёмом, что в E2 (принудительный клиент web без JS-рантайма): «No video formats found!». Важное для порядка проверок: формат запрошен несуществующим для этого клиента, но yt-dlp говорит НЕ «Requested format is not available» — устаревание и устаревшие данные карточки на этом пине не путаются.",
+    "reality": "live",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "--extractor-args",
+      "youtube:player_client=web",
+      "-f",
+      "137+140",
+      "-o",
+      "%(title)s.%(ext)s",
+      "-P",
+      "temp:.",
+      "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 1,
+  "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=jNQXAC9IVRw\n[youtube] jNQXAC9IVRw: Downloading webpage\n",
+  "stderr": "WARNING: [youtube] jNQXAC9IVRw: n challenge solving failed: Some formats may be missing. Ensure you have a supported JavaScript runtime and challenge solver script distribution installed. Review any warnings presented before this message. For more details, refer to  https://github.com/yt-dlp/yt-dlp/wiki/EJS\nERROR: [youtube] jNQXAC9IVRw: No video formats found!; please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U\n"
+}
