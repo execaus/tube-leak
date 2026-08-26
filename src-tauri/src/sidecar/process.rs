@@ -34,6 +34,39 @@ pub struct RunOutput {
     pub stderr: String,
 }
 
+/// Максимальная длина хвоста stderr в Unicode-символах (не байтах).
+///
+/// По контракту TL-1 для «Подробнее» на служебном экране достаточно
+/// «~1000 символов или ~20 строк»; тот же предел действует и для
+/// «Подробнее» у разбора ссылки (Н-4 эпика E2) — это одна конвенция
+/// приложения, а не два независимых решения, поэтому и константа одна.
+pub const STDERR_TAIL_MAX_CHARS: usize = 1000;
+
+/// Обрезает stderr до последних [`STDERR_TAIL_MAX_CHARS`] символов.
+///
+/// `None`, если после `trim()` не осталось ничего: «Подробнее», за
+/// которым пусто, — это состояние без содержания, а не диагностика.
+/// Полный поток пишется в лог приложения и на экран не попадает ни в
+/// каком состоянии.
+pub fn stderr_tail(stderr: &str) -> Option<String> {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let char_count = trimmed.chars().count();
+    if char_count <= STDERR_TAIL_MAX_CHARS {
+        Some(trimmed.to_string())
+    } else {
+        Some(
+            trimmed
+                .chars()
+                .skip(char_count - STDERR_TAIL_MAX_CHARS)
+                .collect(),
+        )
+    }
+}
+
 /// Запускает `program` с аргументами `args`, ждёт завершения не дольше
 /// `timeout` и возвращает захваченные stdout/stderr.
 ///

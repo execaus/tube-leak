@@ -24,7 +24,12 @@ mod resolve;
 mod version;
 
 pub use error::SidecarError;
-pub use process::{run, RunOutput};
+pub use process::{run, stderr_tail, RunOutput};
+// Предел обрезки нужен только тем, кто его проверяет: продакшен-код зовёт
+// `stderr_tail`, а само число сверяют тесты обоих потребителей — команды
+// служебного экрана и классификации разбора.
+#[cfg(test)]
+pub use process::STDERR_TAIL_MAX_CHARS;
 pub use registry::ChildRegistry;
 pub use resolve::resolve_sidecar_path;
 pub use version::{parse_ffmpeg_version, parse_ytdlp_version, SidecarVersion};

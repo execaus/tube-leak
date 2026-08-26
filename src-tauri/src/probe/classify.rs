@@ -18,7 +18,7 @@
 //!
 //! Обратное тоже верно и тоже проверено: запланированная трансляция
 //! (премьера) приходит **кодом 1 и текстом в stderr** («This live event
-//! will begin in 4 days.»), то есть класс «прямая трансляция» живёт на
+//! will begin in 3 days.»), то есть класс «прямая трансляция» живёт на
 //! обеих ветках сразу, а не на одной из них.
 //!
 //! # Классификация идёт по строкам `ERROR:`, а не по всему stderr
@@ -57,15 +57,12 @@
 use serde_json::Value;
 
 use crate::probe::error::ProbeFailure;
+// Хвост stderr для «Подробнее» (Н-4) берётся общей функцией домена
+// `sidecar`, а не своей копией: предел и способ обрезки — одна конвенция
+// приложения на служебный экран E1 и на разбор ссылки, и две копии этой
+// конвенции неизбежно разошлись бы.
+use crate::sidecar::stderr_tail;
 use crate::types::{ProbeErrorDetails, YtDlpFailureReason};
-
-/// Сколько символов stderr уходит в «Подробнее» (Н-4).
-///
-/// Значение и способ обрезки — те же, что у служебного экрана E1
-/// (`crate::commands::sidecar`): пользователю нужен хвост, которого хватает
-/// на опознание причины, а не поток целиком. Полный stderr пишет в лог
-/// вызывающий.
-const STDERR_TAIL_MAX_CHARS: usize = 1000;
 
 /// Всё, что осталось от одного запуска yt-dlp.
 ///
@@ -90,22 +87,24 @@ pub struct YtDlpOutcome<'a> {
 /// метаданных, который не оказался ни плейлистом, ни идущим/запланированным
 /// эфиром. Всё остальное — отказ; какой именно, решает stderr.
 pub fn classify(outcome: &YtDlpOutcome<'_>) -> Result<Value, ProbeFailure> {
-    let details = details(outcome);
-
     if outcome.exit_code == Some(0) {
         if let Some(metadata) = parse_metadata(outcome.stdout) {
             if is_playlist(&metadata) {
-                return Err(ProbeFailure::PlaylistUnsupported { details });
+                return Err(ProbeFailure::PlaylistUnsupported {
+                    details: details(outcome),
+                });
             }
             if is_live(&metadata) {
-                return Err(ProbeFailure::LiveUnsupported { details });
+                return Err(ProbeFailure::LiveUnsupported {
+                    details: details(outcome),
+                });
             }
 
             return Ok(metadata);
         }
     }
 
-    Err(failure_from_stderr(outcome.stderr, details))
+    Err(failure_from_stderr(outcome.stderr, details(outcome)))
 }
 
 /// Метаданные ролика из stdout, если они там есть.
@@ -161,16 +160,30 @@ fn is_live(metadata: &Value) -> bool {
 
 /// Класс отказа по выводу процесса.
 ///
-/// Порядок проверок нагружен: сообщения yt-dlp пересекаются словами, и
-/// первая совпавшая группа решает исход. Обоснование каждого шага — в
-/// комментариях внутри; каждую развилку держит отдельный тест на снятом
-/// выводе — `a_gone_recording_of_a_broadcast_is_unavailable_and_not_live`,
-/// `a_failed_playlist_is_a_playlist_and_not_a_yt_dlp_failure`,
-/// `an_http_error_from_the_site_is_not_a_dead_network`,
-/// `a_dead_network_is_not_mistaken_for_an_outdated_yt_dlp`,
-/// `a_private_video_lands_in_one_class_on_both_of_its_wordings`. Порядок
-/// «регион раньше недоступности» — единственный, под который живого
-/// вывода не нашлось (см. README фикстур).
+/// Порядок проверок нагружен: группы маркеров пересекаются словами, и
+/// первая совпавшая решает исход. Обоснование каждого шага — в
+/// комментариях внутри.
+///
+/// # Чем порядок проверен, а чем — нет
+///
+/// Из девятнадцати снятых исходов **ровно один** попадает больше чем в
+/// одну группу: `playlist-without-network` (ссылка на плейлист при
+/// выключенной сети — метка `[youtube:tab]` и транспортный сбой сразу).
+/// Он и держит единственную пару шагов, проверенную живым выводом, —
+/// шаги 1 и 2, тест
+/// `a_playlist_link_stays_a_playlist_even_when_the_network_is_down`.
+///
+/// Остальные пары порядка на снятом выводе **не проверяются ничем**:
+/// каждая живая фикстура совпадает ровно с одной группой, и перестановка
+/// шагов 3–6 между собой не изменила бы на наборе ни одного исхода.
+/// Тесты вроде `a_gone_recording_of_a_broadcast_is_unavailable_and_not_live`
+/// проверяют **состав** маркеров (что общее слово не попало в чужую
+/// группу), а не их очерёдность, и прошли бы при любой перестановке.
+/// Пары, за которыми есть смысл, но нет живого вывода, закреплены
+/// собранными строками в
+/// `the_order_of_the_groups_decides_when_two_of_them_match_at_once`; там
+/// же сказано, из чего собрана каждая. Если менять порядок — смотреть
+/// надо туда, живой набор перестановку не заметит.
 fn failure_from_stderr(stderr: &str, details: ProbeErrorDetails) -> ProbeFailure {
     let text = fatal_text(stderr);
 
@@ -205,15 +218,21 @@ fn failure_from_stderr(stderr: &str, details: ProbeErrorDetails) -> ProbeFailure
         return ProbeFailure::RegionBlocked { details };
     }
 
-    // 5. Ролик недоступен: удалён, снят, не существует.
-    if contains_any(&text, &UNAVAILABLE_MARKERS) {
-        return ProbeFailure::VideoUnavailable { details };
-    }
-
-    // 6. Нужен вход: возрастное ограничение, приватный ролик, ролик для
-    //    подписчиков канала.
+    // 5. Нужен вход: возрастное ограничение, приватный ролик, ролик для
+    //    подписчиков канала. Тоже перед «ролик недоступен» и по тому же
+    //    правилу: «video unavailable» — такая же общая обёртка, как и
+    //    «Video unavailable. …in your country», и формулировка вида
+    //    «This video is unavailable. Sign in…» уехала бы в класс, у
+    //    которого действия нет вовсе, вместо класса, у которого действие
+    //    появится в E8. Сегодня такого текста в снятом выводе нет —
+    //    порядок стоит на будущее, а не на наблюдении.
     if contains_any(&text, &SIGN_IN_MARKERS) {
         return ProbeFailure::SignInRequired { details };
+    }
+
+    // 6. Ролик недоступен: удалён, снят, не существует.
+    if contains_any(&text, &UNAVAILABLE_MARKERS) {
+        return ProbeFailure::VideoUnavailable { details };
     }
 
     // 7. Всё остальное — сбой yt-dlp; под-причина меняет только текст
@@ -259,27 +278,6 @@ fn details(outcome: &YtDlpOutcome<'_>) -> ProbeErrorDetails {
     }
 }
 
-/// Последние [`STDERR_TAIL_MAX_CHARS`] символов stderr; `None`, если после
-/// `trim()` не осталось ничего.
-fn stderr_tail(stderr: &str) -> Option<String> {
-    let trimmed = stderr.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let char_count = trimmed.chars().count();
-    if char_count <= STDERR_TAIL_MAX_CHARS {
-        Some(trimmed.to_string())
-    } else {
-        Some(
-            trimmed
-                .chars()
-                .skip(char_count - STDERR_TAIL_MAX_CHARS)
-                .collect(),
-        )
-    }
-}
-
 /// Транспортные сбои, снятые живьём на macOS с пином 2026.08.19.
 ///
 /// Все маркеры — про то, что до YouTube не доехал запрос, а не про то,
@@ -319,14 +317,14 @@ const NETWORK_MARKERS_OTHER_OS: [&str; 4] = [
 ];
 
 /// Идущий эфир и запланированная трансляция/премьера, сообщённые ошибкой.
-const LIVE_MARKERS: [&str; 3] = [
-    // Снято живьём: «This live event will begin in 4 days.»
+const LIVE_MARKERS: [&str; 2] = [
+    // Снято живьём: «This live event will begin in 3 days.» Взято общее
+    // начало: дальше идёт срок, а у эфира, который вот-вот начнётся, —
+    // «in a few moments» вместо срока.
     "live event will begin",
-    // ЖИВЬЁМ НЕ ПРОВЕРЕНО: премьера, до которой остались минуты, и эфир,
-    // который вот-вот начнётся, — те же ситуации другими словами
-    // yt-dlp. Подходящего ролика на момент съёмки фикстур не нашлось.
+    // ЖИВЬЁМ НЕ ПРОВЕРЕНО: премьера теми же словами, но другим глаголом.
+    // Подходящего ролика на момент съёмки фикстур не нашлось.
     "premieres in",
-    "live event will begin in a few moments",
 ];
 
 /// Региональная блокировка.
@@ -410,6 +408,7 @@ const OUTDATED_MARKERS: [&str; 5] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidecar::STDERR_TAIL_MAX_CHARS;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -431,7 +430,7 @@ mod tests {
     /// Таблица — источник истины теста, а сами фикстуры хранят только
     /// факты («что напечатал процесс»), не ответ. Разбор, чем какой ролик
     /// интересен и как он найден, — в README рядом с фикстурами.
-    const OUTCOMES: [(&str, Expected); 18] = [
+    const OUTCOMES: [(&str, Expected); 19] = [
         // Успех — контрольные случаи.
         ("success-watch-with-list", Expected::Success),
         ("success-finished-live", Expected::Success),
@@ -485,6 +484,10 @@ mod tests {
         ),
         (
             "channel-missing",
+            Expected::Failure(ProbeErrorKind::PlaylistUnsupported),
+        ),
+        (
+            "playlist-without-network",
             Expected::Failure(ProbeErrorKind::PlaylistUnsupported),
         ),
         // Прямая трансляция — обе ветки, с кодом 0 и с кодом 1.
@@ -922,6 +925,233 @@ mod tests {
         assert!(
             matches!(result, Err(ProbeFailure::VideoUnavailable { .. })),
             "решает итоговая строка ERROR, а не шум до неё"
+        );
+    }
+
+    /// Итоговая строка `ERROR:` снятой фикстуры — как есть.
+    fn first_error_line(name: &str) -> String {
+        capture(name)
+            .stderr
+            .lines()
+            .find(|line| line.starts_with("ERROR:"))
+            .expect("в фикстуре отказа есть итоговая ошибка")
+            .to_string()
+    }
+
+    /// Приписка «please report this issue … yt-dlp -U», снятая с живого
+    /// вывода: yt-dlp дописывает её к любой неожиданной ошибке.
+    fn report_issue_footer() -> String {
+        let line = first_error_line("network-proxy-refused");
+        let at = line
+            .find("please report this issue")
+            .expect("в сетевой фикстуре есть приписка про отчёт об ошибке");
+
+        line[at..].to_string()
+    }
+
+    /// Группы маркеров, совпавшие с выводом, в порядке проверки.
+    fn matching_groups(stderr: &str) -> Vec<&'static str> {
+        let text = fatal_text(stderr);
+        let mut groups = Vec::new();
+
+        if text.contains("[youtube:tab]") {
+            groups.push("плейлист");
+        }
+        if contains_any(&text, &NETWORK_MARKERS) || contains_any(&text, &NETWORK_MARKERS_OTHER_OS) {
+            groups.push("сеть");
+        }
+        if contains_any(&text, &LIVE_MARKERS) {
+            groups.push("трансляция");
+        }
+        if contains_any(&text, &REGION_MARKERS) {
+            groups.push("регион");
+        }
+        if contains_any(&text, &SIGN_IN_MARKERS) {
+            groups.push("вход");
+        }
+        if contains_any(&text, &UNAVAILABLE_MARKERS) {
+            groups.push("недоступен");
+        }
+
+        groups
+    }
+
+    #[test]
+    fn only_one_captured_outcome_matches_two_groups_at_once() {
+        // Честная мера того, что живой набор проверяет в порядке шагов, а
+        // что нет: если вывод совпал ровно с одной группой, перестановка
+        // шагов на нём ничего не изменит. Такова вся выборка, кроме
+        // единственного исхода — ссылки на плейлист при выключенной сети.
+        for (name, _) in OUTCOMES {
+            let groups = matching_groups(&capture(name).stderr);
+
+            if name == "playlist-without-network" {
+                assert_eq!(
+                    groups,
+                    vec!["плейлист", "сеть"],
+                    "{name}: фикстура снята ради двух признаков сразу"
+                );
+                continue;
+            }
+
+            assert!(
+                groups.len() <= 1,
+                "{name}: вывод совпал с группами {groups:?}. Появилась вторая \
+                 живая пара — закрепите её порядок отдельным тестом и \
+                 поправьте doc `failure_from_stderr`, который сейчас честно \
+                 говорит, что такая пара одна"
+            );
+        }
+    }
+
+    #[test]
+    fn a_playlist_link_stays_a_playlist_even_when_the_network_is_down() {
+        // Единственная пара шагов, проверенная снятым выводом: в одной
+        // строке ERROR сразу метка экстрактора `[youtube:tab]` и отказ
+        // резолвера. Выбран плейлист, а не сеть: метка проставлена по
+        // адресу ещё до обращения к сети, и даже с восстановленной сетью
+        // эта ссылка карточку не даст — «вставьте ссылку на отдельный
+        // ролик» остаётся единственным действием, которое что-то меняет.
+        let capture = capture("playlist-without-network");
+        let error = first_error_line("playlist-without-network");
+
+        assert!(
+            error.contains("[youtube:tab]"),
+            "признак плейлиста на месте"
+        );
+        assert!(
+            error.to_lowercase().contains("failed to resolve"),
+            "признак мёртвой сети на месте"
+        );
+
+        assert!(matches!(
+            classify(&capture.outcome()),
+            Err(ProbeFailure::PlaylistUnsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn the_order_of_the_groups_decides_when_two_of_them_match_at_once() {
+        // Пары, за которыми есть смысл, но которых нет в снятом выводе.
+        // Каждая строка собрана из настоящей итоговой ошибки фикстуры и
+        // дописанной формулировки второй группы — это единственный способ
+        // закрепить очерёдность, пока YouTube не выдал такой текст сам.
+        let cases: [(&str, String, ProbeErrorKind); 3] = [
+            (
+                "региональная блокировка сформулирована как частный случай \
+                 недоступности — общая обёртка не должна её съедать",
+                format!(
+                    "{} The uploader has not made this video available in your country",
+                    first_error_line("video-unavailable-missing-id")
+                ),
+                ProbeErrorKind::RegionBlocked,
+            ),
+            (
+                "просьба войти важнее общей недоступности: у класса «вход» \
+                 действие появится в E8, у «недоступен» действия нет вовсе",
+                format!(
+                    "{}. Sign in to confirm your age",
+                    first_error_line("video-unavailable-deleted")
+                ),
+                ProbeErrorKind::SignInRequired,
+            ),
+            (
+                "известный класс важнее признака устаревания: под-причина \
+                 уточняет только «сбой yt-dlp», а не перебивает диагноз",
+                format!(
+                    "{}; unable to extract player response",
+                    first_error_line("video-unavailable-missing-id")
+                ),
+                ProbeErrorKind::VideoUnavailable,
+            ),
+        ];
+
+        for (why, stderr, expected) in cases {
+            assert!(
+                matching_groups(&stderr).len() >= 2 || expected == ProbeErrorKind::VideoUnavailable,
+                "{why}: вход обязан совпасть с двумя группами, иначе тест \
+                 порядка ничего не проверяет"
+            );
+
+            let result = classify(&YtDlpOutcome {
+                exit_code: Some(1),
+                stdout: "",
+                stderr: &stderr,
+            });
+
+            let Err(failure) = result else {
+                panic!("{why}: это отказ");
+            };
+            assert_eq!(failure.kind(), expected, "{why}");
+        }
+    }
+
+    #[test]
+    fn warnings_alone_decide_the_class_when_there_is_no_error_line() {
+        // Фолбэк на весь stderr: процесс упал, не сказав ничего строкой
+        // ERROR. Взяты настоящие предупреждения о повторах из сетевой
+        // фикстуры — без итоговой строки они и есть всё, что известно.
+        let captured = capture("network-proxy-refused");
+        let stderr = captured
+            .stderr
+            .lines()
+            .filter(|line| line.starts_with("WARNING:"))
+            .collect::<Vec<&str>>()
+            .join("\n");
+
+        assert!(
+            !stderr.contains("ERROR:"),
+            "во входе не должно остаться итоговой строки"
+        );
+
+        let result = classify(&YtDlpOutcome {
+            exit_code: Some(1),
+            stdout: "",
+            stderr: &stderr,
+        });
+
+        assert!(
+            matches!(result, Err(ProbeFailure::NetworkUnavailable { .. })),
+            "решать по шумному тексту лучше, чем не решать вовсе"
+        );
+    }
+
+    #[test]
+    fn the_report_this_issue_footer_never_makes_a_failure_look_outdated() {
+        // Ловушка сама по себе: приписка про «последнюю версию» стоит в
+        // сетевой фикстуре, но та отсекается шагом 2 и до сигнатуры
+        // устаревания не доходит никогда — то есть на ней утверждение
+        // «приписка не считается устареванием» непроверяемо. Здесь вход
+        // собран так, чтобы дойти до шага 7: настоящая ошибка, не
+        // совпадающая ни с одной группой классов, плюс настоящая приписка.
+        let stderr = format!(
+            "{} {}",
+            first_error_line("ytdlp-failure-generic"),
+            report_issue_footer()
+        );
+
+        assert!(
+            stderr
+                .to_lowercase()
+                .contains("confirm you are on the latest version"),
+            "приписка на месте — иначе тест ничего не проверяет"
+        );
+        assert!(
+            matching_groups(&stderr).is_empty(),
+            "вход обязан дойти до шага 7, а не отсечься раньше"
+        );
+
+        let result = classify(&YtDlpOutcome {
+            exit_code: Some(1),
+            stdout: "",
+            stderr: &stderr,
+        });
+
+        assert_eq!(
+            verdict(&result),
+            Expected::YtDlpFailure(YtDlpFailureReason::Generic),
+            "«Confirm you are on the latest version» — приписка к любой \
+             неожиданной ошибке, а не признак устаревшего yt-dlp"
         );
     }
 
