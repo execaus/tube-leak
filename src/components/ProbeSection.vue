@@ -18,7 +18,7 @@
  */
 import { computed, useId } from 'vue'
 
-import type { QualityStreams } from '@/types/probe'
+import type { QualitySize, QualityStreams } from '@/types/probe'
 import { useLinkProbe } from '@/composables/useProbe'
 
 import ProbeErrorBlock from './ProbeErrorBlock.vue'
@@ -37,12 +37,12 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  download: [payload: { url: string; title: string; streams: QualityStreams; qualityLabel: string }]
+  download: [payload: { url: string; title: string; streams: QualityStreams; size: QualitySize; qualityLabel: string }]
 }>()
 
 const { url, state, retry } = useLinkProbe()
 
-function onDownload(payload: { title: string; streams: QualityStreams; qualityLabel: string }): void {
+function onDownload(payload: { title: string; streams: QualityStreams; size: QualitySize; qualityLabel: string }): void {
   // `url.value` — то, что буквально лежит в поле (для отображения); разбор
   // (`useLinkProbe`) уже давно решает по обрезанной строке (`evaluate`
   // делает `value.trim()` перед проверками). Ссылка, вставленная с

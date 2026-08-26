@@ -67,6 +67,75 @@ describe('DownloadPanel — степпер фаз (нетерминальные 
   })
 })
 
+describe('DownloadPanel — доступность степпера: текущий шаг не только цветом (ревью TL-45)', () => {
+  it('marks exactly the current step with aria-current="step", not the others', () => {
+    const wrapper = mount(DownloadPanel, {
+      props: {
+        displayTitle: TITLE,
+        plan: 'videoAndAudio',
+        progress: { phase: 'downloading', state: 'running', percent: 10 },
+      },
+    })
+
+    const steps = wrapper.findAll('.download-panel__step')
+    const withAriaCurrent = steps.filter((s) => s.attributes('aria-current') === 'step')
+    expect(withAriaCurrent).toHaveLength(1)
+    expect(withAriaCurrent[0]?.text()).toContain('Скачивание')
+
+    const others = steps.filter((s) => !s.text().includes('Скачивание'))
+    for (const other of others) {
+      expect(other.attributes('aria-current')).toBeUndefined()
+    }
+  })
+})
+
+describe('DownloadPanel — одна живая зона за раз, процент не в ней (ревью TL-45, «Заметки»)', () => {
+  it('has no aria-live on its root — the panel is not one big nested live region', () => {
+    const wrapper = mount(DownloadPanel, {
+      props: {
+        displayTitle: TITLE,
+        plan: 'videoAndAudio',
+        progress: { phase: 'downloading', state: 'running', percent: 10 },
+      },
+    })
+    expect(wrapper.attributes('aria-live')).toBeUndefined()
+  })
+
+  it('exposes exactly one aria-live element while running, and the percent line sits outside of it', () => {
+    const wrapper = mount(DownloadPanel, {
+      props: {
+        displayTitle: TITLE,
+        plan: 'videoAndAudio',
+        progress: {
+          phase: 'downloading',
+          state: 'running',
+          percent: 62,
+          speedBytesPerSec: 1024,
+        },
+        softStallSeconds: 7,
+      },
+    })
+
+    const liveRegions = wrapper.findAll('[aria-live]')
+    expect(liveRegions).toHaveLength(1)
+    expect(liveRegions[0]?.find('.download-panel__percent').exists()).toBe(false)
+    expect(wrapper.find('.download-panel__percent').exists()).toBe(true)
+  })
+
+  it('exposes no aria-live element (and no nesting) on a terminal panel — role="status" alone carries the announcement', () => {
+    const wrapper = mount(DownloadPanel, {
+      props: {
+        displayTitle: TITLE,
+        plan: 'videoAndAudio',
+        progress: { phase: 'done', fileName: 'x.mp4' },
+      },
+    })
+
+    expect(wrapper.findAll('[aria-live]')).toHaveLength(0)
+    expect(wrapper.findAll('[role="status"]')).toHaveLength(1)
+  })
+})
+
 describe('DownloadPanel — заголовок (С-13, требование п.6)', () => {
   it('renders exactly the displayTitle snapshot, regardless of progress content', () => {
     const wrapper = mount(DownloadPanel, {

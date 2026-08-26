@@ -30,6 +30,7 @@
 import { storeToRefs } from 'pinia'
 import { computed, onMounted } from 'vue'
 
+import DownloadCommandErrorBlock from '@/components/DownloadCommandErrorBlock.vue'
 import DownloadPanel from '@/components/DownloadPanel.vue'
 import ProbeSection from '@/components/ProbeSection.vue'
 import SidecarStatusRow from '@/components/SidecarStatusRow.vue'
@@ -38,7 +39,7 @@ import YtDlpPrepareScreen from '@/components/YtDlpPrepareScreen.vue'
 import { useSidecarCheck } from '@/composables/useSidecarCheck'
 import { useYtDlpPrepare } from '@/composables/useYtDlpPrepare'
 import { useDownloadTaskStore } from '@/stores/downloadTask'
-import type { QualityStreams } from '@/types/probe'
+import type { QualitySize, QualityStreams } from '@/types/probe'
 
 // Версия приложения известна локально и не зависит от sidecar (дизайн E1,
 // «Компоновка»). Держим в синхроне с `package.json` вручную — единственное
@@ -107,8 +108,13 @@ onMounted(() => {
  * стартом задачи и прокидывает пропсы панели, ничего не решая сам.
  */
 const downloadTaskStore = useDownloadTaskStore()
-const { task: downloadTask, progress: downloadProgress, softStallSeconds, isActive: isDownloadActive } =
-  storeToRefs(downloadTaskStore)
+const {
+  task: downloadTask,
+  progress: downloadProgress,
+  softStallSeconds,
+  commandError: downloadCommandError,
+  isActive: isDownloadActive,
+} = storeToRefs(downloadTaskStore)
 
 /**
  * Заголовок панели — снимок «название + качество», собранный **здесь**, в
@@ -121,10 +127,14 @@ function onDownloadRequested(payload: {
   url: string
   title: string
   streams: QualityStreams
+  size: QualitySize
   qualityLabel: string
 }): void {
   const displayTitle = `«${payload.title}» — ${payload.qualityLabel}`
-  void downloadTaskStore.start({ url: payload.url, title: payload.title, streams: payload.streams }, displayTitle)
+  void downloadTaskStore.start(
+    { url: payload.url, title: payload.title, streams: payload.streams, size: payload.size },
+    displayTitle,
+  )
 }
 </script>
 
@@ -202,20 +212,36 @@ function onDownloadRequested(payload: {
       <!--
         Секция «Текущая загрузка» (дизайн E3) — рендерится тогда и только
         тогда, когда задача существует (с момента клика «Скачать» до
-        «Скрыть»/новой загрузки); пока задачи нет, макет не резервирует под
-        неё пустое место (дизайн, «Где живёт задача экрана»).
+        «Скрыть»/новой загрузки) **или** есть отказ команды управления
+        загрузкой, который ещё не скрыт (ревью TL-45, «Достижимый путь
+        к молчаливому отказу»): отказ `start_download` возможен и без
+        существующей задачи (слот и не должен был занять что-то), поэтому
+        секция не привязана только к наличию `downloadTask`. Пока ни того,
+        ни другого нет, макет не резервирует под секцию пустое место
+        (дизайн, «Где живёт задача экрана»).
       -->
-      <template v-if="downloadTask && downloadProgress">
+      <template v-if="(downloadTask && downloadProgress) || downloadCommandError">
         <hr class="screen__divider">
 
-        <section
-          aria-live="polite"
-          class="download-section"
-        >
+        <!--
+          Без собственного aria-live здесь (ревью TL-45, «Заметки»):
+          `DownloadCommandErrorBlock` несёт role="alert", `DownloadPanel` —
+          свою единственную живую зону для нетерминальных фаз и role="status"
+          для терминальных. Обёртка секции с ещё одним aria-live поверх них
+          дала бы вложенные регионы и задвоенные объявления одного и того
+          же текста.
+        -->
+        <section class="download-section">
           <h2 class="download-section__title">
             Текущая загрузка
           </h2>
+          <DownloadCommandErrorBlock
+            v-if="downloadCommandError"
+            :error="downloadCommandError"
+            @hide="downloadTaskStore.dismissCommandError"
+          />
           <DownloadPanel
+            v-if="downloadTask && downloadProgress"
             :display-title="downloadTask.displayTitle"
             :plan="downloadTask.plan"
             :progress="downloadProgress"

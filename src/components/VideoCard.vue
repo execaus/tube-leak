@@ -24,9 +24,9 @@
  * `useDownloadTaskStore`, независимая от карточки панель) её не касается —
  * это и есть требование С-13 «панель переживает замену карточки».
  */
-import { computed, ref } from 'vue'
+import { computed, ref, useId } from 'vue'
 
-import type { ProbeResult, QualityItem, QualityStreams } from '@/types/probe'
+import type { ProbeResult, QualityItem, QualitySize, QualityStreams } from '@/types/probe'
 import { formatDuration } from '@/utils/formatDuration'
 import { qualityLabel } from '@/utils/qualityLabel'
 
@@ -45,7 +45,7 @@ const props = withDefaults(
 )
 
 const emit = defineEmits<{
-  download: [payload: { title: string; streams: QualityStreams; qualityLabel: string }]
+  download: [payload: { title: string; streams: QualityStreams; size: QualitySize; qualityLabel: string }]
 }>()
 
 const selected = ref<QualityItem>()
@@ -67,12 +67,26 @@ const downloadHint = computed(() =>
     : undefined,
 )
 
+/**
+ * Связывает подсказку с кнопкой для скринридера (`aria-describedby`) —
+ * ревью TL-45, «Заметки»: заблокированная кнопка не получает фокус (это
+ * обычное и ожидаемое поведение `disabled`), но клавиатурный пользователь,
+ * дошедший до неё виртуальным курсором чтения, должен слышать не только
+ * «Скачать, недоступно», а и причину — без явной связи подсказка была
+ * соседним, никак не привязанным к кнопке абзацем.
+ */
+const downloadHintId = useId()
+
 function onDownloadClick(): void {
   const item = selected.value
   if (!item) return
   emit('download', {
     title: props.result.title,
     streams: item.streams,
+    // Оценка размера того же пункта — стартовый знаменатель агрегации
+    // прогресса в ядре (TL-41); берётся отсюда же, где и `streams`, не
+    // собирается отдельно (правило контракта `StartDownloadRequest.size`).
+    size: item.size,
     qualityLabel: qualityLabel(item),
   })
 }
@@ -111,12 +125,14 @@ function onDownloadClick(): void {
       type="button"
       class="tap-target video-card__download"
       :disabled="downloadDisabled"
+      :aria-describedby="downloadHint ? downloadHintId : undefined"
       @click="onDownloadClick"
     >
       Скачать
     </button>
     <p
       v-if="downloadHint"
+      :id="downloadHintId"
       class="video-card__download-hint"
     >
       {{ downloadHint }}

@@ -216,6 +216,7 @@ describe('ProbeSection — ретрансляция запроса скачив�
           url: 'https://youtu.be/a',
           title: 'Ролик A',
           streams: { audioFormatId: 'a' },
+          size: { kind: 'unknown' },
           qualityLabel: 'Только аудио',
         },
       ],

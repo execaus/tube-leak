@@ -26,6 +26,7 @@ const request: StartDownloadRequest = {
   url: 'https://youtu.be/x',
   title: 'Как приручить дракона',
   streams: { videoFormatId: 'v1080', audioFormatId: 'a' },
+  size: { kind: 'known', bytes: 303_038_464 },
 }
 
 const started: DownloadStarted = {

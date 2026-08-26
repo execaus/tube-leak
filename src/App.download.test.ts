@@ -121,7 +121,12 @@ describe('App — секция «Текущая загрузка» (эпик E3,
     invokeMock.mockImplementationOnce((command: string, args) => {
       expect(command).toBe('start_download')
       expect(args).toStrictEqual({
-        request: { url: 'https://youtu.be/a', title: 'Ролик A', streams: { audioFormatId: 'a' } },
+        request: {
+          url: 'https://youtu.be/a',
+          title: 'Ролик A',
+          streams: { audioFormatId: 'a' },
+          size: { kind: 'unknown' },
+        },
       })
       return Promise.resolve(started)
     })
@@ -212,5 +217,63 @@ describe('App — секция «Текущая загрузка» (эпик E3,
     await wrapper.vm.$nextTick()
 
     expect(wrapper.text()).toContain('15 %')
+  })
+})
+
+describe('App — отказ команды виден на экране, не только в консоли (ревью TL-45)', () => {
+  it('shows the typed command-error block (with the title from the table, no Retry button, no diagnostic message) when start_download rejects, and never renders a task panel', async () => {
+    const wrapper = await mountReady()
+    await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
+
+    invokeMock.mockRejectedValueOnce({ kind: 'alreadyActive', message: 'CORE-DIAGNOSTIC-NOT-SCREEN-TEXT' })
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Текущая загрузка')
+    expect(wrapper.text()).toContain('Уже идёт другая загрузка')
+    expect(wrapper.text()).not.toContain('CORE-DIAGNOSTIC-NOT-SCREEN-TEXT')
+    expect(wrapper.findAll('button').some((b) => b.text() === 'Повторить')).toBe(false)
+    // Слот не занят — задача не была создана.
+    const downloadButton = wrapper.findAll('button').find((b) => b.text() === 'Скачать')
+    expect(downloadButton?.attributes('disabled')).toBeUndefined()
+  })
+
+  it('clears the command-error banner on "Скрыть", and it does not reappear on its own', async () => {
+    const wrapper = await mountReady()
+    await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
+
+    invokeMock.mockRejectedValueOnce({ kind: 'invalidUrl', message: 'diag' })
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('Ссылка не распознана')
+
+    await wrapper.findAll('button').find((b) => b.text() === 'Скрыть')?.trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.text()).not.toContain('Текущая загрузка')
+    expect(wrapper.text()).not.toContain('Ссылка не распознана')
+  })
+
+  it('trims a pasted url with a trailing newline before starting — the achievable silent-failure path from the review is now closed end-to-end', async () => {
+    const wrapper = await mountReady()
+    invokeMock.mockResolvedValueOnce(resultA)
+
+    await wrapper.find('input').setValue('https://youtu.be/a\n')
+    await vi.advanceTimersByTimeAsync(400)
+    await vi.waitFor(() => {
+      expect(wrapper.text()).toContain('Ролик A')
+    })
+    await wrapper.find('input[type="radio"]').setValue(true)
+
+    invokeMock.mockImplementationOnce((command: string, args) => {
+      expect(command).toBe('start_download')
+      expect(args).toMatchObject({ request: { url: 'https://youtu.be/a' } })
+      return Promise.resolve(started)
+    })
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Текущая загрузка')
+    expect(wrapper.text()).not.toContain('Ссылка не распознана')
   })
 })

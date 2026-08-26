@@ -174,10 +174,7 @@ const showDetailsToggle = computed(() => {
 </script>
 
 <template>
-  <div
-    class="download-panel"
-    aria-live="polite"
-  >
+  <div class="download-panel">
     <p class="download-panel__title">
       {{ displayTitle }}
     </p>
@@ -189,6 +186,7 @@ const showDetailsToggle = computed(() => {
           :key="step.key"
           class="download-panel__step"
           :class="`download-panel__step--${stepStatus(step.key)}`"
+          :aria-current="stepStatus(step.key) === 'current' ? 'step' : undefined"
         >
           <span
             class="download-panel__step-marker"
@@ -199,7 +197,10 @@ const showDetailsToggle = computed(() => {
       </ol>
 
       <template v-if="progress.phase === 'queued' || progress.phase === 'fetching'">
-        <p class="download-panel__row">
+        <p
+          class="download-panel__row"
+          aria-live="polite"
+        >
           <span
             class="spinner"
             aria-hidden="true"
@@ -234,18 +235,27 @@ const showDetailsToggle = computed(() => {
         >
           {{ Math.round(progress.percent) }} %
         </p>
-        <p
-          v-if="runningLineParts.length > 0"
-          class="download-panel__row"
-        >
-          {{ runningLineParts.join(' · ') }}
-        </p>
-        <p
-          v-if="softStallSeconds !== undefined"
-          class="download-panel__stall"
-        >
-          Нет новых данных уже {{ softStallSeconds }} с — проверяем соединение…
-        </p>
+        <!--
+          Единственная живая зона фазы «Скачивание» — процент в неё
+          сознательно не входит (ревью TL-45, «Заметки»): три вложенных
+          региона, где процент объявлялся по несколько раз в секунду,
+          устроили бы очередь объявлений ровно того рода, которого дизайн
+          просил избежать.
+        -->
+        <div aria-live="polite">
+          <p
+            v-if="runningLineParts.length > 0"
+            class="download-panel__row"
+          >
+            {{ runningLineParts.join(' · ') }}
+          </p>
+          <p
+            v-if="softStallSeconds !== undefined"
+            class="download-panel__stall"
+          >
+            Нет новых данных уже {{ softStallSeconds }} с — проверяем соединение…
+          </p>
+        </div>
       </template>
 
       <template v-else-if="progress.phase === 'downloading' && progress.state === 'waitingRetry'">
@@ -268,7 +278,10 @@ const showDetailsToggle = computed(() => {
         >
           {{ Math.round(progress.percent) }} % (сохранено)
         </p>
-        <p class="download-panel__row">
+        <p
+          class="download-panel__row"
+          aria-live="polite"
+        >
           Соединение потеряно. Ждём повторной попытки ({{ progress.attempt.number }} из
           {{ progress.attempt.total }}) — через {{ progress.remainingSecs }} с…
         </p>
@@ -285,6 +298,7 @@ const showDetailsToggle = computed(() => {
         <p
           class="download-panel__row"
           aria-busy="true"
+          aria-live="polite"
         >
           <span
             class="spinner"
