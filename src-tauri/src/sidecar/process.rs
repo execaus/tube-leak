@@ -294,6 +294,21 @@ impl RunHandle {
     /// Возврат из `cancel` означает, что убийство уже **отправлено** (а на
     /// Unix — что `kill(2)` уже отработал): вызывающий может стартовать
     /// следующий процесс, не рискуя оставить два живых сразу.
+    ///
+    /// # Известное микроокно (осознанно оставлено в E2)
+    ///
+    /// PID читается под мьютексом, а убивается после его отпускания.
+    /// Между этими двумя моментами процесс теоретически может завершиться
+    /// сам, а ОС — выдать тот же номер кому-то ещё; тогда убийство уйдёт
+    /// не туда. Закрывать окно в E2 нечем без удержания мьютекса через
+    /// `await`, а цена сейчас нулевая: процесс один, живёт секунды, и
+    /// номера PID на такой дистанции не переиспользуются.
+    ///
+    /// **В E3 это перестанет быть теоретическим:** отмена скачивания и
+    /// склейки переиспользует этот же код при куда большей текучке
+    /// процессов (докачки, ретраи, ffmpeg на каждый файл). Там окно
+    /// придётся закрыть — например, убийством под собственным
+    /// async-мьютексом дескриптора или проверкой, что PID всё ещё наш.
     pub async fn cancel(&self) {
         let pid = {
             let mut state = self
@@ -833,5 +848,192 @@ mod tests {
                 stderr: "partial diagnostic output\n".to_string(),
             })
         );
+    }
+    /// Жив ли процесс с таким PID.
+    ///
+    /// Через `ps`, а не через `kill(2)`: крейта `libc` в графе нет, а
+    /// заводить его ради одной проверки в тесте — плохая сделка.
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    /// Ждёт, пока процесс исчезнет из таблицы (осиротевшего потомка ещё
+    /// должен подобрать и похоронить init) — не дольше пары секунд.
+    async fn wait_until_dead(pid: u32) -> bool {
+        for _ in 0..200 {
+            if !process_is_alive(pid) {
+                return true;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// Ждёт, пока скрипт-фикстура запишет PID своего потомка.
+    async fn pid_written_by_the_script(path: &Path) -> u32 {
+        for _ in 0..600 {
+            if let Ok(text) = fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("скрипт-фикстура так и не сообщил PID своего потомка");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_run_kills_the_forked_grandchild_too() {
+        // Тот самый дефект, ради которого в E1 появился TL-10: убийство
+        // одного прямого потомка (`kill_on_drop`) оставляет форкнутого им
+        // внука жить и реродиться на PID 1. Здесь это проверяется на
+        // настоящем дереве процессов, а не рассуждением: скрипт форкает
+        // долгий `sleep` (это и есть «внук»), сообщает его PID и засыпает
+        // сам.
+        let dir = tempdir().expect("failed to create temp dir");
+        let pid_file = dir.path().join("grandchild.pid");
+        let marker = dir.path().join("finished-normally");
+        let script = write_script(
+            &dir,
+            "forks-a-child.sh",
+            &format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nsleep 30\ntouch '{}'\n",
+                pid_file.display(),
+                marker.display()
+            ),
+            0o755,
+        );
+
+        let registry = ChildRegistry::new();
+        let handle = RunHandle::new();
+
+        let started = Instant::now();
+        let (result, grandchild) = tokio::join!(
+            // Таймаут заведомо больше, чем живёт скрипт: если бы отмена не
+            // работала, тест ждал бы полминуты и упал по времени, а не
+            // прошёл бы «за компанию» с таймаутом.
+            run_cancellable(&script, &[], Duration::from_secs(30), &registry, &handle),
+            async {
+                let grandchild = pid_written_by_the_script(&pid_file).await;
+                assert!(
+                    process_is_alive(grandchild),
+                    "внук должен быть жив до отмены — иначе тест ничего не проверяет"
+                );
+                handle.cancel().await;
+                grandchild
+            }
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(
+                result,
+                Err(SidecarError::LaunchFailed {
+                    reason: LaunchFailedReason::Corrupted,
+                    ..
+                })
+            ),
+            "убитый сигналом процесс не оставляет кода завершения: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "отмена обязана прервать запуск, а не дождаться его конца: {elapsed:?}"
+        );
+        assert!(
+            handle.was_cancelled(),
+            "вызывающий отличает отмену от честного отказа только по этому флагу"
+        );
+        assert!(
+            wait_until_dead(grandchild).await,
+            "внук {grandchild} пережил отмену — значит убит был только прямой \
+             потомок, и это ровно дефект Ф-2 эпика E1 (осиротевший yt-dlp)"
+        );
+        assert!(
+            !marker.exists(),
+            "скрипт не должен был досидеть до конца — он убит, а не дождался"
+        );
+        assert!(
+            registry.is_empty(),
+            "отменённый запуск снимается с реестра так же, как убитый по таймауту"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_that_arrives_before_the_spawn_kills_the_process_at_once() {
+        // Единственная ветка отмены, порядок в которой держится ручным
+        // рассуждением («между `spawn` и `attach` нет ни одной точки
+        // `await`»): отмена пришла, когда убивать было ещё нечего. Процесс
+        // всё равно обязан не пережить свой запуск.
+        let dir = tempdir().expect("failed to create temp dir");
+        let marker = dir.path().join("finished-normally");
+        let script = write_script(
+            &dir,
+            "slow-after-cancel.sh",
+            &format!("#!/bin/sh\nsleep 30\ntouch '{}'\n", marker.display()),
+            0o755,
+        );
+
+        let registry = ChildRegistry::new();
+        let handle = RunHandle::new();
+
+        // Отмена до запуска: PID ещё не существует, остаётся только флаг.
+        handle.cancel().await;
+
+        let started = Instant::now();
+        let result =
+            run_cancellable(&script, &[], Duration::from_secs(30), &registry, &handle).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(
+                result,
+                Err(SidecarError::LaunchFailed {
+                    reason: LaunchFailedReason::Corrupted,
+                    ..
+                })
+            ),
+            "процесс убит сразу после старта: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "запуск не должен доживать ни до конца скрипта, ни до таймаута: {elapsed:?}"
+        );
+        time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !marker.exists(),
+            "процесс обязан быть убит, а не отработать осиротело"
+        );
+        assert!(registry.is_empty(), "PID снят с реестра и на этой ветке");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_run_that_already_returned_kills_nothing() {
+        // Состояние 3 дескриптора: запуск вернул управление, PID больше не
+        // наш. Отмена после этого обязана быть пустой операцией — иначе
+        // убийство ушло бы по номеру, который ОС уже могла выдать другому
+        // процессу.
+        let dir = tempdir().expect("failed to create temp dir");
+        let script = write_script(&dir, "quick.sh", "#!/bin/sh\nexit 0\n", 0o755);
+
+        let registry = ChildRegistry::new();
+        let handle = RunHandle::new();
+
+        run_cancellable(&script, &[], Duration::from_secs(20), &registry, &handle)
+            .await
+            .expect("скрипт завершается сам и успешно");
+
+        // Не виснет, не паникует и никого не убивает: убивать уже нечего.
+        handle.cancel().await;
+
+        assert!(handle.was_cancelled(), "запрос отмены зафиксирован честно");
+        assert!(registry.is_empty());
     }
 }

@@ -36,6 +36,7 @@ yt-dlp -J --no-playlist --flat-playlist --playlist-end 1 -- "<url>"
 |---|---|---|---|
 | `final-argv-success-4k.json` | `watch?v=aqz-KE-bpKQ` — Big Buck Bunny 4K | 3,40 с | Полная лестница 2160/1440/1080/720 + «только аудио» **на финальном наборе**: `--flat-playlist` не обрезает список форматов у одиночного ролика. Тот же ролик, что в `../4k-full-ladder.json` (снят базовой формой) — лестницы совпадают. |
 | `final-argv-watch-with-list.json` | `watch?v=aqz-KE-bpKQ&list=PLbpi…` | 3,29 с | Ролик внутри плейлиста: `--no-playlist` перебивает `--flat-playlist`, приходит `_type: video` с полным списком форматов, а не вкладка. Карточка совпадает с предыдущей строка в строку. |
+| `final-argv-short-form.json` | `youtu.be/aqz-KE-bpKQ` | 3,70 с | Короткая форма — так копируют с телефона и из «Поделиться». Тот же ролик, что выше: карточка обязана совпасть с обеими предыдущими. Три формы адреса на одном наборе аргументов — это и есть проверка утверждения «набор один на все формы». |
 | `final-argv-playlist.json` | `playlist?list=PLbpi…` | 5,04 с | Класс «плейлист» достижим: `_type: playlist`, extractor `youtube:tab`. Без `--flat-playlist` тот же адрес не завершился за 60 с (замер TL-31). |
 | `final-argv-channel.json` | `@NASA` | 3,36 с | То же для канала — и ради него в наборе есть `--playlist-end 1`: без ограничения `/@NASA` не завершился и за 45 с даже с `--flat-playlist` (замер TL-32), то есть С-9 для каналов не выполнялся бы. |
 
@@ -70,7 +71,8 @@ yt-dlp -J --no-playlist --flat-playlist --playlist-end 1 -- "<url>"
 - `the_launch_arguments_are_the_ones_the_fixtures_were_captured_with` —
   argv фикстуры совпадает с тем, что строит код.
 - `the_final_arguments_still_yield_the_whole_ladder` и
-  `a_video_inside_a_playlist_gives_exactly_the_same_card` — лестница на
-  финальном наборе полная, а ролик внутри плейлиста даёт ту же карточку.
+  `every_shape_of_the_same_link_gives_exactly_the_same_card` — лестница на
+  финальном наборе полная, а все три формы адреса одного ролика дают одну
+  и ту же карточку.
 - `a_playlist_and_a_channel_reach_their_class_instead_of_the_timeout` —
   класс «плейлист» и замер, уложившийся в таймаут разбора.

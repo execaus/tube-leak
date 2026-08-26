@@ -47,8 +47,9 @@
 //! TL-31 базовой формой (`-J --no-playlist`), финальный набор не
 //! покрывают. Поэтому он снят отдельно и целиком: полная лестница
 //! (`final-argv-success-4k`), ролик внутри плейлиста
-//! (`final-argv-watch-with-list`), плейлист и канал — и на них стоят
-//! тесты ниже.
+//! (`final-argv-watch-with-list`), короткая форма `youtu.be`
+//! (`final-argv-short-form`), плейлист и канал — и на них стоят тесты
+//! ниже.
 //!
 //! # Что не задаётся аргументами
 //!
@@ -128,25 +129,55 @@ use crate::types::{ProbeErrorDetails, ProbeResult, YtDlpFailureReason};
 /// Таймаут одного разбора, в секундах.
 ///
 /// Значение задано дизайном E2 и этой задачей не пересматривается;
-/// калибровка (Н-1, урок E1) подтвердила запас, а не изменила число.
-/// Замеры финальным набором аргументов на пине 2026.08.19 (Apple Silicon,
-/// macOS 26.6, прогретое дерево yt-dlp в каталоге данных — то есть
-/// состояние, в котором разбор вообще доступен пользователю, см. С-11):
+/// калибровка (Н-1, урок E1: некалиброванные таймауты дважды провалили
+/// приёмку) подтвердила запас, а не изменила число.
 ///
-/// | ролик                                   | 4 запуска подряд        |
+/// # Замеры, снятые финальным набором аргументов (пин 2026.08.19)
+///
+/// Apple Silicon, macOS 26.6, прогретое дерево yt-dlp в каталоге данных —
+/// то есть состояние, в котором разбор вообще доступен пользователю
+/// (С-11: до готовности yt-dlp поле ссылки неактивно).
+///
+/// Прямой запуск того же бинарника, по 4 запуска подряд на ролик:
+///
+/// | ролик                                   | разброс                 |
 /// |-----------------------------------------|-------------------------|
 /// | Big Buck Bunny (полная лестница до 4K)  | 2,71–2,99 с             |
 /// | Gangnam Style (максимум 1080p)          | 2,92–3,06 с             |
 /// | MrBeast (110 аудиодорожек, 22 языка)    | 3,28–3,40 с             |
 /// | «Me at the zoo» (максимум 240p)         | 2,64–2,90 с             |
 ///
-/// Худший замер — 3,40 с при цели Н-1 «карточка ≤ 10 с»: расхождения с
-/// целью нет, запас до цели трёхкратный, до таймаута — почти
-/// девятикратный. Уменьшать значение вслед за замером нельзя: 30 с — это
-/// не ожидаемое время, а граница, за которой ожидание перестаёт быть
-/// осмысленным, и она обязана пережить медленную сеть, ролик с сотнями
-/// форматов и машину слабее эталонной. Увеличивать — тем более: Н-1
-/// требует ≤ 10 с в норме, а 30 с уже втрое больше.
+/// Полный путь ядра (`probe` целиком: валидация, запуск, классификация,
+/// лестница), релизный профиль, та же машина: **3,88 с** на первом разборе
+/// после старта приложения и 3,32 / 3,20 с на следующих. Разница с прямым
+/// запуском — цена первого обращения, а не самой оркестрации.
+///
+/// # Чего этот замер не покрывает
+///
+/// Замер снят **не через смонтированный `.app`**. Бандл собран
+/// (`npm run tauri build`), образ смонтирован, приложение из образа
+/// запущено и живо — но вставить ссылку в поле снаружи нечем: разбор
+/// начинается вводом пользователя, а у автоматизации нет разрешения
+/// macOS «Упрощённый доступ» (`osascript` получает −1719). Поэтому числа
+/// выше сняты релизной сборкой того же кода, дошедшей до `probe` тем же
+/// путём, что и команда, — от бандла её отделяет только IPC-хоп
+/// (единицы миллисекунд на локальном IPC) и рендер карточки.
+///
+/// То есть таймаут откалиброван на **ядре релизной сборки**, а не на
+/// пути «вставка ссылки → карточка» целиком. Оставшийся кусок закрывает
+/// визуальный проход владельца при приёмке эпика (К-1), и это
+/// расхождение с формулировкой критерия записано здесь намеренно, а не
+/// умолчано.
+///
+/// # Вывод
+///
+/// Худшее измеренное время — 3,88 с при цели Н-1 «карточка ≤ 10 с»:
+/// расхождения с целью нет, запас до цели 2,6×, до таймаута — 7,7×.
+/// Уменьшать значение вслед за замером нельзя: 30 с — это не ожидаемое
+/// время, а граница, за которой ожидание перестаёт быть осмысленным, и
+/// она обязана пережить медленную сеть, ролик с сотнями форматов и машину
+/// слабее эталонной. Увеличивать — тем более: Н-1 требует ≤ 10 с в норме,
+/// а 30 с уже втрое больше.
 pub const PROBE_TIMEOUT_SECS: u64 = 30;
 
 /// [`PROBE_TIMEOUT_SECS`] как [`Duration`] — то, что уходит в запуск.
@@ -507,21 +538,24 @@ fn interpret(outcome: Result<RunOutput, SidecarError>) -> Result<ProbeResult, Pr
         stderr: &stderr,
     })?;
 
-    card(&metadata, exit_code, &stderr)
+    card(&metadata, &stderr)
 }
 
 /// Собирает карточку из метаданных, признанных успехом.
 ///
 /// Два исхода без выразимого успеха (нет длительности, пустая лестница)
 /// становятся отказом класса «сбой yt-dlp» — см. doc модуля.
-fn card(
-    metadata: &Value,
-    exit_code: Option<i32>,
-    stderr: &str,
-) -> Result<ProbeResult, ProbeFailure> {
+fn card(metadata: &Value, stderr: &str) -> Result<ProbeResult, ProbeFailure> {
+    // Кода завершения в деталях этих трёх отказов нет намеренно, хотя он
+    // известен и равен нулю: «Подробнее» под заголовком «Не удалось
+    // получить данные о ролике», где написано, что процесс завершился
+    // успешно, — это не диагностика, а противоречие. Процесс здесь
+    // действительно отработал штатно, вопрос не к нему: полезен только
+    // хвост stderr (предупреждения окружения yt-dlp), а чего именно не
+    // хватило в метаданных, сказано строкой лога рядом.
     let details = ProbeErrorDetails {
         stderr_tail: stderr_tail(stderr),
-        exit_code,
+        exit_code: None,
     };
 
     let Some(title) = text(metadata, "title") else {
@@ -580,9 +614,19 @@ fn text<'a>(metadata: &'a Value, key: &str) -> Option<&'a str> {
 /// дробное), поэтому читается как `f64` и округляется. Ноль и
 /// отрицательное значение — то же отсутствие данных, просто выраженное
 /// числом: карточка «0:00» врала бы пользователю.
+///
+/// Отсечка стоит **после** округления, а не до: ролик короче полусекунды
+/// прошёл бы проверку `> 0` и всё равно стал бы нулём — той самой
+/// карточкой «0:00». На живом YouTube такой ролик почти недостижим, но
+/// порядок двух строк не должен решать, соврём мы пользователю или нет.
 fn duration_secs(metadata: &Value) -> Option<u64> {
     let secs = metadata.get("duration").and_then(Value::as_f64)?;
-    (secs.is_finite() && secs > 0.0).then(|| secs.round() as u64)
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+
+    let rounded = secs.round() as u64;
+    (rounded > 0).then_some(rounded)
 }
 
 #[cfg(test)]
@@ -796,11 +840,21 @@ mod tests {
         }
     }
 
-    const CAPTURES: [&str; 4] = [
+    const CAPTURES: [&str; 5] = [
         "final-argv-success-4k",
         "final-argv-watch-with-list",
+        "final-argv-short-form",
         "final-argv-playlist",
         "final-argv-channel",
+    ];
+
+    /// Фикстуры одного и того же ролика, снятые тремя формами адреса.
+    /// Обоснование «набор аргументов один на все формы ссылки» держится
+    /// ровно на том, сколько форм на нём проверено.
+    const SAME_VIDEO: [&str; 3] = [
+        "final-argv-success-4k",
+        "final-argv-watch-with-list",
+        "final-argv-short-form",
     ];
 
     const URL: &str = "https://www.youtube.com/watch?v=aqz-KE-bpKQ";
@@ -985,20 +1039,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_video_inside_a_playlist_gives_exactly_the_same_card() {
-        // `--no-playlist` перебивает `--flat-playlist`: адрес
-        // `watch?v=…&list=…` — это ролик (решение анализа E2), и карточка
-        // у него та же, что у голого адреса того же ролика.
-        let plain = probe_outcome(Capture::load("final-argv-success-4k").outcome())
+    async fn every_shape_of_the_same_link_gives_exactly_the_same_card() {
+        // Три формы одного адреса на одном наборе аргументов:
+        // - `watch?v=…` — как копируют из адресной строки;
+        // - `watch?v=…&list=…` — как копируют из открытого плейлиста;
+        //   `--no-playlist` перебивает `--flat-playlist`, и это ролик, а не
+        //   вкладка (решение анализа E2, С-9);
+        // - `youtu.be/…` — как копируют с телефона и из «Поделиться».
+        //
+        // Карточка обязана быть одна и та же: ролик один.
+        let plain = probe_outcome(Capture::load(SAME_VIDEO[0]).outcome())
             .await
             .expect("карточка ролика");
-        let inside_playlist = probe_outcome(Capture::load("final-argv-watch-with-list").outcome())
-            .await
-            .expect("ролик внутри плейлиста — тоже ролик, а не вкладка");
 
-        assert_eq!(inside_playlist.title, plain.title);
-        assert_eq!(inside_playlist.duration_secs, plain.duration_secs);
-        assert_eq!(inside_playlist.qualities, plain.qualities);
+        for name in &SAME_VIDEO[1..] {
+            let other = probe_outcome(Capture::load(name).outcome())
+                .await
+                .unwrap_or_else(|failure| {
+                    panic!("{name}: ожидалась карточка, получен {failure:?}")
+                });
+
+            assert_eq!(other.title, plain.title, "{name}");
+            assert_eq!(other.duration_secs, plain.duration_secs, "{name}");
+            assert_eq!(other.channel, plain.channel, "{name}");
+            assert_eq!(other.qualities, plain.qualities, "{name}");
+        }
     }
 
     #[tokio::test]
@@ -1250,22 +1315,41 @@ mod tests {
     // ──────────── исходы без выразимого успеха и отказы запуска ────────
 
     #[tokio::test]
-    async fn metadata_without_a_duration_is_not_a_card() {
+    async fn metadata_without_a_usable_duration_is_not_a_card() {
         // Собрано вручную, а не снято: у живого ролика длительность есть
         // всегда, а единственный живой случай без неё — идущий эфир,
         // который классификация отсекает раньше (находка TL-31).
-        let failure = probe_outcome(Ok(RunOutput {
-            stdout: r#"{"_type":"video","title":"Ролик без длительности",
-                        "formats":[{"format_id":"137","protocol":"https",
-                        "vcodec":"avc1","acodec":"none","height":1080,
-                        "format_note":"1080p","filesize":1000}]}"#
-                .to_string(),
-            stderr: String::new(),
-        }))
-        .await
-        .expect_err("контракт не допускает карточку без длительности (Ф-5, К-1)");
+        //
+        // Ноль и «0,4 с» проверяются вместе с отсутствием поля не для
+        // полноты: отсечка стоит после округления именно потому, что
+        // полсекунды иначе превратились бы в карточку «0:00».
+        for duration in [
+            r#""duration":null,"#,
+            r#""duration":0,"#,
+            r#""duration":0.4,"#,
+            "",
+        ] {
+            let stdout = format!(
+                r#"{{"_type":"video","title":"Ролик без длительности",{duration}
+                    "formats":[{{"format_id":"137","protocol":"https",
+                    "vcodec":"avc1","acodec":"none","height":1080,
+                    "format_note":"1080p","filesize":1000}}]}}"#
+            );
 
-        assert!(matches!(failure, ProbeFailure::YtDlpFailure { .. }));
+            let Err(failure) = probe_outcome(Ok(RunOutput {
+                stdout,
+                stderr: String::new(),
+            }))
+            .await
+            else {
+                panic!("«{duration}» не длительность, а карточка всё равно получилась");
+            };
+
+            assert!(
+                matches!(failure, ProbeFailure::YtDlpFailure { .. }),
+                "«{duration}»: контракт не допускает карточку без длительности (Ф-5, К-1)"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1277,12 +1361,26 @@ mod tests {
             stdout: r#"{"_type":"video","title":"Запись эфира без форматов",
                         "duration":3600,"live_status":"was_live","formats":[]}"#
                 .to_string(),
-            stderr: String::new(),
+            stderr: "WARNING: No supported JavaScript runtime could be found".to_string(),
         }))
         .await
         .expect_err("пустая лестница — не карточка");
 
         assert!(matches!(failure, ProbeFailure::YtDlpFailure { .. }));
+
+        // Код завершения в детали таких отказов не кладётся, хотя известен
+        // и равен нулю: «Подробнее» под заголовком «Не удалось получить
+        // данные о ролике», где написано, что процесс завершился успешно, —
+        // это противоречие, а не диагностика. Хвост stderr остаётся: он
+        // единственное, что тут вообще может пригодиться.
+        let details = failure
+            .to_contract()
+            .details
+            .expect("хвост stderr для «Подробнее» остаётся");
+        assert_eq!(details.exit_code, None);
+        assert!(details
+            .stderr_tail
+            .is_some_and(|tail| tail.contains("JavaScript runtime")));
     }
 
     #[tokio::test]
