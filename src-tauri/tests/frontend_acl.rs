@@ -25,7 +25,8 @@
 //! Ловит: новую подписку или новый вызов Tauri API во фронтенде без
 //! выданного разрешения — в любой форме импорта, включая корневую
 //! `from '@tauri-apps/api'` и `import * as`; вызов плагина по
-//! литеральному имени; разрешение, за которым нет вызова; capability,
+//! литеральному имени; вызов метода объекта окна, за которым нет
+//! разрешения; разрешение, за которым нет вызова; capability,
 //! открытую наружу (`remote`) или привязанную к окнам по glob;
 //! переименование окна в `tauri.conf.json` мимо `windows` в capability;
 //! появление у приложения собственного ACL-манифеста, после которого
@@ -35,6 +36,23 @@
 //! именем из переменной) — статически их не видно. Такой код во фронтенде
 //! запрещён соглашением: обёртки над `invoke`/`listen` держат имена
 //! команд и событий в константах модуля (см. `src/composables/`).
+//!
+//! # Модуль окон разбирается глубже импорта
+//!
+//! У `@tauri-apps/api/window` команда стоит не за импортом, а за методом:
+//! `getCurrentWindow()` сам по себе IPC не делает (читает метку из
+//! `window.__TAURI_INTERNALS__.metadata` и строит `Window` с внутренним
+//! `skip: true`, минуя `plugin:window|create`), зато у возвращённого
+//! объекта 78 методов с командами. Часть из них библиотека зовёт сама:
+//! `onCloseRequested` после обработчика, не вызвавшего `preventDefault`,
+//! вызывает `destroy()` — вызова, который надо разрешить, в наших
+//! исходниках при этом не написано вовсе. Поэтому по окну разбирается не
+//! импорт, а употребление: прямая цепочка `getCurrentWindow().m()` и
+//! локальная переменная, в которую объект положили. Метод, за которым
+//! может стоять оконная команда, обязан быть перечислен в
+//! `window_handle_commands` — иначе падение: новое оконное разрешение
+//! выдаётся только в capability, то есть решением области core, и
+//! проходить это молча ему нельзя.
 //!
 //! Разбор намеренно не-строгий в одну сторону: всё, что не удалось
 //! разобрать однозначно, — это падение с объяснением, а не пропуск.
@@ -63,12 +81,6 @@ const DEFAULT_WINDOW_LABEL: &str = "main";
 /// «не знаю — значит можно» вернёт ровно тот дефект, ради которого тест
 /// написан.
 fn ipc_commands_of(module: &str, binding: &str) -> Option<&'static [&'static str]> {
-    const NONE: &[&str] = &[];
-    // `listen()` возвращает `UnlistenFn`, который дёргает
-    // `plugin:event|unlisten`; отписка в `onUnmounted` — обычный путь, а не
-    // экзотика, поэтому подписка всегда тянет за собой оба разрешения.
-    const LISTEN: &[&str] = &["plugin:event|listen", "plugin:event|unlisten"];
-
     match (module, binding) {
         // `invoke` сама по себе ACL не требует: собственные команды
         // приложения не проходят проверку, пока нет app-манифеста (см.
@@ -86,9 +98,52 @@ fn ipc_commands_of(module: &str, binding: &str) -> Option<&'static [&'static str
         ("event", "emitTo") => Some(&["plugin:event|emit_to"]),
         // Перечисление имён событий `tauri://…`, само по себе IPC нет.
         ("event", "TauriEvent") => Some(NONE),
+        // Объект окна: IPC даёт не он, а вызванные на нём методы —
+        // их разбирает `window_handle_methods` (см. doc модуля).
+        ("window", WINDOW_HANDLE_FACTORY) => Some(NONE),
         _ => None,
     }
 }
+
+/// Привязка, дающая фронтенду объект текущего окна.
+const WINDOW_HANDLE_FACTORY: &str = "getCurrentWindow";
+
+/// Что вызывает по IPC метод объекта `Window`.
+///
+/// `None` — метод неизвестен: за ним может стоять любая из 78 оконных
+/// команд, и молчаливый проход вернул бы ровно дефект TL-24 — отказ ACL,
+/// видимый только на собранном приложении. Перечислены здесь только те
+/// методы, состав команд которых сверен с исходником
+/// `node_modules/@tauri-apps/api/window.js`.
+fn window_handle_commands(method: &str) -> Option<&'static [&'static str]> {
+    match method {
+        // Все `Window.on*` и `Window.listen/once` идут через тот же
+        // `plugin:event|listen`, что и свободная функция из модуля
+        // `event`, — с `target: { kind: 'Window' }`. Своего оконного
+        // разрешения они не требуют.
+        "listen" | "once" | "onResized" | "onMoved" | "onFocusChanged" | "onScaleChanged"
+        | "onThemeChanged" | "onDragDropEvent" => Some(LISTEN),
+        "emit" => Some(&["plugin:event|emit"]),
+        "emitTo" => Some(&["plugin:event|emit_to"]),
+        // Единственный метод, чей состав команд шире написанного:
+        // подписавшись на `tauri://close-requested`, он в конце
+        // обработчика сам зовёт `this.destroy()`, если тот не вызвал
+        // `preventDefault()`. Разрешения `plugin:window|destroy` под это
+        // достаточно: закрывать окно повторным `close()` нельзя — он
+        // снова поднимет то же событие (TL-47, #49).
+        "onCloseRequested" => Some(CLOSE_REQUESTED),
+        "destroy" => Some(&[DESTROY]),
+        _ => None,
+    }
+}
+
+/// `listen()` возвращает `UnlistenFn`, который дёргает
+/// `plugin:event|unlisten`; отписка в `onUnmounted` — обычный путь, а не
+/// экзотика, поэтому подписка всегда тянет за собой оба разрешения.
+const LISTEN: &[&str] = &["plugin:event|listen", "plugin:event|unlisten"];
+const NONE: &[&str] = &[];
+const DESTROY: &str = "plugin:window|destroy";
+const CLOSE_REQUESTED: &[&str] = &["plugin:event|listen", "plugin:event|unlisten", DESTROY];
 
 /// Разобранный импорт из пакета `@tauri-apps/api`.
 #[derive(Debug)]
@@ -353,6 +408,184 @@ fn parse_literal_plugin_commands(content: &str) -> Vec<String> {
     found
 }
 
+/// Обращение к члену объекта сразу за выражением.
+///
+/// `Some(Some("m"))` — вызов метода `.m(…)` (и `?.m(…)`), `Some(None)` —
+/// чтение поля (`.label`), за которым IPC нет, `None` — точки нет вовсе.
+fn leading_member(rest: &str) -> Option<Option<String>> {
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("?.").or_else(|| rest.strip_prefix('.'))?;
+    let name: String = rest.chars().take_while(|c| is_ident_char(*c)).collect();
+    if name.is_empty() {
+        return Some(None);
+    }
+    let is_call = rest[name.len()..].trim_start().starts_with('(');
+    Some(is_call.then_some(name))
+}
+
+/// Имя локальной переменной, в которую положили объект окна, и позиция
+/// этого имени в тексте.
+///
+/// `head` — всё, что стоит в файле до вызова фабрики.
+fn window_alias(head: &str) -> Result<(String, usize), String> {
+    let escaped = |what: String| {
+        format!(
+            "{what}: статически не видно, какие методы на нём вызовут, а за \
+             объектом окна стоят все 78 оконных команд при одной \
+             разрешённой. Положи окно в локальную переменную этого файла \
+             (`const appWindow = {WINDOW_HANDLE_FACTORY}()`) и вызывай \
+             методы прямо на ней"
+        )
+    };
+
+    let decl = head.trim_end().strip_suffix('=').ok_or_else(|| {
+        escaped(format!(
+            "{WINDOW_HANDLE_FACTORY}() не присваивается переменной"
+        ))
+    })?;
+    if decl.trim_end().ends_with('=') {
+        return Err(escaped(format!(
+            "{WINDOW_HANDLE_FACTORY}() стоит в сравнении, а не в объявлении"
+        )));
+    }
+
+    let keyword_at = ["const", "let", "var"]
+        .iter()
+        .filter_map(|kw| rfind_token(decl, kw))
+        .max()
+        .ok_or_else(|| {
+            escaped(format!(
+                "{WINDOW_HANDLE_FACTORY}() присваивается не в объявление \
+                 переменной (const/let/var)"
+            ))
+        })?;
+
+    let tail = &decl[keyword_at..];
+    let mut parts = tail.split_whitespace();
+    let keyword = parts.next().expect("ключевое слово найдено выше");
+    let declared = parts.next().ok_or_else(|| {
+        escaped(format!(
+            "после {keyword} нет имени переменной перед {WINDOW_HANDLE_FACTORY}()"
+        ))
+    })?;
+    // `const appWindow: Window = …` — аннотацию типа отрезаем.
+    let name = declared.split(':').next().unwrap_or(declared);
+    if name.is_empty()
+        || !name.chars().all(is_ident_char)
+        || name.starts_with(|c: char| c.is_ascii_digit())
+    {
+        return Err(escaped(format!(
+            "окно разбирается по частям (`{declared}`), а не кладётся в \
+             переменную целиком"
+        )));
+    }
+
+    let offset = keyword_at
+        + keyword.len()
+        + tail[keyword.len()..]
+            .find(declared)
+            .expect("имя взято из этого же куска");
+    Ok((name.to_string(), offset))
+}
+
+/// Стоит ли имя в списке привязок собственного оператора `import`.
+///
+/// `head` — текст файла до имени. Между `import` и именем в этом случае
+/// бывают только другие привязки: `{`, запятые, `type`, пробелы. Любая
+/// скобка вызова или закрытая `}` предыдущего оператора означают, что имя
+/// стоит уже не в импорте.
+fn is_import_binding(head: &str) -> bool {
+    let Some(import_at) = rfind_token(head, "import") else {
+        return false;
+    };
+    if rfind_token(head, "export").is_some_and(|export_at| export_at > import_at) {
+        return false;
+    }
+    head[import_at..]
+        .chars()
+        .all(|c| is_ident_char(c) || c.is_whitespace() || c == '{' || c == ',')
+}
+
+/// Методы, вызванные в файле на объекте текущего окна.
+///
+/// Разбираются две формы: прямая цепочка `getCurrentWindow().m(…)` и
+/// локальная переменная, в которую объект положили. Любая третья — `Err`:
+/// см. doc модуля, почему по окну недостаточно разобрать импорт.
+fn window_handle_methods(content: &str) -> Result<Vec<String>, String> {
+    let code = strip_comments(content);
+    let mut methods = Vec::new();
+    let mut aliases: Vec<(String, usize)> = Vec::new();
+
+    for (idx, _) in code.match_indices(WINDOW_HANDLE_FACTORY) {
+        if code[..idx].chars().next_back().is_some_and(is_ident_char) {
+            continue;
+        }
+        let after = &code[idx + WINDOW_HANDLE_FACTORY.len()..];
+        let Some(call) = after.trim_start().strip_prefix('(') else {
+            // Имя без вызова законно ровно в одном месте — в списке
+            // привязок собственного оператора импорта. Везде ещё это
+            // фабрика, отданная кому-то в руки (`useWindow(getCurrentWindow)`,
+            // реэкспорт): окно тогда возьмут в другом месте, и по
+            // импортам `@tauri-apps/api` его там уже не видно.
+            if is_import_binding(&code[..idx]) {
+                continue;
+            }
+            return Err(format!(
+                "{WINDOW_HANDLE_FACTORY} используется не как вызов и не в \
+                 списке привязок импорта — фабрику окна передают дальше, и \
+                 где на окне вызовут методы, статически не видно. Бери окно \
+                 там же, где вызываешь его методы"
+            ));
+        };
+        let Some(rest) = call.trim_start().strip_prefix(')') else {
+            return Err(format!(
+                "{WINDOW_HANDLE_FACTORY}(…) вызывается с аргументами — у фабрики \
+                 окна из @tauri-apps/api их нет, и что это за вызов, проверка \
+                 ACL не знает"
+            ));
+        };
+
+        match leading_member(rest) {
+            // `getCurrentWindow().m(…)` — метод виден прямо здесь.
+            Some(Some(method)) => methods.push(method),
+            // `getCurrentWindow().label` — чтение поля, IPC за ним нет.
+            Some(None) => {}
+            None => aliases.push(window_alias(&code[..idx])?),
+        }
+    }
+
+    let declarations: BTreeSet<usize> = aliases.iter().map(|(_, at)| *at).collect();
+    let names: BTreeSet<&str> = aliases.iter().map(|(name, _)| name.as_str()).collect();
+    for name in names {
+        for (at, _) in code.match_indices(name) {
+            if declarations.contains(&at) {
+                continue;
+            }
+            let rest = &code[at + name.len()..];
+            if code[..at].chars().next_back().is_some_and(is_ident_char)
+                || rest.chars().next().is_some_and(is_ident_char)
+            {
+                continue;
+            }
+            match leading_member(rest) {
+                Some(Some(method)) => methods.push(method),
+                Some(None) => {}
+                None => {
+                    return Err(format!(
+                        "окно лежит в `{name}`, но `{name}` употреблён не как \
+                         вызов метода: статически не видно, какие методы на нём \
+                         вызовут, а за объектом окна стоят все 78 оконных \
+                         команд при одной разрешённой. Вызывай методы окна в \
+                         том же файле, где его взяли"
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(methods)
+}
+
 /// Полный набор IPC-команд, которые может выдать текущий фронтенд.
 ///
 /// Возвращает также карту «команда → откуда взялась», чтобы падение теста
@@ -410,6 +643,34 @@ fn frontend_ipc_commands() -> BTreeMap<String, BTreeSet<String>> {
                 .entry(literal.clone())
                 .or_default()
                 .insert(format!("{shown}: литерал \"{literal}\""));
+        }
+
+        match window_handle_methods(&content) {
+            Ok(methods) => {
+                for method in methods {
+                    match window_handle_commands(&method) {
+                        Some(cmds) => {
+                            for cmd in cmds {
+                                commands
+                                    .entry((*cmd).to_string())
+                                    .or_default()
+                                    .insert(format!(
+                                    "{shown}: окно из {WINDOW_HANDLE_FACTORY}(), метод .{method}()"
+                                ));
+                            }
+                        }
+                        None => unknown.push(format!(
+                            "{shown}: на объекте окна из {WINDOW_HANDLE_FACTORY}() вызван \
+                             .{method}() — метод, о котором проверка ACL ничего не знает. Сверь по \
+                             node_modules/@tauri-apps/api/window.js, какие команды он \
+                             вызывает, добавь его в `window_handle_commands` и выдай \
+                             разрешение в src-tauri/capabilities/: оконные команды \
+                             запрещены все, кроме destroy.",
+                        )),
+                    }
+                }
+            }
+            Err(reason) => unknown.push(format!("{shown}: {reason}.")),
         }
     }
 
@@ -590,6 +851,136 @@ fn a_literal_command_inside_script_setup_is_found() {
     );
 }
 
+/// Окно, взятое в локальную переменную, прослеживается до методов.
+///
+/// Форма из TL-46: объект берут один раз на модуль, а закрывают окно
+/// потом, из обработчика подтверждения.
+#[test]
+fn the_window_object_is_traced_from_a_local_variable_to_its_methods() {
+    let source = "import { getCurrentWindow } from '@tauri-apps/api/window'\n\
+         const appWindow = getCurrentWindow()\n\
+         export async function onExit(handler) {\n\
+         return appWindow.onCloseRequested(handler)\n\
+         }\n\
+         export async function exitNow() {\n\
+         await appWindow.destroy()\n\
+         }\n";
+    assert_eq!(
+        window_handle_methods(source),
+        Ok(vec!["onCloseRequested".to_string(), "destroy".to_string()])
+    );
+}
+
+/// Прямая цепочка и аннотация типа при объявлении разбираются тоже, а
+/// чтение поля команд не требует.
+#[test]
+fn the_window_object_is_traced_through_a_chain_and_a_typed_declaration() {
+    assert_eq!(
+        window_handle_methods("await getCurrentWindow()\n  .destroy()\n"),
+        Ok(vec!["destroy".to_string()])
+    );
+    assert_eq!(
+        window_handle_methods("const w: Window = getCurrentWindow()\nw?.onCloseRequested(h)\n"),
+        Ok(vec!["onCloseRequested".to_string()])
+    );
+    assert_eq!(
+        window_handle_methods("const w = getCurrentWindow()\nconsole.log(w.label)\n"),
+        Ok(Vec::new()),
+        "`label` — поле объекта, IPC за ним нет"
+    );
+}
+
+/// Окно, уехавшее из файла, — падение, а не пустой список методов.
+///
+/// За объектом стоят все оконные команды; разрешена одна. Молчаливый
+/// проход здесь — та же дыра, что импорт всем модулем (`import * as`).
+#[test]
+fn a_window_object_that_leaves_the_file_is_reported() {
+    assert!(
+        window_handle_methods("export const appWindow = getCurrentWindow()\nsetup(appWindow)\n")
+            .is_err(),
+        "окно передали в чужую функцию — какие методы позовут там, здесь не видно"
+    );
+    assert!(
+        window_handle_methods("export function useWindow() {\n  return getCurrentWindow()\n}\n")
+            .is_err(),
+        "окно вернули наружу, не положив в переменную"
+    );
+    assert!(
+        window_handle_methods("const { destroy } = getCurrentWindow()\ndestroy()\n").is_err(),
+        "деструктуризация уводит метод из-под привязки к объекту"
+    );
+}
+
+/// Имя фабрики в операторе импорта за вызов не считается.
+#[test]
+fn mentioning_the_window_factory_in_an_import_is_not_a_call() {
+    assert_eq!(
+        window_handle_methods("import { getCurrentWindow } from '@tauri-apps/api/window'\n"),
+        Ok(Vec::new())
+    );
+}
+
+/// Фабрика окна, отданная кому-то в руки, — падение.
+///
+/// Тот же случай, что окно в переменной, уехавшей из файла, только на
+/// шаг раньше: получатель возьмёт окно у себя, а импорта
+/// `@tauri-apps/api/window` там уже не будет — искать методы окна станет
+/// негде.
+#[test]
+fn passing_the_window_factory_itself_somewhere_is_reported() {
+    assert!(window_handle_methods(
+        "import { getCurrentWindow } from '@tauri-apps/api/window'\n\
+             export const port = useWindow(getCurrentWindow)\n"
+    )
+    .is_err());
+    assert!(
+        window_handle_methods(
+            "import { getCurrentWindow } from '@tauri-apps/api/window'\n\
+             export { getCurrentWindow }\n"
+        )
+        .is_err(),
+        "реэкспорт уводит окно в файл, который по импортам @tauri-apps/api \
+         не найти"
+    );
+}
+
+/// Разрешена ровно одна оконная команда — и это `destroy`.
+///
+/// `close()` соседняя по смыслу и на этом месте выглядит естественнее, но
+/// он снова поднимает `tauri://close-requested`, то есть возвращает нас в
+/// тот же диалог подтверждения; закрывает окно мимо события `destroy` —
+/// этим путём идёт и сам `@tauri-apps/api` внутри `onCloseRequested`
+/// (TL-47, #49). Тест держит именно это различие: подменить одно другим
+/// «чтобы заработало» нельзя молча.
+#[test]
+fn destroy_is_the_only_window_command_allowed_and_close_is_not() {
+    assert_eq!(window_handle_commands("destroy"), Some(&[DESTROY][..]));
+    assert!(
+        window_handle_commands("close").is_none(),
+        "`close()` не должен проходить: разрешения под него нет, и \
+         появиться оно может только вместе с разбором цикла \
+         close-requested"
+    );
+    assert!(
+        window_handle_commands("onCloseRequested").is_some_and(|cmds| cmds.contains(&DESTROY)),
+        "`onCloseRequested` сам зовёт `destroy()`, когда обработчик не \
+         вызвал `preventDefault()`: разрешение нужно, хотя вызова в нашем \
+         коде не написано"
+    );
+    let mut context = app_context();
+    let authority = context.runtime_authority_mut();
+    for label in configured_window_labels() {
+        assert!(
+            authority
+                .resolve_access("plugin:window|close", &label, &label, &Origin::Local)
+                .is_none(),
+            "ACL пропускает plugin:window|close — соседние оконные команды \
+             обязаны оставаться запрещёнными"
+        );
+    }
+}
+
 /// Главный инвариант: всё, что фронтенд может позвать, ACL пропускает.
 #[test]
 fn every_ipc_command_the_frontend_can_call_is_allowed_by_the_acl() {
@@ -624,6 +1015,123 @@ fn every_ipc_command_the_frontend_can_call_is_allowed_by_the_acl() {
     );
 }
 
+/// Разрешения, выданные раньше кода, который их позовёт.
+///
+/// Обычно так нельзя — «разрешение появляется вместе с вызовом» написано
+/// в самой capability, и проверку избытка эта таблица ослабляет.
+/// Исключение держится тем, что править capability из области ui нельзя:
+/// разрешение и код, который его использует, физически разъезжаются по
+/// разным задачам, и в промежутке разрешение стоит без вызова.
+///
+/// Чтобы аванс не превратился в бессрочный, он гасится не памятью
+/// разработчика, а условием: см. `granted_ahead_of_caller`.
+const GRANTED_AHEAD_OF_CALLER: &[AdvanceGrant] = &[AdvanceGrant {
+    command: DESTROY,
+    why: "TL-47 (#49) — под диалог подтверждения выхода из TL-46 (#48): \
+          разрешение выдаёт область core, вызывающий его код пишет область ui",
+    still_waiting: || !frontend_uses_the_window_module(),
+}];
+
+/// Строка таблицы авансов.
+struct AdvanceGrant {
+    command: &'static str,
+    why: &'static str,
+    /// Пока это верно, аванс действует; как только перестало — команда
+    /// возвращается под обычную проверку избытка.
+    still_waiting: fn() -> bool,
+}
+
+/// Причина, по которой команда разрешена, хотя вызова за ней ещё нет.
+///
+/// Аванс гаснет сам: у строки есть условие, и как только оно перестало
+/// выполняться, команда возвращается под обычную проверку избытка. Для
+/// `destroy` условие — «фронтенд ещё не притронулся к модулю окон»:
+/// в тот же коммит, где появится `getCurrentWindow()`, появится и вызов,
+/// требующий `destroy`, и подпирать его авансом больше не нужно. Строку
+/// после этого можно удалить, но забыть её — не дефект: она уже ничего
+/// не разрешает.
+fn granted_ahead_of_caller(command: &str) -> Option<&'static str> {
+    GRANTED_AHEAD_OF_CALLER
+        .iter()
+        .find(|grant| grant.command == command && (grant.still_waiting)())
+        .map(|grant| grant.why)
+}
+
+/// Есть ли во фронтенде хоть один импорт из `@tauri-apps/api/window`.
+fn frontend_uses_the_window_module() -> bool {
+    let (_, files) = scanned_files();
+    files.iter().any(|file| {
+        let bytes = fs::read(file).expect("исходник фронтенда читается");
+        touches_window_module(&String::from_utf8_lossy(&bytes))
+    })
+}
+
+fn touches_window_module(content: &str) -> bool {
+    parse_api_imports(content)
+        .iter()
+        .any(|import| import.module.as_deref() == Some("window"))
+}
+
+/// Аванс выдан на то, что реально разрешено, и гаснет, когда должен.
+///
+/// Мёртвая строка (разрешение из capability убрали, а строка осталась)
+/// молча выключала бы проверку избытка для этой команды — ни за чем.
+/// Погасший аванс, наоборот, обязан перестать действовать сразу.
+#[test]
+fn a_permission_granted_ahead_of_its_caller_is_actually_granted_and_expires_on_its_own() {
+    let labels = configured_window_labels();
+    let mut context = app_context();
+    let authority = context.runtime_authority_mut();
+
+    for AdvanceGrant {
+        command,
+        why,
+        still_waiting,
+    } in GRANTED_AHEAD_OF_CALLER
+    {
+        for label in &labels {
+            assert!(
+                authority
+                    .resolve_access(command, label, label, &Origin::Local)
+                    .is_some(),
+                "{command} числится выданной авансом, но ACL её не пропускает \
+                 для окна «{label}»: либо разрешение убрали из capability, и \
+                 строка осталась мёртвой, либо имя команды написано с \
+                 опечаткой ({why})"
+            );
+        }
+        assert_eq!(
+            still_waiting(),
+            granted_ahead_of_caller(command).is_some(),
+            "{command}: условие аванса и его действие разошлись ({why})"
+        );
+    }
+
+    assert!(
+        !frontend_uses_the_window_module() || granted_ahead_of_caller(DESTROY).is_none(),
+        "фронтенд начал работать с модулем окон — аванс на {DESTROY} обязан \
+         был погаснуть, и дальше разрешение держит обычная проверка избытка"
+    );
+}
+
+/// Импорт модуля окон виден и в `.ts`, и вместе с другими импортами.
+#[test]
+fn the_frontend_touching_the_window_module_is_noticed() {
+    assert!(touches_window_module(
+        "import { getCurrentWindow } from '@tauri-apps/api/window'\n"
+    ));
+    assert!(
+        touches_window_module(
+            "import type { CloseRequestedEvent } from '@tauri-apps/api/window'\n"
+        ),
+        "импорт только типов — тоже работа с модулем окон: код под него \
+         пишется в том же файле"
+    );
+    assert!(!touches_window_module(
+        "import { listen } from '@tauri-apps/api/event'\n"
+    ));
+}
+
 /// Ни одна команда сверх вызываемых фронтендом не разрешена.
 ///
 /// Обратная сторона предыдущего теста: он ловит недостачу, этот — избыток
@@ -631,7 +1139,8 @@ fn every_ipc_command_the_frontend_can_call_is_allowed_by_the_acl() {
 /// весь `core:window`; `core:event:allow-emit` дал бы фронтенду
 /// возможность подделывать события ядра. Команда, за которой нет вызова в
 /// `src/`, здесь падает — забрать выданное потом всегда труднее, чем не
-/// выдать сейчас.
+/// выдать сейчас. Единственное исключение — `GRANTED_AHEAD_OF_CALLER`, и
+/// у него свой тест.
 ///
 /// Две другие оси избытка — origin и метки окон — этим тестом не
 /// измеряются: скан идёт с `Origin::Local`, а `windows: ["*"]` даёт для
@@ -651,7 +1160,7 @@ fn no_permission_is_granted_beyond_what_the_frontend_calls() {
     // бы невидимым (ревью TL-24).
     let mut extra = Vec::new();
     for command in all_plugin_commands() {
-        if needed.contains_key(&command) {
+        if needed.contains_key(&command) || granted_ahead_of_caller(&command).is_some() {
             continue;
         }
         for label in &labels {
