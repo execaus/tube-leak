@@ -21,9 +21,26 @@ thiserror = "2"
 tokio = { version = "1", features = ["process", "time", "io-util", "macros", "rt-multi-thread", "sync"] }
 # Распаковка onedir-архива yt-dlp в каталог данных при первом запуске
 # (TL-12) и — тем же кодом — распаковка обновлений yt-dlp в E6. Только
-# чтение и только deflate: остальные кодеки апстрим не использует, а
-# deflate-flate2 берёт чистый Rust-бэкенд (miniz_oxide), без C-зависимостей.
+# чтение и только deflate: остальные кодеки апстрим не использует.
 zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+# Бэкенд flate2 выбирается здесь, и это не педантизм (TL-25). Фича
+# `deflate-flate2` у zip включает сам крейт flate2, но НЕ включает ему ни
+# одного бэкенда сжатия — их у zip отдельные фичи (deflate-flate2-zlib,
+# -zlib-rs). Пока бэкенд не выбран, flate2 не собирается вообще:
+# `compile_error!("No compression backend selected")`.
+#
+# До TL-25 это не проявлялось на macOS и потому оставалось незамеченным:
+# бэкенд прилетал по unification из чужой ветки графа — flate2/default у
+# png ← ico ← tauri-codegen. На Linux и Windows этой ветки в графе нет, и
+# сборка бандла падала на flate2; нашёл это первый же прогон нового джоба
+# test (см. #26), а джоб build до сих пор ни разу не гоняли живьём (Р-6).
+#
+# Явная зависимость с `rust_backend` вместо zip-фичи `deflate-flate2-zlib-rs`:
+# rust_backend — это miniz_oxide, который в графе уже есть (тот же png), то
+# есть выбор бэкенда не добавляет в сборку ни одного нового крейта и не
+# тянет C-зависимостей. Крейт не используется из кода напрямую намеренно:
+# он здесь ради фичи.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 tempfile = "3"
