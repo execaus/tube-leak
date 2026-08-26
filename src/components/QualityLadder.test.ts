@@ -78,6 +78,31 @@ describe('QualityLadder', () => {
     expect(wrapper.find('.ladder__label').text()).toBe('Максимальное доступное (480p)')
   })
 
+  it('emits update:selected with the chosen item on click (эпик E3, TL-45)', async () => {
+    const wrapper = mount(QualityLadder, { props: { items: fullLadder } })
+    const inputs = wrapper.findAll('input[type="radio"]')
+
+    await inputs[2]?.setValue(true)
+
+    const emitted = wrapper.emitted('update:selected')
+    expect(emitted).toHaveLength(1)
+    expect(emitted?.[0]).toStrictEqual([fullLadder[2]])
+  })
+
+  it('emits update:selected with undefined when the item list is replaced (selection reset)', async () => {
+    const wrapper = mount(QualityLadder, { props: { items: fullLadder } })
+    const inputs = wrapper.findAll('input[type="radio"]')
+    await inputs[1]?.setValue(true)
+
+    const otherLadder: QualityItem[] = [
+      { kind: 'audioOnly', size: { kind: 'known', bytes: 6 * 1024 ** 2 }, streams: { audioFormatId: 'a' } },
+    ]
+    await wrapper.setProps({ items: otherLadder })
+
+    const emitted = wrapper.emitted('update:selected')
+    expect(emitted?.at(-1)).toStrictEqual([undefined])
+  })
+
   it('scopes the radio group name per instance — two ladders on the same screen do not merge into one group (E4 concern)', () => {
     // Обе лестницы обязаны жить в одном дереве приложения — `useId()`
     // уникален в рамках инстанса Vue-приложения, а не глобально, поэтому

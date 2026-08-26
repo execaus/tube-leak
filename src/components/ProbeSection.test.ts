@@ -195,3 +195,43 @@ describe('ProbeSection — ошибки (8 классов из 9, кроме not
     })
   })
 })
+
+describe('ProbeSection — ретрансляция запроса скачивания (эпик E3, TL-45)', () => {
+  it('relays VideoCard\'s download event upward, adding the current url', async () => {
+    const wrapper = mount(ProbeSection, { props: { ytDlpState: 'ready' } })
+    invokeMock.mockResolvedValueOnce(resultA)
+
+    await wrapper.find('input').setValue('https://youtu.be/a')
+    await vi.advanceTimersByTimeAsync(400)
+    await vi.waitFor(() => {
+      expect(wrapper.text()).toContain('Ролик A')
+    })
+
+    await wrapper.find('input[type="radio"]').setValue(true)
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+
+    expect(wrapper.emitted('download')).toStrictEqual([
+      [
+        {
+          url: 'https://youtu.be/a',
+          title: 'Ролик A',
+          streams: { audioFormatId: 'a' },
+          qualityLabel: 'Только аудио',
+        },
+      ],
+    ])
+  })
+
+  it('forwards downloadBlocked to VideoCard so its download button carries the С-13 hint', async () => {
+    const wrapper = mount(ProbeSection, { props: { ytDlpState: 'ready', downloadBlocked: true } })
+    invokeMock.mockResolvedValueOnce(resultA)
+
+    await wrapper.find('input').setValue('https://youtu.be/a')
+    await vi.advanceTimersByTimeAsync(400)
+    await vi.waitFor(() => {
+      expect(wrapper.text()).toContain('Ролик A')
+    })
+
+    expect(wrapper.text()).toContain('Уже идёт другая загрузка')
+  })
+})

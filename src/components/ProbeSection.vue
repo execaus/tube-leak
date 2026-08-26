@@ -7,9 +7,18 @@
  * Поле ссылки имеет три состояния, зависящие только от статуса **yt-dlp**
  * (`ytDlpState`, передаётся родителем из `useSidecarCheck`) — статус
  * ffmpeg его не блокирует, потому что разбор ролика ffmpeg не использует.
+ *
+ * # Ретрансляция запроса скачивания (эпик E3, TL-45)
+ *
+ * `VideoCard` эмитит снимок «что скачивать» без ссылки на сам ролик — она
+ * известна только здесь, в `useLinkProbe`. `ProbeSection` дополняет снимок
+ * текущим значением поля `url` и ретранслирует его наверх, в `App.vue`,
+ * где живёт стор задачи скачивания: сама секция разбора задачу не
+ * запускает и ничего о ней не хранит.
  */
 import { computed, useId } from 'vue'
 
+import type { QualityStreams } from '@/types/probe'
 import { useLinkProbe } from '@/composables/useProbe'
 
 import ProbeErrorBlock from './ProbeErrorBlock.vue'
@@ -23,9 +32,19 @@ const props = defineProps<{
    * - `ready` — yt-dlp `ok`, поле активно.
    */
   ytDlpState: 'checking' | 'blocked' | 'ready'
+  /** Уже идёт другая задача скачивания — передаётся в `VideoCard` как есть (С-13). */
+  downloadBlocked?: boolean
+}>()
+
+const emit = defineEmits<{
+  download: [payload: { url: string; title: string; streams: QualityStreams; qualityLabel: string }]
 }>()
 
 const { url, state, retry } = useLinkProbe()
+
+function onDownload(payload: { title: string; streams: QualityStreams; qualityLabel: string }): void {
+  emit('download', { ...payload, url: url.value })
+}
 
 /** Стабильный id, связывающий видимый `<label>` с полем (доступность: не только aria-label). */
 const inputId = useId()
@@ -111,6 +130,8 @@ const inlineNotAUrlText = computed(() =>
       <VideoCard
         v-else-if="state.kind === 'success'"
         :result="state.result"
+        :download-blocked="downloadBlocked"
+        @download="onDownload"
       />
 
       <ProbeErrorBlock
