@@ -1,0 +1,15 @@
+{
+  "_capture": {
+    "note": "http(s)-ссылка, которую yt-dlp не умеет разбирать: общий экстрактор дошёл до сайта и получил 404. Сигнатуры устаревшей версии нет — под-причина Generic.",
+    "argv": [
+      "-J",
+      "--no-playlist",
+      "https://example.com/some/page"
+    ],
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 1,
+  "stderr": "ERROR: [generic] page: Unable to download webpage: HTTP Error 404: Not Found (caused by <HTTPError 404: Not Found>)\n",
+  "stdout": null
+}

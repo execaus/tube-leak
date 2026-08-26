@@ -1,0 +1,88 @@
+{
+  "_capture": {
+    "note": "Ссылка на плейлист. Код завершения 0 и валидный JSON с _type: playlist — как и у эфира, «ошибкой процесса» это не является. --flat-playlist обязателен: без него yt-dlp обходит каждый ролик и не завершается за 60 с.",
+    "argv": [
+      "-J",
+      "--no-playlist",
+      "--flat-playlist",
+      "https://www.youtube.com/playlist?list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb"
+    ],
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 0,
+  "stderr": "",
+  "stdout": {
+    "id": "PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb",
+    "title": "Top Trending Videos of the Week",
+    "availability": "unlisted",
+    "channel_follower_count": null,
+    "modified_date": "20250722",
+    "view_count": 931526,
+    "playlist_count": 19,
+    "channel": "by YouTube",
+    "channel_id": "UCBR8-60-B28hp2BmDPdntcQ",
+    "uploader_id": "@YouTube",
+    "uploader": "by YouTube",
+    "channel_url": "https://www.youtube.com/channel/UCBR8-60-B28hp2BmDPdntcQ",
+    "uploader_url": "https://www.youtube.com/@YouTube",
+    "_type": "playlist",
+    "entries": [
+      {
+        "title": "I Explored A $200,000,000 Forgotten Space Colony",
+        "duration": 969,
+        "view_count": 7400000,
+        "timestamp": null,
+        "live_status": null,
+        "availability": null,
+        "channel_url": "https://www.youtube.com/channel/UCvK4bOhULCpmLabd2pDMtnA",
+        "uploader_url": "https://www.youtube.com/@YesTheory",
+        "creators": null,
+        "channel": "Yes Theory",
+        "channel_id": "UCvK4bOhULCpmLabd2pDMtnA",
+        "uploader": "Yes Theory",
+        "uploader_id": "@YesTheory",
+        "ie_key": "Youtube",
+        "id": "Vh4O04Bpovw",
+        "_type": "url",
+        "url": "https://www.youtube.com/watch?v=Vh4O04Bpovw",
+        "__x_forwarded_for_ip": null
+      },
+      {
+        "title": "I spent a day with REALITY TV STARS",
+        "duration": 1158,
+        "view_count": 1200000,
+        "timestamp": null,
+        "live_status": null,
+        "availability": null,
+        "channel_url": "https://www.youtube.com/channel/UCPJHQ5_DLtxZ1gzBvZE99_g",
+        "uploader_url": "https://www.youtube.com/@SmoshAlike",
+        "creators": null,
+        "channel": "Smosh Alike",
+        "channel_id": "UCPJHQ5_DLtxZ1gzBvZE99_g",
+        "uploader": "Smosh Alike",
+        "uploader_id": "@SmoshAlike",
+        "ie_key": "Youtube",
+        "id": "5TIp7oVKHq8",
+        "_type": "url",
+        "url": "https://www.youtube.com/watch?v=5TIp7oVKHq8",
+        "__x_forwarded_for_ip": null
+      }
+    ],
+    "extractor_key": "YoutubeTab",
+    "extractor": "youtube:tab",
+    "webpage_url": "https://www.youtube.com/playlist?list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb",
+    "original_url": "https://www.youtube.com/playlist?list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb",
+    "webpage_url_basename": "playlist",
+    "webpage_url_domain": "youtube.com",
+    "release_year": null,
+    "epoch": 1787741020,
+    "__files_to_move": {},
+    "_version": {
+      "version": "2026.08.19",
+      "current_git_head": null,
+      "release_git_head": "594bd50c2c78ac432f81600d309fdc4e0a92d82c",
+      "repository": "yt-dlp/yt-dlp"
+    }
+  }
+}
