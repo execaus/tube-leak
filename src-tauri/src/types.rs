@@ -187,9 +187,10 @@ pub struct YtDlpPrepared {
 //
 // До появления оркестрации (TL-32) типы секции никто не конструировал, и
 // каждый нёс `#[allow(dead_code)]`, чтобы контракт не исчез из-за того, что
-// реализация отстаёт на задачу. Вызывающий появился — глушители сняты, и
-// остался ровно один, у `QualityStreams::has_any` (см. комментарий там же):
-// дальше `dead_code` в этой секции означает настоящий мёртвый код.
+// реализация отстаёт на задачу. Вызывающие появились — глушители сняты все
+// до одного (последний, у `QualityStreams::has_any`, снят в TL-44, когда
+// команда старта начала проверять инвариант сама): дальше `dead_code` в
+// этой секции означает настоящий мёртвый код.
 
 /// Вид пункта лестницы качеств (решение владельца Р-1).
 ///
@@ -297,10 +298,9 @@ impl QualityStreams {
     /// Одно место на всех, кто его проверяет: TL-30 (не выпускать пункт
     /// без потоков в лестницу), TL-32 и E3 (не принимать такой объект
     /// обратно от UI). Три копии условия разошлись бы.
-    // Единственное, что в секции ещё не зовёт продакшен-код: лестница
-    // (TL-30) проверяет инвариант своим построением и сверяет его тестом,
-    // а принимать объект обратно от UI будет E3. `allow` снимется там.
-    #[allow(dead_code)]
+    // Вызывающий появился в TL-44: команда старта отказывает пункту без
+    // единого потока классом `noStreamsSelected`, не полагаясь на то, что
+    // лестница такого пункта не выпустит.
     pub fn has_any(&self) -> bool {
         self.video_format_id.is_some() || self.audio_format_id.is_some()
     }
@@ -469,11 +469,12 @@ pub struct ProbeError {
 // TL-44 (оркестрация и сами команды); здесь только объявление типов,
 // которые зеркалятся в `src/types/` (TL-39).
 //
-// Пока ни один из типов секции никто не конструирует, поэтому каждый несёт
-// `#[allow(dead_code)]` — тот же приём и та же причина, что были у секции
-// E2 до появления оркестрации: контракт не должен исчезать из-за того, что
-// реализация отстаёт на задачу. Глушители снимаются задачей, которая
-// начинает тип конструировать (для большинства — TL-44).
+// До появления оркестрации (TL-44) типы секции никто не конструировал, и
+// каждый нёс `#[allow(dead_code)]` — тот же приём и та же причина, что были
+// у секции E2: контракт не должен исчезать из-за того, что реализация
+// отстаёт на задачу. Вызывающий появился — глушители сняты, и остался ровно
+// один, у `DownloadPercent::value` (см. комментарий там же): дальше
+// `dead_code` в этой секции означает настоящий мёртвый код.
 //
 // Три вещи, которые дизайн развёл намеренно, и то, как это выражено здесь:
 //
@@ -514,7 +515,6 @@ pub struct ProbeError {
 /// жизни такой задачи не будет. Знать об этом заранее — до того, как фаза
 /// наступит или не наступит, — фронтенду нужно уже в момент старта, и
 /// говорит ему это [`DownloadPlan`], а не догадка по числу форматов.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DownloadPhase {
@@ -552,7 +552,6 @@ pub enum DownloadPhase {
 /// текст диалога выхода фронтенд всё равно снимает с карточки в момент
 /// клика и держит у себя. Речь именно о правиле, а не об источнике
 /// данных.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DownloadPlan {
@@ -570,7 +569,6 @@ pub enum DownloadPlan {
 /// Это подслой внутри шага «Скачивание», а не фаза задачи: смена потока не
 /// меняет ни шаг степпера, ни шкалу процента — процент агрегирован по обоим
 /// потокам сразу и от перехода видео → аудио назад не откатывается (Ф-2).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DownloadStream {
@@ -597,12 +595,10 @@ pub enum DownloadStream {
 ///
 /// На проводе — просто число (`#[serde(transparent)]`): TS-зеркало видит
 /// `number`, отдельного объекта тут нет.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct DownloadPercent(u8);
 
-#[allow(dead_code)]
 impl DownloadPercent {
     /// Единственный конструктор: всё, что больше ста, становится сотней.
     pub fn new(percent: u8) -> Self {
@@ -610,6 +606,13 @@ impl DownloadPercent {
     }
 
     /// Значение для форматирования на стороне вызывающего.
+    ///
+    /// Единственный член секции, у которого глушитель остался и после
+    /// TL-44: продакшен-путь процент только **строит** и сериализует, а
+    /// разворачивать его обратно в число незачем — форматирует его UI по
+    /// ту сторону границы. Читают его отсюда только тесты, которые
+    /// проверяют, что показанный процент не откатывается назад.
+    #[allow(dead_code)]
     pub fn value(self) -> u8 {
         self.0
     }
@@ -628,7 +631,6 @@ impl DownloadPercent {
 /// значение дизайна — 6: первая плюс пять докачек). Счётчик обнуляется
 /// любым продвижением байт (С-6), поэтому `number` за долгую загрузку
 /// может доходить до `total` многократно и это не признак близкого отказа.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadAttempt {
@@ -650,7 +652,6 @@ pub struct DownloadAttempt {
 /// подчистка при отмене всегда полная и без исключений по классам (Ф-4,
 /// таблица «Отмена по фазам»), поэтому либо `removed`, либо
 /// `nothingCreated` — если отменили до старта процесса.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PartialData {
@@ -688,7 +689,6 @@ pub enum PartialData {
 ///
 /// А вот под-причина `outdated` у сбоя yt-dlp из E2 переносится и живёт
 /// отдельным полем [`DownloadError::reason`] — почему, написано там же.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DownloadErrorKind {
@@ -712,7 +712,6 @@ pub enum DownloadErrorKind {
     YtDlpFailure,
 }
 
-#[allow(dead_code)]
 impl DownloadErrorKind {
     /// Имеет ли смысл повтор той же задачи — колонка «Повторить?» таблицы
     /// ошибок дизайна.
@@ -754,7 +753,6 @@ impl DownloadErrorKind {
 ///
 /// Пустая структура границу не пересекает — см. [`DownloadErrorDetails::is_empty`]
 /// и проекцию `crate::download::DownloadFailure::to_contract`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadErrorDetails {
@@ -766,7 +764,6 @@ pub struct DownloadErrorDetails {
     pub exit_code: Option<i32>,
 }
 
-#[allow(dead_code)]
 impl DownloadErrorDetails {
     /// Нечего показывать: ни хвоста stderr, ни кода завершения.
     ///
@@ -790,7 +787,6 @@ impl DownloadErrorDetails {
 /// `crate::download::DownloadFailure::to_contract`: `retryable` обязано
 /// быть ровно [`DownloadErrorKind::is_retryable`] своего класса, а не
 /// чьим-то мнением на месте вызова.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadError {
@@ -855,7 +851,6 @@ pub struct DownloadError {
 /// отвечает отдельный `rename_all_fields`. Без него `delay_secs` уехал бы
 /// на провод змеиным регистром посреди camelCase-объекта; поймано
 /// сравнением значения целиком в тестах ниже, а не глазами.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(
     tag = "state",
@@ -928,7 +923,6 @@ pub enum DownloadingState {
 /// На проводе тег — поле `phase` с теми же семью значениями, что у
 /// [`DownloadPhase`]; у варианта `downloading` рядом появляется второй тег
 /// `state` ([`DownloadingState`]).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(
     tag = "phase",
@@ -969,7 +963,6 @@ pub enum DownloadProgress {
     },
 }
 
-#[allow(dead_code)]
 impl DownloadProgress {
     /// Фаза задачи для степпера.
     ///
@@ -1020,7 +1013,6 @@ impl DownloadProgress {
 /// 300 мс), кроме перехода в терминальную фазу: он не может быть проглочен
 /// троттлингом. Это поведение ядра (TL-44), а не свойство типа, но
 /// подписчик должен знать, что событий не бывает «на каждый байт».
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadProgressEvent {
@@ -1053,7 +1045,6 @@ pub struct DownloadProgressEvent {
 /// Название — тоже непроверенный ввод с точки зрения файловой системы:
 /// имя файла из него строит санитизация ядра (Ф-6, TL-40), и пустой
 /// результат санитизации получает запасное имя, выведенное из адреса.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartDownloadRequest {
@@ -1099,7 +1090,6 @@ pub struct StartDownloadRequest {
 ///
 /// Возвращается быстро и не дожидается ни одного байта — вся работа идёт
 /// событиями. Ждать в промисе тут нечего: загрузка длится минуты и часы.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadStarted {
@@ -1124,7 +1114,6 @@ pub struct DownloadStarted {
 /// (кнопки, которых нельзя нажать, он не показывает). Тем не менее они
 /// типизированы, а не строки: защита на стороне ядра обязана быть
 /// настоящей, а её срабатывание — различимым в логе.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DownloadCommandErrorKind {
@@ -1157,7 +1146,6 @@ pub enum DownloadCommandErrorKind {
 ///
 /// `message` — диагностика для лога, как и у [`DownloadError`]: решение
 /// принимается по `kind`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadCommandError {

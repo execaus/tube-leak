@@ -89,9 +89,13 @@ mod sidecar;
 mod types;
 mod ytdlp;
 
+use std::sync::Arc;
+
 use commands::{
-    cancel_probe, check_sidecar, prepare_ytdlp, probe_url, start_ytdlp_preparation, PreparationLock,
+    cancel_download, cancel_probe, check_sidecar, prepare_ytdlp, probe_url, retry_download,
+    start_download, start_ytdlp_preparation, PreparationLock,
 };
+use download::DownloadSession;
 use probe::ProbeSession;
 use sidecar::ChildRegistry;
 use tauri::{Manager, RunEvent};
@@ -99,16 +103,24 @@ use tauri::{Manager, RunEvent};
 fn main() {
     let app = tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
+            cancel_download,
             cancel_probe,
             check_sidecar,
             prepare_ytdlp,
-            probe_url
+            probe_url,
+            retry_download,
+            start_download
         ])
         .manage(ChildRegistry::new())
         .manage(PreparationLock::new())
         // Состояние «идёт разбор ссылки» (E2): одно на приложение —
         // одновременно выполняется не более одного разбора (Ф-8).
         .manage(ProbeSession::new())
+        // Слот активной загрузки (E3): активная задача одна, и её
+        // единственность держится здесь, а не неактивной кнопкой во
+        // фронтенде. `Arc` — потому что воркер задачи живёт отдельной
+        // задачей рантайма и переживает возврат из команды.
+        .manage(Arc::new(DownloadSession::new()))
         // Подготовка yt-dlp (TL-12) стартует, не дожидаясь фронтенда:
         // приложение без yt-dlp неработоспособно, и готовить его —
         // обязанность ядра. Фронтенд подписывается на события

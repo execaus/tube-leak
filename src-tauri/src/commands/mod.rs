@@ -4,10 +4,12 @@
 //! (`crate::sidecar`, `crate::ytdlp` и далее) и адаптацию их результата под
 //! контракт, зеркалируемый в `src/types/` фронтендом.
 
+mod download;
 mod probe;
 mod sidecar;
 mod ytdlp;
 
+pub use download::{cancel_download, retry_download, start_download};
 pub use probe::{cancel_probe, probe_url};
 pub use sidecar::check_sidecar;
 pub use ytdlp::{prepare_ytdlp, start_ytdlp_preparation, PreparationLock};
