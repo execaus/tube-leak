@@ -1,0 +1,17 @@
+{
+  "_capture": {
+    "note": "Системный прокси объявлен, но не отвечает: --proxy на заведомо закрытый порт localhost.",
+    "argv": [
+      "-J",
+      "--no-playlist",
+      "--proxy",
+      "http://127.0.0.1:9",
+      "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+    ],
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 1,
+  "stderr": "WARNING: [youtube] ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (1/3)...\nWARNING: [youtube] ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (2/3)...\nWARNING: [youtube] ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (3/3)...\nWARNING: [youtube] jNQXAC9IVRw: Unable to download webpage: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 61] Connection refused\")) (caused by ProxyError('(\\'Unable to connect to proxy\\', NewConnectionError(\"HTTPSConnection(host=\\'127.0.0.1\\', port=9): Failed to establish a new connection: [Errno 61] Connection refused\"))')); please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U. Giving up after 3 retries\nWARNING: [youtube] ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (1/3)...\nWARNING: [youtube] ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (2/3)...\nWARNING: [youtube] ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (3/3)...\nERROR: [youtube] jNQXAC9IVRw: Unable to download API page: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 61] Connection refused\")) (caused by ProxyError('(\\'Unable to connect to proxy\\', NewConnectionError(\"HTTPSConnection(host=\\'127.0.0.1\\', port=9): Failed to establish a new connection: [Errno 61] Connection refused\"))')); please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U\n",
+  "stdout": null
+}

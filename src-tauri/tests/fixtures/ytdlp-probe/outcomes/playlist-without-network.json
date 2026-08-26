@@ -1,0 +1,17 @@
+{
+  "_capture": {
+    "note": "Ссылка на плейлист при выключенной сети: в одном выводе сразу два признака — метка экстрактора [youtube:tab] и транспортный сбой резолвера. Единственная снятая фикстура, на которой порядок проверок что-то решает.",
+    "argv": [
+      "-J",
+      "--no-playlist",
+      "--flat-playlist",
+      "https://www.youtube.com/playlist?list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb"
+    ],
+    "sandbox": "sandbox-exec: (deny network*)",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 1,
+  "stderr": "WARNING: [youtube:tab] HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 8] nodename nor servname provided, or not known). Retrying (1/3)...\nWARNING: [youtube:tab] HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 8] nodename nor servname provided, or not known). Retrying (2/3)...\nWARNING: [youtube:tab] HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 8] nodename nor servname provided, or not known). Retrying (3/3)...\nWARNING: [youtube:tab] PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb: Unable to download webpage: HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 8] nodename nor servname provided, or not known) (caused by TransportError(\"HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 8] nodename nor servname provided, or not known)\")). Giving up after 3 retries\nWARNING: [youtube:tab] HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 8] nodename nor servname provided, or not known). Retrying (1/3)...\nWARNING: [youtube:tab] HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 8] nodename nor servname provided, or not known). Retrying (2/3)...\nWARNING: [youtube:tab] HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 8] nodename nor servname provided, or not known). Retrying (3/3)...\nERROR: [youtube:tab] PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb: Unable to download API page: HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 8] nodename nor servname provided, or not known) (caused by TransportError(\"HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 8] nodename nor servname provided, or not known)\"))\n",
+  "stdout": null
+}

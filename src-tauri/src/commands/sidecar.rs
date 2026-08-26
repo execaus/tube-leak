@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 
 use crate::clock::now_iso8601;
-use crate::sidecar::{self, ChildRegistry, SidecarError};
+use crate::sidecar::{self, stderr_tail, ChildRegistry, SidecarError};
 use crate::types::{LaunchFailedReason, SidecarCheckReport, SidecarCheckResult, SidecarStatus};
 use crate::ytdlp;
 
@@ -95,11 +95,6 @@ const YT_DLP_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
 /// холодному запуску это запас 3,6×. Прежние 5 с тоже покрывали замер, но
 /// были взяты из дизайна, а не из него.
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
-
-/// Максимальная длина `stderrTail` в Unicode-символах (не байтах) — по
-/// контракту TL-1 достаточно «~1000 символов или ~20 строк» для «Подробнее»
-/// на служебном экране; полный stderr в DTO не попадает, только хвост.
-const STDERR_TAIL_MAX_CHARS: usize = 1000;
 
 /// Возвращает результат проверки обоих sidecar-бинарников (yt-dlp, ffmpeg).
 ///
@@ -291,7 +286,7 @@ fn error_to_result(
                 Some(reason),
                 None,
                 os_error_code,
-                tail(&stderr),
+                stderr_tail(&stderr),
                 None,
             )
         }
@@ -300,7 +295,7 @@ fn error_to_result(
             None,
             Some(code),
             None,
-            tail(&stderr),
+            stderr_tail(&stderr),
             None,
         ),
         SidecarError::Timeout { ms, stderr } => (
@@ -308,7 +303,7 @@ fn error_to_result(
             None,
             None,
             None,
-            tail(&stderr),
+            stderr_tail(&stderr),
             Some(ms),
         ),
     };
@@ -328,23 +323,6 @@ fn error_to_result(
     }
 }
 
-/// Обрезает stderr до последних [`STDERR_TAIL_MAX_CHARS`] символов;
-/// `None`, если после `trim()` пусто (нечего показывать в «Подробнее»).
-fn tail(stderr: &str) -> Option<String> {
-    let trimmed = stderr.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let char_count = trimmed.chars().count();
-    if char_count <= STDERR_TAIL_MAX_CHARS {
-        Some(trimmed.to_string())
-    } else {
-        let skip = char_count - STDERR_TAIL_MAX_CHARS;
-        Some(trimmed.chars().skip(skip).collect())
-    }
-}
-
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -352,6 +330,7 @@ fn elapsed_ms(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidecar::STDERR_TAIL_MAX_CHARS;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 

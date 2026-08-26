@@ -1,0 +1,17 @@
+{
+  "_capture": {
+    "note": "Ответ YouTube получен, но разобрать его нечем. Воспроизведено принудительным клиентом web: без JS-рантайма он форматов не отдаёт. Это и есть форма отказа «yt-dlp не понимает ответ» — та, что при настоящем устаревании приходит сама.",
+    "argv": [
+      "-J",
+      "--no-playlist",
+      "--extractor-args",
+      "youtube:player_client=web",
+      "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+    ],
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 1,
+  "stderr": "ERROR: [youtube] jNQXAC9IVRw: No video formats found!; please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U\n",
+  "stdout": null
+}
