@@ -66,14 +66,14 @@ pub fn build_quality_ladder(metadata: &Value) -> Vec<QualityItem> {
 
     // Аудио выбирается один раз на весь ролик: и для «только аудио», и для
     // каждой видеостроки (дизайн E2 — дорожка не зависит от разрешения).
-    let audio = best(streams.iter().filter(|stream| stream.height.is_none()));
+    let audio = best_audio(streams.iter().filter(|stream| stream.height.is_none()));
 
     let mut items = Vec::with_capacity(LADDER_STEPS.len() + 1);
 
     let standard: Vec<(u32, &Stream<'_>)> = LADDER_STEPS
         .iter()
         .filter_map(|&height| {
-            best(
+            best_video(
                 streams
                     .iter()
                     .filter(|stream| stream.height == Some(height)),
@@ -96,7 +96,7 @@ pub fn build_quality_ladder(metadata: &Value) -> Vec<QualityItem> {
         let max_height = streams.iter().filter_map(|stream| stream.height).max();
 
         if let Some(height) = max_height {
-            if let Some(stream) = best(streams.iter().filter(|s| s.height == Some(height))) {
+            if let Some(stream) = best_video(streams.iter().filter(|s| s.height == Some(height))) {
                 items.push(video_item(QualityKind::MaxAvailable, height, stream, audio));
             }
         }
@@ -139,11 +139,11 @@ fn video_item(
     QualityItem {
         kind,
         height_px: Some(height),
-        // Сумма размеров агрегированных потоков (Ф-4). Если размер известен
-        // только у одного из двух — суммируется он один: оценка «видео без
-        // звуковой дорожки» промахивается на проценты, а «неизвестно» при
-        // наличии данных было бы потерей информации на ровном месте.
-        size: size_of(sum_sizes(video.size, audio.and_then(|audio| audio.size))),
+        // Сумма размеров агрегированных потоков (Ф-4).
+        size: size_of(video_row_size(
+            video.size,
+            audio.and_then(|audio| audio.size),
+        )),
         streams: QualityStreams {
             video_format_id: Some(video.format_id.to_owned()),
             audio_format_id: audio.map(|audio| audio.format_id.to_owned()),
@@ -151,12 +151,22 @@ fn video_item(
     }
 }
 
-/// Сумма известных размеров; `None`, только если не известен ни один.
-fn sum_sizes(video: Option<u64>, audio: Option<u64>) -> Option<u64> {
-    match (video, audio) {
-        (None, None) => None,
-        (video, audio) => Some(video.unwrap_or(0).saturating_add(audio.unwrap_or(0))),
-    }
+/// Оценка размера видеостроки: размер видеопотока плюс размер дорожки,
+/// если он известен.
+///
+/// Два несимметричных случая, и несимметричны они по существу:
+///
+/// - **размер видео известен, размер дорожки нет** — оценка выдаётся:
+///   дорожка весит проценты от строки, и «размер неизвестен» вместо
+///   честных «≈ 1,36 ГБ» был бы потерей информации на ровном месте;
+/// - **размер видео неизвестен** — оценки нет, чем бы ни был известен
+///   размер дорожки. Ступень из одних HLS-вариантов (размера не сообщает
+///   ни один) плюс прямое аудио дала бы строку «2160p ≈ 10 МБ»: промах не
+///   на проценты, а на два порядка. Это уже не оценка, а дезинформация,
+///   и «размер неизвестен» здесь — единственный честный ответ (Ф-4
+///   прямо разрешает пункт без оценки, он остаётся выбираемым).
+fn video_row_size(video: Option<u64>, audio: Option<u64>) -> Option<u64> {
+    Some(video?.saturating_add(audio.unwrap_or(0)))
 }
 
 /// Оценка размера в терминах контракта.
@@ -169,18 +179,39 @@ fn size_of(bytes: Option<u64>) -> QualitySize {
     bytes.map_or(QualitySize::Unknown, |bytes| QualitySize::Known { bytes })
 }
 
+/// Лучший видеопоток ступени.
+///
+/// Язык в сравнении не участвует — см. [`Rank::compare_as_audio`].
+fn best_video<'a, 'f>(streams: impl Iterator<Item = &'a Stream<'f>>) -> Option<&'a Stream<'f>>
+where
+    'f: 'a,
+{
+    best_by(streams, Rank::compare)
+}
+
+/// Лучшая аудиодорожка ролика — единственное место, где сравнивается язык.
+fn best_audio<'a, 'f>(streams: impl Iterator<Item = &'a Stream<'f>>) -> Option<&'a Stream<'f>>
+where
+    'f: 'a,
+{
+    best_by(streams, Rank::compare_as_audio)
+}
+
 /// Лучший поток из перечисленных или `None`, если перечислять нечего.
 ///
 /// При полном равенстве всех признаков выигрывает тот, кто идёт в выводе
 /// yt-dlp раньше (замена — только по строгому «лучше»): порядок форматов
 /// у yt-dlp стабилен, и разбор одного и того же ролика обязан давать один
 /// и тот же результат.
-fn best<'a, 'f>(streams: impl Iterator<Item = &'a Stream<'f>>) -> Option<&'a Stream<'f>>
+fn best_by<'a, 'f>(
+    streams: impl Iterator<Item = &'a Stream<'f>>,
+    compare: fn(&Rank, &Rank) -> Ordering,
+) -> Option<&'a Stream<'f>>
 where
     'f: 'a,
 {
     streams.fold(None, |best, candidate| match best {
-        Some(best) if candidate.rank.compare(&best.rank) != Ordering::Greater => Some(best),
+        Some(best) if compare(&candidate.rank, &best.rank) != Ordering::Greater => Some(best),
         _ => Some(candidate),
     })
 }
@@ -244,7 +275,10 @@ impl<'a> Stream<'a> {
 /// приоритет правил (см. [`Rank::compare`]).
 struct Rank {
     /// `language_preference` yt-dlp: 10 у оригинальной дорожки, −1 у
-    /// автодубляжа и у всего, где язык не при чём (видеопотоки).
+    /// автодубляжа.
+    ///
+    /// Участвует только в выборе аудио ([`Rank::compare_as_audio`]) —
+    /// объяснение там же.
     language_preference: i64,
     /// Поток отдаётся напрямую по http(s), а не через манифест
     /// (HLS/DASH/mhtml).
@@ -264,12 +298,13 @@ struct Rank {
 ///
 /// Ровно то же значение, что подставляет сам yt-dlp в своей сортировке
 /// форматов (`FormatSorter`, поля `lang`, `quality`, `source`), и это не
-/// косметика: у HLS-вариантов `language_preference` не объявлен вовсе, а у
-/// прямых потоков он равен −1. Любой «нейтральный» ноль на месте
-/// отсутствующего значения поставил бы HLS выше прямого потока ещё до
-/// сравнения по протоколу и битрейту — ровно тот дефект, который поймала
-/// первая же прогонка на фикстуре `4k-full-ladder.json` (выбирался `628`
-/// вместо `315`).
+/// косметика: одни и те же признаки у части форматов объявлены, у части
+/// нет (у HLS-вариантов нет ни `language_preference`, ни размера, а у
+/// прямых потоков `language_preference` = −1). «Нейтральный» ноль на
+/// месте отсутствующего значения поставил бы формат без признака выше
+/// формата с объявленным −1 — первая же прогонка на фикстуре
+/// `4k-full-ladder.json` из-за этого выбрала HLS-вариант `628` вместо
+/// прямого `315`.
 const UNDECLARED: i64 = -1;
 
 /// [`UNDECLARED`] для дробного `quality`.
@@ -299,45 +334,67 @@ impl Rank {
 
     /// Кто из двух потоков лучше. Правила по убыванию важности:
     ///
-    /// 1. **Язык дорожки.** Оригинал важнее автодубляжа: у ролика с
-    ///    дубляжами (реальная фикстура `multi-language-audio.json`)
-    ///    самый жирный аудиопоток — малаялам (132 kbps) против
-    ///    английского оригинала (129 kbps), и выбор «просто по битрейту»
-    ///    молча подменил бы звук. Для видеопотоков признак одинаков и
-    ///    ни на что не влияет.
-    /// 2. **Прямая раздача важнее манифеста.** Это уточнение правила
+    /// 1. **Прямая раздача важнее манифеста.** Это уточнение правила
     ///    дизайна «наибольший битрейт», без которого правило не работает
     ///    на живых данных: у HLS-вариантов (`m3u8_native`) `tbr` — это
     ///    объявленная в манифесте пиковая полоса, а у прямых потоков —
-    ///    средний битрейт, посчитанный из размера. Сравнивать их между
-    ///    собой некорректно, HLS всегда «выигрывает» и при этом никогда
-    ///    не сообщает размер — лестница целиком стала бы «размер
-    ///    неизвестен» вопреки К-1. Отбором это не сделано: если у ступени
-    ///    есть только HLS-варианты, строка всё равно нужна (Р-1 — строка
-    ///    существует, если качество доступно), просто с неизвестным
-    ///    размером.
-    /// 3. **Битрейт** — правило дизайна: на глаз он соответствует
+    ///    средний битрейт, посчитанный из размера (у формата `315`
+    ///    фикстуры `4k-full-ladder.json` `filesize · 8 / duration` = 17 162
+    ///    против объявленных `tbr` = 17 174, у HLS-варианта той же
+    ///    ступени — 27 987). Сравнивать их между собой некорректно, HLS
+    ///    всегда «выигрывает» и при этом никогда не сообщает размер — все
+    ///    видеостроки лестницы стали бы «размер неизвестен» вопреки К-1.
+    ///    (Строка «только аудио» уцелела бы и по буквальному правилу:
+    ///    HLS-аудио `233`/`234` не объявляет `tbr` вовсе и проигрывает
+    ///    прямой дорожке по битрейту.) Отбором это не сделано: если у
+    ///    ступени есть только HLS-варианты, строка всё равно нужна (Р-1 —
+    ///    строка существует, если качество доступно), просто с
+    ///    неизвестным размером.
+    /// 2. **Битрейт** — правило дизайна: на глаз он соответствует
     ///    «лучше» вернее, чем кодек или контейнер (которые в выборе
     ///    не участвуют вовсе и наружу не выходят).
-    /// 4. **Наличие оценки размера** — тай-брейк дизайна: пункт не должен
+    /// 3. **Наличие оценки размера** — тай-брейк дизайна: пункт не должен
     ///    становиться «размер неизвестен» из-за порядка перебора при
     ///    прочих равных.
-    /// 5. **`quality` yt-dlp** — разводит потоки, равные по всему
+    /// 4. **`quality` yt-dlp** — разводит потоки, равные по всему
     ///    вышеперечисленному. Реальный случай: `140` и `140-drc`
     ///    (сжатая по громкости копия) с точностью до бита одинаковы по
     ///    битрейту и размеру, и yt-dlp сам ставит DRC ниже (3.0 против
     ///    2.5).
-    /// 6. **`source_preference` yt-dlp** — то же для случая, когда и
+    /// 5. **`source_preference` yt-dlp** — то же для случая, когда и
     ///    `quality` совпал (HLS-аудио `233`/`234`: качество −1 у обоих,
     ///    предпочтение 0 и 1).
     fn compare(&self, other: &Self) -> Ordering {
-        self.language_preference
-            .cmp(&other.language_preference)
-            .then(self.direct.cmp(&other.direct))
+        self.direct
+            .cmp(&other.direct)
             .then(bitrate_key(self.bitrate).total_cmp(&bitrate_key(other.bitrate)))
             .then(self.has_size.cmp(&other.has_size))
             .then(self.quality.total_cmp(&other.quality))
             .then(self.source_preference.cmp(&other.source_preference))
+    }
+
+    /// То же сравнение, но с языком дорожки первым ключом — только для
+    /// выбора аудио.
+    ///
+    /// Оригинал важнее автодубляжа: у ролика с дубляжами (реальная
+    /// фикстура `multi-language-audio.json`) самый жирный аудиопоток —
+    /// малаялам (132,2 kbps) против английского оригинала (129,5), и
+    /// выбор «просто по наибольшему битрейту» молча подменил бы звук.
+    /// В самом yt-dlp порядок ключей по умолчанию тот же: `… lang,
+    /// quality, res, …, br, …` — язык выше битрейта.
+    ///
+    /// Ключ сужен до аудио намеренно, и это не оптимизация. yt-dlp
+    /// проставляет `language_preference` любому формату, у которого есть
+    /// звук, — то есть и прогрессивному видео тоже. На ролике с
+    /// дубляжами прогрессивный `22` (720p, ~1 Мбит/с) получил бы
+    /// `language_preference` оригинальной дорожки и обошёл бы раздельный
+    /// `298` (720p60, 1,9 Мбит/с) ещё до сравнения по битрейту —
+    /// пользователь получил бы худшую картинку. Язык — свойство дорожки,
+    /// а не картинки, и в выборе видеопотока ему делать нечего.
+    fn compare_as_audio(&self, other: &Self) -> Ordering {
+        self.language_preference
+            .cmp(&other.language_preference)
+            .then(self.compare(other))
     }
 }
 
@@ -563,6 +620,16 @@ mod tests {
             let expected = audio.streams.audio_format_id.as_deref();
 
             for item in &items {
+                // Прогрессивная строка (видеопоток уже со звуком) отдельной
+                // дорожки не несёт по контракту — сравнивать там нечего.
+                // Живых фикстур с такими форматами сейчас нет, но набор
+                // фикстур пополняется, и ложное падение тут было бы
+                // неприятным сюрпризом для того, кто их добавит.
+                if item.streams.video_format_id.is_some() && item.streams.audio_format_id.is_none()
+                {
+                    continue;
+                }
+
                 assert_eq!(
                     item.streams.audio_format_id.as_deref(),
                     expected,
@@ -587,6 +654,49 @@ mod tests {
             "у оригинальной дорожки language_preference = 10, у дубляжей −1"
         );
         assert_eq!(size_bytes(audio), Some(19_880_859));
+    }
+
+    #[test]
+    fn the_language_of_a_progressive_stream_never_outranks_a_better_picture() {
+        // yt-dlp проставляет `language_preference` любому формату со
+        // звуком, включая прогрессивный. На ролике с дубляжами
+        // прогрессивный `22` несёт оригинальную дорожку (10), а
+        // раздельный `298` — видео без языка (−1). Если сравнивать
+        // видеопотоки по языку, `22` (1,0 Мбит/с) обойдёт `298`
+        // (1,9 Мбит/с) ещё до битрейта, и пользователь получит худшую
+        // картинку при том же звуке. Язык — свойство дорожки, не картинки.
+        let metadata = json!({
+            "formats": [
+                {"format_id": "22", "vcodec": "avc1.64001F", "acodec": "mp4a.40.2",
+                 "height": 720, "tbr": 1000.0, "filesize": 30_000_000,
+                 "language": "en", "language_preference": 10, "protocol": "https"},
+                {"format_id": "298", "vcodec": "avc1.4d4020", "acodec": "none",
+                 "height": 720, "tbr": 1897.673, "filesize": 150_524_867,
+                 "language_preference": -1, "protocol": "https"},
+                {"format_id": "140-en", "vcodec": "none", "acodec": "mp4a.40.2",
+                 "tbr": 129.476, "filesize": 19_880_859,
+                 "language": "en", "language_preference": 10, "protocol": "https"},
+                {"format_id": "140-ml", "vcodec": "none", "acodec": "mp4a.40.2",
+                 "tbr": 132.243, "filesize": 20_304_957,
+                 "language": "ml", "language_preference": -1, "protocol": "https"},
+            ]
+        });
+
+        let items = build_quality_ladder(&metadata);
+
+        assert_eq!(
+            items.iter().map(shape).collect::<Vec<_>>(),
+            vec![
+                (
+                    QualityKind::Standard,
+                    Some(720),
+                    Some("298"),
+                    Some("140-en")
+                ),
+                (QualityKind::AudioOnly, None, None, Some("140-en")),
+            ],
+            "видео выбирается по битрейту, дорожка — по языку"
+        );
     }
 
     #[test]
@@ -668,11 +778,11 @@ mod tests {
     }
 
     #[test]
-    fn a_partially_known_size_is_still_an_estimate() {
+    fn a_row_keeps_its_estimate_when_only_the_audio_size_is_missing() {
         // Размер известен только у видеопотока: аудиодорожка весит
         // проценты от строки, и «неизвестно» при наличии данных было бы
-        // потерей информации на ровном месте (Ф-4 требует «неизвестно»
-        // только когда не известно ничего).
+        // потерей информации на ровном месте. Обратный случай (неизвестен
+        // видеопоток) разобран отдельным тестом и ведёт себя иначе.
         let metadata = json!({
             "formats": [
                 {"format_id": "v", "vcodec": "avc1", "acodec": "none", "height": 1080,
@@ -686,6 +796,79 @@ mod tests {
 
         assert_eq!(size_bytes(&items[0]), Some(100));
         assert_eq!(items[1].size, QualitySize::Unknown);
+    }
+
+    #[test]
+    fn a_row_whose_video_stream_has_no_size_reports_no_estimate() {
+        // Обратный случай к предыдущему, и ведёт он себя иначе. Ступень
+        // собрана из одних HLS-вариантов (размера не сообщает ни один), а
+        // дорожка — прямая и с размером. Сложение известного дало бы
+        // «2160p ≈ 10 МБ»: промах на два порядка, потому что видеопоток —
+        // доминирующая часть строки. Такое «≈» дезинформирует сильнее,
+        // чем честное «размер неизвестен» (Ф-4 оставляет пункт
+        // выбираемым).
+        let metadata = json!({
+            "formats": [
+                {"format_id": "628", "vcodec": "vp09", "acodec": "none", "height": 2160,
+                 "tbr": 27987.109, "protocol": "m3u8_native"},
+                {"format_id": "140", "vcodec": "none", "acodec": "mp4a.40.2",
+                 "tbr": 129.481, "filesize": 10_271_496, "protocol": "https"},
+            ]
+        });
+
+        let items = build_quality_ladder(&metadata);
+
+        assert_eq!(
+            shape(&items[0]),
+            (QualityKind::Standard, Some(2160), Some("628"), Some("140")),
+            "строка остаётся: качество доступно, скачать его есть чем (Р-1)"
+        );
+        assert_eq!(
+            items[0].size,
+            QualitySize::Unknown,
+            "размер дорожки не выдаётся за размер строки"
+        );
+        assert_eq!(size_bytes(&items[1]), Some(10_271_496));
+    }
+
+    #[test]
+    fn a_gap_in_the_ladder_removes_only_the_missing_step() {
+        // У ролика есть 2160p и 720p, но нет 1440p и 1080p. Живые фикстуры
+        // такого не дают (YouTube выкладывает высоты подряд), а код этот
+        // случай обрабатывает — значит он должен быть зафиксирован: строк
+        // ровно две, порядок сверху вниз сохраняется, дыра не превращает
+        // лестницу в «максимальное доступное».
+        let metadata = json!({
+            "formats": [
+                {"format_id": "top", "vcodec": "vp9", "acodec": "none", "height": 2160,
+                 "tbr": 17174.188, "filesize": 1_362_269_481, "protocol": "https"},
+                {"format_id": "bottom", "vcodec": "avc1", "acodec": "none", "height": 720,
+                 "tbr": 1897.673, "filesize": 150_524_867, "protocol": "https"},
+                {"format_id": "audio", "vcodec": "none", "acodec": "mp4a.40.2",
+                 "tbr": 129.481, "filesize": 10_271_496, "protocol": "https"},
+            ]
+        });
+
+        let items = build_quality_ladder(&metadata);
+
+        assert_eq!(
+            items.iter().map(shape).collect::<Vec<_>>(),
+            vec![
+                (
+                    QualityKind::Standard,
+                    Some(2160),
+                    Some("top"),
+                    Some("audio")
+                ),
+                (
+                    QualityKind::Standard,
+                    Some(720),
+                    Some("bottom"),
+                    Some("audio")
+                ),
+                (QualityKind::AudioOnly, None, None, Some("audio")),
+            ]
+        );
     }
 
     #[test]
@@ -830,30 +1013,81 @@ mod tests {
         );
     }
 
+    /// Единственная фикстура, у которой состав форматов изменён: из вывода
+    /// оставлены только потоки через манифест (см. README рядом с ней).
+    const DERIVED_FIXTURE: &str = "sizes-unknown.json";
+
     #[test]
-    fn fixtures_are_real_yt_dlp_output() {
-        // Сторож происхождения: фикстуры — вывод настоящего yt-dlp, а не
-        // собранный руками JSON (Ф-7). Если кто-то однажды «поправит»
-        // фикстуру, потеряв эти поля, тест скажет об этом раньше ревью.
+    fn fixtures_are_real_output_of_the_pinned_yt_dlp() {
+        // Фикстуры заморожены, а yt-dlp — нет: набор останется зелёным и
+        // после того, как апстрим сменит форму вывода. Единственная защита
+        // от «тесты проходят, приложение получает другое» — чтобы смена
+        // пина в binaries.lock.json громко ломала этот тест и заставляла
+        // переснять фикстуры. До сих пор эта связь держалась только
+        // словами README.
+        let pinned = pinned_yt_dlp_version();
+
         for name in FIXTURES {
             let metadata = fixture(name);
 
+            assert_eq!(
+                metadata
+                    .get("_version")
+                    .and_then(|version| version.get("version"))
+                    .and_then(Value::as_str),
+                Some(pinned.as_str()),
+                "{name}: фикстура снята не тем yt-dlp, который вложен в                  приложение ({pinned} по binaries.lock.json). Пин сменили —                  переснимите фикстуры по README, а не правьте эту строку"
+            );
             assert_eq!(
                 metadata.get("extractor").and_then(Value::as_str),
                 Some("youtube"),
                 "{name}: фикстура должна быть выводом yt-dlp по ролику YouTube"
             );
-            assert!(
-                metadata.get("_version").is_some(),
-                "{name}: в фикстуре нет блока версии yt-dlp"
-            );
-            assert!(
-                metadata
-                    .get("formats")
-                    .and_then(Value::as_array)
-                    .is_some_and(|formats| !formats.is_empty()),
-                "{name}: в фикстуре нет форматов"
+
+            let formats = metadata
+                .get("formats")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("{name}: в фикстуре нет массива форматов"));
+            assert!(!formats.is_empty(), "{name}: в фикстуре нет форматов");
+
+            for format in formats {
+                for key in ["format_id", "protocol", "ext"] {
+                    assert!(
+                        format.get(key).is_some(),
+                        "{name}: у формата нет поля {key} — так yt-dlp не отдаёт"
+                    );
+                }
+            }
+
+            // Живой вывод содержит прямые потоки; их отсутствие — признак
+            // производной фикстуры, и она у нас ровно одна.
+            let has_direct = formats.iter().any(|format| {
+                matches!(
+                    format.get("protocol").and_then(Value::as_str),
+                    Some("https" | "http")
+                )
+            });
+            assert_eq!(
+                has_direct,
+                name != DERIVED_FIXTURE,
+                "{name}: состав форматов не соответствует README — производной                  объявлена только {DERIVED_FIXTURE}"
             );
         }
+    }
+
+    /// Версия yt-dlp из пина `binaries.lock.json` — та, что реально
+    /// вкладывается в приложение.
+    fn pinned_yt_dlp_version() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries.lock.json");
+        let raw = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("пин {} не читается: {err}", path.display()));
+        let pin: Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|err| panic!("пин {} — не JSON: {err}", path.display()));
+
+        pin.get("ytDlp")
+            .and_then(|yt_dlp| yt_dlp.get("version"))
+            .and_then(Value::as_str)
+            .expect("в пине объявлена версия yt-dlp")
+            .to_owned()
     }
 }
