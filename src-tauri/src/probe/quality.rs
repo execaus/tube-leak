@@ -575,10 +575,10 @@ mod tests {
     }
 
     fn size_bytes(item: &QualityItem) -> Option<u64> {
-        match item.size {
-            QualitySize::Known { bytes } => Some(bytes),
-            QualitySize::Unknown => None,
-        }
+        // Разворачивает вариант сам тип: копия этого `match` здесь и в
+        // агрегации прогресса (E3) однажды разошлась бы на том, чем
+        // считать `Unknown`.
+        item.size.bytes()
     }
 
     #[test]

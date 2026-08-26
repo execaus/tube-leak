@@ -1,0 +1,22 @@
+{
+  "_capture": {
+    "note": "Первая попытка, оборванная убийством процесса на 995 883 байтах из 18 294 110 (модель обрыва связи: на диске остаётся d.mp4.part). Строки finished нет — поток кончается на середине.",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "-f",
+      "134",
+      "-o",
+      "d.%(ext)s",
+      "-P",
+      "temp:.",
+      "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=aqz-KE-bpKQ\n[youtube] aqz-KE-bpKQ: Downloading webpage\n[youtube] aqz-KE-bpKQ: Downloading visionos player API JSON\n[youtube] aqz-KE-bpKQ: Downloading m3u8 information\n[info] aqz-KE-bpKQ: Downloading 1 format(s): 134\n[download] Destination: ./d.mp4\n@tl-progress|downloading|1024|18294110|NA|265203.2908922507|69|NA|NA|134\n@tl-progress|downloading|3072|18294110|NA|665645.6004546159|27|NA|NA|134\n@tl-progress|downloading|7168|18294110|NA|1456838.255172748|12|NA|NA|134\n@tl-progress|downloading|15360|18294110|NA|2960141.032898364|6|NA|NA|134\n@tl-progress|downloading|31744|18294110|NA|1906660.167776489|9|NA|NA|134\n@tl-progress|downloading|64512|18294110|NA|1470759.2860334285|12|NA|NA|134\n@tl-progress|downloading|130048|18294110|NA|818379.9064564382|22|NA|NA|134\n@tl-progress|downloading|261120|18294110|NA|376216.1177849067|47|NA|NA|134\n@tl-progress|downloading|506041|18294110|NA|728038.9436555174|24|NA|NA|134\n@tl-progress|downloading|995883|18294110|NA|729043.5475284468|23|NA|NA|134\n"
+}

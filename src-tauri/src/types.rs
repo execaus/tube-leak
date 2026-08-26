@@ -223,13 +223,41 @@ pub enum QualityKind {
 /// оценки в контракт не выносится: yt-dlp даёт оценку и в поле точного
 /// размера тоже, гарантий совпадения с итоговым файлом эпик не даёт, и UI
 /// показывает любую оценку одинаково — со знаком «≈».
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// **Тип ходит в обе стороны границы** — как и [`QualityStreams`], и по
+/// той же причине. Разбор отдаёт оценку карточке, а карточка возвращает её
+/// обратно вместе с выбранным пунктом ([`StartDownloadRequest::size`]):
+/// она — стартовый знаменатель агрегации прогресса (дизайн E3,
+/// «Агрегация видео+аудио»), а взять его в ядре больше неоткуда, повторный
+/// разбор запрещён обещанием Ф-3 E2.
+///
+/// Величина считается **на пункт целиком**, а не на поток: у ступени из
+/// раздельных потоков это сумма видео и звука, и разнести её обратно по
+/// потокам разбор не может — про это знает агрегация
+/// (`crate::download::aggregate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum QualitySize {
     /// Сумма размеров агрегированных потоков пункта.
     Known { bytes: u64 },
     /// Ни у одного потока пункта нет данных о размере.
     Unknown,
+}
+
+impl QualitySize {
+    /// Число байт, если оценка есть.
+    ///
+    /// Одно место на всех, кто разворачивает вариант в число: разбор
+    /// (тесты лестницы) и агрегация прогресса. Копия этого `match` на
+    /// стороне вызывающего — приглашение однажды написать в ней `0` для
+    /// [`QualitySize::Unknown`], а ноль и «нет данных» тип разводит
+    /// намеренно.
+    pub fn bytes(self) -> Option<u64> {
+        match self {
+            Self::Known { bytes } => Some(bytes),
+            Self::Unknown => None,
+        }
+    }
 }
 
 /// Непрозрачные для фронтенда идентификаторы потоков, которые скачает E3.
@@ -1035,12 +1063,36 @@ pub struct StartDownloadRequest {
     /// станет в имени файла, решает санитизация ядра.
     pub title: String,
     /// Потоки выбранного пункта лестницы. Тип E2 переиспользуется как
-    /// есть — это то самое единственное поле контракта разбора, которое
-    /// ходит в обе стороны границы (см. [`QualityStreams`]). Объект без
-    /// единого потока команда обязана отклонить
-    /// ([`QualityStreams::has_any`],
+    /// есть — одно из двух полей контракта разбора, которые ходят в обе
+    /// стороны границы (см. [`QualityStreams`]). Объект без единого потока
+    /// команда обязана отклонить ([`QualityStreams::has_any`],
     /// [`DownloadCommandErrorKind::NoStreamsSelected`]).
     pub streams: QualityStreams,
+    /// Оценка размера того же пункта — стартовый знаменатель агрегации
+    /// прогресса (дизайн E3: «Ожидаемые размеры на старте берутся из
+    /// оценки, которую уже вернул разбор E2»).
+    ///
+    /// **Поле обязательное, а не `Option`.** Оценка есть у каждого пункта
+    /// лестницы всегда — просто иногда со значением
+    /// [`QualitySize::Unknown`] (Ф-4 E2); «неизвестно» уже выражено самим
+    /// типом, и `Option` поверх него завёл бы третье состояние («поле не
+    /// прислали»), которого не существует ни у одного пункта. Фронтенд
+    /// берёт величину из того же объекта лестницы, что и `streams`, —
+    /// дополнительных данных ему собирать не нужно.
+    ///
+    /// Зачем она ядру. Пока знаменатель неизвестен, агрегация двух потоков
+    /// вынуждена брать веса 50/50 (правило дизайна для неизвестного
+    /// размера), а по байтам видео обычно весит около 70 % пункта — полоса
+    /// проходила бы половину за 90 % времени и вторую половину за 10 %.
+    /// Замерено на живых данных: тест
+    /// `two_streams_without_an_estimate_fall_back_to_equal_weights` в
+    /// `crate::download::aggregate` показывает ровно эту разницу.
+    ///
+    /// Ядро оценке не верит на слово: как только yt-dlp сообщает
+    /// фактический размер потока, тот вытесняет оценку из знаменателя
+    /// (см. шапку `crate::download::aggregate`). Заниженная оценка
+    /// поэтому портит только темп полосы, а не её конец.
+    pub size: QualitySize,
 }
 
 /// Ответ команды «начать загрузку»: задача создана.
@@ -2255,7 +2307,8 @@ mod tests {
             r#"{
                 "url": "https://www.youtube.com/watch?v=abc",
                 "title": "Как приручить дракона",
-                "streams": { "videoFormatId": "137", "audioFormatId": "140" }
+                "streams": { "videoFormatId": "137", "audioFormatId": "140" },
+                "size": { "kind": "known", "bytes": 303038464 }
             }"#,
         )
         .expect("deserialization must work");
@@ -2266,8 +2319,49 @@ mod tests {
                 url: "https://www.youtube.com/watch?v=abc".to_string(),
                 title: "Как приручить дракона".to_string(),
                 streams: video_streams(),
+                size: QualitySize::Known { bytes: 303_038_464 },
             }
         );
+    }
+
+    #[test]
+    fn a_start_request_carries_the_size_estimate_in_the_shape_probe_sends_it() {
+        // Оценка ходит в обе стороны границы одним и тем же типом: то, что
+        // разбор отдал карточке, карточка возвращает командой старта. Если
+        // формы разойдутся, поле молча перестанет доезжать — а без него
+        // агрегация уходит на веса 50/50 (см. doc поля).
+        for size in [
+            QualitySize::Known { bytes: 303_038_464 },
+            QualitySize::Unknown,
+        ] {
+            let outbound = serde_json::to_value(size).expect("serialization must not fail");
+            let request: StartDownloadRequest = serde_json::from_value(json!({
+                "url": "https://youtu.be/abc",
+                "title": "Ролик",
+                "streams": { "audioFormatId": "140" },
+                "size": outbound,
+            }))
+            .expect("то, что уехало на карточку, обязано приехать обратно");
+
+            assert_eq!(request.size, size);
+        }
+    }
+
+    #[test]
+    fn a_start_request_without_the_size_estimate_is_rejected_by_the_border() {
+        // Поле обязательное: у каждого пункта лестницы оценка есть всегда,
+        // пусть и со значением «неизвестно». Пропуск поля — не «третье
+        // состояние», а рассогласование сторон, и ловиться оно должно на
+        // границе, а не превращаться молча в огрублённые веса.
+        let missing = serde_json::from_str::<StartDownloadRequest>(
+            r#"{
+                "url": "https://youtu.be/abc",
+                "title": "Ролик",
+                "streams": { "audioFormatId": "140" }
+            }"#,
+        );
+
+        assert!(missing.is_err(), "запрос без оценки размера не разбирается");
     }
 
     #[test]
@@ -2276,13 +2370,19 @@ mod tests {
             r#"{
                 "url": "https://www.youtube.com/watch?v=abc",
                 "title": "Как приручить дракона",
-                "streams": { "audioFormatId": "140" }
+                "streams": { "audioFormatId": "140" },
+                "size": { "kind": "unknown" }
             }"#,
         )
         .expect("deserialization must work");
 
         assert_eq!(request.streams.video_format_id, None);
         assert!(request.streams.has_any());
+        assert_eq!(
+            request.size,
+            QualitySize::Unknown,
+            "«размер неизвестен» — обычное значение пункта, а не отсутствие поля"
+        );
     }
 
     #[test]
@@ -2291,7 +2391,8 @@ mod tests {
         // инвариант сама: пункт без потоков скачать нечем (Ф-3 E2,
         // `noStreamsSelected`).
         let request: StartDownloadRequest = serde_json::from_str(
-            r#"{ "url": "https://youtu.be/abc", "title": "Ролик", "streams": {} }"#,
+            r#"{ "url": "https://youtu.be/abc", "title": "Ролик", "streams": {},
+                 "size": { "kind": "unknown" } }"#,
         )
         .expect("deserialization must work");
 
