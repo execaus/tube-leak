@@ -1,0 +1,22 @@
+{
+  "_capture": {
+    "note": "Обычная ступень с раздельными потоками: yt-dlp одним процессом качает видео (133, 240p mp4) и следом звук (139, m4a). Оба прямые (https), у обоих total_bytes точный с первой строки. В хвосте — строка [Merger] того запуска, где склейку вёл сам yt-dlp; приложение склеивает своим ffmpeg (TL-42), эта строка здесь как часть неотредактированного вывода.",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "-f",
+      "133+139",
+      "-o",
+      "a.%(ext)s",
+      "-P",
+      "temp:.",
+      "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=aqz-KE-bpKQ\n[youtube] aqz-KE-bpKQ: Downloading webpage\n[youtube] aqz-KE-bpKQ: Downloading visionos player API JSON\n[youtube] aqz-KE-bpKQ: Downloading m3u8 information\n[info] aqz-KE-bpKQ: Downloading 1 format(s): 133+139\n[download] Destination: ./a.f133.mp4\n@tl-progress|downloading|1024|9323483|NA|288931.53689875547|32|NA|NA|133\n@tl-progress|downloading|3072|9323483|NA|645503.8268623817|14|NA|NA|133\n@tl-progress|downloading|7168|9323483|NA|1287349.9645456881|7|NA|NA|133\n@tl-progress|downloading|15360|9323483|NA|2409473.761687486|3|NA|NA|133\n@tl-progress|downloading|31744|9323483|NA|2465355.4452468245|3|NA|NA|133\n@tl-progress|downloading|64512|9323483|NA|1915550.0626380472|4|NA|NA|133\n@tl-progress|downloading|130048|9323483|NA|812530.774249193|11|NA|NA|133\n@tl-progress|downloading|261120|9323483|NA|807593.1630521425|11|NA|NA|133\n@tl-progress|downloading|523264|9323483|NA|996702.6575773085|8|NA|NA|133\n@tl-progress|downloading|1047552|9323483|NA|1069908.7686363128|7|NA|NA|133\n@tl-progress|downloading|2096128|9323483|NA|1145151.5621690126|6|NA|NA|133\n@tl-progress|downloading|3327815|9323483|NA|1145198.0823173686|5|NA|NA|133\n@tl-progress|downloading|4473092|9323483|NA|1188417.1870568458|4|NA|NA|133\n@tl-progress|downloading|5807880|9323483|NA|1204415.630117651|2|NA|NA|133\n@tl-progress|downloading|7069197|9323483|NA|1228677.4740575268|1|NA|NA|133\n@tl-progress|downloading|8423493|9323483|NA|1251538.1923477072|0|NA|NA|133\n@tl-progress|downloading|9323483|9323483|NA|1270382.4396485274|0|NA|NA|133\n@tl-progress|finished|9323483|9323483|NA|1180076.8758545523|NA|NA|NA|133\n[download] Destination: ./a.f139.m4a\n@tl-progress|downloading|1024|3871021|NA|127348.84943367135|30|NA|NA|139\n@tl-progress|downloading|3072|3871021|NA|310023.8658357595|12|NA|NA|139\n@tl-progress|downloading|7168|3871021|NA|629655.086537656|6|NA|NA|139\n@tl-progress|downloading|15360|3871021|NA|1201770.4342635428|3|NA|NA|139\n@tl-progress|downloading|31744|3871021|NA|1805170.8471873857|2|NA|NA|139\n@tl-progress|downloading|64512|3871021|NA|1582143.5692743082|2|NA|NA|139\n@tl-progress|downloading|130048|3871021|NA|1603711.7245239972|2|NA|NA|139\n@tl-progress|downloading|261120|3871021|NA|1428923.0667103305|2|NA|NA|139\n@tl-progress|downloading|523264|3871021|NA|1054674.1005596472|3|NA|NA|139\n@tl-progress|downloading|1047552|3871021|NA|1141034.4121075948|2|NA|NA|139\n@tl-progress|downloading|2096128|3871021|NA|933822.4246708126|1|NA|NA|139\n@tl-progress|downloading|2886549|3871021|NA|815827.3590470443|1|NA|NA|139\n@tl-progress|downloading|3497615|3871021|NA|797945.767813209|0|NA|NA|139\n@tl-progress|downloading|3871021|3871021|NA|792399.2704521022|0|NA|NA|139\n@tl-progress|finished|3871021|3871021|NA|736820.4236021584|NA|NA|NA|139\n[Merger] Merging formats into \"./a.mp4\"\nDeleting original file ./a.f139.m4a (pass -k to keep)\nDeleting original file ./a.f133.mp4 (pass -k to keep)\n"
+}

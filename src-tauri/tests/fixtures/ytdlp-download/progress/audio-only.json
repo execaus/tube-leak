@@ -1,0 +1,22 @@
+{
+  "_capture": {
+    "note": "Пункт «только аудио» (С-2): единственный поток 140, признака потока у события быть не должно вовсе. В хвосте — постпроцессор [FixupM4a].",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "-f",
+      "140",
+      "-o",
+      "e.%(ext)s",
+      "-P",
+      "temp:.",
+      "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=aqz-KE-bpKQ\n[youtube] aqz-KE-bpKQ: Downloading webpage\n[youtube] aqz-KE-bpKQ: Downloading visionos player API JSON\n[youtube] aqz-KE-bpKQ: Downloading m3u8 information\n[info] aqz-KE-bpKQ: Downloading 1 format(s): 140\n[download] Destination: ./e.m4a\n@tl-progress|downloading|1024|10271496|NA|123315.83726205173|83|NA|NA|140\n@tl-progress|downloading|3072|10271496|NA|242042.71495660668|42|NA|NA|140\n@tl-progress|downloading|7168|10271496|NA|485173.9001726725|21|NA|NA|140\n@tl-progress|downloading|15360|10271496|NA|929552.7066530077|11|NA|NA|140\n@tl-progress|downloading|31744|10271496|NA|1057075.8300662935|9|NA|NA|140\n@tl-progress|downloading|64512|10271496|NA|843491.9515569424|12|NA|NA|140\n@tl-progress|downloading|130048|10271496|NA|593755.7519435876|17|NA|NA|140\n@tl-progress|downloading|261120|10271496|NA|599394.1900803741|16|NA|NA|140\n@tl-progress|downloading|523264|10271496|NA|596775.2981814998|16|NA|NA|140\n@tl-progress|downloading|1047552|10271496|NA|609535.8697334038|15|NA|NA|140\n@tl-progress|downloading|1670379|10271496|NA|637076.0841236681|13|NA|NA|140\n@tl-progress|downloading|2359850|10271496|NA|651475.4429166671|12|NA|NA|140\n@tl-progress|downloading|3049065|10271496|NA|635493.6902237561|11|NA|NA|140\n@tl-progress|downloading|3635316|10271496|NA|653173.8209599478|10|NA|NA|140\n@tl-progress|downloading|4398990|10271496|NA|651817.4294145651|9|NA|NA|140\n@tl-progress|downloading|5044427|10271496|NA|652693.973560321|8|NA|NA|140\n@tl-progress|downloading|5703158|10271496|NA|655630.5888539245|6|NA|NA|140\n@tl-progress|downloading|6382183|10271496|NA|665215.5946960513|5|NA|NA|140\n@tl-progress|downloading|7140514|10271496|NA|678969.2664506986|4|NA|NA|140\n@tl-progress|downloading|7962517|10271496|NA|697527.3665121703|3|NA|NA|140\n@tl-progress|downloading|8877225|10271496|NA|716938.7241831267|1|NA|NA|140\n@tl-progress|downloading|9823365|10271496|NA|735269.2730957413|0|NA|NA|140\n@tl-progress|downloading|9975954|10271496|NA|737768.9617933028|0|NA|NA|140\n@tl-progress|downloading|9976978|10271496|NA|77400.74420616328|3|NA|NA|140\n@tl-progress|downloading|9979026|10271496|NA|192194.3570054146|1|NA|NA|140\n@tl-progress|downloading|9983122|10271496|NA|401930.0687423965|0|NA|NA|140\n@tl-progress|downloading|9991314|10271496|NA|776591.8831215797|0|NA|NA|140\n@tl-progress|downloading|10007698|10271496|NA|1093459.365461056|0|NA|NA|140\n@tl-progress|downloading|10040466|10271496|NA|991807.5040796428|0|NA|NA|140\n@tl-progress|downloading|10106002|10271496|NA|980253.0808609594|0|NA|NA|140\n@tl-progress|downloading|10237074|10271496|NA|1029763.8409832629|0|NA|NA|140\n@tl-progress|downloading|10271496|10271496|NA|938637.61444765|0|NA|NA|140\n@tl-progress|finished|10271496|10271496|NA|707374.6058028432|NA|NA|NA|140\n[FixupM4a] Correcting container of \"./e.m4a\"\n"
+}

@@ -1,0 +1,22 @@
+{
+  "_capture": {
+    "note": "Тот же запуск по уже скачанному файлу: ни одной строки прогресса, ни status=finished — только [download] e.m4a has already been downloaded. Поток, который качать не пришлось, о себе не сообщает ничего.",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "-f",
+      "140",
+      "-o",
+      "e.%(ext)s",
+      "-P",
+      "temp:.",
+      "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=aqz-KE-bpKQ\n[youtube] aqz-KE-bpKQ: Downloading webpage\n[youtube] aqz-KE-bpKQ: Downloading visionos player API JSON\n[youtube] aqz-KE-bpKQ: Downloading m3u8 information\n[info] aqz-KE-bpKQ: Downloading 1 format(s): 140\n[download] e.m4a has already been downloaded\n"
+}
