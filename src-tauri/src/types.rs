@@ -1,6 +1,7 @@
 //! Типы, пересекающие границу Rust↔TS: результат проверки sidecar-бинарников
-//! (yt-dlp, ffmpeg), ход подготовки yt-dlp при первом запуске (TL-12) и
-//! результат разбора ссылки на ролик (TL-27, эпик E2).
+//! (yt-dlp, ffmpeg), ход подготовки yt-dlp при первом запуске (TL-12),
+//! результат разбора ссылки на ролик (TL-27, эпик E2) и задача скачивания —
+//! фазы, прогресс, классы отказа, формы команд (TL-38, эпик E3).
 //! Объявлены здесь один раз; TS-зеркало в `src/types/` поддерживает точное
 //! соответствие полей и значений enum-строк — расхождение с этим файлом
 //! дорого чинить постфактум (см. TL-1/TL-2 в эпике E1).
@@ -430,6 +431,627 @@ pub struct ProbeError {
     /// вообще любой отказ, о котором нечего сказать технически.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<ProbeErrorDetails>,
+}
+
+// ───────────────────────── скачивание ролика (TL-38) ─────────────────────────
+//
+// Контракт эпика E3: чем ядро отчитывается о задаче скачивания и что
+// принимают три её команды. Реализация — TL-41 (разбор прогресса и
+// агрегация), TL-42 (склейка), TL-43 (классификация ошибок и ретраи),
+// TL-44 (оркестрация и сами команды); здесь только объявление типов,
+// которые зеркалятся в `src/types/` (TL-39).
+//
+// Пока ни один из типов секции никто не конструирует, поэтому каждый несёт
+// `#[allow(dead_code)]` — тот же приём и та же причина, что были у секции
+// E2 до появления оркестрации: контракт не должен исчезать из-за того, что
+// реализация отстаёт на задачу. Глушители снимаются задачей, которая
+// начинает тип конструировать (для большинства — TL-44).
+//
+// Три вещи, которые дизайн развёл намеренно, и то, как это выражено здесь:
+//
+// 1. **Процент осмыслен только внутри фазы `downloading`.** Поэтому
+//    [`DownloadProgress`] — размеченное объединение по `phase`, а не
+//    структура с опциональным `percent` рядом с полем фазы: сквозную шкалу
+//    «сколько процентов всей задачи» этой формой не выразить, и «Склейка»
+//    физически не может продолжить ту же шкалу — у её варианта нет поля
+//    процента вовсе.
+// 2. **Три разных «нет движения»** различены по месту, а не по флагу.
+//    Косметический индикатор фронтенда (5 с без событий) в контракте не
+//    представлен и представлен быть не может: он определяется отсутствием
+//    событий, а не их содержимым. Сторож «ноль байт 20 с» в ядре тоже не
+//    имеет своего значения на проводе — по дизайну он не показывается
+//    пользователем отдельно, а переводит задачу в третье состояние. И
+//    только оно, пауза между попытками, — отдельный вариант
+//    [`DownloadingState::WaitingRetry`], а не «то же `Running`, только с
+//    другими числами».
+// 3. **Что осталось на диске** — не текст UI и не таблица на его стороне, а
+//    факт, о котором отчитывается ядро ([`PartialData`]): оно и удаляет.
+//    Таблица дизайна почти для всех классов постоянна, но не для всех
+//    (у `destinationUnavailable` исход зависит от того, доступна ли ещё
+//    папка), а классы, приходящие в фазе `fetching`, не удаляют ничего —
+//    удалять нечего. Постоянна и потому выводится из класса только
+//    осмысленность повтора: [`DownloadErrorKind::is_retryable`].
+
+/// Фаза задачи скачивания (Ф-3). Ровно семь — по автомату
+/// `Queued → Fetching → Downloading → Merging → Done / Failed / Cancelled`.
+///
+/// Это то, из чего фронтенд рисует степпер шагов, а не внутренние шаги
+/// реализации. Ожидание повтора между попытками (С-6) отдельной фазой
+/// **не** является: по дизайну степпер в паузе продолжает показывать
+/// «Скачивание», а отличается панель содержимым — см.
+/// [`DownloadingState`].
+///
+/// Шаг «Склейка» рисуется не всегда: для «только аудио» и прогрессивного
+/// формата (С-2, С-3) ffmpeg не запускается вовсе, и фазы `merging` в
+/// жизни такой задачи не будет. Знать об этом заранее — до того, как фаза
+/// наступит или не наступит, — фронтенду нужно уже в момент старта, и
+/// говорит ему это [`DownloadPlan`], а не догадка по числу форматов.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DownloadPhase {
+    /// Задача создана, процесс ещё не запускался.
+    Queued,
+    /// yt-dlp запущен, данных о прогрессе ещё нет («Подготовка»).
+    Fetching,
+    /// Идёт приём байт либо пауза перед следующей попыткой.
+    Downloading,
+    /// Оба потока скачаны, ffmpeg объединяет их (remux, Ф-9).
+    Merging,
+    /// Готовый файл лежит в папке назначения под финальным именем.
+    Done,
+    /// Задача завершилась ошибкой одного из девяти классов.
+    Failed,
+    /// Задача отменена пользователем (Ф-4).
+    Cancelled,
+}
+
+/// Сколько потоков скачивает задача — то есть какой степпер рисовать.
+///
+/// Отдаётся один раз, в ответе команды старта, а не в каждом событии
+/// прогресса: величина постоянна на всю жизнь задачи, и повторять её
+/// 3 раза в секунду незачем.
+///
+/// Почему это вообще в контракте, а не выводится фронтендом из того, что
+/// он сам же и отправил (два `formatId` — значит будет склейка): панель по
+/// дизайну не привязана к карточке и переживает её замену (С-13), то есть
+/// не имеет права зависеть от данных карточки; а правило «два потока ⇒
+/// склейка» и без того живёт в ядре, которое решает, запускать ли ffmpeg.
+/// Две копии одного правила разошлись бы — ровно то, чего требование
+/// «типы объявляются один раз в Rust» и просит избегать.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DownloadPlan {
+    /// Раздельные видео- и аудиопоток: Подготовка → Скачивание → Склейка →
+    /// Готово.
+    VideoAndAudio,
+    /// Один поток — «только аудио» либо прогрессивный формат (С-2, С-3):
+    /// Подготовка → Скачивание → Готово, шага «Склейка» не будет.
+    SingleStream,
+}
+
+/// Какой из двух потоков принимается прямо сейчас (подпись «Скачиваем
+/// видео…» / «Скачиваем звук…»).
+///
+/// Это подслой внутри шага «Скачивание», а не фаза задачи: смена потока не
+/// меняет ни шаг степпера, ни шкалу процента — процент агрегирован по обоим
+/// потокам сразу и от перехода видео → аудио назад не откатывается (Ф-2).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DownloadStream {
+    Video,
+    Audio,
+}
+
+/// Доля скачанного в процентах, 0..=100.
+///
+/// Отдельный тип, а не голый `u8`, ради одного инварианта: на провод не
+/// уходит число больше ста. Это не педантизм — знаменатель агрегации на
+/// старте берётся из оценки размера, которую дал разбор E2, и уточняется
+/// фактическим размером потока уже по ходу приёма (дизайн, «Агрегация
+/// видео+аудио»); заниженная оценка даёт «103 %» раньше, чем уточнение
+/// приедет. Обрезание в конструкторе делает это невыразимым, а не
+/// оставляет полосе прогресса выезжать за край.
+///
+/// На проводе — просто число (`#[serde(transparent)]`): TS-зеркало видит
+/// `number`, отдельного объекта тут нет.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct DownloadPercent(u8);
+
+#[allow(dead_code)]
+impl DownloadPercent {
+    /// Единственный конструктор: всё, что больше ста, становится сотней.
+    pub fn new(percent: u8) -> Self {
+        Self(percent.min(100))
+    }
+
+    /// Значение для форматирования на стороне вызывающего.
+    pub fn value(self) -> u8 {
+        self.0
+    }
+}
+
+/// Номер попытки и их предел — «попытка 2 из 6».
+///
+/// `number` — номер той попытки, о которой идёт речь **сейчас**: в
+/// [`DownloadingState::Running`] это идущая попытка, в
+/// [`DownloadingState::WaitingRetry`] — та, которая начнётся по истечении
+/// паузы (дизайн: «Ждём повторной попытки (2 из 6)»). Разница ровно на
+/// единицу, и путать её на границе дорого — отсюда явная оговорка здесь, а
+/// не два поля с почти одинаковыми именами.
+///
+/// `total` — предел числа попыток подряд, без продвижения (стартовое
+/// значение дизайна — 6: первая плюс пять докачек). Счётчик обнуляется
+/// любым продвижением байт (С-6), поэтому `number` за долгую загрузку
+/// может доходить до `total` многократно и это не признак близкого отказа.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadAttempt {
+    pub number: u32,
+    pub total: u32,
+}
+
+/// Что стало с частично скачанными данными к моменту терминальной фазы.
+///
+/// Отдельное значение на проводе, а не таблица «класс → судьба файлов» на
+/// стороне UI, по двум причинам. Во-первых, удаляет их ядро — оно и
+/// отчитывается о том, что сделало, а не фронтенд, который угадывает по
+/// классу. Во-вторых, таблица дизайна не постоянна: у
+/// [`DownloadErrorKind::DestinationUnavailable`] частичное «сохраняется,
+/// если технически осталось доступным», а классы, пришедшие ещё в фазе
+/// `fetching`, не оставляют и не удаляют ничего — файлов не появлялось.
+///
+/// Для [`DownloadProgress::Cancelled`] значений бывает ровно два:
+/// подчистка при отмене всегда полная и без исключений по классам (Ф-4,
+/// таблица «Отмена по фазам»), поэтому либо `removed`, либо
+/// `nothingCreated` — если отменили до старта процесса.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PartialData {
+    /// Файлов не появлялось: задача не дошла до приёма байт.
+    NothingCreated,
+    /// Частично скачанное удалено ядром — на диске не осталось ничего.
+    Removed,
+    /// Частично скачанное оставлено на диске: повтор продолжит с места
+    /// штатным механизмом докачки yt-dlp (С-7, С-9).
+    Kept,
+}
+
+/// Девять классов отказа скачивания (Ф-10). Ровно по ним фронтенд выбирает
+/// заголовок и пояснение (таблица в дизайне E3) — тексты живут на стороне
+/// UI, в контракте только классификация.
+///
+/// Пять классов — свои для E3, четыре последних переиспользуют смысловые
+/// классы разбора: их строки на проводе **совпадают** с одноимёнными
+/// значениями [`ProbeErrorKind`] намеренно, чтобы тексты, уже написанные
+/// для карточки E2, годились без перевода (сторож —
+/// `reused_error_kinds_keep_their_probe_wire_values`).
+///
+/// Чего в девятке сознательно нет:
+///
+/// - **`timeout`** (E2 выделяет его отдельным классом). Таймаут фазы
+///   «Подготовка» (стартовое значение дизайна — 20 с) в E3 отдельного
+///   класса не получает: девятка зафиксирована декомпозицией, и честнее
+///   всего он ложится в [`DownloadErrorKind::YtDlpFailure`] — тот самый
+///   «сбой, не отнесённый к классам выше», с текстом «Попробуйте ещё раз».
+/// - **`networkUnavailable`** (тоже класс E2). Отсутствие сети во время
+///   скачивания не отказ, а повод к циклу повторов (С-6); отказом оно
+///   становится, только когда попытки исчерпаны, и тогда это
+///   [`DownloadErrorKind::ConnectionLost`] — вне зависимости от того, была
+///   ли сеть в начале.
+/// - **под-причина `outdated`** у сбоя yt-dlp (в E2 — поле `reason`).
+///   Таблица ошибок E3 держит для сбоя yt-dlp одну строку с одним текстом,
+///   и разделение на «устарел / не опознано» ей нечего менять на экране.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DownloadErrorKind {
+    /// Соединение потеряно, попытки исчерпаны (С-7).
+    ConnectionLost,
+    /// Место на диске кончилось по ходу записи (С-9).
+    DiskFull,
+    /// Выбранный формат больше не отдаётся: данные разбора устарели (С-10).
+    StaleFormat,
+    /// Потоки скачаны, ffmpeg завершился ошибкой (С-11).
+    MergeFailed,
+    /// Папка назначения недоступна: нет прав либо её не существует.
+    DestinationUnavailable,
+    /// Ролик удалён, снят с публикации или не существует (класс E2).
+    VideoUnavailable,
+    /// Нужен вход в аккаунт YouTube (класс E2).
+    SignInRequired,
+    /// Ролик не показывается в стране пользователя (класс E2).
+    RegionBlocked,
+    /// Сбой yt-dlp, не отнесённый к классам выше (класс E2).
+    YtDlpFailure,
+}
+
+#[allow(dead_code)]
+impl DownloadErrorKind {
+    /// Имеет ли смысл повтор той же задачи — колонка «Повторить?» таблицы
+    /// ошибок дизайна.
+    ///
+    /// Выводится из класса, а не передаётся отдельным полем структуры:
+    /// таблица здесь безусловна, и это единственное место, где она
+    /// записана. Им пользуются обе стороны — фронтенд решает, рисовать ли
+    /// кнопку, ядро отклоняет команду повтора для класса, где повтор
+    /// заведомо бесполезен ([`DownloadCommandErrorKind::NotRetryable`]).
+    /// Значение уезжает на провод в поле `retryable` (см.
+    /// [`DownloadError`]) — не как второй источник правды, а как проекция
+    /// этой функции.
+    ///
+    /// `false` только там, где повтор гарантированно провалится тем же
+    /// образом: устаревшие данные разбора чинятся новым разбором (Н-2 E2
+    /// запрещает делать его фоном), а вход в аккаунт и региональная
+    /// блокировка — не то, что меняется от повторного запуска (вход — E8).
+    pub fn is_retryable(self) -> bool {
+        match self {
+            Self::ConnectionLost
+            | Self::DiskFull
+            | Self::MergeFailed
+            | Self::DestinationUnavailable
+            | Self::VideoUnavailable
+            | Self::YtDlpFailure => true,
+            Self::StaleFormat | Self::SignInRequired | Self::RegionBlocked => false,
+        }
+    }
+}
+
+/// Технические детали отказа для свёрнутого «Подробнее».
+///
+/// Форма повторяет [`ProbeErrorDetails`] и повторяет её сознательно, а не
+/// переиспользует тип: «Подробнее» панели загрузки и «Подробнее» карточки —
+/// разные экраны разных эпиков, и поле, которое понадобится одному, не
+/// должно появляться у другого молча. Правило Н-4 E2 общее для обоих:
+/// через границу идёт хвост stderr и код завершения, полный поток пишется
+/// в лог приложения и на экран не попадает никогда.
+///
+/// Пустая структура границу не пересекает — см. [`DownloadErrorDetails::is_empty`]
+/// и проекцию `crate::download::DownloadFailure::to_contract`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadErrorDetails {
+    /// Хвост stderr процесса (yt-dlp либо ffmpeg), обрезанный по длине.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
+    /// Код завершения процесса, если он успел завершиться сам.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+#[allow(dead_code)]
+impl DownloadErrorDetails {
+    /// Нечего показывать: ни хвоста stderr, ни кода завершения.
+    ///
+    /// Так бывает у отказа, за которым нет процесса вовсе (недоступная
+    /// папка назначения, обнаруженная до запуска), — и это не повод
+    /// отдавать фронтенду пустой объект, за которым откроется пустое
+    /// «Подробнее».
+    pub fn is_empty(&self) -> bool {
+        self.stderr_tail.is_none() && self.exit_code.is_none()
+    }
+}
+
+/// Отказ скачивания в сериализуемом виде — полезная нагрузка фазы `failed`.
+///
+/// Решение принимается по `kind`; `message` — формулировка ядра для
+/// «Подробнее» и лога, **не** основной текст на экране: тексты по классам
+/// задаёт UI (таблица дизайна E3), и stderr в них не попадает никогда
+/// (Н-4).
+///
+/// Единственный благословлённый конструктор —
+/// `crate::download::DownloadFailure::to_contract`: `retryable` обязано
+/// быть ровно [`DownloadErrorKind::is_retryable`] своего класса, а не
+/// чьим-то мнением на месте вызова.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadError {
+    pub kind: DownloadErrorKind,
+    pub message: String,
+    /// Проекция [`DownloadErrorKind::is_retryable`]: есть ли смысл в
+    /// команде повтора. Фронтенд рисует кнопку по этому полю, а не по
+    /// собственной копии таблицы классов.
+    pub retryable: bool,
+    /// Что стало с частично скачанным. Факт, а не свойство класса:
+    /// см. [`PartialData`].
+    pub partial_data: PartialData,
+    /// Отсутствует, когда деталей нет: отказ без процесса за спиной
+    /// (недоступная папка назначения) технически сказать ничего не может.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<DownloadErrorDetails>,
+}
+
+/// Что происходит внутри фазы `downloading` — два взаимоисключающих
+/// состояния, а не одно с флагом.
+///
+/// Дизайн разводит их прямо: пауза перед повтором — «отдельное, не „то же
+/// Downloading, только с другим числом“ состояние». Разница видна и в
+/// составе полей: у ждущей паузы нет ни скорости, ни оценки оставшегося
+/// времени — их неоткуда взять, процесс уже завершился, — зато есть
+/// обратный отсчёт; показывать в этот момент последнюю известную скорость
+/// значило бы врать (тот же класс дефекта, что «не отвечает» в E1).
+///
+/// Второе из трёх «нет движения» — сторож ядра «ни одного нового байта
+/// за 20 с» (С-8) — своего варианта здесь не имеет намеренно: по дизайну
+/// пользователю не показывают «поток завис», зависшая попытка признаётся
+/// неудавшейся и уходит в тот же цикл повторов, то есть наблюдаемо
+/// становится [`DownloadingState::WaitingRetry`]. Третье, «событий не было
+/// 5 с», — косметика фронтенда и в контракте не выразимо в принципе:
+/// это отсутствие событий, а не их содержимое.
+///
+/// Оговорка про сериализацию: `rename_all` у enum переименовывает
+/// **варианты**, но не поля внутри них, — за поля struct-вариантов
+/// отвечает отдельный `rename_all_fields`. Без него `delay_secs` уехал бы
+/// на провод змеиным регистром посреди camelCase-объекта; поймано
+/// сравнением значения целиком в тестах ниже, а не глазами.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum DownloadingState {
+    /// Байты идут (или только что пошли).
+    Running {
+        /// Какой поток принимается. Присутствует только у задачи с двумя
+        /// потоками ([`DownloadPlan::VideoAndAudio`]); при одном потоке
+        /// различать нечего, и подпись на экране — просто «Скачиваем…».
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stream: Option<DownloadStream>,
+        /// Агрегированная доля обоих потоков. Отсутствует, пока считать
+        /// не из чего: размер потока ещё не известен ни из оценки E2, ни
+        /// от yt-dlp. Не «0» — ноль означал бы «ничего не скачано».
+        #[serde(skip_serializing_if = "Option::is_none")]
+        percent: Option<DownloadPercent>,
+        /// Мгновенная скорость в байтах в секунду; форматирование
+        /// («4,2 МБ/с») — на UI.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        speed_bytes_per_sec: Option<u64>,
+        /// Оценка оставшегося времени в секундах, как её даёт yt-dlp.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        eta_secs: Option<u64>,
+        /// Номер идущей попытки — только начиная со второй: на обычном
+        /// пути номер всегда «1», и рисовать его значит загромождать
+        /// экран числом, которое ничего не сообщает.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attempt: Option<DownloadAttempt>,
+    },
+    /// Попытка не удалась, идёт пауза перед следующей (С-6).
+    WaitingRetry {
+        /// Последний известный процент, замороженный на время паузы:
+        /// К-6 требует, чтобы он не откатывался к нулю. Отсутствует,
+        /// только если процента не было и до обрыва.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        percent: Option<DownloadPercent>,
+        /// Попытка, которая начнётся по истечении паузы, и предел
+        /// («2 из 6»). В этом состоянии всегда известна — паузы без
+        /// следующей попытки не бывает.
+        attempt: DownloadAttempt,
+        /// Полная длительность текущей паузы: растёт от 5 с удвоением,
+        /// потолок 60 с (стартовые значения дизайна).
+        delay_secs: u64,
+        /// Сколько секунд паузы осталось — обратный отсчёт на экране.
+        remaining_secs: u64,
+    },
+}
+
+/// Состояние задачи скачивания на момент события — размеченное по фазе
+/// объединение.
+///
+/// Форма выбрана так, чтобы сквозная шкала «процентов всей задачи» была
+/// невыразима (дизайн отвергает её явно): процент есть только внутри
+/// `downloading`, у `merging` его нет и быть не может — remux не даёт
+/// надёжной оценки дешевле, чем сам remux, и по дизайну показывается
+/// нейтральным индикатором без числа.
+///
+/// На проводе тег — поле `phase` с теми же семью значениями, что у
+/// [`DownloadPhase`]; у варианта `downloading` рядом появляется второй тег
+/// `state` ([`DownloadingState`]).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "phase",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum DownloadProgress {
+    /// Задача создана, процесс ещё не запускался.
+    Queued,
+    /// yt-dlp запущен, прогресса ещё нет («Подготовка»). Числа здесь нет
+    /// сознательно: пока не пришло ни одной строки прогресса, любое —
+    /// выдумка.
+    Fetching,
+    Downloading(DownloadingState),
+    /// ffmpeg объединяет скачанные потоки. Без процента — см. doc типа.
+    Merging,
+    Done {
+        /// Имя готового файла с фактическим расширением, без пути: папка
+        /// назначения одна и та же на всё приложение (Р-1), и подставлять
+        /// её в текст — дело UI.
+        file_name: String,
+    },
+    Failed {
+        error: DownloadError,
+    },
+    Cancelled {
+        /// При отмене подчистка всегда полная, поэтому здесь бывает либо
+        /// `removed`, либо `nothingCreated` (отмена в `queued`) — разница
+        /// ровно та, что разводит два текста панели в дизайне.
+        partial_data: PartialData,
+    },
+}
+
+#[allow(dead_code)]
+impl DownloadProgress {
+    /// Фаза задачи для степпера.
+    ///
+    /// Выводится из варианта, а не хранится рядом: два поля, способных
+    /// разойтись, — приглашение к состоянию, где степпер показывает одно,
+    /// а панель другое. Поле `phase` на проводе — тег этого же
+    /// объединения, то есть та же величина, а не её копия.
+    pub fn phase(&self) -> DownloadPhase {
+        match self {
+            Self::Queued => DownloadPhase::Queued,
+            Self::Fetching => DownloadPhase::Fetching,
+            Self::Downloading(_) => DownloadPhase::Downloading,
+            Self::Merging => DownloadPhase::Merging,
+            Self::Done { .. } => DownloadPhase::Done,
+            Self::Failed { .. } => DownloadPhase::Failed,
+            Self::Cancelled { .. } => DownloadPhase::Cancelled,
+        }
+    }
+
+    /// Терминальна ли фаза: в терминальной слот свободен, новых событий по
+    /// задаче не приходит (Ф-4), а выход из приложения не спрашивает
+    /// подтверждения (Р-2).
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Done { .. } | Self::Failed { .. } | Self::Cancelled { .. }
+        )
+    }
+}
+
+/// Полезная нагрузка события `download://progress`
+/// (константа `PROGRESS_EVENT` в `crate::download`).
+///
+/// Ключ задачи — `taskId`: события ключуются им с самого начала, хотя
+/// активная задача в E3 ровно одна. Это требование CLAUDE.md и задел под
+/// очередь E4, который не переписывается: подписчик обязан сверять id, а не
+/// считать, что любое пришедшее событие — про его панель.
+///
+/// Частота эмита ограничена (стартовое значение дизайна — не чаще раза в
+/// 300 мс), кроме перехода в терминальную фазу: он не может быть проглочен
+/// троттлингом. Это поведение ядра (TL-44), а не свойство типа, но
+/// подписчик должен знать, что событий не бывает «на каждый байт».
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadProgressEvent {
+    pub task_id: String,
+    /// Разворачивается в те же поля объекта, что и сам вариант: `phase`
+    /// лежит рядом с `taskId`, а не вложенным объектом.
+    #[serde(flatten)]
+    pub progress: DownloadProgress,
+}
+
+/// Вход команды «начать загрузку».
+///
+/// Собирается ровно из того, что уже есть на экране к моменту клика:
+/// ссылка из поля ввода, название ролика и потоки выбранного пункта
+/// лестницы. Папка назначения, число попыток и таймауты параметрами не
+/// являются — это константы дизайна (Р-1 и таблица «Числа»), и настройками
+/// они станут в E5, не меняя форму этой команды.
+///
+/// **Про `url`.** Дизайн перечисляет только потоки и название («принимает
+/// то, что уже есть у карточки E2»), но без адреса скачивать нечего:
+/// yt-dlp запускается как `yt-dlp -f <formatId> <URL>`, а результат разбора
+/// E2 адреса не содержит и в ядре между вызовами не хранится. Держать
+/// «последнюю разобранную ссылку» состоянием ядра — тот же класс скрытой
+/// связи, который С-13 требует разорвать (разбор новой ссылки не должен
+/// касаться идущей загрузки), поэтому адрес едет явным полем. Он —
+/// пользовательский ввод и потому проверяется ядром заново (Ф-1: ничего
+/// непроверенного в аргументы процесса), даже если фронтенд отдаёт ту же
+/// строку, которую уже разобрал.
+///
+/// Название — тоже непроверенный ввод с точки зрения файловой системы:
+/// имя файла из него строит санитизация ядра (Ф-6, TL-40), и пустой
+/// результат санитизации получает запасное имя, выведенное из адреса.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartDownloadRequest {
+    /// Ссылка на ролик — та же, которую разобрал E2.
+    pub url: String,
+    /// Название ролика как его показала карточка, без обрезания: чем оно
+    /// станет в имени файла, решает санитизация ядра.
+    pub title: String,
+    /// Потоки выбранного пункта лестницы. Тип E2 переиспользуется как
+    /// есть — это то самое единственное поле контракта разбора, которое
+    /// ходит в обе стороны границы (см. [`QualityStreams`]). Объект без
+    /// единого потока команда обязана отклонить
+    /// ([`QualityStreams::has_any`],
+    /// [`DownloadCommandErrorKind::NoStreamsSelected`]).
+    pub streams: QualityStreams,
+}
+
+/// Ответ команды «начать загрузку»: задача создана.
+///
+/// Возвращается быстро и не дожидается ни одного байта — вся работа идёт
+/// событиями. Ждать в промисе тут нечего: загрузка длится минуты и часы.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadStarted {
+    /// Идентификатор задачи, непрозрачный для фронтенда: он приходит
+    /// обратно в событиях и в командах отмены и повтора, но не
+    /// разбирается на части и ничего не означает.
+    pub task_id: String,
+    /// Фаза, в которой задача создана. Всегда `queued` в E3 (активная
+    /// задача одна, и стартовать ей нечего ждать), но фронтенд рисует
+    /// панель по этому полю, а не по константе: в E4 задача может встать
+    /// за уже идущей и остаться в `queued` надолго.
+    pub phase: DownloadPhase,
+    /// Один поток или два — то есть будет ли шаг «Склейка».
+    pub plan: DownloadPlan,
+}
+
+/// Почему команда управления загрузкой отклонена.
+///
+/// Это **не** классы отказа самой загрузки ([`DownloadErrorKind`]): те
+/// описывают судьбу задачи и рисуются панелью, а эти — отказ выполнить
+/// вызов, то есть состояние, до которого исправный фронтенд не доводит
+/// (кнопки, которых нельзя нажать, он не показывает). Тем не менее они
+/// типизированы, а не строки: защита на стороне ядра обязана быть
+/// настоящей, а её срабатывание — различимым в логе.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DownloadCommandErrorKind {
+    /// Слот занят: уже есть задача в нетерминальной фазе. В E3 активная
+    /// задача ровно одна, и проверка живёт в ядре, а не только в
+    /// неактивной кнопке (С-13, дизайн: «Старт задачи тоже проверяется на
+    /// стороне Rust»). Тем же классом отклоняется и повтор, если
+    /// пользователь успел запустить новую загрузку поверх завершившейся.
+    AlreadyActive,
+    /// Задачи с таким `taskId` ядро не знает: она никогда не создавалась
+    /// либо приложение перезапускалось (до E4/E5 задачи не переживают
+    /// выход — Р-2).
+    UnknownTask,
+    /// Повтор запрошен для задачи, которая не в фазе `failed`.
+    NotFailed,
+    /// Повтор запрошен для класса ошибки, где он заведомо бесполезен
+    /// ([`DownloadErrorKind::is_retryable`] = `false`): устаревшие данные
+    /// разбора чинятся новым разбором, а не тем же запросом ещё раз.
+    NotRetryable,
+    /// В запросе нет ни одного идентификатора потока — скачивать нечего
+    /// (инвариант [`QualityStreams::has_any`]).
+    NoStreamsSelected,
+    /// Ссылка не является http(s)-адресом. Проверяется заново, даже если
+    /// её уже разобрал E2: ни одна часть пользовательского ввода не
+    /// попадает в аргументы процесса непроверенной (Ф-1).
+    InvalidUrl,
+}
+
+/// Отказ команды управления загрузкой в сериализуемом виде.
+///
+/// `message` — диагностика для лога, как и у [`DownloadError`]: решение
+/// принимается по `kind`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadCommandError {
+    pub kind: DownloadCommandErrorKind,
+    pub message: String,
 }
 
 /// Фиксированные stub-данные: реальный запуск и разбор бинарников теперь
@@ -1022,5 +1644,584 @@ mod tests {
                 json!(expected)
             );
         }
+    }
+
+    // ───────────────── скачивание ролика (TL-38) ─────────────────
+    //
+    // Как и в секции E2, тесты фиксируют не «что код сериализует», а форму
+    // JSON, по которой пишется TS-зеркало (TL-39) и панель загрузки
+    // (TL-45): любое переименование поля или значения enum обязано ронять
+    // их, а не всплывать в рантайме. Сравнение — со значением целиком, а
+    // не по отдельным ключам: лишнее поле должно ронять равенство само по
+    // себе.
+
+    /// Событие с фиксированным id задачи — id в форме ничего не меняет.
+    fn download_event(progress: DownloadProgress) -> serde_json::Value {
+        serde_json::to_value(DownloadProgressEvent {
+            task_id: "task-1".to_string(),
+            progress,
+        })
+        .expect("serialization must not fail")
+    }
+
+    fn download_details() -> DownloadErrorDetails {
+        DownloadErrorDetails {
+            stderr_tail: Some("ERROR: unable to download video data".to_string()),
+            exit_code: Some(1),
+        }
+    }
+
+    /// Все семь вариантов [`DownloadProgress`] — по одному представителю.
+    fn every_progress_variant() -> Vec<DownloadProgress> {
+        vec![
+            DownloadProgress::Queued,
+            DownloadProgress::Fetching,
+            DownloadProgress::Downloading(DownloadingState::Running {
+                stream: Some(DownloadStream::Video),
+                percent: Some(DownloadPercent::new(62)),
+                speed_bytes_per_sec: Some(4_404_019),
+                eta_secs: Some(100),
+                attempt: None,
+            }),
+            DownloadProgress::Downloading(DownloadingState::WaitingRetry {
+                percent: Some(DownloadPercent::new(62)),
+                attempt: DownloadAttempt {
+                    number: 2,
+                    total: 6,
+                },
+                delay_secs: 10,
+                remaining_secs: 8,
+            }),
+            DownloadProgress::Merging,
+            DownloadProgress::Done {
+                file_name: "Как приручить дракона.mp4".to_string(),
+            },
+            DownloadProgress::Failed {
+                error: DownloadError {
+                    kind: DownloadErrorKind::ConnectionLost,
+                    message: "соединение потеряно".to_string(),
+                    retryable: true,
+                    partial_data: PartialData::Kept,
+                    details: None,
+                },
+            },
+            DownloadProgress::Cancelled {
+                partial_data: PartialData::Removed,
+            },
+        ]
+    }
+
+    #[test]
+    fn every_download_phase_has_its_own_wire_value() {
+        let phases = [
+            (DownloadPhase::Queued, "queued"),
+            (DownloadPhase::Fetching, "fetching"),
+            (DownloadPhase::Downloading, "downloading"),
+            (DownloadPhase::Merging, "merging"),
+            (DownloadPhase::Done, "done"),
+            (DownloadPhase::Failed, "failed"),
+            (DownloadPhase::Cancelled, "cancelled"),
+        ];
+
+        // Ф-3 фиксирует автомат ровно из семи состояний: и лишнее, и
+        // потерянное — расхождение с требованием, а не мелочь.
+        assert_eq!(phases.len(), 7);
+
+        for (phase, expected) in phases {
+            assert_eq!(
+                serde_json::to_value(phase).expect("serialization must not fail"),
+                json!(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn every_download_error_kind_has_its_own_wire_value() {
+        let kinds = [
+            (DownloadErrorKind::ConnectionLost, "connectionLost"),
+            (DownloadErrorKind::DiskFull, "diskFull"),
+            (DownloadErrorKind::StaleFormat, "staleFormat"),
+            (DownloadErrorKind::MergeFailed, "mergeFailed"),
+            (
+                DownloadErrorKind::DestinationUnavailable,
+                "destinationUnavailable",
+            ),
+            (DownloadErrorKind::VideoUnavailable, "videoUnavailable"),
+            (DownloadErrorKind::SignInRequired, "signInRequired"),
+            (DownloadErrorKind::RegionBlocked, "regionBlocked"),
+            (DownloadErrorKind::YtDlpFailure, "ytDlpFailure"),
+        ];
+
+        // Ф-10 плюс декомпозиция E3 — ровно девять классов: пять своих и
+        // четыре переиспользованных из E2.
+        assert_eq!(kinds.len(), 9);
+
+        for (kind, expected) in kinds {
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialization must not fail"),
+                json!(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn reused_error_kinds_keep_their_probe_wire_values() {
+        // Четыре класса E3 — те же смысловые классы, что в E2, и тексты
+        // для них уже написаны там. Разошедшиеся строки заставили бы UI
+        // держать две таблицы вместо одной, причём разошлись бы они молча.
+        for (download, probe) in [
+            (
+                DownloadErrorKind::VideoUnavailable,
+                ProbeErrorKind::VideoUnavailable,
+            ),
+            (
+                DownloadErrorKind::SignInRequired,
+                ProbeErrorKind::SignInRequired,
+            ),
+            (
+                DownloadErrorKind::RegionBlocked,
+                ProbeErrorKind::RegionBlocked,
+            ),
+            (
+                DownloadErrorKind::YtDlpFailure,
+                ProbeErrorKind::YtDlpFailure,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_value(download).expect("serialization must not fail"),
+                serde_json::to_value(probe).expect("serialization must not fail")
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_follows_the_design_table_of_error_classes() {
+        // Таблица ошибок дизайна E3, колонка «Повторить?». Она безусловна
+        // и записана ровно здесь — и фронтенд, и команда повтора читают
+        // одно и то же значение.
+        for (kind, retryable) in [
+            (DownloadErrorKind::ConnectionLost, true),
+            (DownloadErrorKind::DiskFull, true),
+            (DownloadErrorKind::StaleFormat, false),
+            (DownloadErrorKind::MergeFailed, true),
+            (DownloadErrorKind::DestinationUnavailable, true),
+            (DownloadErrorKind::VideoUnavailable, true),
+            (DownloadErrorKind::SignInRequired, false),
+            (DownloadErrorKind::RegionBlocked, false),
+            (DownloadErrorKind::YtDlpFailure, true),
+        ] {
+            assert_eq!(
+                kind.is_retryable(),
+                retryable,
+                "{kind:?}: расхождение с таблицей ошибок дизайна"
+            );
+        }
+    }
+
+    #[test]
+    fn every_download_command_error_kind_has_its_own_wire_value() {
+        let kinds = [
+            (DownloadCommandErrorKind::AlreadyActive, "alreadyActive"),
+            (DownloadCommandErrorKind::UnknownTask, "unknownTask"),
+            (DownloadCommandErrorKind::NotFailed, "notFailed"),
+            (DownloadCommandErrorKind::NotRetryable, "notRetryable"),
+            (
+                DownloadCommandErrorKind::NoStreamsSelected,
+                "noStreamsSelected",
+            ),
+            (DownloadCommandErrorKind::InvalidUrl, "invalidUrl"),
+        ];
+
+        assert_eq!(kinds.len(), 6);
+
+        for (kind, expected) in kinds {
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialization must not fail"),
+                json!(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn serializes_plan_stream_and_partial_data_wire_values() {
+        for (plan, expected) in [
+            (DownloadPlan::VideoAndAudio, "videoAndAudio"),
+            (DownloadPlan::SingleStream, "singleStream"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(plan).expect("serialization must not fail"),
+                json!(expected)
+            );
+        }
+
+        for (stream, expected) in [
+            (DownloadStream::Video, "video"),
+            (DownloadStream::Audio, "audio"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(stream).expect("serialization must not fail"),
+                json!(expected)
+            );
+        }
+
+        for (partial, expected) in [
+            (PartialData::NothingCreated, "nothingCreated"),
+            (PartialData::Removed, "removed"),
+            (PartialData::Kept, "kept"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(partial).expect("serialization must not fail"),
+                json!(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn percent_is_a_bare_number_that_never_exceeds_one_hundred() {
+        assert_eq!(
+            serde_json::to_value(DownloadPercent::new(62)).expect("serialization must not fail"),
+            json!(62)
+        );
+        // Заниженная оценка размера (знаменатель ещё не уточнён фактическим
+        // размером потока) не должна выпускать полосу прогресса за край.
+        assert_eq!(DownloadPercent::new(137).value(), 100);
+        assert_eq!(DownloadPercent::new(0).value(), 0);
+        assert_eq!(DownloadPercent::new(100).value(), 100);
+    }
+
+    #[test]
+    fn serializes_queued_and_fetching_with_nothing_but_the_phase() {
+        assert_eq!(
+            download_event(DownloadProgress::Queued),
+            json!({ "taskId": "task-1", "phase": "queued" })
+        );
+        // «Подготовка» без числа: пока не пришло ни строки прогресса,
+        // любой процент был бы выдумкой.
+        assert_eq!(
+            download_event(DownloadProgress::Fetching),
+            json!({ "taskId": "task-1", "phase": "fetching" })
+        );
+    }
+
+    #[test]
+    fn serializes_a_running_download_with_every_optional_present() {
+        let value = download_event(DownloadProgress::Downloading(DownloadingState::Running {
+            stream: Some(DownloadStream::Video),
+            percent: Some(DownloadPercent::new(62)),
+            speed_bytes_per_sec: Some(4_404_019),
+            eta_secs: Some(100),
+            attempt: Some(DownloadAttempt {
+                number: 2,
+                total: 6,
+            }),
+        }));
+
+        assert_eq!(
+            value,
+            json!({
+                "taskId": "task-1",
+                "phase": "downloading",
+                "state": "running",
+                "stream": "video",
+                "percent": 62,
+                "speedBytesPerSec": 4_404_019u64,
+                "etaSecs": 100,
+                "attempt": { "number": 2, "total": 6 },
+            })
+        );
+    }
+
+    #[test]
+    fn running_download_without_data_omits_every_optional_key() {
+        let value = download_event(DownloadProgress::Downloading(DownloadingState::Running {
+            stream: None,
+            percent: None,
+            speed_bytes_per_sec: None,
+            eta_secs: None,
+            attempt: None,
+        }));
+
+        // Так выглядит первая строка прогресса задачи с одним потоком, у
+        // которого размер ещё неизвестен: ни процента, ни скорости, ни
+        // оценки — и ни одного `null`, за который UI мог бы нарисовать
+        // «0 %» или «—».
+        assert_eq!(
+            value,
+            json!({
+                "taskId": "task-1",
+                "phase": "downloading",
+                "state": "running",
+            })
+        );
+    }
+
+    #[test]
+    fn waiting_retry_is_a_separate_state_without_speed_and_eta() {
+        let value = download_event(DownloadProgress::Downloading(
+            DownloadingState::WaitingRetry {
+                percent: Some(DownloadPercent::new(62)),
+                attempt: DownloadAttempt {
+                    number: 2,
+                    total: 6,
+                },
+                delay_secs: 10,
+                remaining_secs: 8,
+            },
+        ));
+
+        assert_eq!(
+            value,
+            json!({
+                "taskId": "task-1",
+                "phase": "downloading",
+                "state": "waitingRetry",
+                "percent": 62,
+                "attempt": { "number": 2, "total": 6 },
+                "delaySecs": 10,
+                "remainingSecs": 8,
+            })
+        );
+
+        // Пауза — это не «то же Downloading с другими числами»: процесса
+        // уже нет, и последняя известная скорость в этот момент была бы
+        // ложью (класс дефекта «не отвечает» из E1). Выразить её здесь
+        // нечем — полей просто не существует.
+        let object = value.as_object().expect("event must be an object");
+        assert!(!object.contains_key("speedBytesPerSec"));
+        assert!(!object.contains_key("etaSecs"));
+        // Процент, наоборот, заморожен и обязан пережить паузу (К-6).
+        assert_eq!(object["percent"], json!(62));
+    }
+
+    #[test]
+    fn merging_carries_no_percent_at_all() {
+        let value = download_event(DownloadProgress::Merging);
+
+        assert_eq!(value, json!({ "taskId": "task-1", "phase": "merging" }));
+        // Сквозной шкалы через всю задачу нет и быть не может: у склейки
+        // нет поля процента, а не «процент, который забыли заполнить».
+        assert!(!value
+            .as_object()
+            .expect("event must be an object")
+            .contains_key("percent"));
+    }
+
+    #[test]
+    fn serializes_done_with_the_final_file_name_only() {
+        assert_eq!(
+            download_event(DownloadProgress::Done {
+                file_name: "Как приручить дракона.mp4".to_string(),
+            }),
+            json!({
+                "taskId": "task-1",
+                "phase": "done",
+                "fileName": "Как приручить дракона.mp4",
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_failed_with_the_class_retry_hint_and_disk_outcome() {
+        assert_eq!(
+            download_event(DownloadProgress::Failed {
+                error: DownloadError {
+                    kind: DownloadErrorKind::MergeFailed,
+                    message: "не удалось склеить видео и звук".to_string(),
+                    retryable: true,
+                    partial_data: PartialData::Kept,
+                    details: Some(download_details()),
+                },
+            }),
+            json!({
+                "taskId": "task-1",
+                "phase": "failed",
+                "error": {
+                    "kind": "mergeFailed",
+                    "message": "не удалось склеить видео и звук",
+                    "retryable": true,
+                    "partialData": "kept",
+                    "details": {
+                        "stderrTail": "ERROR: unable to download video data",
+                        "exitCode": 1,
+                    },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn failed_without_technical_details_omits_them_entirely() {
+        let value = download_event(DownloadProgress::Failed {
+            error: DownloadError {
+                kind: DownloadErrorKind::DestinationUnavailable,
+                message: "папка назначения недоступна: нет прав на запись".to_string(),
+                retryable: true,
+                partial_data: PartialData::Kept,
+                details: None,
+            },
+        });
+
+        assert_eq!(
+            value["error"],
+            json!({
+                "kind": "destinationUnavailable",
+                "message": "папка назначения недоступна: нет прав на запись",
+                "retryable": true,
+                "partialData": "kept",
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_cancelled_with_what_is_left_on_disk() {
+        // Отмена после начала приёма байт: подчистка при отмене всегда
+        // полная, без исключений по классам (Ф-4).
+        assert_eq!(
+            download_event(DownloadProgress::Cancelled {
+                partial_data: PartialData::Removed,
+            }),
+            json!({
+                "taskId": "task-1",
+                "phase": "cancelled",
+                "partialData": "removed",
+            })
+        );
+        // Отмена до старта процесса: удалять было нечего, и утверждать
+        // «данные удалены» — неправда, за которой пользователь ищет
+        // несуществующие файлы.
+        assert_eq!(
+            download_event(DownloadProgress::Cancelled {
+                partial_data: PartialData::NothingCreated,
+            })["partialData"],
+            json!("nothingCreated")
+        );
+    }
+
+    #[test]
+    fn the_phase_of_a_progress_value_is_the_wire_tag_itself() {
+        // Степпер рисуется по фазе, панель — по варианту. Если бы фаза
+        // хранилась отдельным полем, они могли бы разойтись; здесь это
+        // одна и та же величина, и тест сторожит именно равенство.
+        for progress in every_progress_variant() {
+            let phase =
+                serde_json::to_value(progress.phase()).expect("serialization must not fail");
+            let value = download_event(progress);
+
+            assert_eq!(value["phase"], phase);
+        }
+    }
+
+    #[test]
+    fn terminal_phases_are_exactly_done_failed_and_cancelled() {
+        for progress in every_progress_variant() {
+            let terminal = matches!(
+                progress.phase(),
+                DownloadPhase::Done | DownloadPhase::Failed | DownloadPhase::Cancelled
+            );
+
+            assert_eq!(
+                progress.is_terminal(),
+                terminal,
+                "{:?}: терминальность решает, свободен ли слот и спрашивать \
+                 ли подтверждение выхода",
+                progress.phase()
+            );
+        }
+    }
+
+    #[test]
+    fn serializes_the_answer_of_the_start_command() {
+        assert_eq!(
+            serde_json::to_value(DownloadStarted {
+                task_id: "task-1".to_string(),
+                phase: DownloadPhase::Queued,
+                plan: DownloadPlan::VideoAndAudio,
+            })
+            .expect("serialization must not fail"),
+            json!({
+                "taskId": "task-1",
+                "phase": "queued",
+                "plan": "videoAndAudio",
+            })
+        );
+    }
+
+    #[test]
+    fn deserializes_a_start_request_with_both_streams() {
+        let request: StartDownloadRequest = serde_json::from_str(
+            r#"{
+                "url": "https://www.youtube.com/watch?v=abc",
+                "title": "Как приручить дракона",
+                "streams": { "videoFormatId": "137", "audioFormatId": "140" }
+            }"#,
+        )
+        .expect("deserialization must work");
+
+        assert_eq!(
+            request,
+            StartDownloadRequest {
+                url: "https://www.youtube.com/watch?v=abc".to_string(),
+                title: "Как приручить дракона".to_string(),
+                streams: video_streams(),
+            }
+        );
+    }
+
+    #[test]
+    fn deserializes_a_start_request_for_an_audio_only_item() {
+        let request: StartDownloadRequest = serde_json::from_str(
+            r#"{
+                "url": "https://www.youtube.com/watch?v=abc",
+                "title": "Как приручить дракона",
+                "streams": { "audioFormatId": "140" }
+            }"#,
+        )
+        .expect("deserialization must work");
+
+        assert_eq!(request.streams.video_format_id, None);
+        assert!(request.streams.has_any());
+    }
+
+    #[test]
+    fn a_start_request_without_a_single_stream_is_syntactically_valid() {
+        // `{}` разбирается — и именно поэтому команда обязана проверять
+        // инвариант сама: пункт без потоков скачать нечем (Ф-3 E2,
+        // `noStreamsSelected`).
+        let request: StartDownloadRequest = serde_json::from_str(
+            r#"{ "url": "https://youtu.be/abc", "title": "Ролик", "streams": {} }"#,
+        )
+        .expect("deserialization must work");
+
+        assert!(!request.streams.has_any());
+    }
+
+    #[test]
+    fn serializes_a_command_rejection() {
+        assert_eq!(
+            serde_json::to_value(DownloadCommandError {
+                kind: DownloadCommandErrorKind::AlreadyActive,
+                message: "уже идёт другая загрузка".to_string(),
+            })
+            .expect("serialization must not fail"),
+            json!({
+                "kind": "alreadyActive",
+                "message": "уже идёт другая загрузка",
+            })
+        );
+    }
+
+    #[test]
+    fn empty_download_details_are_recognised_as_having_nothing_to_show() {
+        assert!(DownloadErrorDetails {
+            stderr_tail: None,
+            exit_code: None,
+        }
+        .is_empty());
+        assert!(!DownloadErrorDetails {
+            stderr_tail: None,
+            exit_code: Some(1),
+        }
+        .is_empty());
+        assert!(!download_details().is_empty());
     }
 }

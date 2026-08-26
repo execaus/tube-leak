@@ -83,6 +83,7 @@
 
 mod clock;
 mod commands;
+mod download;
 mod probe;
 mod sidecar;
 mod types;
