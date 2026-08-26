@@ -14,6 +14,15 @@
  * Смена карточки (новый разбор или очистка поля) всегда пересоздаёт
  * список `items` новым массивом — выбор сбрасывается по смене ссылки на
  * объект, без сравнения по идентификатору строки.
+ *
+ * # Эмит выбора (эпик E3, TL-45)
+ *
+ * В E2 выбор был только визуальной фиксацией текущей карточки — действия
+ * «скачать» не было, и наверх ничего не эмитилось. E3 добавляет кнопку
+ * «Скачать» в `VideoCard`, которой нужен сам выбранный пункт — компонент
+ * начинает сообщать его через `update:selected` (v-model), оставаясь тем
+ * же компонентом: список, порядок, отсутствие предвыбранного пункта (Р-1)
+ * не меняются ни строкой.
  */
 import { ref, useId, watch } from 'vue'
 
@@ -23,6 +32,10 @@ import { qualityLabel } from '@/utils/qualityLabel'
 
 const props = defineProps<{
   items: QualityItem[]
+}>()
+
+const emit = defineEmits<{
+  'update:selected': [item: QualityItem | undefined]
 }>()
 
 const selectedIndex = ref<number>()
@@ -39,11 +52,13 @@ watch(
   () => props.items,
   () => {
     selectedIndex.value = undefined
+    emit('update:selected', undefined)
   },
 )
 
 function select(index: number): void {
   selectedIndex.value = index
+  emit('update:selected', props.items[index])
 }
 </script>
 

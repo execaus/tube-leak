@@ -42,3 +42,62 @@ describe('VideoCard', () => {
     expect(wrapper.find('[role="radiogroup"]').exists()).toBe(true)
   })
 })
+
+describe('VideoCard — кнопка «Скачать» (эпик E3, дизайн «Кнопка Скачать»)', () => {
+  function downloadButton(wrapper: ReturnType<typeof mount>) {
+    return wrapper.findAll('button').find((b) => b.text() === 'Скачать')
+  }
+
+  it('is disabled with no hint when nothing is selected yet', () => {
+    const wrapper = mount(VideoCard, { props: { result: full } })
+    expect(downloadButton(wrapper)?.attributes('disabled')).toBeDefined()
+    expect(wrapper.find('.video-card__download-hint').exists()).toBe(false)
+  })
+
+  it('becomes enabled once a quality row is selected', async () => {
+    const wrapper = mount(VideoCard, { props: { result: full } })
+    await wrapper.find('input[type="radio"]').setValue(true)
+    expect(downloadButton(wrapper)?.attributes('disabled')).toBeUndefined()
+  })
+
+  it('is disabled with an explanatory hint when another download is already active (С-13), even after selecting a quality', async () => {
+    const wrapper = mount(VideoCard, { props: { result: full, downloadBlocked: true } })
+    await wrapper.find('input[type="radio"]').setValue(true)
+
+    expect(downloadButton(wrapper)?.attributes('disabled')).toBeDefined()
+    expect(wrapper.text()).toContain('Уже идёт другая загрузка')
+  })
+
+  it('associates the blocked hint with the button via aria-describedby, for keyboard/screen-reader users (ревью TL-45)', async () => {
+    const wrapper = mount(VideoCard, { props: { result: full, downloadBlocked: true } })
+    const button = downloadButton(wrapper)
+    const hint = wrapper.find('.video-card__download-hint')
+
+    expect(hint.exists()).toBe(true)
+    const describedBy = button?.attributes('aria-describedby')
+    expect(describedBy).toBeTruthy()
+    expect(hint.attributes('id')).toBe(describedBy)
+  })
+
+  it('has no aria-describedby when there is no hint to point to', () => {
+    const wrapper = mount(VideoCard, { props: { result: full } })
+    expect(downloadButton(wrapper)?.attributes('aria-describedby')).toBeUndefined()
+  })
+
+  it('emits download with the title, the streams of the selected item, and its quality label', async () => {
+    const wrapper = mount(VideoCard, { props: { result: full } })
+    await wrapper.find('input[type="radio"]').setValue(true)
+    await downloadButton(wrapper)?.trigger('click')
+
+    expect(wrapper.emitted('download')).toStrictEqual([
+      [
+        {
+          title: full.title,
+          streams: { audioFormatId: 'a' },
+          size: { kind: 'known', bytes: 14 * 1024 ** 2 },
+          qualityLabel: 'Только аудио',
+        },
+      ],
+    ])
+  })
+})

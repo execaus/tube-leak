@@ -1,4 +1,5 @@
 import { flushPromises, mount } from '@vue/test-utils'
+import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SidecarCheckReport, SidecarCheckResult } from '@/types/sidecar'
@@ -88,6 +89,9 @@ beforeEach(() => {
   listenMock.mockClear()
   unlistenMock.mockClear()
   capturedHandler = undefined
+  // App.vue использует `useDownloadTaskStore` (эпик E3, TL-45) — стору
+  // нужен активный Pinia-инстанс, иначе `useStore()` падает ещё на mount.
+  setActivePinia(createPinia())
 })
 
 describe('App — order of calls (TL-17, #18)', () => {
