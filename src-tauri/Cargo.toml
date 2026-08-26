@@ -35,9 +35,36 @@ zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
 #
 # До TL-25 это не проявлялось на macOS и потому оставалось незамеченным:
 # бэкенд прилетал по unification из чужой ветки графа — flate2/default у
-# png ← ico ← tauri-codegen. На Linux и Windows этой ветки в графе нет, и
-# сборка бандла падала на flate2; нашёл это первый же прогон нового джоба
-# test (см. #26), а джоб build до сих пор ни разу не гоняли живьём (Р-6).
+# png ← muda. Ветка macOS-only не по нашей воле, а по манифесту muda:
+# `[target.'cfg(target_os = "macos")'.dependencies.png]`. На Linux и Windows
+# png на target-стороне графа нет вовсе, и flate2 там оставался без бэкенда;
+# падала и сборка бандла тоже, то есть джоб build на этих двух платформах
+# был красный с TL-12, но живьём его не гоняли (Р-6).
+#
+# Проверяется так (`-i` — обратное дерево, `--target` обязателен, см. ниже):
+#
+#   cargo tree -e normal -i flate2 --target x86_64-unknown-linux-gnu
+#     flate2 |                                    ← пусто: compile_error!
+#     └── zip | _deflate-any,deflate-flate2 → tube-leak
+#     flate2 | any_impl,default,miniz_oxide,rust_backend
+#     └── png ← ico ← tauri-codegen ← tauri-macros (proc-macro) ← tauri
+#
+# Ветка png ← ico ← tauri-codegen присутствует на ВСЕХ тройках, включая
+# Linux и Windows, но замаскировать ничего не может: она идёт через
+# proc-macro, а resolver v2 не объединяет фичи host- и target-стороны —
+# отсюда в дереве два отдельных узла flate2 с разными наборами фич.
+# Смотреть надо с явным `--target`: без него cargo tree схлопывает обе
+# стороны в один узел, и разницы не видно. Что расхождение реально, а не
+# артефакт отображения, показал прогон #26: на ubuntu падал и `cargo
+# clippy` (без --target), и `tauri build --target x86_64-unknown-linux-gnu`.
+#
+# Следствие, важное за пределами этой строки. Расхождение возникает на
+# target-стороне графа, а маскирует его зависимость, объявленная macOS-only.
+# Значит джоб test, который после TL-25 гоняется на macos-latest, этот класс
+# дефектов не ловит by construction: конфигурация фич под другие тройки на
+# нём просто не резолвится. Этот дефект нашли ubuntu-прогоны (#26) — на
+# macOS он не нашёлся бы никогда. Единственный сторож класса «собирается на
+# macOS, не собирается под другую тройку» сейчас — матрица build; см. #37.
 #
 # Явная зависимость с `rust_backend` вместо zip-фичи `deflate-flate2-zlib-rs`:
 # rust_backend — это miniz_oxide, который в графе уже есть (тот же png), то
