@@ -1,0 +1,25 @@
+{
+  "_capture": {
+    "note": "Класс E2 на пути скачивания: тот же удалённый ролик, что в ../../ytdlp-probe/outcomes/video-unavailable-deleted.json, но запущенный не разбором (-J), а скачиванием. Формулировка совпадает — это и есть основание переиспользовать маркеры TL-31, а не писать свои.",
+    "reality": "live",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "-f",
+      "137+140",
+      "-o",
+      "%(title)s.%(ext)s",
+      "-P",
+      "temp:.",
+      "https://www.youtube.com/watch?v=I67ewAeU9bU"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 1,
+  "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=I67ewAeU9bU\n[youtube] I67ewAeU9bU: Downloading webpage\n[youtube] I67ewAeU9bU: Downloading visionos player API JSON\n",
+  "stderr": "WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one\nERROR: [youtube] I67ewAeU9bU: This video is unavailable\n"
+}

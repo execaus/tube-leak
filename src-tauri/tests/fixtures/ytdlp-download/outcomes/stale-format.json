@@ -1,0 +1,25 @@
+{
+  "_capture": {
+    "note": "С-10: выбранный формат больше не отдаётся. Смоделирован несуществующим идентификатором 999 в паре с настоящим 140 — на проводе это то же самое, что устаревшая карточка E2: yt-dlp сравнивает запрошенные идентификаторы со списком и отвечает одной строкой, не начиная скачивание.",
+    "reality": "live",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "-f",
+      "999+140",
+      "-o",
+      "%(title)s.%(ext)s",
+      "-P",
+      "temp:.",
+      "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 1,
+  "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=aqz-KE-bpKQ\n[youtube] aqz-KE-bpKQ: Downloading webpage\n[youtube] aqz-KE-bpKQ: Downloading visionos player API JSON\n[youtube] aqz-KE-bpKQ: Downloading m3u8 information\n",
+  "stderr": "WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one\nERROR: [youtube] aqz-KE-bpKQ: Requested format is not available. Use --list-formats for a list of available formats\n"
+}

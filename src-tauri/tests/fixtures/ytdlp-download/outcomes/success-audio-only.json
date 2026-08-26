@@ -1,0 +1,25 @@
+{
+  "_capture": {
+    "note": "Контрольный успех: поток скачан целиком, код 0. В stderr при этом не пусто — предупреждение про JS-рантайм yt-dlp печатает в КАЖДОМ запуске по ролику YouTube, и классификация обязана не принять его за отказ.",
+    "reality": "live",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "-f",
+      "139",
+      "-o",
+      "%(title)s.%(ext)s",
+      "-P",
+      "temp:.",
+      "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 0,
+  "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=aqz-KE-bpKQ\n[youtube] aqz-KE-bpKQ: Downloading webpage\n[youtube] aqz-KE-bpKQ: Downloading visionos player API JSON\n[youtube] aqz-KE-bpKQ: Downloading m3u8 information\n[info] aqz-KE-bpKQ: Downloading 1 format(s): 139\n[download] Destination: ./Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film.m4a\n@tl-progress|downloading|1024|3871021|NA|43958.071111293066|88|NA|NA|139\n@tl-progress|downloading|3072|3871021|NA|120741.24432366584|32|NA|NA|139\n@tl-progress|downloading|7168|3871021|NA|272693.86284024635|14|NA|NA|139\n@tl-progress|downloading|15360|3871021|NA|568302.7922690825|6|NA|NA|139\n@tl-progress|downloading|31744|3871021|NA|210738.88751432425|18|NA|NA|139\n@tl-progress|downloading|64512|3871021|NA|277087.57036225393|13|NA|NA|139\n@tl-progress|downloading|130048|3871021|NA|258994.8883853703|14|NA|NA|139\n@tl-progress|downloading|261120|3871021|NA|267381.5924245639|13|NA|NA|139\n@tl-progress|downloading|523264|3871021|NA|304900.233636118|10|NA|NA|139\n@tl-progress|downloading|877704|3871021|NA|337613.9529532346|8|NA|NA|139\n@tl-progress|downloading|1278860|3871021|NA|378254.2086947741|6|NA|NA|139\n@tl-progress|downloading|1792354|3871021|NA|419768.91236191505|4|NA|NA|139\n@tl-progress|downloading|2370024|3871021|NA|453935.83978878736|3|NA|NA|139\n@tl-progress|downloading|2977332|3871021|NA|478646.8312161262|1|NA|NA|139\n@tl-progress|downloading|3585092|3871021|NA|502981.82959256537|0|NA|NA|139\n@tl-progress|downloading|3871021|3871021|NA|513784.58978337474|0|NA|NA|139\n@tl-progress|finished|3871021|3871021|NA|480617.051127536|NA|NA|NA|139\n[FixupM4a] Correcting container of \"./Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film.m4a\"\n",
+  "stderr": "WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one\n"
+}

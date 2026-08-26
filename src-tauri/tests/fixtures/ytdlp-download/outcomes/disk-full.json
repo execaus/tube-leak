@@ -1,0 +1,23 @@
+{
+  "_capture": {
+    "note": "С-9: место кончилось ПО ХОДУ записи, а не до старта. Снято на образе диска 6 МиБ (hdiutil create -size 6m -fs HFS+), смонтированном в /Volumes/tinyvol, при потоке 134 весом 18,3 МБ: 20 строк прогресса, затем отказ на 6 078 464 байтах. Частичный .part остался на томе — основание PartialData::Kept.",
+    "reality": "live",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "-f",
+      "134",
+      "-o",
+      "/Volumes/tinyvol/%(title)s.%(ext)s",
+      "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 1,
+  "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=aqz-KE-bpKQ\n[youtube] aqz-KE-bpKQ: Downloading webpage\n[youtube] aqz-KE-bpKQ: Downloading visionos player API JSON\n[youtube] aqz-KE-bpKQ: Downloading m3u8 information\n[info] aqz-KE-bpKQ: Downloading 1 format(s): 134\n[download] Destination: /Volumes/tinyvol/Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film.mp4\n@tl-progress|downloading|1024|18294110|NA|6860.049603567572|2667|NA|NA|134\n@tl-progress|downloading|3072|18294110|NA|20238.341288415446|903|NA|NA|134\n@tl-progress|downloading|7168|18294110|NA|46706.765148549304|391|NA|NA|134\n@tl-progress|downloading|15360|18294110|NA|99398.7574327848|183|NA|NA|134\n@tl-progress|downloading|31744|18294110|NA|171451.14377951276|106|NA|NA|134\n@tl-progress|downloading|64512|18294110|NA|141357.7677480225|128|NA|NA|134\n@tl-progress|downloading|130048|18294110|NA|93999.8212224266|193|NA|NA|134\n@tl-progress|downloading|200735|18294110|NA|134179.79790085394|134|NA|NA|134\n@tl-progress|downloading|342109|18294110|NA|163552.90252815225|109|NA|NA|134\n@tl-progress|downloading|579426|18294110|NA|140557.8494257188|126|NA|NA|134\n@tl-progress|downloading|698084|18294110|NA|146445.71027094324|120|NA|NA|134\n@tl-progress|downloading|882188|18294110|NA|180607.64628248638|96|NA|NA|134\n@tl-progress|downloading|1250396|18294110|NA|170007.5709225885|100|NA|NA|134\n@tl-progress|downloading|1434500|18294110|NA|191742.00975515862|87|NA|NA|134\n@tl-progress|downloading|1802708|18294110|NA|202624.06364338234|81|NA|NA|134\n@tl-progress|downloading|2062851|18294110|NA|206904.7580214229|78|NA|NA|134\n@tl-progress|downloading|2305241|18294110|NA|211475.89448769923|75|NA|NA|134\n@tl-progress|downloading|2565686|18294110|NA|214677.1286545201|73|NA|NA|134\n@tl-progress|downloading|2813576|18294110|NA|218744.60267356073|70|NA|NA|134\n@tl-progress|downloading|3085681|18294110|NA|222518.32501029567|68|NA|NA|134\n@tl-progress|downloading|3356510|18294110|NA|229318.52055576298|65|NA|NA|134\n@tl-progress|downloading|3708325|18294110|NA|238072.9235867101|61|NA|NA|134\n@tl-progress|downloading|4082781|18294110|NA|250012.81392552605|56|NA|NA|134\n@tl-progress|downloading|4579497|18294110|NA|262932.2158364957|52|NA|NA|134\n@tl-progress|downloading|5036567|18294110|NA|274122.2915282028|48|NA|NA|134\n@tl-progress|downloading|5514470|18294110|NA|286627.00487667194|44|NA|NA|134\n@tl-progress|downloading|6066477|18294110|NA|299513.66110740294|40|NA|NA|134\n",
+  "stderr": "WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one\n\n\nERROR: unable to write data: [Errno 28] No space left on device\n"
+}

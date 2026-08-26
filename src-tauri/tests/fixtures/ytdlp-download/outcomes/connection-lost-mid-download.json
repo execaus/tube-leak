@@ -1,0 +1,31 @@
+{
+  "_capture": {
+    "note": "С-6/С-7: транспорт умер посреди скачивания. СМОДЕЛИРОВАНО: загрузка шла через локальный CONNECT-прокси, который убит на 8-й секунде; Wi-Fi не выключался. На диске остаётся тот же .part, что и при настоящем обрыве (см. README), а в выводе — то, ради чего фикстура снята: yt-dlp сам исчерпал 10 внутренних повторов за 35 мс и завершился кодом 1. Строка «ERROR:» при этом ПУСТАЯ, а текст ошибки стоит на следующей строке — из-за этого правило разбора E2 «решать по строкам ERROR:» без переноса потеряло бы причину целиком.",
+    "reality": "modelled",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "--proxy",
+      "http://127.0.0.1:8897",
+      "--limit-rate",
+      "300K",
+      "--socket-timeout",
+      "10",
+      "-f",
+      "134",
+      "-o",
+      "%(title)s.%(ext)s",
+      "-P",
+      "temp:.",
+      "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 1,
+  "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=aqz-KE-bpKQ\n[youtube] aqz-KE-bpKQ: Downloading webpage\n[youtube] aqz-KE-bpKQ: Downloading visionos player API JSON\n[youtube] aqz-KE-bpKQ: Downloading m3u8 information\n[info] aqz-KE-bpKQ: Downloading 1 format(s): 134\n[download] Destination: ./Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film.mp4\n@tl-progress|downloading|1024|18294110|NA|24012.743321666985|762|NA|NA|134\n@tl-progress|downloading|3072|18294110|NA|69525.97808174828|263|NA|NA|134\n@tl-progress|downloading|7168|18294110|NA|158485.87808118082|115|NA|NA|134\n@tl-progress|downloading|15360|18294110|NA|294670.99710929784|62|NA|NA|134\n@tl-progress|downloading|31744|18294110|NA|137521.71492728012|132|NA|NA|134\n@tl-progress|downloading|64512|18294110|NA|53328.75161622321|341|NA|NA|134\n@tl-progress|downloading|97987|18294110|NA|80866.90155812327|225|NA|NA|134\n@tl-progress|downloading|164937|18294110|NA|57136.74807790036|317|NA|NA|134\n@tl-progress|downloading|204907|18294110|NA|66485.9177485698|272|NA|NA|134\n@tl-progress|downloading|284847|18294110|NA|82822.29729098518|217|NA|NA|134\n[download] Got error: 393216 bytes read, 9904515 more expected. Retrying (1/10)...\n[download] Got error: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8897): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (2/10)...\n[download] Got error: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8897): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (3/10)...\n[download] Got error: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8897): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (4/10)...\n[download] Got error: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8897): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (5/10)...\n[download] Got error: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8897): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (6/10)...\n[download] Got error: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8897): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (7/10)...\n[download] Got error: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8897): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (8/10)...\n[download] Got error: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8897): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (9/10)...\n[download] Got error: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8897): Failed to establish a new connection: [Errno 61] Connection refused\")). Retrying (10/10)...\n",
+  "stderr": "WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one\nERROR: \r[download] Got error: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8897): Failed to establish a new connection: [Errno 61] Connection refused\")). Giving up after 10 retries\n"
+}
