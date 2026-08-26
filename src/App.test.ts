@@ -426,3 +426,55 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     expect(wrapper.find('button').exists()).toBe(false)
   })
 })
+
+describe('App — link probe section gating by yt-dlp status only (эпик E2, TL-33)', () => {
+  it('disables the link field with a "checking" placeholder before check_sidecar resolves', async () => {
+    let resolveCheck: (value: SidecarCheckReport) => void = () => {}
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () =>
+        new Promise<SidecarCheckReport>((resolve) => {
+          resolveCheck = resolve
+        }),
+    })
+
+    const wrapper = mount(App)
+    await flushPromises()
+
+    const input = wrapper.find('input')
+    expect(input.attributes('disabled')).toBeDefined()
+    expect(input.attributes('placeholder')).toBe('Проверяем yt-dlp…')
+
+    resolveCheck(okReport)
+    await flushPromises()
+  })
+
+  it('enables the link field once yt-dlp is ok, even if ffmpeg is not', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve({ ytDlp: okYtDlp, ffmpeg: timeoutFfmpeg }),
+    })
+
+    const wrapper = mount(App)
+    await flushPromises()
+
+    const input = wrapper.find('input')
+    expect(input.attributes('disabled')).toBeUndefined()
+  })
+
+  it('disables the link field with a hint (not repeating the yt-dlp row error text) when yt-dlp is not ok', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve({ ytDlp: notFoundYtDlp, ffmpeg: okFfmpeg }),
+    })
+
+    const wrapper = mount(App)
+    await flushPromises()
+
+    const input = wrapper.find('input')
+    expect(input.attributes('disabled')).toBeDefined()
+    expect(input.attributes('placeholder')).toBe(
+      'Разбор ссылок недоступен, пока не решена проблема с yt-dlp выше',
+    )
+  })
+})

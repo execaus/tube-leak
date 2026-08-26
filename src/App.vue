@@ -29,6 +29,7 @@
  */
 import { computed, onMounted } from 'vue'
 
+import ProbeSection from '@/components/ProbeSection.vue'
 import SidecarStatusRow from '@/components/SidecarStatusRow.vue'
 import YtDlpPrepareError from '@/components/YtDlpPrepareError.vue'
 import YtDlpPrepareScreen from '@/components/YtDlpPrepareScreen.vue'
@@ -72,6 +73,16 @@ const showRetry = computed(() => {
   const r = report.value
   if (!r) return false
   return r.ytDlp.status !== 'ok' || r.ffmpeg.status !== 'ok'
+})
+
+/**
+ * Гейт поля ссылки (эпик E2, TL-33) — зависит только от статуса **yt-dlp**
+ * (дизайн, «Где живёт поле ссылки»): статус ffmpeg его не блокирует,
+ * разбор ролика ffmpeg не использует (он нужен только в E3, для склейки).
+ */
+const ytDlpState = computed<'checking' | 'blocked' | 'ready'>(() => {
+  if (isLoading.value || !report.value) return 'checking'
+  return report.value.ytDlp.status === 'ok' ? 'ready' : 'blocked'
 })
 
 /** Готовит yt-dlp и, только по успешному разрешению, проверяет оба sidecar. */
@@ -143,16 +154,40 @@ onMounted(() => {
           {{ isLoading ? 'Проверяем…' : 'Повторить проверку' }}
         </button>
       </footer>
+
+      <!--
+        Разделитель — единственное, что явно отделяет «служебную» часть
+        экрана (E1, про инструменты) от «рабочей» (про конкретный ролик,
+        E2), чтобы ошибка ffmpeg выше не путалась с состоянием разбора
+        ниже (дизайн E2, «Где живёт поле ссылки»).
+      -->
+      <hr class="screen__divider">
+
+      <ProbeSection :yt-dlp-state="ytDlpState" />
     </template>
   </main>
 </template>
 
 <style scoped>
+/*
+ * Пересмотр ограничения E1 «без прокрутки» (дизайн E2): контентная область
+ * (всё, что ниже шапки) может не поместиться по высоте с карточкой,
+ * превью и лестницей до пяти строк. Шапка не закреплена принудительно —
+ * никакого `position: sticky`/фиксированной высоты здесь нет, страница
+ * прокручивается штатно средствами браузера/webview без дополнительной
+ * разметки.
+ */
 .screen {
   max-width: 40rem;
   margin: 0 auto;
   padding: 1.5rem;
   font-family: system-ui, -apple-system, sans-serif;
+}
+
+.screen__divider {
+  margin: 1.5rem 0;
+  border: none;
+  border-top: 1px solid #ddd;
 }
 
 .version {
