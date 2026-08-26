@@ -184,11 +184,10 @@ pub struct YtDlpPrepared {
 // TL-31 (классификация ошибок), TL-32 (оркестрация и сами команды); здесь
 // только объявление типов, которые зеркалятся в `src/types/` (TL-29).
 //
-// Отсюда и `#[allow(dead_code)]` на каждом типе секции: конструирует их код,
-// которого ещё нет, а зеркало (TL-29) и экран (TL-33) пишутся по контракту
-// уже сейчас. Атрибуты снимаются задачами, которые начнут эти типы
-// заполнять, — по той же причине, что и у типов E1 выше: контракт не должен
-// исчезать из-за того, что реализация отстаёт на задачу.
+// До появления оркестрации (TL-32) типы секции никто не конструировал, и
+// каждый нёс `#[allow(dead_code)]`, чтобы контракт не исчез из-за того, что
+// реализация отстаёт на задачу. Вызывающий появился — глушители сняты все
+// до одного: дальше `dead_code` здесь означает настоящий мёртвый код.
 
 /// Вид пункта лестницы качеств (решение владельца Р-1).
 ///
@@ -199,7 +198,6 @@ pub struct YtDlpPrepared {
 ///
 /// Лестница показывает **только доступные** строки: пункта, которого у
 /// ролика нет, в списке нет вовсе — ни выключенного, ни с пометкой (Р-1).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum QualityKind {
@@ -223,7 +221,6 @@ pub enum QualityKind {
 /// оценки в контракт не выносится: yt-dlp даёт оценку и в поле точного
 /// размера тоже, гарантий совпадения с итоговым файлом эпик не даёт, и UI
 /// показывает любую оценку одинаково — со знаком «≈».
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum QualitySize {
@@ -255,7 +252,6 @@ pub enum QualitySize {
 /// дефолт конструировал бы ровно то состояние, которое инвариант
 /// запрещает, а тип десериализуемый, то есть пустой объект может приехать
 /// и снаружи (`{}` из UI в E3).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QualityStreams {
@@ -271,7 +267,9 @@ impl QualityStreams {
     /// Одно место на всех, кто его проверяет: TL-30 (не выпускать пункт
     /// без потоков в лестницу), TL-32 и E3 (не принимать такой объект
     /// обратно от UI). Три копии условия разошлись бы.
-    // Объявлено раньше своих вызывающих — как и типы этой секции.
+    // Единственное, что в секции ещё не зовёт продакшен-код: лестница
+    // (TL-30) проверяет инвариант своим построением и сверяет его тестом,
+    // а принимать объект обратно от UI будет E3. `allow` снимется там.
     #[allow(dead_code)]
     pub fn has_any(&self) -> bool {
         self.video_format_id.is_some() || self.audio_format_id.is_some()
@@ -280,7 +278,6 @@ impl QualityStreams {
 
 /// Строка лестницы качеств: что это за пункт, сколько примерно весит и что
 /// скачивать, если пользователь выберет именно его.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QualityItem {
@@ -312,7 +309,6 @@ pub struct QualityItem {
 /// обязана оставаться полезной, если yt-dlp не отдал имя канала или у
 /// ролика нет превью — соответствующий элемент просто не рисуется
 /// (превью — со статичным плейсхолдером, дизайн E2).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeResult {
@@ -333,7 +329,6 @@ pub struct ProbeResult {
 /// Девять классов отказа разбора (Ф-6). Ровно по ним фронтенд выбирает
 /// заголовок, пояснение и наличие кнопки «Повторить» (таблица в дизайне
 /// E2) — тексты живут на стороне UI, в контракте только классификация.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ProbeErrorKind {
@@ -371,7 +366,6 @@ pub enum ProbeErrorKind {
 
 /// Под-причина класса `ytDlpFailure` (С-12): меняет только текст пояснения,
 /// класс остаётся один — тот же приём, что `launchFailed.reason` в E1.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum YtDlpFailureReason {
@@ -392,7 +386,6 @@ pub enum YtDlpFailureReason {
 /// нет `details` вовсе (см. [`ProbeErrorDetails::is_empty`] и проекцию
 /// [`crate::probe::ProbeFailure::to_contract`]). Иначе фронтенд получил бы
 /// повод нарисовать «Подробнее», за которым пусто.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeErrorDetails {
@@ -420,7 +413,6 @@ impl ProbeErrorDetails {
 /// `message` — формулировка ядра для «Подробнее» и лога, **не** основной
 /// текст на экране: тексты для пользователя задаёт UI по классу (дизайн
 /// E2), и stderr в них не попадает никогда (Н-4).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeError {

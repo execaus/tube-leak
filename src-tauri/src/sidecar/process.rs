@@ -110,6 +110,31 @@ pub async fn run(
     timeout: Duration,
     registry: &ChildRegistry,
 ) -> Result<RunOutput, SidecarError> {
+    // Собственный одноразовый дескриптор: отменять этот запуск снаружи
+    // некому, и `handle` остаётся пустышкой, которая ничего не стоит.
+    run_cancellable(program, args, timeout, registry, &RunHandle::new()).await
+}
+
+/// То же, что [`run`], плюс отмена снаружи через [`RunHandle`] (Ф-8 эпика
+/// E2): пока процесс жив, владелец `handle` может в любой момент убить его
+/// группу, не дожидаясь ни завершения, ни таймаута.
+///
+/// Отмена — это именно убийство группы процессов (см. doc [`RunHandle`]),
+/// а не сброс возвращаемого future: `kill_on_drop` шлёт `SIGKILL` одному
+/// прямому потомку, и для двухпроцессной сборки (PyInstaller onefile) этого
+/// не хватает — ровно тот дефект, ради которого в E1 появился
+/// [`ChildRegistry`]. Отменённый запуск возвращает обычный результат
+/// убитого процесса ([`SidecarError::LaunchFailed`] с
+/// [`LaunchFailedReason::Corrupted`] — кода завершения у убитого сигналом
+/// процесса нет), а отличить отмену от честного отказа вызывающий может по
+/// [`RunHandle::was_cancelled`].
+pub async fn run_cancellable(
+    program: &Path,
+    args: &[&str],
+    timeout: Duration,
+    registry: &ChildRegistry,
+    handle: &RunHandle,
+) -> Result<RunOutput, SidecarError> {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -132,6 +157,20 @@ pub async fn run(
     // выполняется, и PID остаётся в реестре ровно для того, чтобы его
     // подхватил `RunEvent::Exit`.
     let _unregister_on_return = pid.map(|pid| UnregisterGuard { registry, pid });
+
+    // Отмена могла прийти между входом в функцию и `spawn` — тогда убивать
+    // было ещё нечего, и убить нужно прямо сейчас. Порядок гарантирован
+    // тем, что между `spawn` и этой строкой нет ни одной точки `await`:
+    // либо `attach` увидит отмену, либо отмена увидит PID.
+    if !handle.attach(pid) {
+        if let Some(pid) = pid {
+            kill_process_group(pid).await;
+        }
+    }
+    // Снимает с дескриптора право убивать: после возврата из функции
+    // процесс уже завершён (сам, по таймауту или по отмене), и его PID
+    // операционная система вправе выдать кому-то другому.
+    let _finish_on_return = FinishGuard(handle);
 
     let stdout_pipe = child.stdout.take().expect("stdout must be piped");
     let stderr_pipe = child.stderr.take().expect("stderr must be piped");
@@ -170,16 +209,7 @@ pub async fn run(
             // `start_kill()` избыточен в обоих случаях и убран, чтобы не
             // дублировать источники истины.
             if let Some(pid) = pid {
-                let (kill_program, kill_args) = group_kill_command(pid);
-                // stdout/stderr подавлены — см. аналогичный комментарий в
-                // `ChildRegistry::kill_all`.
-                let _ = Command::new(kill_program)
-                    .args(&kill_args)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .await;
+                kill_process_group(pid).await;
             } else {
                 // Практически недостижимо: `pid` берётся сразу после
                 // успешного `spawn`, до этой точки не пройти без него.
@@ -199,6 +229,160 @@ pub async fn run(
                 stderr,
             })
         }
+    }
+}
+
+/// Убивает всю группу процессов `pid` (см. doc
+/// [`super::registry::group_kill_command`], почему группу, а не один PID).
+///
+/// Best-effort: процесс мог завершиться сам между решением убить и самим
+/// убийством — тогда команда просто ничего не найдёт. stdout/stderr
+/// подавлены по той же причине, что в [`ChildRegistry::kill_all`]:
+/// «No such process» — штатный случай, а не сигнал об ошибке.
+async fn kill_process_group(pid: u32) {
+    let (program, args) = group_kill_command(pid);
+    let _ = Command::new(program)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
+/// Дескриптор одного запуска [`run_cancellable`], через который его можно
+/// отменить снаружи (Ф-8 эпика E2: новая ссылка или очистка поля обязаны
+/// завершить идущий разбор).
+///
+/// Отмена убивает **группу** процессов, а не сбрасывает future запуска:
+/// причины — в doc [`super::registry`] (убийства одного PID недостаточно
+/// для двухпроцессных сборок) и в doc [`run_cancellable`].
+///
+/// Дескриптор одноразовый и живёт ровно столько, сколько один запуск.
+/// Три состояния сменяются в одну сторону:
+///
+/// 1. до `spawn` — PID ещё неизвестен, отмена запоминается флагом;
+/// 2. процесс жив — отмена немедленно убивает его группу;
+/// 3. запуск вернул управление ([`FinishGuard`]) — убивать нечего и
+///    **нельзя**: тот же номер PID ОС вправе выдать другому процессу.
+#[derive(Debug, Default)]
+pub struct RunHandle {
+    state: StdMutex<HandleState>,
+    /// Будит тех, кто ждёт отмены ([`RunHandle::cancelled`]).
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+struct HandleState {
+    /// PID запущенного процесса; `None` — ещё не запущен или запуск не
+    /// сообщил PID.
+    pid: Option<u32>,
+    cancelled: bool,
+    /// Запуск вернул управление: PID больше не наш, убивать по нему нельзя.
+    finished: bool,
+}
+
+impl RunHandle {
+    /// Создаёт дескриптор незапущенного процесса.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Отменяет запуск: помечает дескриптор отменённым, будит ждущих и,
+    /// если процесс уже запущен и ещё не завершён, убивает его группу.
+    ///
+    /// Возврат из `cancel` означает, что убийство уже **отправлено** (а на
+    /// Unix — что `kill(2)` уже отработал): вызывающий может стартовать
+    /// следующий процесс, не рискуя оставить два живых сразу.
+    pub async fn cancel(&self) {
+        let pid = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.cancelled = true;
+            // После возврата из запуска PID уже не наш — см. doc типа.
+            if state.finished {
+                None
+            } else {
+                state.pid
+            }
+        };
+
+        self.notify.notify_waiters();
+
+        if let Some(pid) = pid {
+            kill_process_group(pid).await;
+        }
+    }
+
+    /// Была ли запрошена отмена. Так вызывающий отличает «процесс убит
+    /// нами» от «процесс отказал сам»: убитый сигналом процесс возвращает
+    /// обычный [`SidecarError::LaunchFailed`], неотличимый по значению.
+    pub fn was_cancelled(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cancelled
+    }
+
+    /// Ждёт отмены этого запуска.
+    ///
+    /// Продакшен-путь ждать отмену не умеет и не должен: настоящий запуск
+    /// узнаёт об отмене тем, что его процесс убит. Ожидание нужно
+    /// подменяемому запускателю в тестах оркестрации (TL-32) — он
+    /// изображает «процесс, который висит, пока его не убьют», не запуская
+    /// ничего. Отсюда `cfg(test)`: за пределами тестов у метода
+    /// вызывающего нет и быть не должно.
+    ///
+    /// Регистрация в [`tokio::sync::Notify`] делается **до** проверки
+    /// флага: иначе отмена, случившаяся между проверкой и ожиданием, была
+    /// бы потеряна, и ожидание не проснулось бы никогда.
+    #[cfg(test)]
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.was_cancelled() {
+                return;
+            }
+            notified.await;
+            if self.was_cancelled() {
+                return;
+            }
+        }
+    }
+
+    /// Связывает дескриптор с запущенным процессом.
+    ///
+    /// `false` — отмена пришла раньше запуска, и вызывающий обязан убить
+    /// процесс сам: к моменту прихода отмены убивать было нечего.
+    fn attach(&self, pid: Option<u32>) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pid = pid;
+        !state.cancelled
+    }
+
+    /// Закрывает дескриптор: запуск вернул управление.
+    fn finish(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.finished = true;
+    }
+}
+
+/// RAII-хэлпер: закрывает [`RunHandle`] при любом выходе из
+/// [`run_cancellable`] — дальше по этому PID убивать нельзя (см. doc
+/// [`RunHandle`], состояние 3).
+struct FinishGuard<'a>(&'a RunHandle);
+
+impl Drop for FinishGuard<'_> {
+    fn drop(&mut self) {
+        self.0.finish();
     }
 }
 

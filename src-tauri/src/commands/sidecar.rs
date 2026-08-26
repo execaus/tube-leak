@@ -135,7 +135,7 @@ pub async fn check_sidecar(
 /// тот же статус, что у отсутствующего sidecar-файла, с той же подсказкой
 /// пользователю. Подробную причину знает и показывает экран подготовки
 /// (`prepare_ytdlp`), дублировать её здесь незачем.
-fn resolve_ytdlp_path(app: &AppHandle) -> Result<PathBuf, SidecarError> {
+pub(super) fn resolve_ytdlp_path(app: &AppHandle) -> Result<PathBuf, SidecarError> {
     let data_dir = app.path().app_data_dir().map_err(|err| {
         eprintln!("yt-dlp: каталог данных приложения не определяется: {err}");
         SidecarError::NotFound
