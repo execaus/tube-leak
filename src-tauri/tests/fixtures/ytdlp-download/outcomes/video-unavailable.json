@@ -21,5 +21,5 @@
   },
   "exitCode": 1,
   "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=I67ewAeU9bU\n[youtube] I67ewAeU9bU: Downloading webpage\n[youtube] I67ewAeU9bU: Downloading visionos player API JSON\n",
-  "stderr": "WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one\nERROR: [youtube] I67ewAeU9bU: Video unavailable\n"
+  "stderr": "WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one\nERROR: [youtube] I67ewAeU9bU: This video is unavailable\n"
 }

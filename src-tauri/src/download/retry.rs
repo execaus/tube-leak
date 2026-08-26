@@ -41,13 +41,24 @@
 //! **своего** потока. Видео заканчивается на 18 294 110 байтах, следом
 //! начинается звук и первой же строкой сообщает 1024. Отметка «максимум,
 //! достигнутый задачей», снятая с сырых строк, после такого перехода
-//! перестала бы расти на всё время скачивания звука (2 МБ против 18 МБ
-//! видео) — и сторож объявил бы зависшей совершенно здоровую загрузку
-//! ровно через двадцать секунд после начала второго потока. Сумма по
-//! потокам растёт монотонно, и её уже считает агрегатор; заводить второе
-//! место, где та же величина выводится иначе, — верный способ их
-//! разойтись. Тест `a_healthy_switch_between_streams_is_not_a_stall`
-//! гоняет через политику снятые живьём строки обоих потоков.
+//! перестаёт расти на **всё** время скачивания звука: на снятой живьём
+//! фикстуре это 16 строк подряд — весь звуковой поток целиком (15 строк)
+//! плюс `finished` видео перед ним, то есть половина вывода загрузки.
+//!
+//! Сколько это секунд, зависит от длины ролика, и здесь пределы честности
+//! снятых данных: ролик фикстуры короткий, его звук укладывается в порог,
+//! и **сработавшим** сторож на ней не увидеть. Но серия покрывает поток
+//! целиком, а не его кусок, — значит на ролике, чей звук качается дольше
+//! двадцати секунд (то есть на любом сколько-нибудь длинном), наивный
+//! сторож объявит зависшей совершенно здоровую загрузку. Тест
+//! `a_healthy_switch_between_streams_is_not_a_stall` показывает и то и
+//! другое: механизм — на снятых байтах и снятой частоте строк,
+//! срабатывание — на тех же байтах с растянутым шагом, и растяжение в нём
+//! оговорено.
+//!
+//! Сумма по потокам растёт монотонно, и её уже считает агрегатор;
+//! заводить второе место, где та же величина выводится иначе, — верный
+//! способ их разойтись.
 //!
 //! # Числа
 //!
@@ -113,6 +124,17 @@ pub const NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(20);
 /// **внутренний** механизм повторов yt-dlp по времени, вместо того чтобы
 /// заставлять их сработать одновременно.
 ///
+/// # Решение владельца ожидается
+///
+/// Число меняет **сетевое поведение** приложения, а инвариант проекта
+/// требует вести себя как обычный пользователь: вдвое более короткий
+/// таймаут — вдвое более частые переподключения на медленной связи.
+/// Вопрос вынесен владельцу; до ответа значение остаётся здесь, и
+/// вернуть умолчание (20 с) — правка одной строки. Что при этом
+/// изменится, названо ниже: сторож и внутренние повторы yt-dlp снова
+/// сойдутся в одну точку, и какой из них сработает первым, будет решать
+/// планировщик.
+///
 /// Замерено на том же замолчавшем транспорте: с `--socket-timeout 10`
 /// yt-dlp обнаруживает тишину на 10-й секунде и переподключается сам, а
 /// на 20-й, если это не помогло, попытку забирает сторож
@@ -138,6 +160,18 @@ pub enum RetryDecision {
     /// Попытки исчерпаны: задача падает классом
     /// [`crate::download::DownloadFailure::ConnectionLost`] с этим
     /// числом попыток.
+    ///
+    /// **Технических деталей решение не несёт, и это обязанность
+    /// вызывающего.** `ConnectionLost` требует ещё и
+    /// [`crate::types::DownloadErrorDetails`] — хвост stderr и код
+    /// завершения, — а знает их не политика, а классификация: они
+    /// приезжают в
+    /// [`crate::download::classify::AttemptVerdict::Interrupted`] на
+    /// каждой неудачной попытке. Оркестрации (TL-44) держать последние
+    /// такие детали при себе и подставить их сюда; иначе в «Подробнее» у
+    /// исчерпания попыток не будет ничего, кроме слова «попытки
+    /// закончились», — а это ровно тот класс состояний без содержания,
+    /// который правило Н-4 и запрещает.
     GiveUp { attempts: u32 },
 }
 
@@ -155,9 +189,9 @@ pub enum RetryDecision {
 ///     // …запустить yt-dlp; на каждую применённую строку прогресса:
 ///     policy.observe(aggregator.received_bytes(), clock::monotonic_now());
 ///     // …и параллельно — таймер, а не опрос:
-///     //     tokio::time::sleep_until(policy.stall_deadline().into())
-///     //     перевооружается после каждого продвижения.
-///     match policy.attempt_failed(clock::monotonic_now()) {
+///     //     stall_deadline() отдаёт момент, только пока попытка идёт;
+///     //     таймер перевооружается после каждого продвижения.
+///     match policy.attempt_failed() {
 ///         RetryDecision::Retry { attempt, delay } => { /* пауза, событие */ }
 ///         RetryDecision::GiveUp { attempts } => { /* connectionLost */ }
 ///     }
@@ -176,6 +210,15 @@ pub struct RetryPolicy {
     /// Момент последнего продвижения либо начала попытки — от него
     /// отсчитывается сторож С-8.
     last_progress_at: Instant,
+    /// Идёт ли сейчас попытка.
+    ///
+    /// Сторожу продвижения нечего сторожить, пока процесса нет: между
+    /// неудачей и следующим запуском выдерживается пауза до минуты, и
+    /// таймер, вооружённый в этом промежутке, выстрелил бы **внутри
+    /// паузы**. Поэтому состояние живёт в поле, а
+    /// [`RetryPolicy::stall_deadline`] в этом промежутке не отдаёт
+    /// момента вовсе — ошибиться нечем.
+    attempt_running: bool,
 }
 
 impl RetryPolicy {
@@ -185,6 +228,7 @@ impl RetryPolicy {
             attempt: 1,
             high_water_bytes: 0,
             last_progress_at: now,
+            attempt_running: false,
         }
     }
 
@@ -208,6 +252,7 @@ impl RetryPolicy {
     /// прошли и двадцать секунд тишины, и пауза перед повтором.
     pub fn attempt_started(&mut self, now: Instant) {
         self.last_progress_at = now;
+        self.attempt_running = true;
     }
 
     /// Учесть суммарное число принятых байт задачи.
@@ -238,15 +283,17 @@ impl RetryPolicy {
     /// Отдаётся моментом, а не флагом, намеренно: по нему вооружается
     /// таймер. Опрос в цикле здесь работал бы, но требовал бы того, чего
     /// в этой фазе как раз и нет, — событий, на которых опрашивать.
-    pub fn stall_deadline(&self) -> Instant {
-        self.last_progress_at + NO_PROGRESS_TIMEOUT
+    pub fn stall_deadline(&self) -> Option<Instant> {
+        self.attempt_running
+            .then(|| self.last_progress_at + NO_PROGRESS_TIMEOUT)
     }
 
     /// Замерла ли попытка к моменту `now`.
     ///
     /// Для тех мест, где момент уже под рукой и заводить таймер незачем.
     pub fn is_stalled(&self, now: Instant) -> bool {
-        now >= self.stall_deadline()
+        self.stall_deadline()
+            .is_some_and(|deadline| now >= deadline)
     }
 
     /// Попытка не удалась — обрывом, зависанием или отказом процесса, по
@@ -255,7 +302,18 @@ impl RetryPolicy {
     /// Вызывать **только** для [`crate::download::classify::AttemptVerdict::Interrupted`]
     /// и для сработавшего сторожа: класс отказа, который повтором не
     /// чинится, до политики не доходит вовсе.
-    pub fn attempt_failed(&mut self, now: Instant) -> RetryDecision {
+    ///
+    /// Момента здесь нет в аргументах, и это не упущение: решение
+    /// «повторять или сдаться» зависит только от числа неудач подряд, а
+    /// отсчёт сторожа заводится от **старта** следующей попытки
+    /// ([`RetryPolicy::attempt_started`]), а не от неудачи предыдущей —
+    /// иначе пауза до минуты съедала бы всё окно сторожа ещё до того,
+    /// как процесс успеет запуститься.
+    pub fn attempt_failed(&mut self) -> RetryDecision {
+        // Попытки больше нет: сторожу нечего сторожить до тех пор, пока
+        // `attempt_started` не объявит следующую.
+        self.attempt_running = false;
+
         if self.attempt >= MAX_ATTEMPTS {
             return RetryDecision::GiveUp {
                 attempts: self.attempt,
@@ -264,9 +322,6 @@ impl RetryPolicy {
 
         let delay = delay_after(self.attempt);
         self.attempt += 1;
-        // Отсчёт сторожа не заводится здесь: попытка ещё не началась, а
-        // впереди пауза. Заведёт `attempt_started`.
-        self.last_progress_at = now;
         RetryDecision::Retry {
             attempt: self.attempt(),
             delay,
@@ -295,7 +350,7 @@ mod tests {
     use super::*;
     use crate::download::aggregate::{ProgressAggregator, SampleOutcome};
     use crate::download::fixtures;
-    use crate::download::progress::{parse_line, StdoutLine};
+    use crate::download::progress::{parse_line, ProgressSample, StdoutLine};
     use crate::types::{QualitySize, QualityStreams};
 
     /// Момент «начала времён» теста: фиксированная точка, от которой
@@ -325,7 +380,7 @@ mod tests {
 
         let mut delays = Vec::new();
         for second in 1..=5 {
-            match policy.attempt_failed(at(base, second)) {
+            match policy.attempt_failed() {
                 RetryDecision::Retry { attempt, delay } => {
                     assert_eq!(attempt.total, MAX_ATTEMPTS);
                     assert_eq!(attempt.number, second as u32 + 1);
@@ -337,7 +392,7 @@ mod tests {
 
         assert_eq!(delays, vec![5, 10, 20, 40, 60]);
         assert_eq!(
-            policy.attempt_failed(at(base, 6)),
+            policy.attempt_failed(),
             RetryDecision::GiveUp {
                 attempts: MAX_ATTEMPTS
             },
@@ -369,7 +424,7 @@ mod tests {
             );
 
             assert!(matches!(
-                policy.attempt_failed(at(base, round * 600 + 300)),
+                policy.attempt_failed(),
                 RetryDecision::Retry { .. }
             ));
         }
@@ -384,7 +439,7 @@ mod tests {
 
         assert!(policy.observe(995_883, at(base, 10)));
         assert!(matches!(
-            policy.attempt_failed(at(base, 20)),
+            policy.attempt_failed(),
             RetryDecision::Retry { .. }
         ));
         assert_eq!(policy.attempt().number, 2);
@@ -409,9 +464,10 @@ mod tests {
         // С-8: порог отсчитывается от последнего принятого байта.
         let base = t0();
         let mut policy = RetryPolicy::new(base);
+        policy.attempt_started(base);
 
         policy.observe(1024, at(base, 5));
-        assert_eq!(policy.stall_deadline(), at(base, 25));
+        assert_eq!(policy.stall_deadline(), Some(at(base, 25)));
 
         assert!(!policy.is_stalled(at(base, 24)));
         assert!(
@@ -423,8 +479,37 @@ mod tests {
 
         // Пришёл байт — отсчёт заводится заново, а не продолжается.
         policy.observe(2048, at(base, 24));
-        assert_eq!(policy.stall_deadline(), at(base, 44));
+        assert_eq!(policy.stall_deadline(), Some(at(base, 44)));
         assert!(!policy.is_stalled(at(base, 43)));
+    }
+
+    #[test]
+    fn the_watchdog_stays_silent_while_there_is_no_attempt_to_watch() {
+        // Между неудачей и следующим запуском выдерживается пауза до
+        // минуты. Таймер, вооружённый в этом промежутке от последнего
+        // принятого байта, выстрелил бы **внутри паузы** — то есть
+        // объявил бы зависшей попытку, которой ещё нет. Момента в этом
+        // промежутке не выдаётся вовсе: вооружать нечем.
+        let base = t0();
+        let mut policy = RetryPolicy::new(base);
+        policy.attempt_started(base);
+        policy.observe(1024, at(base, 5));
+
+        assert!(policy.stall_deadline().is_some(), "попытка идёт");
+        policy.attempt_failed();
+
+        assert_eq!(
+            policy.stall_deadline(),
+            None,
+            "попытки нет — сторожить нечего"
+        );
+        assert!(
+            !policy.is_stalled(at(base, 3600)),
+            "и никакая пауза не превращается в зависание сама по себе"
+        );
+
+        policy.attempt_started(at(base, 65)); // после паузы в 60 с
+        assert_eq!(policy.stall_deadline(), Some(at(base, 85)));
     }
 
     #[test]
@@ -435,11 +520,12 @@ mod tests {
         // принять.
         let base = t0();
         let mut policy = RetryPolicy::new(base);
+        policy.attempt_started(base);
 
         policy.observe(1024, at(base, 5));
         assert!(policy.is_stalled(at(base, 25)));
 
-        policy.attempt_failed(at(base, 25));
+        policy.attempt_failed();
         policy.attempt_started(at(base, 30)); // после паузы в 5 с
 
         assert!(!policy.is_stalled(at(base, 49)));
@@ -452,42 +538,35 @@ mod tests {
         // `downloaded_bytes` строки. Данные настоящие: снятый живьём
         // вывод загрузки `133+139`, где видео кончается на 18 МБ, а звук
         // начинается с килобайта.
-        let stdout = fixtures::stdout("video-and-audio.json");
-        let mut aggregator = ProgressAggregator::new(
-            &QualityStreams {
-                video_format_id: Some("133".to_string()),
-                audio_format_id: Some("139".to_string()),
-            },
-            QualitySize::Unknown,
-        )
-        .expect("два потока — агрегатор строится");
+        let samples = progress_samples("video-and-audio.json");
+        let mut aggregator = video_and_audio_aggregator();
 
         let base = t0();
         let mut policy = RetryPolicy::new(base);
-        let mut naive_high_water = 0u64;
-        let mut naive_still = 0;
-        let mut policy_still = 0;
-        let mut second = 0u64;
+        policy.attempt_started(base);
 
-        for line in stdout.lines() {
-            let StdoutLine::Progress(sample) = parse_line(line) else {
-                continue;
-            };
+        let mut naive_high_water = 0u64;
+        let mut naive_run = 0u32;
+        let mut longest_naive_run = 0u32;
+        let mut policy_still = 0;
+
+        for (index, sample) in samples.iter().enumerate() {
             // Строки идут раз в секунду — вдвое реже, чем на живой
             // загрузке (замер TL-41: медиана 0,18–0,46 с), и всё равно
             // втрое чаще порога сторожа.
-            second += 1;
-            let now = at(base, second);
+            let now = at(base, index as u64 + 1);
 
             // Как считала бы наивная политика — по сырым байтам строки.
             if sample.downloaded_bytes > naive_high_water {
                 naive_high_water = sample.downloaded_bytes;
+                naive_run = 0;
             } else {
-                naive_still += 1;
+                naive_run += 1;
+                longest_naive_run = longest_naive_run.max(naive_run);
             }
 
             assert!(matches!(
-                aggregator.apply(&sample),
+                aggregator.apply(sample),
                 SampleOutcome::Applied { .. }
             ));
             if !policy.observe(aggregator.received_bytes(), now) {
@@ -496,22 +575,84 @@ mod tests {
             assert!(
                 !policy.is_stalled(now),
                 "здоровая загрузка не должна выглядеть зависшей ни на одной \
-                 строке (секунда {second})"
+                 строке (строка {index})"
             );
         }
 
-        assert!(
-            naive_still > 10,
-            "фикстура снята ради перехода между потоками: наивный счёт по \
-             строке не увидел продвижения всего {naive_still} раз, и ловушка \
-             перестала быть ловушкой"
+        // Сколько именно строк держится наивная отметка — не «больше
+        // десяти», а ровно весь второй поток: 16 строк из 33. Число
+        // закреплено, потому что на нём стоит вывод «серия покрывает
+        // поток целиком, а не его кусок».
+        let audio_lines = samples
+            .iter()
+            .filter(|sample| sample.format_id == "139")
+            .count();
+        assert_eq!(
+            longest_naive_run as usize,
+            audio_lines + 1,
+            "серия начинается на одну строку раньше звука — на `finished` \
+             видео, где yt-dlp повторяет тот же счётчик, — и дальше идёт \
+             весь звуковой поток целиком, без единого просвета"
         );
+        assert_eq!(
+            (longest_naive_run, samples.len()),
+            (16, 33),
+            "фикстура изменилась — пересчитайте числа в шапке модуля, они \
+             сняты с неё"
+        );
+
         assert_eq!(
             policy_still, 2,
             "по сумме потоков не растут ровно две строки — по одной \
              `finished` на поток: yt-dlp повторяет в ней тот же счётчик, \
              что в последней `downloading`. Это не зависание, а конец \
              потока, и сторож переживает его с запасом"
+        );
+    }
+
+    #[test]
+    fn the_naive_watchdog_fires_on_a_stream_that_takes_longer_than_the_threshold() {
+        // Вторая половина того же: на коротком ролике фикстуры звук
+        // укладывается в порог, и **сработавшим** наивный сторож на ней
+        // не увидеть. Байты здесь снятые, а шаг растянут до двух секунд
+        // на строку — растяжение и есть допущение теста, и оно тут
+        // единственное. Оно же и есть обычная жизнь: звук ролика на час
+        // качается минутами, и наивная отметка стоит всё это время.
+        let samples = progress_samples("video-and-audio.json");
+        let mut aggregator = video_and_audio_aggregator();
+
+        let base = t0();
+        let mut policy = RetryPolicy::new(base);
+        policy.attempt_started(base);
+
+        let mut naive = RetryPolicy::new(base);
+        naive.attempt_started(base);
+
+        let mut naive_stalled_at = None;
+        for (index, sample) in samples.iter().enumerate() {
+            let now = at(base, (index as u64 + 1) * 2);
+
+            aggregator.apply(sample);
+            policy.observe(aggregator.received_bytes(), now);
+            naive.observe(sample.downloaded_bytes, now);
+
+            if naive.is_stalled(now) && naive_stalled_at.is_none() {
+                naive_stalled_at = Some(index);
+            }
+            assert!(
+                !policy.is_stalled(now),
+                "сумма по потокам растёт — зависания нет (строка {index})"
+            );
+        }
+
+        let stalled_at = naive_stalled_at.expect(
+            "наивный сторож обязан сработать: на растянутом шаге звук \
+             качается дольше порога",
+        );
+        assert_eq!(
+            samples[stalled_at].format_id, "139",
+            "срабатывает он ровно там, где ловушка и живёт, — на втором \
+             потоке, а не на дырке в выводе"
         );
     }
 
@@ -535,7 +676,7 @@ mod tests {
 
         // Обрыв, повтор, пауза — счётчик пошёл вверх.
         assert!(matches!(
-            policy.attempt_failed(at(base, 100)),
+            policy.attempt_failed(),
             RetryDecision::Retry { .. }
         ));
         assert_eq!(policy.attempt().number, 2);
@@ -558,6 +699,40 @@ mod tests {
     }
 
     #[test]
+    fn the_socket_timeout_of_the_constant_is_the_one_the_fixtures_were_shot_with() {
+        // Симметрия с шаблоном вывода прогресса: тот сверяется с
+        // фикстурами посимвольно, а таймаут сокета до сих пор не
+        // сверялся ничем — и требование к запуску (TL-44) тихо
+        // разошлось бы с числом, на котором стоят замеры.
+        //
+        // Сверять есть с чем: обе смоделированные фикстуры сняты
+        // запуском с этим аргументом, и обе показывают именно то
+        // поведение, ради которого он выбран.
+        let expected = SOCKET_TIMEOUT_SECS.to_string();
+
+        for name in [
+            "connection-lost-mid-download.json",
+            "stalled-killed-by-watchdog.json",
+        ] {
+            let argv = fixtures::outcome(name).capture.argv;
+            let at = argv
+                .iter()
+                .position(|arg| arg == "--socket-timeout")
+                .unwrap_or_else(|| {
+                    panic!("{name}: фикстура снята без --socket-timeout, а замеры сделаны с ним")
+                });
+
+            assert_eq!(
+                argv.get(at + 1).map(String::as_str),
+                Some(expected.as_str()),
+                "{name}: фикстура снята с другим таймаутом сокета. Число \
+                 сменили — переснимите фикстуры обрыва и перепроверьте \
+                 замеры в doc SOCKET_TIMEOUT_SECS, а не правьте эту строку"
+            );
+        }
+    }
+
+    #[test]
     fn the_socket_timeout_leaves_the_process_exactly_one_recovery_attempt() {
         // Связь двух чисел, ради которой они стоят рядом: у yt-dlp
         // должна быть ровно одна попытка переподключиться внутри окна
@@ -575,6 +750,28 @@ mod tests {
             "двух попыток в окне быть не должно: вторая уже не дешевле \
              честного повтора с паузой"
         );
+    }
+
+    /// Разобранные строки прогресса фикстуры — как есть, по порядку.
+    fn progress_samples(fixture: &str) -> Vec<ProgressSample> {
+        fixtures::stdout(fixture)
+            .lines()
+            .filter_map(|line| match parse_line(line) {
+                StdoutLine::Progress(sample) => Some(sample),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn video_and_audio_aggregator() -> ProgressAggregator {
+        ProgressAggregator::new(
+            &QualityStreams {
+                video_format_id: Some("133".to_string()),
+                audio_format_id: Some("139".to_string()),
+            },
+            QualitySize::Unknown,
+        )
+        .expect("два потока — агрегатор строится")
     }
 
     fn downloaded_bytes(fixture: &str) -> Vec<u64> {
