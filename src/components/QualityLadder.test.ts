@@ -1,5 +1,6 @@
 import { mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
+import { defineComponent, h } from 'vue'
 
 import type { QualityItem } from '@/types/probe'
 
@@ -75,5 +76,27 @@ describe('QualityLadder', () => {
     const newInputs = wrapper.findAll('input[type="radio"]')
     expect(newInputs.some((i) => (i.element as HTMLInputElement).checked)).toBe(false)
     expect(wrapper.find('.ladder__label').text()).toBe('Максимальное доступное (480p)')
+  })
+
+  it('scopes the radio group name per instance — two ladders on the same screen do not merge into one group (E4 concern)', () => {
+    // Обе лестницы обязаны жить в одном дереве приложения — `useId()`
+    // уникален в рамках инстанса Vue-приложения, а не глобально, поэтому
+    // два независимых mount() тут дали бы одинаковый id и не проверяли бы
+    // ничего.
+    const TwoLadders = defineComponent({
+      render: () =>
+        h('div', [
+          h(QualityLadder, { items: fullLadder, class: 'first' }),
+          h(QualityLadder, { items: fullLadder, class: 'second' }),
+        ]),
+    })
+
+    const wrapper = mount(TwoLadders)
+    const firstName = wrapper.find('.first input[type="radio"]').attributes('name')
+    const secondName = wrapper.find('.second input[type="radio"]').attributes('name')
+
+    expect(firstName).toBeTruthy()
+    expect(secondName).toBeTruthy()
+    expect(firstName).not.toBe(secondName)
   })
 })

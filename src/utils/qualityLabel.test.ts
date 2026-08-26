@@ -21,4 +21,13 @@ describe('qualityLabel', () => {
   it('labels the audioOnly step with a fixed caption', () => {
     expect(qualityLabel(item({ kind: 'audioOnly' }))).toBe('Только аудио')
   })
+
+  it('falls back to a safe caption instead of printing "undefinedp" when heightPx is missing (contract drift)', () => {
+    expect(qualityLabel(item({ kind: 'standard', heightPx: undefined }))).toBe('Видео')
+    expect(qualityLabel(item({ kind: 'maxAvailable', heightPx: undefined }))).toBe(
+      'Максимальное доступное качество',
+    )
+    expect(qualityLabel(item({ kind: 'standard', heightPx: undefined }))).not.toContain('undefined')
+    expect(qualityLabel(item({ kind: 'maxAvailable', heightPx: undefined }))).not.toContain('undefined')
+  })
 })

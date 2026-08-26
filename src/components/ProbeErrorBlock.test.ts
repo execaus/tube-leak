@@ -1,14 +1,14 @@
 import { mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
 
-import type { ProbeError, ProbeErrorKind } from '@/types/probe'
+import type { ProbeFailure } from '@/composables/useProbe'
 
 import ProbeErrorBlock from './ProbeErrorBlock.vue'
 
 const DECOY_MESSAGE = 'DECOY-MESSAGE-NOT-FROM-TABLE'
 
 const fixtures: Array<{
-  error: ProbeError
+  error: ProbeFailure
   expectedTitle: string
   expectRetry: boolean
 }> = [
@@ -77,12 +77,6 @@ describe('ProbeErrorBlock — заголовок из таблицы, не из 
     expect(retryButton !== undefined).toBe(expectRetry)
   })
 
-  it('covers all nine contract classes plus the notAUrl row of the table (defensive)', () => {
-    const covered = new Set<ProbeErrorKind>(fixtures.map((f) => f.error.kind))
-    covered.add('notAUrl')
-    expect(covered.size).toBe(9)
-  })
-
   it('surfaces the decoy message only inside the collapsed "Подробнее" block, not in the main text', async () => {
     const wrapper = mount(ProbeErrorBlock, {
       props: { error: { kind: 'videoUnavailable', message: DECOY_MESSAGE } },
@@ -94,6 +88,14 @@ describe('ProbeErrorBlock — заголовок из таблицы, не из 
     await detailsButton?.trigger('click')
 
     expect(wrapper.text()).toContain(DECOY_MESSAGE)
+  })
+
+  it('cannot even be typed with notAUrl — the blocker fix rules it out at compile time, not just by convention', () => {
+    // @ts-expect-error notAUrl уходит в состояние `notAUrl` (инлайн под полем,
+    // не блок) на уровне useLinkProbe — ProbeFailure структурно его не
+    // допускает, а не просто «не должен туда попадать по соглашению».
+    const notAllowed: ProbeFailure = { kind: 'notAUrl', message: 'unused' }
+    expect(notAllowed).toBeDefined()
   })
 })
 

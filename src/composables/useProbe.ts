@@ -40,12 +40,22 @@ const KNOWN_ERROR_KINDS: readonly ProbeErrorKind[] = [
 ]
 
 /**
- * То, что реально может оказаться отказом `probe_url`. Контрактный путь
- * честный ({@link ProbeError}), но неконтрактный отказ существует (паника
- * команды, отказ самого IPC-вызова) и должен быть учтён без каста вслепую
- * — тот же приём, что `PrepareFailure` в `useYtDlpPrepare.ts` (E1).
+ * То, что реально может оказаться отказом `probe_url`, **кроме** `notAUrl`
+ * — этот класс, даже если его вернуло ядро (Ф-2 отдаёт полную валидацию в
+ * Rust, фронтовая проверка — только быстрая подсказка), сводится к тому же
+ * состоянию `LinkProbeState['notAUrl']`, что и мгновенная фронтовая
+ * проверка, а не рисуется блоком ошибки (см. {@link useLinkProbe},
+ * "notAUrl из ядра"). Поэтому здесь он структурно исключён — `kind`
+ * сужен через `Exclude`, а не оставлен на совесть компонента.
+ *
+ * Контрактный путь честный ({@link ProbeError} без `notAUrl`), но
+ * неконтрактный отказ существует (паника команды, отказ самого
+ * IPC-вызова) и должен быть учтён без каста вслепую — тот же приём, что
+ * `PrepareFailure` в `useYtDlpPrepare.ts` (E1).
  */
-export type ProbeFailure = ProbeError | { kind?: undefined; message: string }
+export type ProbeFailure =
+  | (Omit<ProbeError, 'kind'> & { kind: Exclude<ProbeErrorKind, 'notAUrl'> })
+  | { kind?: undefined; message: string }
 
 function isProbeError(value: unknown): value is ProbeError {
   if (typeof value !== 'object' || value === null) return false
@@ -57,8 +67,21 @@ function isProbeError(value: unknown): value is ProbeError {
   )
 }
 
+/**
+ * Превращает отклонение `probeUrl` в {@link ProbeFailure}. Вызывающая
+ * сторона обязана сама развести `notAUrl` на состояние `notAUrl` ещё
+ * *до* вызова этой функции (см. {@link dispatchProbe}) — здесь он
+ * трактуется как неконтрактный случай и падает в общий фолбэк, что
+ * является защитой на случай нарушения этого протокола, а не основным
+ * путём.
+ */
 function toProbeFailure(err: unknown): ProbeFailure {
-  if (isProbeError(err)) return err
+  // Проверка `err.kind !== 'notAUrl'` сужает тип свойства `err.kind`, но не
+  // тип всего `err` (`ProbeError` — плоский интерфейс, не размеченное
+  // объединение по вариантам) — TS не свяжет это с более узким `ProbeFailure`
+  // автоматически. Каст безопасен: на этой строке рантайм уже гарантировал,
+  // что `kind` не `notAUrl`.
+  if (isProbeError(err) && err.kind !== 'notAUrl') return err as ProbeFailure
   if (err instanceof Error) return { message: err.message }
   if (typeof err === 'string' && err.length > 0) return { message: err }
   return { message: 'Разбор ролика завершился нераспознанной ошибкой.' }
@@ -66,7 +89,10 @@ function toProbeFailure(err: unknown): ProbeFailure {
 
 /**
  * Состояние карточной области экрана (дизайн E2, раздел «Состояния») —
- * ровно одно одновременно с полем ссылки.
+ * ровно одно одновременно с полем ссылки. `notAUrl` покрывает и
+ * мгновенную фронтовую проверку, и класс `notAUrl`, пришедший из ядра
+ * (см. doc {@link useLinkProbe}) — представление одно и то же независимо
+ * от источника.
  */
 export type LinkProbeState =
   | { kind: 'empty' }
@@ -102,6 +128,20 @@ export interface UseLinkProbeReturn {
  * немедленно). Очистка поля, вторая ссылка и правка уже вставленной — не
  * три ветки, а один и тот же путь с разным содержимым на входе.
  *
+ * # `notAUrl` из ядра — то же состояние, что и мгновенная проверка (блокер ревью)
+ *
+ * Фронтовая проверка {@link looksLikeUrl} — не полная валидация (Ф-2
+ * отдаёт её Rust целиком, здесь только быстрая подсказка «стоит ли вообще
+ * пробовать»). Значит, ядро может вернуть класс `notAUrl` даже после того,
+ * как фронт счёл содержимое похожим на ссылку и запустил разбор — путь
+ * реальный: достаточно набрать `https://` руками и замереть на 400 мс,
+ * не успев дописать хост. Такой отказ **не должен** рисоваться блоком
+ * ошибки (там нет технических деталей — процесс не запускался вовсе, и
+ * заголовка «Это не ссылка» в таблице дизайна для блочного представления
+ * попросту нет, только инлайн) — он сводится к тому же `state.value =
+ * {kind:'notAUrl'}`, что и локальная мгновенная проверка, той же веткой
+ * рендера в `ProbeSection.vue`.
+ *
  * # Сторож по поколениям (обязателен, TL-27 review, К-4)
  *
  * Наивная защита «есть ли активный запрос» не закрывает случай, когда
@@ -114,12 +154,13 @@ export interface UseLinkProbeReturn {
  * Поэтому здесь — монотонный счётчик `generation`, увеличиваемый в
  * {@link evaluate} на **каждое** решение по содержимому поля (на каждое
  * изменение — evaluate вызывается и для мгновенных веток, и для той, что
- * готовит debounce). Каждый вызов {@link dispatchProbe} запоминает
- * поколение, с которым он был запущен, и при разрешении/отклонении
- * промиса `probeUrl` сверяет его с текущим — несовпадение отбрасывает
- * результат целиком, **и resolve, и reject**, не трогая `state`. Ключ —
- * именно счётчик, не URL: одна и та же ссылка, вставленная дважды, и
- * расхождения нормализации не ломают сравнение.
+ * готовит debounce; `retry()` тоже проходит через {@link evaluate} и
+ * получает собственное поколение). Каждый вызов {@link dispatchProbe}
+ * запоминает поколение, с которым он был запущен, и при
+ * разрешении/отклонении промиса `probeUrl` сверяет его с текущим —
+ * несовпадение отбрасывает результат целиком, **и resolve, и reject**, не
+ * трогая `state`. Ключ — именно счётчик, не URL: одна и та же ссылка,
+ * вставленная дважды, и расхождения нормализации не ломают сравнение.
  */
 export function useLinkProbe(): UseLinkProbeReturn {
   const url = ref('')
@@ -177,6 +218,14 @@ export function useLinkProbe(): UseLinkProbeReturn {
         if (myGeneration !== generation) return
         inFlight = false
         clearSlowTimer()
+
+        // Блокер ревью: `notAUrl` из ядра — то же состояние, что и
+        // мгновенная фронтовая проверка, не блок ошибки (см. doc выше).
+        if (isProbeError(err) && err.kind === 'notAUrl') {
+          state.value = { kind: 'notAUrl' }
+          return
+        }
+
         state.value = { kind: 'error', error: toProbeFailure(err) }
       })
   }
@@ -223,7 +272,7 @@ export function useLinkProbe(): UseLinkProbeReturn {
     evaluate(value, { immediate: false })
   })
 
-  /** Повтор по кнопке «Повторить» — сознательно без ожидания тишины ввода. */
+  /** Повтор по кнопке «Повторить» — сознательно без ожидания тишины ввода, но со своим поколением. */
   function retry(): void {
     evaluate(url.value, { immediate: true })
   }
@@ -231,6 +280,12 @@ export function useLinkProbe(): UseLinkProbeReturn {
   onUnmounted(() => {
     clearDebounceTimer()
     clearSlowTimer()
+    // Отмена обязательна на каждом этапе (CLAUDE.md) — включая уход с
+    // экрана: сегодня недостижимо (экраны E1 не поднимаются заново после
+    // готовности), но E3/E4 добавят экраны, и полагаться на
+    // недостижимость как на защиту — тот же класс риска, на котором
+    // проект уже обжигался.
+    cancelIfInFlight()
   })
 
   return { url, state, retry }

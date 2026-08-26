@@ -15,7 +15,7 @@
  * список `items` новым массивом — выбор сбрасывается по смене ссылки на
  * объект, без сравнения по идентификатору строки.
  */
-import { ref, watch } from 'vue'
+import { ref, useId, watch } from 'vue'
 
 import type { QualityItem } from '@/types/probe'
 import { formatApproxSize } from '@/utils/formatApproxSize'
@@ -26,6 +26,14 @@ const props = defineProps<{
 }>()
 
 const selectedIndex = ref<number>()
+
+/**
+ * `name` радио-группы должен быть уникален на экране — общая строка
+ * (`"quality"`) сегодня безобидна (в E2 лестница ровно одна), но E4
+ * положит на экран несколько карточек с собственными лестницами, и общее
+ * имя склеило бы их в одну группу выбора (замечание ревью TL-33).
+ */
+const groupName = `quality-${useId()}`
 
 watch(
   () => props.items,
@@ -52,7 +60,7 @@ function select(index: number): void {
     >
       <input
         type="radio"
-        name="quality"
+        :name="groupName"
         class="ladder__radio"
         :checked="selectedIndex === index"
         @change="select(index)"

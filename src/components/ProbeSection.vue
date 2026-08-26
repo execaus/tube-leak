@@ -8,7 +8,7 @@
  * (`ytDlpState`, передаётся родителем из `useSidecarCheck`) — статус
  * ffmpeg его не блокирует, потому что разбор ролика ffmpeg не использует.
  */
-import { computed } from 'vue'
+import { computed, useId } from 'vue'
 
 import { useLinkProbe } from '@/composables/useProbe'
 
@@ -26,6 +26,9 @@ const props = defineProps<{
 }>()
 
 const { url, state, retry } = useLinkProbe()
+
+/** Стабильный id, связывающий видимый `<label>` с полем (доступность: не только aria-label). */
+const inputId = useId()
 
 const disabled = computed(() => props.ytDlpState !== 'ready')
 
@@ -51,14 +54,17 @@ const inlineNotAUrlText = computed(() =>
 
 <template>
   <section class="probe-section">
-    <h2 class="probe-section__label">
+    <label
+      :for="inputId"
+      class="probe-section__label"
+    >
       Ссылка на видео
-    </h2>
+    </label>
     <input
+      :id="inputId"
       v-model="url"
       type="text"
       class="probe-section__input tap-target"
-      aria-label="Ссылка на видео"
       :disabled="disabled"
       :placeholder="placeholder"
     >

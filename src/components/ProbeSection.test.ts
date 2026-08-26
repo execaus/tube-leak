@@ -90,6 +90,25 @@ describe('ProbeSection — «не ссылка» инлайн, не блок (С
     await wrapper.find('input').setValue('https://youtu.be/x')
     expect(wrapper.find('.probe-section__inline-error').text()).toBe('')
   })
+
+  it('renders a notAUrl rejection from the core the same way as the instant check — inline, no block, no retry (blocker fix)', async () => {
+    // Путь реальный: фронтовая проверка — не полная валидация (Ф-2), можно
+    // замереть на 400мс сразу после "https://" и получить честный notAUrl
+    // от ядра уже после того, как разбор запустился.
+    const wrapper = mount(ProbeSection, { props: { ytDlpState: 'ready' } })
+    const err: ProbeError = { kind: 'notAUrl', message: 'core: rejected shape' }
+    invokeMock.mockRejectedValueOnce(err)
+
+    await wrapper.find('input').setValue('https://y.y')
+    await vi.advanceTimersByTimeAsync(400)
+    await vi.waitFor(() => {
+      expect(wrapper.find('.probe-section__inline-error').text()).not.toBe('')
+    })
+
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(wrapper.findAll('button').find((b) => b.text() === 'Повторить')).toBeUndefined()
+    expect(wrapper.find('.probe-section__inline-error').text()).toContain('не похоже на ссылку')
+  })
 })
 
 describe('ProbeSection — «получаем данные…» и медленная подсказка', () => {

@@ -214,6 +214,23 @@ describe('useLinkProbe — success and error resolution', () => {
     })
     expect(result.state.value).toStrictEqual({ kind: 'error', error: { message: 'IPC exploded' } })
   })
+
+  it('reduces a notAUrl rejection from the core to the same notAUrl state as the instant front-end check, not an error block (blocker fix)', async () => {
+    // Путь реальный, не теоретический (ревью TL-33): фронтовая проверка —
+    // не полная валидация (Ф-2 отдаёт её Rust), значит ядро может честно
+    // вернуть notAUrl даже для содержимого, которое фронт счёл похожим на
+    // ссылку и на котором уже начался разбор.
+    const { result } = withSetup(() => useLinkProbe())
+    const err: ProbeError = { kind: 'notAUrl', message: 'core: not a supported url shape' }
+    invokeMock.mockRejectedValueOnce(err)
+
+    result.url.value = 'https://y.y'
+    await vi.advanceTimersByTimeAsync(400)
+    await vi.waitFor(() => {
+      expect(result.state.value.kind).toBe('notAUrl')
+    })
+    expect(result.state.value).toStrictEqual({ kind: 'notAUrl' })
+  })
 })
 
 describe('useLinkProbe — сторож по поколениям (К-4, TL-27 review)', () => {
@@ -423,5 +440,81 @@ describe('useLinkProbe — retry', () => {
     await vi.waitFor(() => {
       expect(result.state.value).toStrictEqual({ kind: 'success', result: resultA })
     })
+  })
+
+  it('bumps the generation on retry() — a stale response from before the retry click is discarded', async () => {
+    const { result } = withSetup(() => useLinkProbe())
+
+    let resolveFirst: (value: ProbeResult) => void = () => {}
+    invokeMock.mockImplementationOnce(
+      () =>
+        new Promise<ProbeResult>((resolve) => {
+          resolveFirst = resolve
+        }),
+    )
+
+    result.url.value = 'https://youtu.be/a'
+    await vi.advanceTimersByTimeAsync(400)
+    expect(invokeMock).toHaveBeenCalledTimes(1)
+
+    invokeMock.mockResolvedValueOnce(resultB)
+    result.retry()
+    expect(invokeMock).toHaveBeenCalledTimes(2)
+    await vi.waitFor(() => {
+      expect(result.state.value).toStrictEqual({ kind: 'success', result: resultB })
+    })
+
+    // Ответ на самый первый (уже вытесненный retry'ем) вызов приходит
+    // позже — он обязан быть отброшен тем же сторожем по поколениям.
+    resolveFirst(resultA)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(result.state.value).toStrictEqual({ kind: 'success', result: resultB })
+  })
+})
+
+describe('useLinkProbe — очистка при размонтировании', () => {
+  it('does not fire the debounced probe after the component unmounts', async () => {
+    const { result, unmount } = withSetup(() => useLinkProbe())
+
+    result.url.value = 'https://youtu.be/a'
+    unmount()
+
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(invokeMock).not.toHaveBeenCalled()
+  })
+
+  it('does not fire the "slow" hint timer after the component unmounts', async () => {
+    const { result, unmount } = withSetup(() => useLinkProbe())
+    invokeMock.mockReturnValue(new Promise(() => {}))
+
+    result.url.value = 'https://youtu.be/a'
+    await vi.advanceTimersByTimeAsync(400)
+    expect(result.state.value).toStrictEqual({ kind: 'loading', slow: false })
+
+    unmount()
+    // Размонтирование само по себе зовёт cancel_probe (см. следующий тест)
+    // — единственный вызов invoke сверх исходного probe_url. Значимая
+    // проверка здесь — что после unmount больше НИЧЕГО не прибавляется:
+    // ни отложенный debounce, ни 6-секундный таймер "slow" не должны были
+    // пережить очистку и вызвать что-то ещё.
+    const callsRightAfterUnmount = invokeMock.mock.calls.length
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(invokeMock.mock.calls.length).toBe(callsRightAfterUnmount)
+  })
+
+  it('calls cancel_probe on unmount when a probe is in flight (Ф-8, "отмена обязательна на каждом этапе")', async () => {
+    const { result, unmount } = withSetup(() => useLinkProbe())
+    invokeMock.mockImplementation(() => new Promise(() => {}))
+
+    result.url.value = 'https://youtu.be/a'
+    await vi.advanceTimersByTimeAsync(400)
+    expect(invokeMock).toHaveBeenCalledTimes(1)
+
+    invokeMock.mockResolvedValueOnce(undefined)
+    unmount()
+    await Promise.resolve()
+
+    expect(invokeMock).toHaveBeenCalledWith('cancel_probe')
   })
 })

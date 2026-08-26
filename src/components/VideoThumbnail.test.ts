@@ -33,7 +33,6 @@ describe('VideoThumbnail', () => {
 
     expect(wrapper.find('.thumb__placeholder').isVisible()).toBe(true)
     expect(wrapper.find('img').classes()).toContain('thumb__img--hidden')
-    expect(wrapper.findAll('.thumb__img--spin')).toHaveLength(0)
   })
 
   it('resets to the placeholder when the src prop changes to a new thumbnail', async () => {

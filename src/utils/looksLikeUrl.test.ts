@@ -21,6 +21,11 @@ describe('looksLikeUrl', () => {
     'www.youtube.com/watch?v=x',
     'ftp://example.com/video',
     'javascript:alert(1)',
+    // Дёшево отсеивает заведомый мусор ещё во фронтовой проверке (ревью
+    // TL-33, Н-2) — хост без точки не бывает настоящим доменом YouTube.
+    'https://w',
+    'https://localhost',
+    'https://',
   ])('rejects %s', (value) => {
     expect(looksLikeUrl(value)).toBe(false)
   })

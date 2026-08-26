@@ -1,8 +1,17 @@
 import type { ProbeErrorKind, YtDlpFailureReason } from '@/types/probe'
 
 /**
- * Тексты и правило показа «Повторить» для девяти классов ошибок разбора
- * (Ф-6), строго по таблице раздела «Состояния» дизайна E2.
+ * Тексты и правило показа «Повторить» для восьми классов ошибок разбора,
+ * которые рисуются блоком (`role="alert"`), строго по таблице раздела
+ * «Состояния» дизайна E2. Девятый класс, `notAUrl`, здесь нет вовсе —
+ * даже пришедший из ядра (Ф-2: полная валидация — на стороне Rust,
+ * фронтовая проверка лишь подсказка), он сводится к тому же
+ * состоянию, что и мгновенная фронтовая проверка (см. doc-комментарий
+ * `useLinkProbe` в `src/composables/useProbe.ts`), и рисуется инлайн под
+ * полем, а не блоком: у него нет заголовка блочного представления в
+ * таблице дизайна (там прочерк) и нет технических деталей («Подробнее») —
+ * процесс не запускался. Поэтому `kind` здесь сужен через `Exclude` —
+ * подать сюда `notAUrl` не получится даже по ошибке (блокер ревью TL-33).
  *
  * # Нормативно: не `ProbeError.message`
  *
@@ -23,12 +32,8 @@ export interface ProbeErrorText {
   canRetry: boolean
 }
 
-const NOT_A_URL_TEXT: ProbeErrorText = {
-  title: 'Это не ссылка',
-  explanation:
-    'Это не похоже на ссылку на ролик YouTube. Проверьте, что скопировали именно адрес страницы (https://…).',
-  canRetry: false,
-}
+/** Классы, которые рисуются блоком ошибки — все, кроме `notAUrl` (см. doc выше). */
+export type BlockProbeErrorKind = Exclude<ProbeErrorKind, 'notAUrl'>
 
 const VIDEO_UNAVAILABLE_TEXT: ProbeErrorText = {
   title: 'Ролик недоступен',
@@ -90,17 +95,17 @@ function timeoutText(timeoutSecs: number | undefined): ProbeErrorText {
 }
 
 /**
- * Текст по классу ошибки (Ф-6), строго из таблицы дизайна. Сигнатура не
- * принимает `message` — подмена структурно невозможна (см. doc выше).
+ * Текст по классу ошибки, строго из таблицы дизайна. Сигнатура не
+ * принимает `message` — подмена структурно невозможна (см. doc выше); не
+ * принимает и `notAUrl` — по той же причине структурно, не только по
+ * соглашению.
  */
 export function getProbeErrorText(
-  kind: ProbeErrorKind,
+  kind: BlockProbeErrorKind,
   reason?: YtDlpFailureReason,
   timeoutSecs?: number,
 ): ProbeErrorText {
   switch (kind) {
-    case 'notAUrl':
-      return NOT_A_URL_TEXT
     case 'videoUnavailable':
       return VIDEO_UNAVAILABLE_TEXT
     case 'signInRequired':

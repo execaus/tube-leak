@@ -4,6 +4,9 @@
  * Название рисуется как есть, без обрезания (К-1 требует посимвольного
  * совпадения с YouTube — `white-space: normal` вместо ellipsis).
  * Имя канала и превью не рисуются, если данных нет (Ф-5, Р-2).
+ *
+ * Превью — `alt=""` (декоративное): название уже показано текстом рядом,
+ * иначе скринридер зачитал бы его дважды подряд.
  */
 import type { ProbeResult } from '@/types/probe'
 import { formatDuration } from '@/utils/formatDuration'
@@ -22,7 +25,7 @@ defineProps<{
       <VideoThumbnail
         v-if="result.thumbnailUrl"
         :src="result.thumbnailUrl"
-        :alt="result.title"
+        alt=""
       />
       <div class="video-card__info">
         <h2 class="video-card__title">

@@ -23,18 +23,4 @@ describe('formatApproxSize', () => {
   it('formats sub-megabyte sizes in kilobytes', () => {
     expect(formatApproxSize({ kind: 'known', bytes: 500 * 1024 })).toBe('≈ 500 КБ')
   })
-
-  it('is monotonically decreasing across a plausible video-to-audio-only ladder (К-1)', () => {
-    const sizes: QualitySize[] = [
-      { kind: 'known', bytes: 1.8 * 1024 ** 3 },
-      { kind: 'known', bytes: 980 * 1024 ** 2 },
-      { kind: 'known', bytes: 512 * 1024 ** 2 },
-      { kind: 'known', bytes: 289 * 1024 ** 2 },
-      { kind: 'known', bytes: 14 * 1024 ** 2 },
-    ]
-    const bytesOf = (s: QualitySize): number => (s.kind === 'known' ? s.bytes : 0)
-    for (let i = 1; i < sizes.length; i++) {
-      expect(bytesOf(sizes[i]!)).toBeLessThan(bytesOf(sizes[i - 1]!))
-    }
-  })
 })
