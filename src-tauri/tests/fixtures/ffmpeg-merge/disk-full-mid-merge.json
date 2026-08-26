@@ -1,0 +1,30 @@
+{
+  "_capture": {
+    "note": "Место кончилось по ходу записи результата: том 6 МиБ.",
+    "reality": "live",
+    "argv": [
+      "-hide_banner",
+      "-loglevel",
+      "warning",
+      "-y",
+      "-i",
+      "file:<video>",
+      "-i",
+      "file:<audio>",
+      "-map",
+      "0:v:0",
+      "-map",
+      "1:a:0",
+      "-c",
+      "copy",
+      "file:<output>"
+    ],
+    "ffmpegVersion": "9.0.1",
+    "ffmpegVersionRaw": "ffmpeg version 9.0.1-https://www.martin-riedl.de Copyright (c) 2000-2026 the FFmpeg developers",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 228,
+  "outputLeftBytes": 6078464,
+  "stdout": "",
+  "stderr": "[vost#0:0/copy @ 0x151e080a0] Error submitting a packet to the muxer: No space left on device\n    Last message repeated 1 times\n[out#0/mp4 @ 0x60000365c6c0] Error muxing a packet\n[out#0/mp4 @ 0x60000365c6c0] Task finished with error code: -28 (No space left on device)\n[out#0/mp4 @ 0x60000365c6c0] Terminating thread with return code -28 (No space left on device)\n[out#0/mp4 @ 0x60000365c6c0] Error writing trailer: No space left on device\n[out#0/mp4 @ 0x60000365c6c0] Error closing file: No space left on device\n"
+}

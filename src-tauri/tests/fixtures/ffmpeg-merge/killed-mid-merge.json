@@ -1,0 +1,30 @@
+{
+  "_capture": {
+    "note": "Перепаковка убита группой процессов на середине.",
+    "reality": "live",
+    "argv": [
+      "-hide_banner",
+      "-loglevel",
+      "warning",
+      "-y",
+      "-i",
+      "file:<video>",
+      "-i",
+      "file:<audio>",
+      "-map",
+      "0:v:0",
+      "-map",
+      "1:a:0",
+      "-c",
+      "copy",
+      "file:<output>"
+    ],
+    "ffmpegVersion": "9.0.1",
+    "ffmpegVersionRaw": "ffmpeg version 9.0.1-https://www.martin-riedl.de Copyright (c) 2000-2026 the FFmpeg developers",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": null,
+  "outputLeftBytes": 78643248,
+  "stdout": "",
+  "stderr": ""
+}

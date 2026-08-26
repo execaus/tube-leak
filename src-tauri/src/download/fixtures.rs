@@ -1,14 +1,17 @@
-//! Доступ к фикстурам вывода yt-dlp для тестов скачивания (Ф-11).
+//! Доступ к фикстурам вывода внешних процессов для тестов скачивания
+//! (Ф-11).
 //!
 //! Только для тестов: модуль объявлен под `#[cfg(test)]` и в сборку
 //! приложения не попадает. Читать фикстуры из двух модулей сразу (разбор
 //! строк и агрегация) двумя копиями кода — гарантированное расхождение,
 //! поэтому конверт и его сверка живут в одном месте.
 //!
-//! Наборов два, и конверты у них разные: `progress/` — stdout идущей
-//! загрузки (TL-41), `outcomes/` — код завершения и stderr законченной
-//! попытки (TL-43). Формат каждого конверта и правила пересъёмки — в
-//! README рядом с ним.
+//! Наборов три, и конверты у них разные: `ytdlp-download/progress/` —
+//! stdout идущей загрузки (TL-41), `ytdlp-download/outcomes/` — код
+//! завершения и stderr законченной попытки yt-dlp (TL-43),
+//! `ffmpeg-merge/` — то же для процесса склейки, но инструмент другой
+//! (TL-42). Формат каждого конверта и правила пересъёмки — в README рядом
+//! с ним.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -176,16 +179,33 @@ pub fn probe_metadata(name: &str) -> Value {
 /// фикстуры заморожены, а yt-dlp нет, поэтому смена пина обязана ломать
 /// тест и заставлять переснять фикстуры.
 pub fn pinned_yt_dlp_version() -> String {
+    pinned_version("ytDlp")
+}
+
+/// Версия ffmpeg из того же пина — та, которой сняты фикстуры склейки
+/// (TL-42).
+///
+/// Сторож ровно того же смысла, что и у yt-dlp: формулировки ошибок и
+/// коды завершения задаёт апстрим ffmpeg, а фикстуры заморожены. Отличие
+/// одно — вложенный бинарник называет себя строкой с суффиксом сборщика
+/// (`9.0.1-https://www.martin-riedl.de`), поэтому фикстура хранит и
+/// сырую строку тоже, а тест сводит её к этому значению тем же
+/// `parse_ffmpeg_version`, которым пользуется служебный экран E1.
+pub fn pinned_ffmpeg_version() -> String {
+    pinned_version("ffmpeg")
+}
+
+fn pinned_version(tool: &str) -> String {
     let path = manifest_dir().join("binaries.lock.json");
     let raw = fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("пин {} не читается: {err}", path.display()));
     let pin: Value = serde_json::from_str(&raw)
         .unwrap_or_else(|err| panic!("пин {} — не JSON: {err}", path.display()));
 
-    pin.get("ytDlp")
-        .and_then(|yt_dlp| yt_dlp.get("version"))
+    pin.get(tool)
+        .and_then(|entry| entry.get("version"))
         .and_then(Value::as_str)
-        .expect("в пине объявлена версия yt-dlp")
+        .unwrap_or_else(|| panic!("в пине объявлена версия {tool}"))
         .to_owned()
 }
 
@@ -197,6 +217,109 @@ pub fn pinned_yt_dlp_version() -> String {
 /// не будучи им.
 pub fn files_on_disk() -> Vec<String> {
     json_files_in(&progress_dir())
+}
+
+/// Все фикстуры склейки (TL-42). Порядок — успехи, потом отказы.
+///
+/// Третий набор с третьим конвертом, и снят он **другим инструментом**:
+/// здесь вывод ffmpeg, а не yt-dlp. Общего с исходами скачивания у него
+/// только форма («что осталось от процесса»), поэтому и каталог свой —
+/// `tests/fixtures/ffmpeg-merge/`.
+pub const MERGE_FIXTURES: &[&str] = &[
+    "success-mp4-h264-aac.json",
+    "success-webm-vp9-opus.json",
+    "success-mkv-mixed.json",
+    "success-awkward-filename.json",
+    "container-refuses-codec.json",
+    "input-missing.json",
+    "input-truncated.json",
+    "output-not-writable.json",
+    "disk-full-mid-merge.json",
+    "killed-mid-merge.json",
+];
+
+/// Обстоятельства съёмки фикстуры склейки.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeCapture {
+    /// Чем интересна эта фикстура — тот же текст, что в README.
+    #[allow(dead_code)]
+    pub note: String,
+    /// Аргументы запуска с плейсхолдерами `<video>`, `<audio>`,
+    /// `<output>` вместо путей (сами пути вели во временный каталог
+    /// съёмки и ничего не значат).
+    pub argv: Vec<String>,
+    /// Версия из пина, которой снята фикстура.
+    pub ffmpeg_version: String,
+    /// Первая строка `ffmpeg -version` вложенного бинарника — как есть,
+    /// с суффиксом сборщика.
+    pub ffmpeg_version_raw: String,
+    #[allow(dead_code)]
+    pub captured_at: String,
+    reality: String,
+}
+
+impl MergeCapture {
+    /// Снят ли исход живьём. Обязательное поле — по той же причине, что и
+    /// у исходов скачивания: неизвестного происхождения фикстур в этом
+    /// проекте не бывает.
+    pub fn is_live(&self) -> bool {
+        match self.reality.as_str() {
+            "live" => true,
+            "modelled" => false,
+            other => panic!(
+                "у фикстуры склейки обязано быть поле _capture.reality со \
+                 значением live или modelled, а не {other:?}"
+            ),
+        }
+    }
+}
+
+/// Снятый исход одного запуска ffmpeg.
+#[derive(Debug)]
+pub struct MergeOutcome {
+    pub capture: MergeCapture,
+    /// Код завершения; `None` — процесс убит сигналом.
+    pub exit_code: Option<i32>,
+    /// Сколько байт занимал файл результата после завершения процесса;
+    /// `None` — файла не появилось вовсе. Это факт о диске, ради которого
+    /// и существует подчистка в [`crate::download::merge`].
+    pub output_left_bytes: Option<u64>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeEnvelope {
+    #[serde(rename = "_capture")]
+    capture: MergeCapture,
+    exit_code: Option<i32>,
+    output_left_bytes: Option<u64>,
+    stdout: String,
+    stderr: String,
+}
+
+/// Снятый исход склейки: конверт `ffmpeg-merge/<имя>.json`.
+pub fn merge_outcome(name: &str) -> MergeOutcome {
+    let path = merge_dir().join(name);
+    let raw = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("фикстура {} не читается: {err}", path.display()));
+    let envelope: MergeEnvelope = serde_json::from_str(&raw)
+        .unwrap_or_else(|err| panic!("фикстура {} — не тот конверт: {err}", path.display()));
+
+    MergeOutcome {
+        capture: envelope.capture,
+        exit_code: envelope.exit_code,
+        output_left_bytes: envelope.output_left_bytes,
+        stdout: envelope.stdout,
+        stderr: envelope.stderr,
+    }
+}
+
+/// Имена файлов, реально лежащих в каталоге фикстур склейки, по алфавиту.
+pub fn merge_files_on_disk() -> Vec<String> {
+    json_files_in(&merge_dir())
 }
 
 fn json_files_in(dir: &Path) -> Vec<String> {
@@ -229,4 +352,8 @@ fn progress_dir() -> PathBuf {
 
 fn outcomes_dir() -> PathBuf {
     fixtures_root().join("ytdlp-download").join("outcomes")
+}
+
+fn merge_dir() -> PathBuf {
+    fixtures_root().join("ffmpeg-merge")
 }
