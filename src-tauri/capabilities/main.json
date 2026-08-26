@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Разрешения основного окна. В Tauri 2 фронтенду доступны только явно перечисленные здесь core-команды; всё остальное отклоняется с «Command … not allowed by ACL» (TL-24, #25). Набор минимальный: каждое разрешение соответствует вызову, который реально есть в src/, и добавляется только вместе с таким вызовом.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}
