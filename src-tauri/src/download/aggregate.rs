@@ -73,7 +73,7 @@
 
 use crate::download::progress::{ProgressSample, SampleStatus};
 use crate::types::{
-    DownloadAttempt, DownloadPercent, DownloadPlan, DownloadStream, DownloadingState,
+    DownloadAttempt, DownloadPercent, DownloadPlan, DownloadStream, DownloadingState, QualitySize,
     QualityStreams,
 };
 
@@ -165,10 +165,11 @@ pub struct ProgressAggregator {
     video: Option<StreamState>,
     audio: Option<StreamState>,
     /// Оценка размера пункта из разбора E2 — **на оба потока сразу**
-    /// (`QualitySize` считается по пункту лестницы, а не по потоку).
+    /// ([`QualitySize`] считается по пункту лестницы, а не по потоку;
+    /// разнести её обратно по потокам разбор не умеет).
     ///
-    /// `None` — оценки нет; тогда веса берутся 50/50 (правило дизайна для
-    /// неизвестного размера).
+    /// `None` — оценка пришла как [`QualitySize::Unknown`]; тогда веса
+    /// берутся 50/50 (правило дизайна для неизвестного размера).
     estimated_total_bytes: Option<u64>,
     current: Option<DownloadStream>,
     speed_bytes_per_sec: Option<u64>,
@@ -177,25 +178,28 @@ pub struct ProgressAggregator {
 }
 
 impl ProgressAggregator {
-    /// Собрать агрегатор по потокам выбранного пункта карточки.
+    /// Собрать агрегатор по выбранному пункту карточки.
     ///
-    /// `estimated_total_bytes` — оценка размера пункта из разбора E2
-    /// (`QualitySize::Known`), если она была. Величина одна на пункт:
-    /// разбор считает её суммой потоков и по потокам не разносит.
+    /// Оба аргумента — поля одного и того же пункта лестницы, и приезжают
+    /// они одним и тем же запросом ([`crate::types::StartDownloadRequest`]).
+    /// `size` принимается типом контракта, а не готовым числом, намеренно:
+    /// стартовый знаменатель обязан быть оценкой разбора E2, а не
+    /// величиной, выведенной по дороге, — а `u64` в сигнатуре не отличал
+    /// бы одно от другого.
     ///
     /// `None` вместо агрегатора — объект без единого потока: инвариант
     /// [`QualityStreams::has_any`] запрещает такой пункт, и команда старта
     /// отклоняет его классом `noStreamsSelected` раньше (TL-44). Возврат
     /// `Option` здесь — чтобы невозможность была видна в типе, а не
     /// держалась на том, что кто-то раньше проверил.
-    pub fn new(streams: &QualityStreams, estimated_total_bytes: Option<u64>) -> Option<Self> {
+    pub fn new(streams: &QualityStreams, size: QualitySize) -> Option<Self> {
         let video = streams.video_format_id.clone().map(StreamState::new);
         let audio = streams.audio_format_id.clone().map(StreamState::new);
 
         (video.is_some() || audio.is_some()).then_some(Self {
             video,
             audio,
-            estimated_total_bytes,
+            estimated_total_bytes: size.bytes(),
             current: None,
             speed_bytes_per_sec: None,
             eta_secs: None,
@@ -464,6 +468,7 @@ mod tests {
     use super::*;
     use crate::download::fixtures;
     use crate::download::progress::{parse_line, StdoutLine};
+    use crate::types::StartDownloadRequest;
 
     /// Все строки прогресса фикстуры по порядку.
     fn samples(name: &str) -> Vec<ProgressSample> {
@@ -474,6 +479,12 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Оценка размера пункта — ровно в той форме, в какой её отдаёт
+    /// разбор E2 и возвращает команда старта.
+    fn known(bytes: u64) -> QualitySize {
+        QualitySize::Known { bytes }
     }
 
     fn streams(video: Option<&str>, audio: Option<&str>) -> QualityStreams {
@@ -530,7 +541,7 @@ mod tests {
 
     #[test]
     fn an_item_without_a_single_stream_has_no_aggregator() {
-        assert!(ProgressAggregator::new(&streams(None, None), Some(100)).is_none());
+        assert!(ProgressAggregator::new(&streams(None, None), QualitySize::Unknown).is_none());
     }
 
     #[test]
@@ -539,7 +550,7 @@ mod tests {
         // оценка E2 — их сумма.
         let mut aggregator = ProgressAggregator::new(
             &streams(Some("133"), Some("139")),
-            Some(9_323_483 + 3_871_021),
+            known(9_323_483 + 3_871_021),
         )
         .expect("потоки заданы");
         assert_eq!(aggregator.plan(), DownloadPlan::VideoAndAudio);
@@ -567,7 +578,8 @@ mod tests {
         // огрубление видно прямо в числах — конец видео даёт ровно
         // половину вместо честных 70 %.
         let mut aggregator =
-            ProgressAggregator::new(&streams(Some("133"), Some("139")), None).expect("потоки");
+            ProgressAggregator::new(&streams(Some("133"), Some("139")), QualitySize::Unknown)
+                .expect("потоки");
 
         let mut shown = Vec::new();
         let mut at_end_of_video = None;
@@ -601,11 +613,65 @@ mod tests {
     }
 
     #[test]
+    fn the_estimate_travels_from_the_start_request_all_the_way_into_the_weights() {
+        // Сквозная проверка правки контракта: оценка выезжает из разбора на
+        // карточку, возвращается командой старта и становится стартовым
+        // знаменателем. Разница видна на одной и той же фикстуре — тот же
+        // пункт, тот же вывод yt-dlp, отличается только присланная оценка.
+        let wire = |size: serde_json::Value| -> StartDownloadRequest {
+            serde_json::from_value(serde_json::json!({
+                "url": "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+                "title": "Big Buck Bunny",
+                "streams": { "videoFormatId": "133", "audioFormatId": "139" },
+                "size": size,
+            }))
+            .expect("запрос той формы, которую шлёт панель")
+        };
+
+        // Оценка есть: видео весит 9 323 483 из 13 194 504 байт пункта.
+        let with_estimate = wire(serde_json::json!({
+            "kind": "known",
+            "bytes": 9_323_483 + 3_871_021
+        }));
+        let mut aggregator =
+            ProgressAggregator::new(&with_estimate.streams, with_estimate.size).expect("потоки");
+        assert_eq!(
+            end_of_video(&mut aggregator),
+            Some(70),
+            "с оценкой шкала идёт по байтам"
+        );
+
+        // Оценки нет — тот же вывод даёт условную половину.
+        let without = wire(serde_json::json!({ "kind": "unknown" }));
+        let mut aggregator =
+            ProgressAggregator::new(&without.streams, without.size).expect("потоки");
+        assert_eq!(
+            end_of_video(&mut aggregator),
+            Some(50),
+            "без оценки веса огрубляются до 50/50 — ровно та разница, ради \
+             которой оценка едет в запросе"
+        );
+    }
+
+    /// Показанный процент в момент, когда видеопоток фикстуры закрылся.
+    fn end_of_video(aggregator: &mut ProgressAggregator) -> Option<u8> {
+        let mut at_end = None;
+        for sample in samples("video-and-audio.json") {
+            let closes_video = sample.format_id == "133" && sample.status == SampleStatus::Finished;
+            aggregator.apply(&sample);
+            if closes_video {
+                at_end = aggregator.percent().map(DownloadPercent::value);
+            }
+        }
+        at_end
+    }
+
+    #[test]
     fn a_single_stream_never_names_a_stream_on_the_wire() {
         // Единственное место контракта, где смысл отсутствия поля держится
         // на дисциплине производителя, — и производитель здесь один.
         let mut aggregator =
-            ProgressAggregator::new(&streams(None, Some("140")), Some(10_271_496)).expect("поток");
+            ProgressAggregator::new(&streams(None, Some("140")), known(10_271_496)).expect("поток");
         assert_eq!(aggregator.plan(), DownloadPlan::SingleStream);
 
         for sample in samples("audio-only.json") {
@@ -623,7 +689,8 @@ mod tests {
     #[test]
     fn two_streams_always_name_the_stream_being_received() {
         let mut aggregator =
-            ProgressAggregator::new(&streams(Some("133"), Some("139")), None).expect("потоки");
+            ProgressAggregator::new(&streams(Some("133"), Some("139")), QualitySize::Unknown)
+                .expect("потоки");
 
         let mut seen = Vec::new();
         for sample in samples("video-and-audio.json") {
@@ -653,7 +720,7 @@ mod tests {
         // остался ею, процент упёрся бы в сотню на середине потока и
         // простоял бы там до конца.
         let mut aggregator =
-            ProgressAggregator::new(&streams(None, Some("140")), Some(5_000_000)).expect("поток");
+            ProgressAggregator::new(&streams(None, Some("140")), known(5_000_000)).expect("поток");
 
         // Первая же строка приносит точный размер — вдвое больший.
         aggregator.apply(&sample("140", 4_000_000, Some(10_271_496)));
@@ -680,7 +747,7 @@ mod tests {
         // настолько, что вся она укладывается в один поток. Знаменатель
         // обязан идти за фактом, а «сто» — дождаться второго потока.
         let mut aggregator =
-            ProgressAggregator::new(&streams(Some("133"), Some("139")), Some(1_000))
+            ProgressAggregator::new(&streams(Some("133"), Some("139")), known(1_000))
                 .expect("потоки");
 
         aggregator.apply(&finished("133", 9_323_483));
@@ -701,10 +768,11 @@ mod tests {
     fn the_estimate_of_a_pending_stream_survives_the_exact_size_of_the_other() {
         // Оценка E2 — на пункт целиком; когда точный размер одного потока
         // приехал, остаток обязан достаться другому, а не пропасть.
-        let estimate = 9_323_483 + 3_871_021;
-        let mut aggregator =
-            ProgressAggregator::new(&streams(Some("133"), Some("139")), Some(estimate))
-                .expect("потоки");
+        let mut aggregator = ProgressAggregator::new(
+            &streams(Some("133"), Some("139")),
+            known(9_323_483 + 3_871_021),
+        )
+        .expect("потоки");
 
         aggregator.apply(&finished("133", 9_323_483));
         assert_eq!(
@@ -719,7 +787,8 @@ mod tests {
         // Прикидка на этой фикстуре гуляет на порядок; если бы делили на
         // неё, процент прыгал бы вверх-вниз десятками.
         let mut aggregator =
-            ProgressAggregator::new(&streams(Some("602"), None), None).expect("поток");
+            ProgressAggregator::new(&streams(Some("602"), None), QualitySize::Unknown)
+                .expect("поток");
 
         let shown = percents(&mut aggregator, "hls-fragmented.json");
 
@@ -741,7 +810,8 @@ mod tests {
     fn a_resumed_attempt_continues_the_percent_instead_of_zeroing_it() {
         // К-6 буквально: обрыв на 5 %, продолжение — с достигнутого.
         let mut aggregator =
-            ProgressAggregator::new(&streams(Some("134"), None), None).expect("поток");
+            ProgressAggregator::new(&streams(Some("134"), None), QualitySize::Unknown)
+                .expect("поток");
 
         let interrupted = percents(&mut aggregator, "resume-interrupted.json");
         let stopped_at = *interrupted.last().expect("оборванная попытка что-то дала");
@@ -764,22 +834,26 @@ mod tests {
         //
         // Проверяется на всех фикстурах со строками прогресса и в обоих
         // режимах веса — с оценкой E2 и без неё.
-        let cases: [(&str, QualityStreams, Option<u64>); 4] = [
+        let cases: [(&str, QualityStreams, QualitySize); 4] = [
             (
                 "video-and-audio.json",
                 streams(Some("133"), Some("139")),
-                Some(9_323_483 + 3_871_021),
+                known(9_323_483 + 3_871_021),
             ),
             (
                 "video-and-audio.json",
                 streams(Some("133"), Some("139")),
-                None,
+                QualitySize::Unknown,
             ),
-            ("hls-fragmented.json", streams(Some("602"), None), None),
+            (
+                "hls-fragmented.json",
+                streams(Some("602"), None),
+                QualitySize::Unknown,
+            ),
             (
                 "audio-only.json",
                 streams(None, Some("140")),
-                Some(10_271_496),
+                known(10_271_496),
             ),
         ];
 
@@ -809,7 +883,7 @@ mod tests {
         // yt-dlp печатает «has already been downloaded» и молчит.
         let mut aggregator = ProgressAggregator::new(
             &streams(Some("133"), Some("139")),
-            Some(9_323_483 + 3_871_021),
+            known(9_323_483 + 3_871_021),
         )
         .expect("потоки");
 
@@ -829,7 +903,8 @@ mod tests {
     #[test]
     fn a_line_about_a_format_nobody_asked_for_is_reported_not_absorbed() {
         let mut aggregator =
-            ProgressAggregator::new(&streams(Some("133"), Some("139")), None).expect("потоки");
+            ProgressAggregator::new(&streams(Some("133"), Some("139")), QualitySize::Unknown)
+                .expect("потоки");
 
         assert_eq!(
             aggregator.apply(&sample("251", 1024, Some(9_000_000))),
@@ -844,7 +919,8 @@ mod tests {
         // Вход политики повторов: продвижение сбрасывает счётчик (С-6),
         // его отсутствие кормит сторож «ни байта за 20 с» (С-8).
         let mut aggregator =
-            ProgressAggregator::new(&streams(Some("133"), Some("139")), None).expect("потоки");
+            ProgressAggregator::new(&streams(Some("133"), Some("139")), QualitySize::Unknown)
+                .expect("потоки");
 
         assert_eq!(
             aggregator.apply(&sample("133", 1024, Some(9_323_483))),
@@ -876,7 +952,8 @@ mod tests {
         // скорость; показать её значило бы соврать ровно так же, как
         // застывшим числом при нулевом движении.
         let mut aggregator =
-            ProgressAggregator::new(&streams(None, Some("140")), None).expect("поток");
+            ProgressAggregator::new(&streams(None, Some("140")), QualitySize::Unknown)
+                .expect("поток");
 
         aggregator.apply(&sample("140", 1_000_000, Some(10_271_496)));
         match aggregator.running(None) {
@@ -908,7 +985,8 @@ mod tests {
     #[test]
     fn the_first_attempt_is_not_numbered_and_the_pause_freezes_the_percent() {
         let mut aggregator =
-            ProgressAggregator::new(&streams(None, Some("140")), None).expect("поток");
+            ProgressAggregator::new(&streams(None, Some("140")), QualitySize::Unknown)
+                .expect("поток");
         aggregator.apply(&sample("140", 5_000_000, Some(10_271_496)));
 
         let first = DownloadAttempt {
@@ -949,7 +1027,8 @@ mod tests {
         // Ноль означал бы «ничего не скачано»; правильный ответ здесь —
         // «числа нет» (Ф-2).
         let mut aggregator =
-            ProgressAggregator::new(&streams(Some("602"), None), None).expect("поток");
+            ProgressAggregator::new(&streams(Some("602"), None), QualitySize::Unknown)
+                .expect("поток");
         assert_eq!(aggregator.percent(), None);
 
         // Байты идут, но ни размера, ни фрагментов нет.
