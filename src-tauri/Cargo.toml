@@ -12,6 +12,10 @@ tauri-build = { version = "2", features = [] }
 # через cargo:rustc-env, а не дублируются Rust-константами (TL-12).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Сверка вложенного архива yt-dlp с sha256 из пина перед укладкой в ресурсы
+# бандла (TL-25). Новых крейтов в сборку не добавляет: sha2 уже есть в графе
+# на host-стороне (tauri-codegen), а build-зависимости резолвятся туда же.
+sha2 = "0.10"
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -21,9 +25,53 @@ thiserror = "2"
 tokio = { version = "1", features = ["process", "time", "io-util", "macros", "rt-multi-thread", "sync"] }
 # Распаковка onedir-архива yt-dlp в каталог данных при первом запуске
 # (TL-12) и — тем же кодом — распаковка обновлений yt-dlp в E6. Только
-# чтение и только deflate: остальные кодеки апстрим не использует, а
-# deflate-flate2 берёт чистый Rust-бэкенд (miniz_oxide), без C-зависимостей.
+# чтение и только deflate: остальные кодеки апстрим не использует.
 zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+# Бэкенд flate2 выбирается здесь, и это не педантизм (TL-25). Фича
+# `deflate-flate2` у zip включает сам крейт flate2, но НЕ включает ему ни
+# одного бэкенда сжатия — их у zip отдельные фичи (deflate-flate2-zlib,
+# -zlib-rs). Пока бэкенд не выбран, flate2 не собирается вообще:
+# `compile_error!("No compression backend selected")`.
+#
+# До TL-25 это не проявлялось на macOS и потому оставалось незамеченным:
+# бэкенд прилетал по unification из чужой ветки графа — flate2/default у
+# png ← muda. Ветка macOS-only не по нашей воле, а по манифесту muda:
+# `[target.'cfg(target_os = "macos")'.dependencies.png]`. На Linux и Windows
+# png на target-стороне графа нет вовсе, и flate2 там оставался без бэкенда;
+# падала и сборка бандла тоже, то есть джоб build на этих двух платформах
+# был красный с TL-12, но живьём его не гоняли (Р-6).
+#
+# Проверяется так (`-i` — обратное дерево, `--target` обязателен, см. ниже):
+#
+#   cargo tree -e normal -i flate2 --target x86_64-unknown-linux-gnu
+#     flate2 |                                    ← пусто: compile_error!
+#     └── zip | _deflate-any,deflate-flate2 → tube-leak
+#     flate2 | any_impl,default,miniz_oxide,rust_backend
+#     └── png ← ico ← tauri-codegen ← tauri-macros (proc-macro) ← tauri
+#
+# Ветка png ← ico ← tauri-codegen присутствует на ВСЕХ тройках, включая
+# Linux и Windows, но замаскировать ничего не может: она идёт через
+# proc-macro, а resolver v2 не объединяет фичи host- и target-стороны —
+# отсюда в дереве два отдельных узла flate2 с разными наборами фич.
+# Смотреть надо с явным `--target`: без него cargo tree схлопывает обе
+# стороны в один узел, и разницы не видно. Что расхождение реально, а не
+# артефакт отображения, показал прогон #26: на ubuntu падал и `cargo
+# clippy` (без --target), и `tauri build --target x86_64-unknown-linux-gnu`.
+#
+# Следствие, важное за пределами этой строки. Расхождение возникает на
+# target-стороне графа, а маскирует его зависимость, объявленная macOS-only.
+# Значит джоб test, который после TL-25 гоняется на macos-latest, этот класс
+# дефектов не ловит by construction: конфигурация фич под другие тройки на
+# нём просто не резолвится. Этот дефект нашли ubuntu-прогоны (#26) — на
+# macOS он не нашёлся бы никогда. Единственный сторож класса «собирается на
+# macOS, не собирается под другую тройку» сейчас — матрица build; см. #37.
+#
+# Явная зависимость с `rust_backend` вместо zip-фичи `deflate-flate2-zlib-rs`:
+# rust_backend — это miniz_oxide, который в графе уже есть (тот же png), то
+# есть выбор бэкенда не добавляет в сборку ни одного нового крейта и не
+# тянет C-зависимостей. Крейт не используется из кода напрямую намеренно:
+# он здесь ради фичи.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 tempfile = "3"

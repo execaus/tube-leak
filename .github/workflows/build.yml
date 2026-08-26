@@ -1,5 +1,11 @@
 name: build
 
+# Два джоба: build — сборка инсталлятора под все целевые платформы, test —
+# проверки репозитория (vitest, cargo test, clippy, fmt, type-check, eslint;
+# TL-25). Оба висят на одних триггерах намеренно: проверка и сборка должны
+# запускаться от одного события, иначе появляется коммит, проверенный, но
+# не собранный, — или наоборот.
+#
 # Сборка инсталлятора под все целевые платформы (Windows, macOS, Linux —
 # см. CLAUDE.md/Стек). Живой прогон в рамках эпика E1 не обязателен (Р-6);
 # конфигурация должна существовать и корректно описывать сборку для всех
@@ -21,6 +27,21 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+
+# Ни один шаг ничего не пишет ни в репозиторий, ни в релизы: и сборка, и
+# проверки только читают. Явное ограничение снимает у GITHUB_TOKEN всё
+# остальное — если когда-нибудь понадобится запись (публикация релиза),
+# её придётся разрешить осознанно, джобу и точечно.
+permissions:
+  contents: read
+
+# Новый пуш в ветку PR отменяет незавершённые прогоны предыдущего: четыре
+# сборки бандла на пуш — дорого, а результат по устаревшему коммиту всё
+# равно никому не нужен. Пуши в main не отменяются: там прогон привязан к
+# коммиту, который уже в истории.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -87,3 +108,114 @@ jobs:
 
       - name: Build installer
         run: npm run tauri build -- --target ${{ matrix.target }}
+
+  # Проверки, которые до TL-25 не запускались в CI вообще: vitest, cargo
+  # test (включая сторож tests/frontend_acl.rs), clippy, fmt, type-check и
+  # eslint (issue #26). Ключевое, ради чего джоб существует: регрессию
+  # вносит правка в src/ (область ui), а ловит её команда из области core —
+  # `cargo test`. Без джоба ничто не заставит исполнителя ui её запустить.
+  #
+  # Джоб отдельный от build, а не шаги внутри него: build — матрица из
+  # четырёх ОС, проверки же от платформы не зависят, и гонять их четырежды
+  # незачем. Падение проверок при этом не отменяет сборку и наоборот —
+  # видно сразу оба сигнала.
+  #
+  # Раннер macos-latest, хотя минуты на нём дороже ubuntu. Причина не в
+  # удобстве: на ubuntu набор тестов Rust зависает (TL-25 разбирался с этим
+  # живьём — `cargo test` не завершается за 25+ минут, шаг не снимается
+  # даже `timeout`; отдельный дефект, к CI отношения не имеющий, — #37,
+  # TL-35). До его починки джоб на Linux красный не по делу, а джоб,
+  # которому не верят, бесполезен.
+  #
+  # Цена решения — не ноль, и списком, чтобы её не считали нулевой:
+  #   1. Компиляция под Linux и Windows не теряется: её проверяет матрица
+  #      build, собирающая бандл под все четыре тройки.
+  #   2. Теряется прогон `cargo test` под Linux — то есть поведение кода
+  #      на другой ОС: пути, права, запуск и убийство процессов.
+  #   3. Теряется clippy под Linux: ветки `#[cfg(...)]` под не-macOS этот
+  #      джоб не линтует вовсе.
+  #   4. Теряется способность самого джоба ловить расхождения фич по
+  #      таргетам: фичи резолвятся только под хостовую тройку раннера, а
+  #      расхождение живёт на target-стороне графа. Именно так и оставался
+  #      невидимым на macOS дефект flate2 — разбор в src-tauri/Cargo.toml
+  #      над зависимостью flate2. Сторож этого класса остаётся один:
+  #      матрица build.
+  # Всё перечисленное зафиксировано в #37 (TL-35): вернуть джоб на ubuntu,
+  # когда зависание починят.
+  test:
+    runs-on: macos-latest
+    # Страховка от зависшего шага: без неё раннер занят дефолтные 6 часов.
+    timeout-minutes: 30
+
+    # Разрешает cargo собраться с заглушками вместо настоящих ассетов: без
+    # переменной build.rs останавливает сборку, потому что архив yt-dlp не
+    # совпадает с sha256 из пина (TL-25). В профиле release переменная не
+    # действует, так что бандл с заглушкой ею не собрать — а джоб build,
+    # который бандл и собирает, её не задаёт вовсе.
+    env:
+      TUBE_LEAK_ALLOW_STUB_YTDLP: '1'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Фронтенд-проверки идут первыми: они дешёвые и не требуют ни
+      # бинарников, ни собранного dist — чем раньше падают, тем меньше
+      # минут тратится на компиляцию Rust ради заведомо красного прогона.
+      - name: Run frontend tests (vitest)
+        run: npm test
+
+      - name: Type-check frontend (vue-tsc)
+        run: npm run type-check
+
+      - name: Lint frontend (eslint)
+        run: npm run lint
+
+      # Заглушки вместо настоящей доставки: тесты бинарники не запускают,
+      # но build.rs + tauri-build обязаны их найти, иначе тестовый бинарник
+      # не соберётся. Подробное обоснование — в самом скрипте.
+      - name: Stub sidecar binaries
+        run: node scripts/ci/stub-binaries.mjs
+
+      # `tauri::generate_context!()` вшивает содержимое frontendDist (../dist)
+      # в тестовый бинарник — сторож frontend_acl.rs резолвит ACL именно
+      # через него. Без `npm run build` каталога dist нет и cargo test не
+      # соберётся. Здесь `vite build` напрямую, а не `tauri build`: нужен
+      # только dist, бандл собирает джоб build.
+      - name: Build frontend (vite)
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+        working-directory: src-tauri
+
+      # `--locked` у clippy и test: PR, правящий Cargo.toml без обновления
+      # Cargo.lock, иначе молча обновил бы lock в CI и позеленел — та же
+      # дисциплина, что `npm ci` даёт фронтенду. У `cargo fmt` этого флага
+      # нет (cargo-fmt его не принимает), но fmt и не резолвит зависимости.
+      - name: Lint Rust (clippy)
+        run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: src-tauri
+
+      - name: Run Rust tests
+        run: cargo test --locked
+        working-directory: src-tauri
