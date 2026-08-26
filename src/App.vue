@@ -32,10 +32,12 @@ import { computed, onMounted } from 'vue'
 
 import DownloadCommandErrorBlock from '@/components/DownloadCommandErrorBlock.vue'
 import DownloadPanel from '@/components/DownloadPanel.vue'
+import ExitConfirmDialog from '@/components/ExitConfirmDialog.vue'
 import ProbeSection from '@/components/ProbeSection.vue'
 import SidecarStatusRow from '@/components/SidecarStatusRow.vue'
 import YtDlpPrepareError from '@/components/YtDlpPrepareError.vue'
 import YtDlpPrepareScreen from '@/components/YtDlpPrepareScreen.vue'
+import { useExitConfirmation } from '@/composables/useExitConfirmation'
 import { useSidecarCheck } from '@/composables/useSidecarCheck'
 import { useYtDlpPrepare } from '@/composables/useYtDlpPrepare'
 import { useDownloadTaskStore } from '@/stores/downloadTask'
@@ -108,6 +110,24 @@ onMounted(() => {
  * стартом задачи и прокидывает пропсы панели, ничего не решая сам.
  */
 const downloadTaskStore = useDownloadTaskStore()
+
+/**
+ * Диалог подтверждения выхода (Р-2, эпик E3, TL-46) — подписывается на
+ * попытку закрытия окна независимо от того, какой экран сейчас показан
+ * (служебный экран E1, разбор E2, панель загрузки), поэтому вызывается
+ * на верхнем уровне `App.vue`, а не внутри одной из веток `v-else`.
+ * Оконное событие пока не подключено к настоящему Tauri API (ждёт
+ * задачу ядра #49 — см. `src/composables/windowExitPort.ts`): до тех
+ * пор диалог технически смонтирован, но не появляется, потому что
+ * заглушка порта никогда не вызывает переданный обработчик.
+ */
+const {
+  visible: showExitConfirm,
+  task: exitConfirmTask,
+  progress: exitConfirmProgress,
+  stay: onExitStay,
+  exitAnyway: onExitAnyway,
+} = useExitConfirmation()
 const {
   task: downloadTask,
   progress: downloadProgress,
@@ -139,6 +159,14 @@ function onDownloadRequested(payload: {
 </script>
 
 <template>
+  <ExitConfirmDialog
+    v-if="showExitConfirm && exitConfirmTask && exitConfirmProgress"
+    :display-title="exitConfirmTask.displayTitle"
+    :progress="exitConfirmProgress"
+    @stay="onExitStay"
+    @exit-anyway="onExitAnyway"
+  />
+
   <main class="screen">
     <header>
       <h1>tube-leak</h1>

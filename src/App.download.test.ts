@@ -114,6 +114,11 @@ describe('App — секция «Текущая загрузка» (эпик E3,
     expect(wrapper.text()).not.toContain('Текущая загрузка')
   })
 
+  it('does not render the exit-confirmation dialog before any close attempt happened (TL-46 — window binding is a stub until #49, so this is a wiring smoke test, not proof of the real event)', async () => {
+    const wrapper = await mountReady()
+    expect(wrapper.text()).not.toContain('Загрузка ещё не завершена')
+  })
+
   it('starts a task on "Скачать", showing the panel with a title snapshot built from the card + quality', async () => {
     const wrapper = await mountReady()
     await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
