@@ -13,6 +13,15 @@ import type { YtDlpPrepared } from '@/types/ytdlp'
  * `capturedHandler` типизирован под `ytdlp://prepare` и его нельзя
  * переиспользовать для `download://progress` без конфликта типов; здесь
  * `listen` замокан маршрутизацией по имени события.
+ *
+ * Здесь же — диалог подтверждения выхода (Р-2, TL-46) с настоящей оконной
+ * привязкой (TL-47/#49): `@tauri-apps/api/window` замокан прямо в этом
+ * файле (`getCurrentWindowMock`/`destroyMock`), а не подставным портом —
+ * это единственное место, проверяющее, что `windowExitPort.ts` действительно
+ * держит подписку на `onCloseRequested` и действительно завершает окно
+ * через `destroy()`, а не только то, что композабл верно решает, когда
+ * показывать диалог (это уже проверено против фейкового порта в
+ * `useExitConfirmation.test.ts`).
  */
 
 const invokeMock = vi.fn()
@@ -32,7 +41,29 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: (...args: [string, Handler]) => listenMock(...args),
 }))
 
+type CloseAttemptHandler = (event: { preventDefault: () => void }) => void | Promise<void>
+let capturedCloseHandler: CloseAttemptHandler | undefined
+const closeUnlistenMock = vi.fn()
+const onCloseRequestedMock = vi.fn((handler: CloseAttemptHandler) => {
+  capturedCloseHandler = handler
+  return Promise.resolve(closeUnlistenMock)
+})
+const destroyMock = vi.fn(() => Promise.resolve())
+const getCurrentWindowMock = vi.fn(() => ({
+  onCloseRequested: onCloseRequestedMock,
+  destroy: destroyMock,
+}))
+
+vi.mock('@tauri-apps/api/window', () => ({
+  getCurrentWindow: () => getCurrentWindowMock(),
+}))
+
 const { default: App } = await import('./App.vue')
+
+/** Симулирует попытку пользователя закрыть окно (крестик, Cmd+Q…). */
+async function attemptWindowClose(): Promise<void> {
+  await capturedCloseHandler?.({ preventDefault: vi.fn() })
+}
 
 const preparedWarm: YtDlpPrepared = {
   version: '2026.08.20',
@@ -78,6 +109,11 @@ beforeEach(() => {
   listenMock.mockClear()
   unlistenMock.mockClear()
   handlers.clear()
+  capturedCloseHandler = undefined
+  onCloseRequestedMock.mockClear()
+  closeUnlistenMock.mockClear()
+  destroyMock.mockClear()
+  getCurrentWindowMock.mockClear()
   setActivePinia(createPinia())
   routeInvoke({
     prepare_ytdlp: () => Promise.resolve(preparedWarm),
@@ -112,11 +148,6 @@ describe('App — секция «Текущая загрузка» (эпик E3,
   it('renders no download section at all before any task exists', async () => {
     const wrapper = await mountReady()
     expect(wrapper.text()).not.toContain('Текущая загрузка')
-  })
-
-  it('does not render the exit-confirmation dialog before any close attempt happened (TL-46 — window binding is a stub until #49, so this is a wiring smoke test, not proof of the real event)', async () => {
-    const wrapper = await mountReady()
-    expect(wrapper.text()).not.toContain('Загрузка ещё не завершена')
   })
 
   it('starts a task on "Скачать", showing the panel with a title snapshot built from the card + quality', async () => {
@@ -280,5 +311,100 @@ describe('App — отказ команды виден на экране, не �
 
     expect(wrapper.text()).toContain('Текущая загрузка')
     expect(wrapper.text()).not.toContain('Ссылка не распознана')
+  })
+})
+
+describe('App — диалог подтверждения выхода, настоящая оконная привязка (Р-2, эпик E3, TL-46/TL-47)', () => {
+  it('subscribes to onCloseRequested on mount', async () => {
+    await mountReady()
+    expect(onCloseRequestedMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('no task at all: a close attempt prevents the default and destroys the window immediately, no dialog', async () => {
+    const wrapper = await mountReady()
+
+    await attemptWindowClose()
+    await flushPromises()
+
+    expect(destroyMock).toHaveBeenCalledTimes(1)
+    expect(wrapper.text()).not.toContain('Загрузка ещё не завершена')
+  })
+
+  it('active task (Downloading): a close attempt shows the dialog with the panel\'s percent and does not destroy the window yet', async () => {
+    const wrapper = await mountReady()
+    await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
+    invokeMock.mockImplementationOnce(() => Promise.resolve(started))
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+    emitProgress({ taskId: 'task-1', phase: 'downloading', state: 'running', percent: 62 })
+    await wrapper.vm.$nextTick()
+
+    await attemptWindowClose()
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.text()).toContain('Загрузка ещё не завершена')
+    expect(wrapper.text()).toContain('скачивается (62 %)')
+    expect(destroyMock).not.toHaveBeenCalled()
+  })
+
+  it('"Остаться" dismisses the dialog without destroying the window and without touching the task', async () => {
+    const wrapper = await mountReady()
+    await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
+    invokeMock.mockImplementationOnce(() => Promise.resolve(started))
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+    emitProgress({ taskId: 'task-1', phase: 'downloading', state: 'running', percent: 10 })
+    await wrapper.vm.$nextTick()
+
+    await attemptWindowClose()
+    await wrapper.vm.$nextTick()
+    expect(wrapper.text()).toContain('Загрузка ещё не завершена')
+
+    await wrapper.findAll('button').find((b) => b.text() === 'Остаться')?.trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.text()).not.toContain('Загрузка ещё не завершена')
+    expect(destroyMock).not.toHaveBeenCalled()
+    // Задача не тронута: панель по-прежнему показывает идущую загрузку.
+    expect(wrapper.text()).toContain('10 %')
+  })
+
+  it('"Всё равно выйти" destroys the window and does not invoke cancel_download (не путь отмены)', async () => {
+    const wrapper = await mountReady()
+    await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
+    invokeMock.mockImplementationOnce(() => Promise.resolve(started))
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+    emitProgress({ taskId: 'task-1', phase: 'downloading', state: 'running', percent: 10 })
+    await wrapper.vm.$nextTick()
+
+    await attemptWindowClose()
+    await wrapper.vm.$nextTick()
+
+    await wrapper.findAll('button').find((b) => b.text() === 'Всё равно выйти')?.trigger('click')
+    await flushPromises()
+
+    expect(destroyMock).toHaveBeenCalledTimes(1)
+    expect(invokeMock).not.toHaveBeenCalledWith('cancel_download', expect.anything())
+    expect(wrapper.text()).not.toContain('Загрузка ещё не завершена')
+  })
+
+  it('terminal task (Cancelled), even not hidden yet: a close attempt destroys the window immediately, no dialog', async () => {
+    const wrapper = await mountReady()
+    await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
+    invokeMock.mockImplementationOnce(() => Promise.resolve(started))
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+    emitProgress({ taskId: 'task-1', phase: 'cancelled', partialData: 'removed' })
+    await wrapper.vm.$nextTick()
+    // Панель ещё видна («Скрыть» не нажато) — терминальность решает диалог,
+    // а не видимость панели.
+    expect(wrapper.text()).toContain('Текущая загрузка')
+
+    await attemptWindowClose()
+    await flushPromises()
+
+    expect(destroyMock).toHaveBeenCalledTimes(1)
+    expect(wrapper.text()).not.toContain('Загрузка ещё не завершена')
   })
 })

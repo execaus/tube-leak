@@ -22,6 +22,19 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: (...args: [string, EventHandler]) => listenMock(...args),
 }))
 
+// `useExitConfirmation` (TL-46) вызывается на верхнем уровне `App.vue` и
+// подписывается на настоящее оконное событие через `windowExitPort.ts` —
+// без мока `getCurrentWindow().onCloseRequested()` бросит на монтаже
+// (в jsdom нет `window.__TAURI_INTERNALS__`). Этот файл не про диалог
+// выхода (см. `App.download.test.ts`), поэтому подписка здесь просто
+// не резолвится — она не нужна ни одному тесту в этом файле.
+vi.mock('@tauri-apps/api/window', () => ({
+  getCurrentWindow: () => ({
+    onCloseRequested: () => new Promise<() => void>(() => {}),
+    destroy: () => Promise.resolve(),
+  }),
+}))
+
 // Импортируется после мока `invoke`/`listen` (тот же приём, что и в
 // useSidecarCheck.test.ts), т.к. App.vue использует composables как есть.
 const { default: App } = await import('./App.vue')

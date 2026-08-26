@@ -3,43 +3,51 @@
  *
  * # Почему это отдельный файл с ровно двумя операциями
  *
- * Перехват попытки закрыть окно в Tauri 2 требует `@tauri-apps/api/window`
- * (`getCurrentWindow().onCloseRequested(...)`, а при подтверждённом выходе —
- * `.destroy()`). Разбор реализации показал (см. отчёт TL-46, задача ядра
- * #49): подписка идёт тем же IPC, что уже разрешён (`plugin:event|listen`/
- * `unlisten`, покрыто `core:event:allow-listen`/`allow-unlisten`), а вот
- * фактическое закрытие окна (`.destroy()`) требует `plugin:window|destroy`,
- * то есть разрешения `core:window:allow-destroy` — его нет в
- * `src-tauri/capabilities/main.json`, и добавить его может только ядро
- * (правка `src-tauri/` — не область `ui`). Сторож `src-tauri/tests/
- * frontend_acl.rs` вдобавок не знает модуль `window` вовсе (`ipc_commands_of`
- * перечисляет только `core`/`event`) — реальный импорт `getCurrentWindow`
- * уронит его тестом «неизвестная привязка», пока ядро не допишет туда
- * сопоставление.
- *
- * Поэтому всё, что реально трогает `@tauri-apps/api/window`, обязано жить
- * только здесь — за интерфейсом {@link WindowExitPort}. Остальной код
- * (`useExitConfirmation`, диалог) работает против интерфейса, а не против
- * Tauri API напрямую: когда задача #49 выдаст разрешение и запись в
- * стороже, реализацию этого файла достаточно заменить на настоящую
- * (`getCurrentWindow().onCloseRequested`/`.destroy()`) — не трогая ничего
+ * Перехват попытки закрыть окно — единственное место во всём фронтенде,
+ * которое трогает оконный модуль Tauri (`getCurrentWindow`). Остальной код
+ * (`useExitConfirmation`, диалог) работает против интерфейса
+ * {@link WindowExitPort}, не против Tauri API напрямую — это позволило
+ * написать и протестировать всю логику диалога (TL-46) до появления
+ * разрешения `core:window:allow-destroy` (задача ядра TL-47/#49, теперь
+ * смержена) и подменить здесь только эту одну реализацию, ничего не меняя
  * снаружи.
  *
- * # Что нужно от #49 (передать исполнителю дословно)
+ * # Требования стража ACL (`src-tauri/tests/frontend_acl.rs`) — не стиль,
+ * а условие, при котором тест вообще проходит
  *
- * 1. `src-tauri/capabilities/main.json` — добавить `core:window:allow-destroy`
- *    (не `allow-close`: `close()` заново входит в тот же цикл
- *    `closeRequested`, а `destroy()` — ровно тот путь, которым сама
- *    библиотека Tauri продолжает закрытие после неотменённого
- *    `onCloseRequested`, без повторного цикла).
- * 2. `src-tauri/tests/frontend_acl.rs` — добавить в `ipc_commands_of`
- *    сопоставление для `("window", "getCurrentWindow")`, покрывающее
- *    команды, которые реально понадобятся: `plugin:event|listen`,
- *    `plugin:event|unlisten`, `plugin:window|destroy`.
+ * Сторож разбирает употребление объекта окна глубже импорта: сам импорт
+ * `getCurrentWindow` не порождает IPC (читает метку и строит `Window` с
+ * `skip: true`, минуя `plugin:window|create`), а вот 78 методов
+ * возвращённого объекта — порождают, и какой именно метод вызван, ему
+ * нужно видеть **в этом же файле**, прямой цепочкой на `getCurrentWindow()`
+ * или в локальной переменной, объявленной и использованной здесь же.
+ * Объект окна, ушедший из файла (возврат, параметр, деструктуризация,
+ * фабрика, отданная в чужие руки), — это ровно то, что сторож не умеет
+ * отследить и на чём осознанно падает: 78 оконных команд при одной
+ * разрешённой не должны становиться отслеживаемыми «на глаз». Поэтому обе
+ * операции ниже вызывают `getCurrentWindow()` заново, каждая на своей
+ * прямой цепочке, а не делят один объект через модульную переменную.
  *
- * Ни строки в `src-tauri/` в рамках TL-46 не менялось — обе правки числятся
- * за #49.
+ * # Почему всегда `preventDefault()` и явный `destroy()`, а не неявное
+ * поведение библиотеки
+ *
+ * `onCloseRequested` сам вызывает `this.destroy()` в конце обработчика,
+ * если тот не позвал `preventDefault()` (учтено в самом стороже —
+ * `onCloseRequested` несёт то же разрешение `plugin:window|destroy`, что
+ * и явный `destroy()`, см. `window_handle_commands`). Полагаться на это
+ * неявное поведение означало бы решать «закрывать сейчас или показать
+ * диалог» до входа в обработчик, синхронно с самим событием закрытия, —
+ * а активность задачи может смениться как раз в этот момент. Проще и
+ * без скрытой развилки внутри чужой библиотеки: обработчик всегда
+ * вызывает `preventDefault()`, а окно всегда закрывает явный
+ * {@link WindowExitPort.finishWindow} — один и тот же путь и для «диалога
+ * не было» (задачи нет/терминальна), и для «диалог был и подтверждён».
+ *
+ * `destroy()`, не `close()` (Р-2, отчёт TL-46, capability TL-47/#49):
+ * `close()` заново поднимает `tauri://close-requested` и вернул бы в тот
+ * же диалог по кругу.
  */
+import { getCurrentWindow } from '@tauri-apps/api/window'
 
 /** Что нужно диалогу выхода от оконного слоя — и ничего больше. */
 export interface WindowExitPort {
@@ -55,41 +63,47 @@ export interface WindowExitPort {
   finishWindow(): Promise<void>
 }
 
-const NOT_WIRED_SUBSCRIBE_WARNING =
-  '[TL-46] Оконное событие закрытия ещё не подключено: ждём разрешение ' +
-  'core:window:allow-destroy и запись в src-tauri/tests/frontend_acl.rs ' +
-  '(задача ядра #49). Диалог подтверждения выхода не увидит настоящую ' +
-  'попытку закрыть приложение, пока эта заглушка не заменена.'
-
-const NOT_WIRED_FINISH_WARNING =
-  '[TL-46] finishWindow() вызван, а оконный адаптер ещё не подключён (#49) ' +
-  '— этот вызов не закрывает окно.'
-
 /**
- * Заглушка на время #49. Умышленно не молчит: предупреждает в консоль на
- * каждый вызов, а не только один раз, — прецедент TL-24/TL-46 (эпик E1)
- * состоял именно в том, что незамеченная тихая заглушка/отказ дожили до
- * собранного приложения через две сборки и два ревью. Здесь конкретно
- * `onCloseAttempt` не перехватывает ничего реального: обработчик никогда
- * не будет вызван этой реализацией, поэтому диалог в собранном приложении
- * до #49 не появится вовсе — окно закрывается системой как обычно.
+ * Настоящая привязка к Tauri (TL-46, после TL-47/#49). Единственная
+ * фабрика в приложении — экземпляр окна один на всё приложение, и
+ * состояние подписки не должно дублироваться между вызовами.
  */
-export function createUnwiredWindowExitPort(): WindowExitPort {
+function createWindowExitPort(): WindowExitPort {
   return {
-    onCloseAttempt() {
-      console.warn(NOT_WIRED_SUBSCRIBE_WARNING)
-      return () => {}
+    onCloseAttempt(handler) {
+      let unlisten: (() => void) | undefined
+      let unsubscribed = false
+
+      void getCurrentWindow()
+        .onCloseRequested((event) => {
+          // Всегда — см. doc модуля, «Почему всегда preventDefault()».
+          event.preventDefault()
+          handler()
+        })
+        .then((stopListening) => {
+          if (unsubscribed) {
+            stopListening()
+            return
+          }
+          unlisten = stopListening
+        })
+
+      return () => {
+        unsubscribed = true
+        unlisten?.()
+      }
     },
     async finishWindow() {
-      console.warn(NOT_WIRED_FINISH_WARNING)
+      await getCurrentWindow().destroy()
     },
   }
 }
 
 /**
- * Единственная продакшен-точка сборки адаптера — один и тот же экземпляр на
- * приложение (окно одно, состояние подписки не должно дублироваться между
- * вызовами). `useExitConfirmation` берёт его по умолчанию; тесты подставляют
- * свой фейк вместо него явным аргументом.
+ * Единственная продакшен-точка сборки адаптера. `useExitConfirmation`
+ * берёт его по умолчанию; тесты логики (`useExitConfirmation.test.ts`)
+ * подставляют свой фейк вместо него явным аргументом — привязка к
+ * настоящему Tauri API проверяется отдельно, через мок оконного модуля
+ * (`getCurrentWindow`) на уровне `App.download.test.ts`.
  */
-export const windowExitPort: WindowExitPort = createUnwiredWindowExitPort()
+export const windowExitPort: WindowExitPort = createWindowExitPort()
