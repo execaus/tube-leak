@@ -71,6 +71,18 @@ describe('getDownloadErrorText — под-причина «yt-dlp устарел
   it('treats reason "generic" the same as no reason at all', () => {
     expect(getDownloadErrorText('ytDlpFailure', 'generic')).toStrictEqual(getDownloadErrorText('ytDlpFailure'))
   })
+
+  it('keeps the E3 title (about failing to download) for both cases — outdated must not borrow the E2 probe-screen title (ревью TL-45)', () => {
+    // Заголовок E2 про этот же класс — «Не удалось получить данные о
+    // ролике» (получение данных, не скачивание). На панели загрузки это
+    // неправда: данные уже получены, карточка построена, качало именно
+    // скачивание — поэтому заголовок обязан быть панельным в обоих
+    // случаях (с под-причиной и без неё), а меняться должно только
+    // пояснение.
+    expect(getDownloadErrorText('ytDlpFailure').title).toBe('Не удалось скачать ролик')
+    expect(getDownloadErrorText('ytDlpFailure', 'outdated').title).toBe('Не удалось скачать ролик')
+    expect(getDownloadErrorText('ytDlpFailure', 'outdated').title).not.toContain('данные о ролике')
+  })
 })
 
 describe('getDownloadErrorText — нормативный запрет на подмену message (требование п.1)', () => {

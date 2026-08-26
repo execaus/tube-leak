@@ -67,12 +67,22 @@ const YTDLP_FAILURE_GENERIC_TEXT: DownloadErrorText = {
 
 /**
  * Под-причина «yt-dlp устарел» (CLAUDE.md: пользователь обязан отличать её
- * от прочих сбоев). Формулировка — та же, что уже показывает экран
- * разбора E2 (`getProbeErrorText('ytDlpFailure', 'outdated')`), чтобы один
- * и тот же факт не объяснялся пользователю двумя разными способами на
- * двух экранах одного приложения.
+ * от прочих сбоев).
+ *
+ * Заголовок — из таблицы **E3** (`YTDLP_FAILURE_GENERIC_TEXT.title`), не
+ * заголовок экрана разбора E2 (ревью TL-45): там заголовок про получение
+ * данных о ролике («Не удалось получить данные о ролике») — неправда для
+ * этой панели, где данные уже получены и качало именно скачивание.
+ * Пояснение, наоборот, берётся дословно из E2
+ * (`getProbeErrorText('ytDlpFailure', 'outdated').explanation`), чтобы
+ * различающая формулировка про устаревший yt-dlp была одной и той же на
+ * обоих экранах — инвариант CLAUDE.md выполняется без противоречия с
+ * «заголовок должен соответствовать тому, что не удалось».
  */
-const YTDLP_FAILURE_OUTDATED_TEXT: DownloadErrorText = getProbeErrorText('ytDlpFailure', 'outdated')
+const YTDLP_FAILURE_OUTDATED_TEXT: DownloadErrorText = {
+  title: YTDLP_FAILURE_GENERIC_TEXT.title,
+  explanation: getProbeErrorText('ytDlpFailure', 'outdated').explanation,
+}
 
 /**
  * Текст по классу отказа скачивания, строго из таблицы дизайна. Три

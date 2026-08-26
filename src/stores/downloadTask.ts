@@ -4,6 +4,9 @@ import { defineStore } from 'pinia'
 import { computed, onScopeDispose, ref } from 'vue'
 
 import type {
+  DownloadCommandError,
+  DownloadCommandErrorKind,
+  DownloadPhase,
   DownloadPlan,
   DownloadProgress,
   DownloadProgressEvent,
@@ -34,8 +37,73 @@ export interface DownloadTask {
   displayTitle: string
 }
 
+const KNOWN_COMMAND_ERROR_KINDS: readonly DownloadCommandErrorKind[] = [
+  'alreadyActive',
+  'unknownTask',
+  'notFailed',
+  'notRetryable',
+  'noStreamsSelected',
+  'invalidUrl',
+]
+
+function isDownloadCommandError(value: unknown): value is DownloadCommandError {
+  if (typeof value !== 'object' || value === null) return false
+  const candidate = value as Record<string, unknown>
+  return (
+    typeof candidate.kind === 'string' &&
+    (KNOWN_COMMAND_ERROR_KINDS as readonly string[]).includes(candidate.kind) &&
+    typeof candidate.message === 'string'
+  )
+}
+
+/**
+ * То, что реально может оказаться отказом одной из трёх команд
+ * (`start_download`/`cancel_download`/`retry_download`). Контрактный путь
+ * честный ({@link DownloadCommandError}), но неконтрактный отказ существует
+ * (паника команды, отказ самого IPC-вызова) и должен быть учтён без каста
+ * вслепую — тот же приём, что `ProbeFailure` в `useProbe.ts` (эпик E2) и
+ * `PrepareFailure` в `useYtDlpPrepare.ts` (эпик E1).
+ */
+export type DownloadCommandFailure = DownloadCommandError | { kind?: undefined; message: string }
+
+function toDownloadCommandFailure(err: unknown): DownloadCommandFailure {
+  if (isDownloadCommandError(err)) return err
+  if (err instanceof Error) return { message: err.message }
+  if (typeof err === 'string' && err.length > 0) return { message: err }
+  return { message: 'Команда управления загрузкой отклонена по нераспознанной причине.' }
+}
+
 function isTerminalPhase(progress: DownloadProgress): boolean {
   return progress.phase === 'done' || progress.phase === 'failed' || progress.phase === 'cancelled'
+}
+
+/**
+ * Начальное представление задачи сразу после `start_download` — строится
+ * по фазе из ответа команды, а не константой (ревью TL-45): doc-комментарий
+ * `DownloadStarted.phase` в `src/types/download.ts` прямо требует рисовать
+ * по присланному полю, потому что в эпике очереди (E4) задача может
+ * реально задержаться в `queued`, ожидая слот.
+ *
+ * Ветки для терминальных фаз и `merging` — оборона на случай будущего
+ * расширения контракта, а не ожидаемый путь (задача только что создана):
+ * ближайшая честная трактовка — «ещё не начиналась»/«идёт скачивание без
+ * данных потока».
+ */
+function initialProgressForPhase(phase: DownloadPhase): DownloadProgress {
+  switch (phase) {
+    case 'queued':
+      return { phase: 'queued' }
+    case 'fetching':
+      return { phase: 'fetching' }
+    case 'downloading':
+      return { phase: 'downloading', state: 'running' }
+    case 'merging':
+      return { phase: 'merging' }
+    case 'done':
+    case 'failed':
+    case 'cancelled':
+      return { phase: 'queued' }
+  }
 }
 
 /**
@@ -59,10 +127,24 @@ function isTerminalPhase(progress: DownloadProgress): boolean {
  * задачу, а новые события того же `taskId` продолжают приходить в тот же
  * `progress` без каких-либо дополнительных действий на этой стороне (doc
  * `DownloadProgressEvent` в `src/types/download.ts`).
+ *
+ * # Отказ команды — виден на экране, не только в консоли (ревью TL-45)
+ *
+ * Кнопка «Скачать» на исправном фронтенде не должна быть достижима для
+ * `alreadyActive`, но путь к молчаливому отказу реален (несовпадение
+ * обрезки пробелов между разбором и стартом — почин в `ProbeSection.vue`)
+ * и для остальных пяти классов тоже: приложение не может полагаться
+ * только на то, что кнопка была неактивна (дизайн E3, «Кнопка Скачать»).
+ * Поэтому отказ любой из трёх команд не глушится молча — он оседает в
+ * `commandError` и рисуется тем же приёмом, что и прочие ошибки: заголовок
+ * и пояснение по классу, без кнопки «Повторить» (все шесть классов
+ * означают, что повторять нечего — либо гонка уже разрешилась сама,
+ * либо нужен другой ввод, а не тот же вызов ещё раз).
  */
 export const useDownloadTaskStore = defineStore('downloadTask', () => {
   const task = ref<DownloadTask>()
   const progress = ref<DownloadProgress>()
+  const commandError = ref<DownloadCommandFailure>()
 
   /**
    * Секунды без события — только пока идёт `downloading`/`running`
@@ -76,6 +158,9 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
   let listening: Promise<void> | undefined
   let lastEventAt = 0
   let stallTimer: ReturnType<typeof setInterval> | undefined
+  // Окно двойного клика (ревью TL-45, «Заметки»): одна из трёх команд в
+  // любой момент, кнопки не блокируют себя сами — блокирует стор.
+  let commandInFlight = false
 
   function clearStallTimer(): void {
     if (stallTimer !== undefined) {
@@ -145,45 +230,58 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
   /**
    * Слот занят, пока задача существует и не в терминальной фазе — по этому
    * полю кнопка «Скачать» на карточке решает, показывать ли подсказку С-13.
-   * Мгновенно после `start()` `progress` уже заполнен (`queued`), поэтому
-   * «задача создана, но фаза ещё не пришла» здесь не бывает.
+   * Мгновенно после `start()` `progress` уже заполнен, поэтому «задача
+   * создана, но фаза ещё не пришла» здесь не бывает.
    */
   const isActive = computed(() => {
     const current = progress.value
     return task.value !== undefined && current !== undefined && !isTerminalPhase(current)
   })
 
+  /** Скрывает баннер отказа команды («Скрыть» на нём же). */
+  function dismissCommandError(): void {
+    commandError.value = undefined
+  }
+
   /**
    * Запускает новую задачу. Слот уже должен быть свободен (кнопка на
    * карточке это гарантирует) — ядро всё равно проверяет это само
    * (`alreadyActive`) и является единственным источником истины (дизайн
-   * E3, «Кнопка Скачать»): отказ здесь просто логируется, не выбрасывается
-   * наверх — исправный фронтенд такую кнопку не показывает.
+   * E3, «Кнопка Скачать»). Отказ не глушится: он оседает в `commandError`
+   * и виден на экране (см. doc стора).
    */
   async function start(request: StartDownloadRequest, displayTitle: string): Promise<void> {
+    if (commandInFlight) return
+    commandInFlight = true
+    commandError.value = undefined
     try {
       await ensureListening()
       const started = await invoke<DownloadStarted>(START_DOWNLOAD_COMMAND, { request })
       task.value = { taskId: started.taskId, plan: started.plan, displayTitle }
-      // `DownloadStarted.phase` — всегда `'queued'` в E3 (doc-комментарий
-      // контракта): единственный вариант объединения, конструируемый без
-      // дополнительных полей, поэтому литерал, а не `{ phase: started.phase }`
-      // (тот не сузился бы до конкретного варианта union).
-      progress.value = { phase: 'queued' }
+      progress.value = initialProgressForPhase(started.phase)
       clearStallTimer()
     } catch (err) {
       console.error('start_download rejected', err)
+      commandError.value = toDownloadCommandFailure(err)
+    } finally {
+      commandInFlight = false
     }
   }
 
   /** Отмена — доступна в любой нетерминальной фазе (Ф-4). */
   async function cancel(): Promise<void> {
+    if (commandInFlight) return
     const current = task.value
     if (!current) return
+    commandInFlight = true
     try {
       await invoke<void>(CANCEL_DOWNLOAD_COMMAND, { taskId: current.taskId })
+      commandError.value = undefined
     } catch (err) {
       console.error('cancel_download rejected', err)
+      commandError.value = toDownloadCommandFailure(err)
+    } finally {
+      commandInFlight = false
     }
   }
 
@@ -193,12 +291,18 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
    * возобновляется сам, без какого-либо сброса состояния здесь.
    */
   async function retry(): Promise<void> {
+    if (commandInFlight) return
     const current = task.value
     if (!current) return
+    commandInFlight = true
     try {
       await invoke<void>(RETRY_DOWNLOAD_COMMAND, { taskId: current.taskId })
+      commandError.value = undefined
     } catch (err) {
       console.error('retry_download rejected', err)
+      commandError.value = toDownloadCommandFailure(err)
+    } finally {
+      commandInFlight = false
     }
   }
 
@@ -217,5 +321,16 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
     if (unlisten) unlisten()
   })
 
-  return { task, progress, softStallSeconds, isActive, start, cancel, retry, hide }
+  return {
+    task,
+    progress,
+    softStallSeconds,
+    commandError,
+    isActive,
+    start,
+    cancel,
+    retry,
+    hide,
+    dismissCommandError,
+  }
 })

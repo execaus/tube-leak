@@ -209,17 +209,23 @@ const showDetailsToggle = computed(() => {
       </template>
 
       <template v-else-if="progress.phase === 'downloading' && progress.state === 'running'">
+        <!--
+          Полоса рисуется только когда есть реальный процент — дизайн:
+          отсутствующий элемент опускается целиком, не рисуется прочерком
+          или нулём (ревью TL-45: нулевая ширина выглядела как «почти
+          ничего не скачано», хотя данных попросту ещё нет).
+        -->
         <div
+          v-if="progress.percent !== undefined"
           class="download-panel__bar"
           role="progressbar"
           aria-valuemin="0"
           aria-valuemax="100"
           :aria-valuenow="progress.percent"
-          :aria-busy="progress.percent === undefined"
         >
           <div
             class="download-panel__bar-fill"
-            :style="{ width: `${progress.percent ?? 0}%` }"
+            :style="{ width: `${progress.percent}%` }"
           />
         </div>
         <p
@@ -244,6 +250,7 @@ const showDetailsToggle = computed(() => {
 
       <template v-else-if="progress.phase === 'downloading' && progress.state === 'waitingRetry'">
         <div
+          v-if="progress.percent !== undefined"
           class="download-panel__bar"
           role="progressbar"
           aria-valuemin="0"
@@ -252,7 +259,7 @@ const showDetailsToggle = computed(() => {
         >
           <div
             class="download-panel__bar-fill"
-            :style="{ width: `${progress.percent ?? 0}%` }"
+            :style="{ width: `${progress.percent}%` }"
           />
         </div>
         <p
@@ -268,16 +275,17 @@ const showDetailsToggle = computed(() => {
       </template>
 
       <template v-else-if="progress.phase === 'merging'">
-        <div
-          class="download-panel__bar"
-          role="progressbar"
-          aria-valuemin="0"
-          aria-valuemax="100"
+        <!--
+          Ревью TL-45: полоса, залитая на всю ширину (блочный `div` без
+          заданной ширины), читалась как «готово», хотя remux ещё идёт.
+          Дизайн для «Склейки» полосы не рисует вовсе — только нейтральный
+          маркер; `aria-busy` держим на самой строке, не заводя пустой
+          `role="progressbar"` без какого-либо визуального смысла.
+        -->
+        <p
+          class="download-panel__row"
           aria-busy="true"
         >
-          <div class="download-panel__bar-fill" />
-        </div>
-        <p class="download-panel__row">
           <span
             class="spinner"
             aria-hidden="true"

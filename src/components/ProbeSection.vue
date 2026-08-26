@@ -43,7 +43,15 @@ const emit = defineEmits<{
 const { url, state, retry } = useLinkProbe()
 
 function onDownload(payload: { title: string; streams: QualityStreams; qualityLabel: string }): void {
-  emit('download', { ...payload, url: url.value })
+  // `url.value` — то, что буквально лежит в поле (для отображения); разбор
+  // (`useLinkProbe`) уже давно решает по обрезанной строке (`evaluate`
+  // делает `value.trim()` перед проверками). Ссылка, вставленная с
+  // завершающим переносом строки/пробелом, давала нормальную карточку (её
+  // строит обрезанное значение), но затем попадала в команду старта
+  // необрезанной — и core честно отклонял её как `invalidUrl` молча
+  // (ревью TL-45, «Достижимый путь к молчаливому отказу»). Обрезаем здесь,
+  // в точке эмита, а не полагаемся на то, что где-то выше её обрежут ещё раз.
+  emit('download', { ...payload, url: url.value.trim() })
 }
 
 /** Стабильный id, связывающий видимый `<label>` с полем (доступность: не только aria-label). */

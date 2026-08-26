@@ -133,7 +133,7 @@ describe('DownloadPanel — Скачивание (running)', () => {
     expect(wrapper.text()).not.toContain('Скачиваем звук')
   })
 
-  it('omits percent, speed and eta entirely when absent — never renders a dash or zero', () => {
+  it('omits percent, speed, eta and the bar itself entirely when absent — never renders a dash, zero, or a bar frozen at 0%', () => {
     const wrapper = mount(DownloadPanel, {
       props: {
         displayTitle: TITLE,
@@ -143,7 +143,10 @@ describe('DownloadPanel — Скачивание (running)', () => {
     })
     expect(wrapper.find('.download-panel__percent').exists()).toBe(false)
     expect(wrapper.text()).not.toMatch(/МБ\/с|КБ\/с|осталось/)
-    expect(wrapper.find('[role="progressbar"]').attributes('aria-valuenow')).toBeUndefined()
+    // Без известного процента полосы нет вовсе (ревью TL-45) — нулевая
+    // ширина выглядела бы как «почти ничего не скачано», хотя данных
+    // попросту ещё нет.
+    expect(wrapper.find('[role="progressbar"]').exists()).toBe(false)
   })
 
   it('does not show the attempt number on the first attempt, but shows it from the second on', () => {
@@ -260,15 +263,18 @@ describe('DownloadPanel — пауза перед повтором (waitingRetry
 })
 
 describe('DownloadPanel — Склейка (merging)', () => {
-  it('shows a neutral spinner and no percent at all — merging has no meaningful percent', () => {
+  it('shows a neutral spinner, no percent, and no progress bar at all — design draws no bar for merging (ревью TL-45)', () => {
     const wrapper = mount(DownloadPanel, {
       props: { displayTitle: TITLE, plan: 'videoAndAudio', progress: { phase: 'merging' } },
     })
     expect(wrapper.text()).toContain('Склеиваем видео и звук')
     expect(wrapper.find('.download-panel__percent').exists()).toBe(false)
-    const bar = wrapper.find('[role="progressbar"]')
-    expect(bar.attributes('aria-busy')).toBe('true')
-    expect(bar.attributes('aria-valuenow')).toBeUndefined()
+    // Раньше здесь рендерилась полностью залитая полоса (блочный div без
+    // ширины = 100% родителя) — читалась как «готово», хотя remux ещё
+    // идёт. Дизайн для этой фазы полосы не рисует вовсе.
+    expect(wrapper.find('.download-panel__bar').exists()).toBe(false)
+    expect(wrapper.find('[role="progressbar"]').exists()).toBe(false)
+    expect(wrapper.find('[aria-busy="true"]').exists()).toBe(true)
   })
 })
 

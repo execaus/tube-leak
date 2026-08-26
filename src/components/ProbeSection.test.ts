@@ -222,6 +222,26 @@ describe('ProbeSection — ретрансляция запроса скачив�
     ])
   })
 
+  it('trims the url before emitting the download request — a trailing newline from a paste must not silently break start_download (ревью TL-45)', async () => {
+    const wrapper = mount(ProbeSection, { props: { ytDlpState: 'ready' } })
+    invokeMock.mockResolvedValueOnce(resultA)
+
+    // Разбор уже работает по обрезанной строке (useLinkProbe.evaluate
+    // делает value.trim()) — карточка строится как обычно, но `url.value`
+    // хранит сырой ввод с завершающим переносом строки.
+    await wrapper.find('input').setValue('https://youtu.be/a\n')
+    await vi.advanceTimersByTimeAsync(400)
+    await vi.waitFor(() => {
+      expect(wrapper.text()).toContain('Ролик A')
+    })
+
+    await wrapper.find('input[type="radio"]').setValue(true)
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+
+    const emitted = wrapper.emitted('download')
+    expect(emitted?.[0]?.[0]).toMatchObject({ url: 'https://youtu.be/a' })
+  })
+
   it('forwards downloadBlocked to VideoCard so its download button carries the С-13 hint', async () => {
     const wrapper = mount(ProbeSection, { props: { ytDlpState: 'ready', downloadBlocked: true } })
     invokeMock.mockResolvedValueOnce(resultA)

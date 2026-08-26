@@ -1,4 +1,4 @@
-import { createPinia, setActivePinia } from 'pinia'
+import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DownloadProgressEvent, DownloadStarted, StartDownloadRequest } from '@/types/download'
@@ -87,6 +87,136 @@ describe('useDownloadTaskStore — start', () => {
     expect(store.task).toBeUndefined()
     expect(consoleErrorSpy).toHaveBeenCalled()
     consoleErrorSpy.mockRestore()
+  })
+
+  it('builds the initial progress from the response phase, not a hardcoded constant (ревью TL-45)', async () => {
+    // Контракт гарантирует `queued` сегодня, но doc `DownloadStarted.phase`
+    // прямо требует рисовать по присланному полю (задел под очередь E4) —
+    // проверяем это буквально, подставив другую фазу в ответ.
+    invokeMock.mockResolvedValueOnce({ taskId: 'task-9', phase: 'fetching', plan: 'singleStream' })
+    const store = useDownloadTaskStore()
+
+    await store.start(request, 'title')
+
+    expect(store.progress).toStrictEqual({ phase: 'fetching' })
+  })
+
+  it('ignores a second concurrent start() call while the first is still in flight (double-click window)', async () => {
+    let resolveFirst: (value: DownloadStarted) => void = () => {}
+    invokeMock.mockImplementationOnce(
+      () =>
+        new Promise<DownloadStarted>((resolve) => {
+          resolveFirst = resolve
+        }),
+    )
+
+    const store = useDownloadTaskStore()
+    const firstCall = store.start(request, 'title')
+    const secondCall = store.start(request, 'title')
+
+    // Дать первому вызову дойти до `invoke()` (несколько микротасков внутри
+    // `ensureListening()`), прежде чем разрешать его, — иначе `resolveFirst`
+    // мог бы вызваться раньше, чем `mockImplementationOnce` успел его
+    // переприсвоить, и промис никогда бы не разрешился.
+    await vi.waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledTimes(1)
+    })
+    resolveFirst(started)
+    await Promise.all([firstCall, secondCall])
+
+    expect(invokeMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('surfaces a rejected start as a typed commandError, visible on screen (not just logged), and clears it on the next successful start', async () => {
+    invokeMock.mockRejectedValueOnce({ kind: 'invalidUrl', message: 'core diagnostic' })
+    const store = useDownloadTaskStore()
+
+    await store.start(request, 'title')
+    expect(store.commandError).toStrictEqual({ kind: 'invalidUrl', message: 'core diagnostic' })
+
+    invokeMock.mockResolvedValueOnce(started)
+    await store.start(request, 'title')
+    expect(store.commandError).toBeUndefined()
+  })
+
+  it('falls back to a message-only failure for a non-contractual rejection (unrecognized shape)', async () => {
+    invokeMock.mockRejectedValueOnce(new Error('boom'))
+    const store = useDownloadTaskStore()
+
+    await store.start(request, 'title')
+
+    expect(store.commandError).toStrictEqual({ message: 'boom' })
+  })
+
+  it('subscribes only once across repeated starts on the same store instance (no leaked/duplicated listeners)', async () => {
+    invokeMock.mockResolvedValueOnce(started)
+    const store = useDownloadTaskStore()
+    await store.start(request, 'title')
+
+    emit({ taskId: 'task-1', phase: 'cancelled', partialData: 'nothingCreated' })
+    store.hide()
+
+    invokeMock.mockResolvedValueOnce({ taskId: 'task-2', phase: 'queued', plan: 'singleStream' })
+    await store.start(request, 'title')
+
+    expect(listenMock).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('useDownloadTaskStore — cancel/retry: отказ команды тоже не глушится', () => {
+  it('surfaces a rejected cancel as commandError', async () => {
+    invokeMock.mockResolvedValueOnce(started)
+    const store = useDownloadTaskStore()
+    await store.start(request, 'title')
+
+    invokeMock.mockRejectedValueOnce({ kind: 'unknownTask', message: 'diag' })
+    await store.cancel()
+
+    expect(store.commandError).toStrictEqual({ kind: 'unknownTask', message: 'diag' })
+  })
+
+  it('surfaces a rejected retry as commandError', async () => {
+    invokeMock.mockResolvedValueOnce(started)
+    const store = useDownloadTaskStore()
+    await store.start(request, 'title')
+    emit({
+      taskId: 'task-1',
+      phase: 'failed',
+      error: { kind: 'connectionLost', message: 'diag', retryable: true, partialData: 'kept' },
+    })
+
+    invokeMock.mockRejectedValueOnce({ kind: 'notFailed', message: 'diag' })
+    await store.retry()
+
+    expect(store.commandError).toStrictEqual({ kind: 'notFailed', message: 'diag' })
+  })
+
+  it('dismissCommandError clears the banner', async () => {
+    invokeMock.mockRejectedValueOnce({ kind: 'invalidUrl', message: 'diag' })
+    const store = useDownloadTaskStore()
+    await store.start(request, 'title')
+    expect(store.commandError).not.toBeUndefined()
+
+    store.dismissCommandError()
+    expect(store.commandError).toBeUndefined()
+  })
+})
+
+describe('useDownloadTaskStore — подписка не течёт: снимается при dispose стора', () => {
+  it('calls unlisten once the store is disposed ($dispose — Pinia\'s public teardown, tears down the store\'s effect scope and its onScopeDispose hooks)', async () => {
+    // Собственный, изолированный Pinia-инстанс — предыдущий из общего
+    // beforeEach() здесь не годится: тест проверяет именно уничтожение
+    // конкретного стора, а не просто создаёт очередной.
+    const pinia: Pinia = createPinia()
+    setActivePinia(pinia)
+
+    invokeMock.mockResolvedValueOnce(started)
+    const store = useDownloadTaskStore()
+    await store.start(request, 'title')
+
+    expect(unlistenMock).not.toHaveBeenCalled()
+    store.$dispose()
+    expect(unlistenMock).toHaveBeenCalledTimes(1)
   })
 })
 
