@@ -96,7 +96,7 @@ export interface ProbeResult {
    * забота E3, не этого типа.
    */
   title: string
-  /** Длительность в секундах; форматирование в `м:сс`/`ч:мм:сс» — на UI. */
+  /** Длительность в секундах; форматирование в `м:сс`/`ч:мм:сс` — на UI. */
   durationSecs: number
   channel?: string
   /** URL превью, который webview грузит напрямую с CDN YouTube (Р-2). */
