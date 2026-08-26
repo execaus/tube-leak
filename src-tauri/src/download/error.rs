@@ -14,7 +14,10 @@
 //! границы, и лишняя конвертация только добавила бы места, где они могут
 //! разойтись.
 
-use crate::types::{DownloadError, DownloadErrorDetails, DownloadErrorKind, PartialData};
+use crate::types::{
+    DownloadCommandError, DownloadCommandErrorKind, DownloadError, DownloadErrorDetails,
+    DownloadErrorKind, PartialData, YtDlpFailureReason,
+};
 
 /// Почему скачивание не дошло до готового файла.
 ///
@@ -117,8 +120,24 @@ pub enum DownloadFailure {
     ///
     /// Сюда же попадает и таймаут фазы «Подготовка»: отдельного класса
     /// `timeout`, как в E2, девятка E3 не содержит.
+    ///
+    /// `reason` — обязательное поле, а не `Option`, дословно как у
+    /// [`crate::probe::ProbeFailure`]: сигнатура устаревшего yt-dlp либо
+    /// опознана, либо нет, третьего состояния не бывает, и
+    /// [`YtDlpFailureReason::Generic`] — честное «не опознана». Маркеры
+    /// распознавания написаны и покрыты фикстурами ещё в E2 (TL-31) —
+    /// классификации E3 (TL-43) их переиспользовать, а не изобретать
+    /// заново.
+    ///
+    /// В текст ошибки под-причина не интерполируется: он уезжает в
+    /// `message`, то есть в «Подробнее» на экран, а имя Rust-варианта
+    /// пользователю не говорит ничего. Фронтенду под-причина приходит
+    /// отдельным полем `reason`.
     #[error("yt-dlp не смог скачать ролик")]
-    YtDlpFailure { details: DownloadErrorDetails },
+    YtDlpFailure {
+        reason: YtDlpFailureReason,
+        details: DownloadErrorDetails,
+    },
 }
 
 #[allow(dead_code)]
@@ -161,6 +180,10 @@ impl DownloadFailure {
             kind,
             message: self.to_string(),
             retryable: kind.is_retryable(),
+            reason: match self {
+                Self::YtDlpFailure { reason, .. } => Some(*reason),
+                _ => None,
+            },
             partial_data,
             // Пустые детали границу не пересекают: «Подробнее», за
             // которым ничего нет, — это состояние без содержания, а не
@@ -190,7 +213,7 @@ impl DownloadFailure {
             | Self::VideoUnavailable { details }
             | Self::SignInRequired { details }
             | Self::RegionBlocked { details }
-            | Self::YtDlpFailure { details } => details,
+            | Self::YtDlpFailure { details, .. } => details,
         }
     }
 }
@@ -260,7 +283,10 @@ mod tests {
                 PartialData::Removed,
             ),
             (
-                DownloadFailure::YtDlpFailure { details: details() },
+                DownloadFailure::YtDlpFailure {
+                    reason: YtDlpFailureReason::Generic,
+                    details: details(),
+                },
                 DownloadErrorKind::YtDlpFailure,
                 PartialData::Kept,
             ),
@@ -381,6 +407,9 @@ mod tests {
                 "SignInRequired",
                 "RegionBlocked",
                 "YtDlpFailure",
+                "Generic",
+                "Outdated",
+                "YtDlpFailureReason",
             ] {
                 assert!(
                     !message.contains(identifier),
@@ -388,6 +417,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn carries_the_failure_reason_only_for_the_yt_dlp_failure_class() {
+        for (failure, kind, partial) in all_variants() {
+            let contract = failure.to_contract(partial);
+            if kind == DownloadErrorKind::YtDlpFailure {
+                assert_eq!(contract.reason, Some(YtDlpFailureReason::Generic));
+            } else {
+                assert_eq!(contract.reason, None);
+            }
+        }
+    }
+
+    #[test]
+    fn recognised_outdated_signature_changes_the_reason_not_the_class() {
+        // Девятка классов от под-причины не растёт — меняется только текст
+        // пояснения на экране (тот же приём, что в E2).
+        let generic = DownloadFailure::YtDlpFailure {
+            reason: YtDlpFailureReason::Generic,
+            details: details(),
+        }
+        .to_contract(PartialData::Kept);
+        let outdated = DownloadFailure::YtDlpFailure {
+            reason: YtDlpFailureReason::Outdated,
+            details: details(),
+        }
+        .to_contract(PartialData::Kept);
+
+        assert_eq!(generic.kind, outdated.kind);
+        assert_ne!(generic.reason, outdated.reason);
+        // Повтор при устаревшем yt-dlp дизайн не запрещает: ценность
+        // под-причины в честном объяснении, а не в другой кнопке.
+        assert_eq!(generic.retryable, outdated.retryable);
     }
 
     #[test]
@@ -402,5 +465,172 @@ mod tests {
         .to_contract(PartialData::Kept);
 
         assert!(contract.message.contains('6'));
+    }
+}
+
+/// Почему команда управления загрузкой отклонена — доменная сторона
+/// [`DownloadCommandError`].
+///
+/// Отдельный тип, а не строки на месте вызова, по той же причине, что и
+/// [`DownloadFailure`]: оркестрация (TL-44) отклоняет вызовы в шести
+/// разных местах, и без общего типа текст собирался бы руками шесть раз —
+/// а отладочное форматирование варианта, случайно попавшее в такой текст,
+/// прошло бы незамеченным. Здесь его ловит тот же сторож, что и у отказа
+/// задачи.
+///
+/// Классы отказа **команды** и классы отказа **задачи** не смешиваются:
+/// первые описывают отказ выполнить вызов (до которого исправный фронтенд
+/// не доводит — кнопок, которых нельзя нажать, он не показывает), вторые —
+/// судьбу задачи, которую рисует панель.
+// Конструировать варианты начнёт TL-44 вместе с самими командами.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DownloadCommandRejection {
+    /// Слот занят задачей в нетерминальной фазе (С-13).
+    #[error("уже идёт другая загрузка")]
+    AlreadyActive,
+
+    /// Задачи с таким идентификатором ядро не знает.
+    ///
+    /// Идентификатор уезжает в `message`, то есть в лог: он выдан самим
+    /// ядром и непрозрачен, разбирать в нём нечего, но по нему видно,
+    /// какой именно вызов промахнулся.
+    #[error("задача {task_id} ядру неизвестна")]
+    UnknownTask { task_id: String },
+
+    /// Повтор запрошен для задачи, которая не завершилась ошибкой.
+    #[error("повтор доступен только для задачи, завершившейся ошибкой")]
+    NotFailed,
+
+    /// Повтор запрошен для класса, где он заведомо бесполезен
+    /// ([`DownloadErrorKind::is_retryable`] = `false`).
+    ///
+    /// Класс в текст не интерполируется: он и так известен фронтенду из
+    /// последнего события, а имя Rust-варианта в логе ничего не добавило
+    /// бы к уже записанному там отказу задачи.
+    #[error("для этого класса ошибки повтор заведомо бесполезен")]
+    NotRetryable,
+
+    /// В запросе нет ни одного идентификатора потока: скачивать нечего
+    /// (инвариант [`crate::types::QualityStreams::has_any`]).
+    #[error("в запросе нет ни одного идентификатора потока")]
+    NoStreamsSelected,
+
+    /// Ссылка не является http(s)-адресом (Ф-1).
+    #[error("ссылка не является http(s)-адресом")]
+    InvalidUrl,
+}
+
+#[allow(dead_code)]
+impl DownloadCommandRejection {
+    /// Класс отказа для фронтенда.
+    pub fn kind(&self) -> DownloadCommandErrorKind {
+        match self {
+            Self::AlreadyActive => DownloadCommandErrorKind::AlreadyActive,
+            Self::UnknownTask { .. } => DownloadCommandErrorKind::UnknownTask,
+            Self::NotFailed => DownloadCommandErrorKind::NotFailed,
+            Self::NotRetryable => DownloadCommandErrorKind::NotRetryable,
+            Self::NoStreamsSelected => DownloadCommandErrorKind::NoStreamsSelected,
+            Self::InvalidUrl => DownloadCommandErrorKind::InvalidUrl,
+        }
+    }
+
+    /// Проекция на контракт — единственный способ получить
+    /// [`DownloadCommandError`].
+    pub fn to_contract(&self) -> DownloadCommandError {
+        DownloadCommandError {
+            kind: self.kind(),
+            message: self.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    /// Все шесть классов отказа команд с представителем каждого.
+    fn all_rejections() -> Vec<(DownloadCommandRejection, DownloadCommandErrorKind)> {
+        vec![
+            (
+                DownloadCommandRejection::AlreadyActive,
+                DownloadCommandErrorKind::AlreadyActive,
+            ),
+            (
+                DownloadCommandRejection::UnknownTask {
+                    task_id: "task-1".to_string(),
+                },
+                DownloadCommandErrorKind::UnknownTask,
+            ),
+            (
+                DownloadCommandRejection::NotFailed,
+                DownloadCommandErrorKind::NotFailed,
+            ),
+            (
+                DownloadCommandRejection::NotRetryable,
+                DownloadCommandErrorKind::NotRetryable,
+            ),
+            (
+                DownloadCommandRejection::NoStreamsSelected,
+                DownloadCommandErrorKind::NoStreamsSelected,
+            ),
+            (
+                DownloadCommandRejection::InvalidUrl,
+                DownloadCommandErrorKind::InvalidUrl,
+            ),
+        ]
+    }
+
+    #[test]
+    fn maps_every_rejection_to_its_own_contract_kind() {
+        let rejections = all_rejections();
+
+        assert_eq!(rejections.len(), 6);
+
+        for (rejection, expected_kind) in rejections {
+            assert_eq!(rejection.kind(), expected_kind);
+
+            let contract = rejection.to_contract();
+            assert_eq!(contract.kind, expected_kind);
+            assert!(
+                !contract.message.is_empty(),
+                "сообщение обязано быть непустым: по нему пишется лог"
+            );
+        }
+    }
+
+    #[test]
+    fn no_rejection_message_leaks_a_rust_identifier() {
+        // Тот же сторож, что у отказа задачи: отладочное форматирование
+        // варианта не должно доехать ни до лога, ни до «Подробнее».
+        for (rejection, _) in all_rejections() {
+            let message = rejection.to_contract().message;
+            for identifier in [
+                "DownloadCommandRejection",
+                "DownloadCommandErrorKind",
+                "DownloadErrorKind",
+                "AlreadyActive",
+                "UnknownTask",
+                "NotFailed",
+                "NotRetryable",
+                "NoStreamsSelected",
+                "InvalidUrl",
+            ] {
+                assert!(
+                    !message.contains(identifier),
+                    "«{message}» содержит Rust-идентификатор {identifier}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_task_keeps_its_identifier_in_the_diagnostics() {
+        let contract = DownloadCommandRejection::UnknownTask {
+            task_id: "task-7".to_string(),
+        }
+        .to_contract();
+
+        assert!(contract.message.contains("task-7"));
     }
 }
