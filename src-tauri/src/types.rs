@@ -250,15 +250,32 @@ pub enum QualitySize {
 ///   (прогрессивный формат) — только `videoFormatId`.
 ///
 /// Инвариант: хотя бы одно из полей заполнено всегда — пункт без единого
-/// потока не имеет смысла и в список не попадает.
+/// потока не имеет смысла и в список не попадает. Проверяется
+/// [`QualityStreams::has_any`]; `Default` тип сознательно не выводит —
+/// дефолт конструировал бы ровно то состояние, которое инвариант
+/// запрещает, а тип десериализуемый, то есть пустой объект может приехать
+/// и снаружи (`{}` из UI в E3).
 #[allow(dead_code)]
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QualityStreams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video_format_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_format_id: Option<String>,
+}
+
+impl QualityStreams {
+    /// Есть ли хоть один поток, то есть выполняется ли инвариант типа.
+    ///
+    /// Одно место на всех, кто его проверяет: TL-30 (не выпускать пункт
+    /// без потоков в лестницу), TL-32 и E3 (не принимать такой объект
+    /// обратно от UI). Три копии условия разошлись бы.
+    // Объявлено раньше своих вызывающих — как и типы этой секции.
+    #[allow(dead_code)]
+    pub fn has_any(&self) -> bool {
+        self.video_format_id.is_some() || self.audio_format_id.is_some()
+    }
 }
 
 /// Строка лестницы качеств: что это за пункт, сколько примерно весит и что
@@ -375,7 +392,6 @@ pub struct ProbeErrorDetails {
     pub exit_code: Option<i32>,
 }
 
-#[allow(dead_code)]
 impl ProbeErrorDetails {
     /// Нечего показывать: ни хвоста stderr, ни кода завершения.
     ///
@@ -946,6 +962,28 @@ mod tests {
                 "details": { "stderrTail": "[youtube] Downloading player" },
             })
         );
+    }
+
+    #[test]
+    fn quality_streams_report_whether_the_invariant_holds() {
+        assert!(video_streams().has_any());
+        assert!(QualityStreams {
+            video_format_id: None,
+            audio_format_id: Some("140".to_string()),
+        }
+        .has_any());
+        assert!(QualityStreams {
+            video_format_id: Some("18".to_string()),
+            audio_format_id: None,
+        }
+        .has_any());
+        // Форма, которая может приехать из UI (`{}`) и которую нельзя
+        // принимать: пункт без единого потока скачать нечем (Ф-3).
+        assert!(!QualityStreams {
+            video_format_id: None,
+            audio_format_id: None,
+        }
+        .has_any());
     }
 
     #[test]

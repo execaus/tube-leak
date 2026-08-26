@@ -64,7 +64,13 @@ pub enum ProbeFailure {
     /// `reason` — обязательное поле, а не `Option`: сигнатура устаревшего
     /// yt-dlp либо опознана, либо нет, третьего состояния не бывает, и
     /// [`YtDlpFailureReason::Generic`] — честное «не опознана».
-    #[error("yt-dlp не смог получить данные о ролике ({reason:?})")]
+    ///
+    /// В текст ошибки под-причина не интерполируется: этот текст уезжает в
+    /// `message` и оттуда — в свёрнутое «Подробнее», то есть на экран, а
+    /// имя Rust-варианта пользователю не говорит ничего. Фронтенду
+    /// под-причина приходит отдельным полем `reason`; в лог её пишет
+    /// вызывающий вместе с классом (как это делает `commands::ytdlp`).
+    #[error("yt-dlp не смог получить данные о ролике")]
     YtDlpFailure {
         reason: YtDlpFailureReason,
         details: ProbeErrorDetails,
@@ -282,6 +288,21 @@ mod tests {
         assert_eq!(contract.kind, ProbeErrorKind::Timeout);
         assert_eq!(contract.timeout_secs, Some(30));
         assert_eq!(contract.details, None);
+    }
+
+    #[test]
+    fn no_message_leaks_a_rust_identifier_to_the_user() {
+        // `message` виден в «Подробнее» (Н-4): в нём не должно быть имён
+        // вариантов Rust — под-причина едет отдельным полем `reason`.
+        for (failure, _) in all_variants() {
+            let message = failure.to_contract().message;
+            for identifier in ["Generic", "Outdated", "ProbeFailure", "YtDlpFailureReason"] {
+                assert!(
+                    !message.contains(identifier),
+                    "«{message}» содержит Rust-идентификатор {identifier}"
+                );
+            }
+        }
     }
 
     #[test]
