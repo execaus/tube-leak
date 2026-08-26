@@ -20,17 +20,40 @@
 //!
 //! # Инварианты, которые держит только код
 //!
-//! - **`standard` ⇒ высота ровно из четырёх ступеней.** Контракт
+//! - **`standard` ⇒ ступень ровно из четырёх.** Контракт
 //!   ([`QualityKind`]) допускает `{kind: standard, heightPx: 360}`, а Р-1
 //!   это запрещает: всё ниже 720p не показывается вовсе, а если 720p —
 //!   выше максимума ролика, вместо всей лестницы остаётся одна строка
 //!   [`QualityKind::MaxAvailable`]. Ступени перебираются по
-//!   [`LADDER_STEPS`], поэтому другой высоты у `standard` появиться неоткуда;
-//!   закреплено тестом `standard_items_only_ever_carry_ladder_heights`.
+//!   [`LADDER_STEPS`], поэтому другого числа у `standard` появиться
+//!   неоткуда; закреплено тестом
+//!   `standard_items_only_ever_carry_ladder_heights`.
+//! - **Ступень — это метка качества, а не высота кадра** (Р-4, см.
+//!   [`step_of`]).
 //! - **Порядок фиксирован** — от большего разрешения к меньшему, «только
 //!   аудио» последней. Фронтенд список не пересортировывает.
 //! - **Один аудиопоток на все строки.** Аудиодорожка не зависит от
 //!   выбранного разрешения (дизайн E2), поэтому выбирается один раз.
+//!
+//! # Что попадает в `heightPx`
+//!
+//! Ступень (то есть метку качества), а не физическую высоту кадра.
+//!
+//! Решение осознанное, а не побочный эффект Р-4. Поле контракта прямо
+//! описано как «идёт в подпись строки, а не в решение о её виде»: подпись
+//! обязана показывать то же число, что YouTube показывает в плеере, иначе
+//! у вертикального ролика (реальная фикстура `vertical-video.json`)
+//! пользователь увидит «1920p» там, где ждёт «1080p». Альтернатива —
+//! класть физическую высоту и заставлять фронтенд выводить из неё метку —
+//! это ровно то дублирование логики агрегации на двух сторонах границы,
+//! которое контракт запрещает своим же doc-комментарием к
+//! [`QualityKind`].
+//!
+//! Цена решения: у не-16:9 роликов имя поля перестаёт быть буквальным —
+//! `heightPx` несёт число метки, а не пиксели кадра. Для подавляющего
+//! большинства роликов (16:9, горизонтальные) оба числа совпадают.
+//! Переименовать поле нельзя: контракт смержен (TL-27) и по нему уже
+//! написано TS-зеркало.
 
 // Вызывающего у лестницы пока нет: её зовёт оркестрация разбора (TL-32),
 // а до неё код модуля живёт только под тестами. Тот же приём и по той же
@@ -66,19 +89,15 @@ pub fn build_quality_ladder(metadata: &Value) -> Vec<QualityItem> {
 
     // Аудио выбирается один раз на весь ролик: и для «только аудио», и для
     // каждой видеостроки (дизайн E2 — дорожка не зависит от разрешения).
-    let audio = best_audio(streams.iter().filter(|stream| stream.height.is_none()));
+    let audio = best_audio(streams.iter().filter(|stream| stream.step.is_none()));
 
     let mut items = Vec::with_capacity(LADDER_STEPS.len() + 1);
 
     let standard: Vec<(u32, &Stream<'_>)> = LADDER_STEPS
         .iter()
-        .filter_map(|&height| {
-            best_video(
-                streams
-                    .iter()
-                    .filter(|stream| stream.height == Some(height)),
-            )
-            .map(|stream| (height, stream))
+        .filter_map(|&step| {
+            best_video(streams.iter().filter(|stream| stream.step == Some(step)))
+                .map(|stream| (step, stream))
         })
         .collect();
 
@@ -93,16 +112,16 @@ pub fn build_quality_ladder(metadata: &Value) -> Vec<QualityItem> {
         // неё: «лучший из всех» мог бы оказаться 360p-потоком с битрейтом
         // выше, чем у 480p, и строка «максимальное доступное (480p)»
         // указывала бы на 360p.
-        let max_height = streams.iter().filter_map(|stream| stream.height).max();
+        let max_step = streams.iter().filter_map(|stream| stream.step).max();
 
-        if let Some(height) = max_height {
-            if let Some(stream) = best_video(streams.iter().filter(|s| s.height == Some(height))) {
-                items.push(video_item(QualityKind::MaxAvailable, height, stream, audio));
+        if let Some(step) = max_step {
+            if let Some(stream) = best_video(streams.iter().filter(|s| s.step == Some(step))) {
+                items.push(video_item(QualityKind::MaxAvailable, step, stream, audio));
             }
         }
     } else {
-        for (height, stream) in standard {
-            items.push(video_item(QualityKind::Standard, height, stream, audio));
+        for (step, stream) in standard {
+            items.push(video_item(QualityKind::Standard, step, stream, audio));
         }
     }
 
@@ -130,7 +149,7 @@ pub fn build_quality_ladder(metadata: &Value) -> Vec<QualityItem> {
 /// `videoFormatId`».
 fn video_item(
     kind: QualityKind,
-    height: u32,
+    step: u32,
     video: &Stream<'_>,
     audio: Option<&Stream<'_>>,
 ) -> QualityItem {
@@ -138,7 +157,9 @@ fn video_item(
 
     QualityItem {
         kind,
-        height_px: Some(height),
+        // В `heightPx` кладётся ступень (Р-4), а не физическая высота
+        // кадра — см. раздел «Что попадает в `heightPx`» в шапке модуля.
+        height_px: Some(step),
         // Сумма размеров агрегированных потоков (Ф-4).
         size: size_of(video_row_size(
             video.size,
@@ -219,8 +240,9 @@ where
 /// Один поток yt-dlp, приведённый к тому, что нужно лестнице.
 struct Stream<'a> {
     format_id: &'a str,
-    /// Высота кадра; `None` — поток без видео, то есть кандидат в аудио.
-    height: Option<u32>,
+    /// Ступень, к которой поток относится (Р-4, см. [`step_of`]);
+    /// `None` — поток без видео, то есть кандидат в аудио.
+    step: Option<u32>,
     /// Видеопоток уже содержит звук (прогрессивный формат).
     carries_audio: bool,
     size: Option<u64>,
@@ -232,9 +254,9 @@ impl<'a> Stream<'a> {
     /// видео-, ни аудиопотоком.
     ///
     /// Отбрасываются раскадровки превью (`sb0`…`sb3`: `vcodec` и `acodec`
-    /// оба `none`, но у них есть `height` — без этой проверки раскадровка
-    /// 180 px попала бы в лестницу как «максимальное доступное») и любые
-    /// будущие служебные форматы того же вида.
+    /// оба `none`, но у них есть размеры кадра — без этой проверки
+    /// раскадровка 180 px попала бы в лестницу как «максимальное
+    /// доступное») и любые будущие служебные форматы того же вида.
     fn from_format(format: &'a Value) -> Option<Self> {
         let format_id = format.get("format_id").and_then(Value::as_str)?;
         let vcodec = format.get("vcodec").and_then(Value::as_str);
@@ -247,12 +269,11 @@ impl<'a> Stream<'a> {
         // отбрасывается только явное `none`.
         let has_audio = acodec != Some("none");
 
-        let height = read_u32(format.get("height"));
-
-        // Видео без высоты выбрать в ступень нельзя, а как аудио оно не
-        // годится; у аудиопотоков высоты нет по определению.
-        let height = match (has_video, height) {
-            (true, Some(height)) => Some(height),
+        // Видеопоток, ступень которого определить нечем (ни метки, ни
+        // размеров кадра), выбрать некуда, а как аудио он не годится;
+        // у аудиопотоков ступени нет по определению.
+        let step = match (has_video, step_of(format)) {
+            (true, Some(step)) => Some(step),
             (true, None) => return None,
             (false, _) if has_audio => None,
             (false, _) => return None,
@@ -260,11 +281,70 @@ impl<'a> Stream<'a> {
 
         Some(Self {
             format_id,
-            height,
+            step,
             carries_audio: has_video && matches!(acodec, Some(codec) if codec != "none"),
             size: read_size(format),
             rank: Rank::from_format(format),
         })
+    }
+}
+
+/// Ступень, к которой относится видеопоток (решение владельца Р-4).
+///
+/// Источник истины — метка качества, которую даёт сам yt-dlp
+/// (`format_note`: `2160p60`, `1080p`, `480p`); если метки нет или в ней
+/// нет числа — короткая сторона кадра `min(width, height)`.
+///
+/// Почему не просто высота кадра, как было до Р-4: Р-1 и вся лестница
+/// говорят на языке меток YouTube, а не пикселей, и пользователь обязан
+/// увидеть в списке то же число, что видит в плеере. У вертикального
+/// ролика (реальная фикстура `vertical-video.json`) «1080p» — это кадр
+/// 1080×1920: по высоте не совпадала ни одна ступень, и вместо лестницы
+/// получалась одна строка «максимальное доступное (3840p)».
+///
+/// Почему не просто короткая сторона: на кашетированном широкоэкранном
+/// кадре она врёт (1920×804 дала бы 804), а метка — нет. Поэтому метка
+/// первая, короткая сторона — запасной путь, и он реально нужен: метку
+/// несут только прямые потоки, у манифестных (`m3u8_native`)
+/// `format_note` отсутствует вовсе — проверено на всех семи фикстурах.
+fn step_of(format: &Value) -> Option<u32> {
+    label_step(format).or_else(|| short_side(format))
+}
+
+/// Число из метки качества yt-dlp: `2160p60` → 2160, `1080p` → 1080.
+///
+/// `None`, если метки нет или числа в ней нет: у премиального потока
+/// (формат `616`, фикстура `label-differs-from-frame.json`) вместо цифры
+/// стоит слово `Premium`. Такой формат не отбрасывается — он уходит на
+/// короткую сторону кадра, иначе ролик потерял бы поток на ровном месте.
+///
+/// Проверка «за цифрами идёт `p`» обязательна: без неё меткой стала бы
+/// любая строка, начинающаяся с числа, — например `60fps`.
+fn label_step(format: &Value) -> Option<u32> {
+    let note = format.get("format_note").and_then(Value::as_str)?;
+    let digits_len = note
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(note.len());
+    let (digits, rest) = note.split_at(digits_len);
+
+    if digits.is_empty() || !rest.starts_with('p') {
+        return None;
+    }
+
+    digits.parse().ok()
+}
+
+/// Короткая сторона кадра — `min(width, height)`.
+///
+/// Ширины может не быть вовсе; тогда остаётся высота — для
+/// горизонтального ролика это то же самое, что было до Р-4.
+fn short_side(format: &Value) -> Option<u32> {
+    let height = read_u32(format.get("height"));
+    let width = read_u32(format.get("width"));
+
+    match (width, height) {
+        (Some(width), Some(height)) => Some(width.min(height)),
+        (width, height) => width.or(height),
     }
 }
 
@@ -452,12 +532,14 @@ mod tests {
     /// Фикстуры — настоящий вывод `yt-dlp -J` (2026.08.19), см. README
     /// рядом с ними: сетевых вызовов в тестах нет (Ф-7), а числа ниже —
     /// не выдумка, а то, что YouTube отдал на конкретный ролик.
-    const FIXTURES: [&str; 5] = [
+    const FIXTURES: [&str; 7] = [
         "4k-full-ladder.json",
         "max-1080p.json",
         "max-240p.json",
         "multi-language-audio.json",
         "sizes-unknown.json",
+        "vertical-video.json",
+        "label-differs-from-frame.json",
     ];
 
     fn fixture_path(name: &str) -> PathBuf {
@@ -604,6 +686,165 @@ mod tests {
                 (QualityKind::Standard, Some(720)),
                 (QualityKind::AudioOnly, None),
             ]
+        );
+    }
+
+    #[test]
+    fn a_vertical_video_gets_the_whole_ladder_not_one_row() {
+        // Ради этого случая и принято Р-4. У вертикального ролика «1080p»
+        // — это кадр 1080×1920: по высоте не совпадает ни одна ступень, и
+        // прежнее правило схлопывало лестницу в одну строку
+        // «максимальное доступное (3840p)».
+        let items = ladder("vertical-video.json");
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.kind, item.height_px))
+                .collect::<Vec<_>>(),
+            vec![
+                (QualityKind::Standard, Some(2160)),
+                (QualityKind::Standard, Some(1440)),
+                (QualityKind::Standard, Some(1080)),
+                (QualityKind::Standard, Some(720)),
+                (QualityKind::AudioOnly, None),
+            ]
+        );
+
+        // И подпись строки берётся из метки, а не из кадра: у выбранного
+        // на верхней ступени формата `313` кадр 2160×3840.
+        let top = &items[0];
+        assert_eq!(top.streams.video_format_id.as_deref(), Some("313"));
+        assert_eq!(top.height_px, Some(2160), "в подписи — метка, а не 3840");
+    }
+
+    #[test]
+    fn the_quality_label_wins_when_it_disagrees_with_the_frame() {
+        // Живое расхождение: у «Despacito» есть рендиция 1080×608 —
+        // короткая сторона 608, а метка YouTube «480p». Побеждает метка:
+        // пользователь в плеере видит именно 480p, и отдельной ступени
+        // «608» в лестнице не возникает.
+        let odd = fixture("label-differs-from-frame.json")
+            .get("formats")
+            .and_then(Value::as_array)
+            .expect("в фикстуре есть форматы")
+            .iter()
+            .find(|format| format.get("format_id").and_then(Value::as_str) == Some("779"))
+            .cloned()
+            .expect("формат 779 — та самая рендиция 1080×608");
+
+        assert_eq!(odd.get("height").and_then(Value::as_u64), Some(608));
+        assert_eq!(odd.get("width").and_then(Value::as_u64), Some(1080));
+        assert_eq!(short_side(&odd), Some(608));
+        assert_eq!(label_step(&odd), Some(480), "метка формата — «480p»");
+        assert_eq!(step_of(&odd), Some(480));
+
+        // В лестнице ролика это никак не проявляется: 480p ниже 720p и не
+        // показывается вовсе (Р-1).
+        assert_eq!(
+            ladder("label-differs-from-frame.json")
+                .iter()
+                .map(|item| (item.kind, item.height_px))
+                .collect::<Vec<_>>(),
+            vec![
+                (QualityKind::Standard, Some(1080)),
+                (QualityKind::Standard, Some(720)),
+                (QualityKind::AudioOnly, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_label_without_a_number_falls_back_to_the_short_side() {
+        // Премиальный поток `616` помечен словом `Premium` — числа в метке
+        // нет. Формат не отбрасывается: ступень считается по кадру.
+        let premium = fixture("label-differs-from-frame.json")
+            .get("formats")
+            .and_then(Value::as_array)
+            .expect("в фикстуре есть форматы")
+            .iter()
+            .find(|format| format.get("format_id").and_then(Value::as_str) == Some("616"))
+            .cloned()
+            .expect("формат 616 — премиальный поток");
+
+        assert_eq!(
+            premium.get("format_note").and_then(Value::as_str),
+            Some("Premium")
+        );
+        assert_eq!(label_step(&premium), None);
+        assert_eq!(step_of(&premium), Some(1080), "1920×1080 — короткая 1080");
+    }
+
+    #[test]
+    fn quality_labels_are_read_the_way_yt_dlp_writes_them() {
+        // Метка несёт частоту кадров (`2160p60`) и иногда приписки; число
+        // — до `p`. Всё, что на метку не похоже, ступенью не становится:
+        // «60fps» начинается с цифр, но это не метка качества, а
+        // `medium`/`Default, high` — подписи аудиодорожек.
+        for (note, expected) in [
+            ("2160p60", Some(2160)),
+            ("1080p", Some(1080)),
+            ("144p", Some(144)),
+            ("1080p60 HDR", Some(1080)),
+            ("Premium", None),
+            ("60fps", None),
+            ("medium", None),
+            ("Default, high", None),
+            ("", None),
+            ("p", None),
+        ] {
+            let format = json!({ "format_note": note });
+            assert_eq!(label_step(&format), expected, "метка {note:?}");
+        }
+
+        // Метки нет вовсе — так yt-dlp отдаёт манифестные потоки.
+        assert_eq!(label_step(&json!({})), None);
+    }
+
+    #[test]
+    fn manifest_streams_carry_no_label_and_fall_back_to_the_frame() {
+        // Утверждение из doc [`step_of`], проверенное на всех фикстурах:
+        // метку несут только прямые потоки, у манифестных её нет, и
+        // ступень им даёт короткая сторона кадра.
+        let mut manifest_video = 0_u32;
+
+        for name in FIXTURES {
+            let metadata = fixture(name);
+            let formats = metadata
+                .get("formats")
+                .and_then(Value::as_array)
+                .expect("в фикстуре есть форматы");
+
+            for format in formats {
+                let is_video = matches!(
+                    format.get("vcodec").and_then(Value::as_str),
+                    Some(codec) if codec != "none"
+                );
+                let is_manifest = !matches!(
+                    format.get("protocol").and_then(Value::as_str),
+                    Some("https" | "http")
+                );
+                if !is_video || !is_manifest {
+                    continue;
+                }
+
+                manifest_video += 1;
+                assert_eq!(
+                    label_step(format),
+                    None,
+                    "{name}: у манифестного {:?} внезапно есть метка качества",
+                    format.get("format_id")
+                );
+                assert!(
+                    step_of(format).is_some(),
+                    "{name}: манифестный поток остался без ступени"
+                );
+            }
+        }
+
+        assert!(
+            manifest_video > 0,
+            "в наборе фикстур не осталось манифестных видеопотоков —              проверять стало нечего"
         );
     }
 
@@ -991,11 +1232,19 @@ mod tests {
     }
 
     #[test]
-    fn a_height_that_is_not_a_ladder_step_never_makes_its_own_row() {
-        // Реальный случай: у «Despacito» есть высота 608 px. Она ниже
-        // 720p, значит по Р-1 не показывается вовсе, а лестница строится
-        // из тех ступеней, что есть. Здесь то же самое на синтетике:
-        // 900p не ступень и своей строки не получает.
+    fn a_step_outside_the_ladder_never_makes_its_own_row() {
+        // Ступень, которой нет в лестнице, своей строки не получает, если
+        // хоть одна ступень лестницы у ролика есть.
+        //
+        // Живых данных под этот случай нет и после Р-4 они маловероятны:
+        // метки YouTube — фиксированный набор (144p…2160p), а запасной
+        // путь (короткая сторона) срабатывает только у манифестных
+        // потоков, у которых рядом всегда есть прямые аналоги с метками.
+        // Единственная живая рендиция «мимо сетки» — 1080×608 у
+        // «Despacito» — размечена самим YouTube как «480p» и после Р-4
+        // просто сливается со ступенью 480p (см.
+        // `the_quality_label_wins_when_it_disagrees_with_the_frame`).
+        // Поэтому здесь синтетика: 900 — не метка YouTube.
         let metadata = json!({
             "formats": [
                 {"format_id": "odd", "vcodec": "avc1", "acodec": "none", "height": 900,
