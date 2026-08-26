@@ -770,6 +770,16 @@ mod tests {
     /// именно затем, чтобы писать построчно.
     const ECHO: &str = "/bin/echo";
 
+    /// Запас на порождение процесса под нагрузкой набора.
+    ///
+    /// Первый срок и срок между строками — разные величины, и смешивать их
+    /// нельзя: первый обязан пережить `sh` плюс `/bin/echo` на загруженной
+    /// машине (замерено до 0,9 с, но потолка у этого нет), а второй должен
+    /// быть коротким, иначе бездействие нечем поймать. Слей их в одно
+    /// число — и тест либо ловит бездействие, либо не флакует, но не то и
+    /// другое сразу.
+    const SPAWN_ALLOWANCE: Duration = Duration::from_secs(30);
+
     /// Собирает `on_line`, который складывает строки и держит срок
     /// `silence` от каждой из них.
     fn collector(
@@ -809,7 +819,7 @@ mod tests {
             &[],
             &registry,
             &handle,
-            Instant::now() + Duration::from_secs(20),
+            Instant::now() + SPAWN_ALLOWANCE,
             &mut on_line,
         )
         .await
@@ -843,11 +853,11 @@ mod tests {
             &format!("#!/bin/sh\n{ECHO} alive\nsleep 30\n"),
             0o755,
         );
-        // Срок с запасом на порождение процесса под нагрузкой набора
-        // (замерено: `sh` + `/bin/echo` в debug-сборке стоят до 0,9 с),
-        // но много меньше `sleep 30` внутри скрипта: сработать он может
-        // только по бездействию, а не по концу процесса.
-        const STALL_DEADLINE: Duration = Duration::from_secs(3);
+        // Срок между строками — много меньше `sleep 30` внутри скрипта:
+        // сработать он может только по бездействию, а не по концу
+        // процесса. Порождение процесса он не покрывает — для этого есть
+        // отдельный запас.
+        const STALL_DEADLINE: Duration = Duration::from_millis(1_500);
 
         let registry = ChildRegistry::new();
         let handle = RunHandle::new();
@@ -859,7 +869,7 @@ mod tests {
             &[],
             &registry,
             &handle,
-            Instant::now() + STALL_DEADLINE,
+            Instant::now() + SPAWN_ALLOWANCE,
             &mut collector(&mut seen, STALL_DEADLINE),
         )
         .await
@@ -888,28 +898,40 @@ mod tests {
             &dir,
             "chatty.sh",
             &format!(
-                "#!/bin/sh\ni=0\nwhile [ $i -lt 6 ]; do {ECHO} tick $i; sleep 0.15; i=$((i+1)); done\nexit 0\n"
+                "#!/bin/sh\ni=0\nwhile [ $i -lt 8 ]; do {ECHO} tick $i; sleep 0.4; i=$((i+1)); done\nexit 0\n"
             ),
             0o755,
         );
+        // Срок на строку — меньше, чем весь прогон (8 × 0,4 с ≈ 3,2 с), и
+        // больше, чем разрыв между строками даже под нагрузкой набора.
+        // Без перевооружения процесс не дожил бы до конца.
+        const CHATTY_BUDGET: Duration = Duration::from_millis(2_500);
+
         let registry = ChildRegistry::new();
         let handle = RunHandle::new();
 
         let mut seen = Vec::new();
+        let started = Instant::now();
         let run = run_streaming(
             &script,
             &[],
             &registry,
             &handle,
-            Instant::now() + Duration::from_millis(1_500),
-            &mut collector(&mut seen, Duration::from_millis(1_500)),
+            Instant::now() + SPAWN_ALLOWANCE,
+            &mut collector(&mut seen, CHATTY_BUDGET),
         )
         .await
         .expect("script must spawn");
 
         assert!(!run.deadline_expired);
         assert_eq!(run.exit_code, Some(0));
-        assert_eq!(seen.len(), 6);
+        assert_eq!(seen.len(), 8);
+        assert!(
+            started.elapsed() > CHATTY_BUDGET,
+            "прогон обязан быть длиннее одного срока, иначе перевооружение \
+             нечем проверить: он прожил {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -936,8 +958,8 @@ mod tests {
             &[],
             &registry,
             &handle,
-            Instant::now() + Duration::from_secs(30),
-            &mut collector(&mut seen, Duration::from_secs(30)),
+            Instant::now() + SPAWN_ALLOWANCE,
+            &mut collector(&mut seen, SPAWN_ALLOWANCE),
         )
         .await
         .expect("script must spawn");
@@ -970,8 +992,8 @@ mod tests {
             &[],
             &registry,
             &handle,
-            Instant::now() + Duration::from_secs(20),
-            &mut collector(&mut seen, Duration::from_secs(20)),
+            Instant::now() + SPAWN_ALLOWANCE,
+            &mut collector(&mut seen, SPAWN_ALLOWANCE),
         )
         .await
         .expect("script must spawn");
@@ -993,8 +1015,8 @@ mod tests {
             &[],
             &registry,
             &handle,
-            Instant::now() + Duration::from_secs(20),
-            &mut collector(&mut seen, Duration::from_secs(20)),
+            Instant::now() + SPAWN_ALLOWANCE,
+            &mut collector(&mut seen, SPAWN_ALLOWANCE),
         )
         .await
         .expect_err("missing binary must fail the call");
