@@ -1,0 +1,30 @@
+{
+  "_capture": {
+    "note": "Видеопоток обрезан (первые 40 000 байт настоящего файла): moov atom not found.",
+    "reality": "live",
+    "argv": [
+      "-hide_banner",
+      "-loglevel",
+      "warning",
+      "-y",
+      "-i",
+      "file:<video>",
+      "-i",
+      "file:<audio>",
+      "-map",
+      "0:v:0",
+      "-map",
+      "1:a:0",
+      "-c",
+      "copy",
+      "file:<output>"
+    ],
+    "ffmpegVersion": "9.0.1",
+    "ffmpegVersionRaw": "ffmpeg version 9.0.1-https://www.martin-riedl.de Copyright (c) 2000-2026 the FFmpeg developers",
+    "capturedAt": "2026-08-26"
+  },
+  "exitCode": 183,
+  "outputLeftBytes": null,
+  "stdout": "",
+  "stderr": "[in#0 @ 0x12ce08b70] moov atom not found\n[in#0 @ 0x12ce08a40] Error opening input: Invalid data found when processing input\nError opening input file file:video.truncated.mp4.\nError opening input files: Invalid data found when processing input\n"
+}
