@@ -5,15 +5,26 @@ mod sidecar;
 mod types;
 mod ytdlp;
 
-use commands::{check_sidecar, prepare_ytdlp, start_ytdlp_preparation, PreparationLock};
+use commands::{
+    cancel_probe, check_sidecar, prepare_ytdlp, probe_url, start_ytdlp_preparation, PreparationLock,
+};
+use probe::ProbeSession;
 use sidecar::ChildRegistry;
 use tauri::{Manager, RunEvent};
 
 fn main() {
     let app = tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![check_sidecar, prepare_ytdlp])
+        .invoke_handler(tauri::generate_handler![
+            cancel_probe,
+            check_sidecar,
+            prepare_ytdlp,
+            probe_url
+        ])
         .manage(ChildRegistry::new())
         .manage(PreparationLock::new())
+        // Состояние «идёт разбор ссылки» (E2): одно на приложение —
+        // одновременно выполняется не более одного разбора (Ф-8).
+        .manage(ProbeSession::new())
         // Подготовка yt-dlp (TL-12) стартует, не дожидаясь фронтенда:
         // приложение без yt-dlp неработоспособно, и готовить его —
         // обязанность ядра. Фронтенд подписывается на события

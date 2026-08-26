@@ -1,0 +1,109 @@
+{
+ "_capture": {
+  "note": "Ссылка на канал финальным набором. Без --playlist-end выдача канала не закончилась и за 45 с даже с --flat-playlist — замер TL-32.",
+  "argv": [
+   "-J",
+   "--no-playlist",
+   "--flat-playlist",
+   "--playlist-end",
+   "1",
+   "--",
+   "https://www.youtube.com/@NASA"
+  ],
+  "ytDlpVersion": "2026.08.19",
+  "capturedAt": "2026-08-26",
+  "elapsedSecs": 3.36
+ },
+ "exitCode": 0,
+ "stderr": "",
+ "stdout": {
+  "id": "@NASA",
+  "channel": "NASA",
+  "channel_id": "UCLA_DiR1FfKNvjuUpBHmylQ",
+  "title": "NASA",
+  "availability": "public",
+  "uploader_id": "@NASA",
+  "uploader_url": "https://www.youtube.com/@NASA",
+  "channel_is_verified": true,
+  "modified_date": null,
+  "playlist_count": 3,
+  "uploader": "NASA",
+  "channel_url": "https://www.youtube.com/channel/UCLA_DiR1FfKNvjuUpBHmylQ",
+  "_type": "playlist",
+  "entries": [
+   {
+    "id": "UCLA_DiR1FfKNvjuUpBHmylQ",
+    "channel": "NASA",
+    "channel_id": "UCLA_DiR1FfKNvjuUpBHmylQ",
+    "title": "NASA - Videos",
+    "availability": "public",
+    "uploader_id": "@NASA",
+    "uploader_url": "https://www.youtube.com/@NASA",
+    "channel_is_verified": true,
+    "modified_date": null,
+    "playlist_count": null,
+    "uploader": "NASA",
+    "channel_url": "https://www.youtube.com/channel/UCLA_DiR1FfKNvjuUpBHmylQ",
+    "_type": "playlist",
+    "entries": [
+     {
+      "title": "NASA's Roman Space Telescope: A New Perspective on the Cosmos (Official NASA Trailer)",
+      "thumbnails": [
+       {
+        "url": "https://i.ytimg.com/vi/FkgVB19I6xw/hq720.jpg?sqp=-oaymwEcCOgCEMoBSFXyq4qpAw4IARUAAIhCGAFwAcABBg==&rs=AOn4CLBeeUSJEnI-3a0La-NBbjs6kChaJw",
+        "height": 202,
+        "width": 360
+       },
+       {
+        "url": "https://i.ytimg.com/vi/FkgVB19I6xw/hq720.jpg?sqp=-oaymwEcCNAFEJQDSFXyq4qpAw4IARUAAIhCGAFwAcABBg==&rs=AOn4CLCbED_4BBmgd9jCLc5aJSAMF7AOkQ",
+        "height": 404,
+        "width": 720
+       }
+      ],
+      "duration": 46,
+      "view_count": 29000,
+      "timestamp": null,
+      "live_status": null,
+      "availability": null,
+      "channel_url": null,
+      "uploader_url": null,
+      "creators": null,
+      "ie_key": "Youtube",
+      "id": "FkgVB19I6xw",
+      "_type": "url",
+      "url": "https://www.youtube.com/watch?v=FkgVB19I6xw",
+      "__x_forwarded_for_ip": null
+     }
+    ],
+    "extractor_key": "YoutubeTab",
+    "extractor": "youtube:tab",
+    "webpage_url": "https://www.youtube.com/@NASA/videos",
+    "__x_forwarded_for_ip": null,
+    "release_year": null,
+    "requested_entries": [
+     1
+    ],
+    "epoch": 1787743762,
+    "__files_to_move": {}
+   }
+  ],
+  "webpage_url": "https://www.youtube.com/@NASA",
+  "original_url": "https://www.youtube.com/@NASA",
+  "webpage_url_basename": "@NASA",
+  "webpage_url_domain": "youtube.com",
+  "extractor": "youtube:tab",
+  "extractor_key": "YoutubeTab",
+  "release_year": null,
+  "requested_entries": [
+   1
+  ],
+  "epoch": 1787743762,
+  "__files_to_move": {},
+  "_version": {
+   "version": "2026.08.19",
+   "current_git_head": null,
+   "release_git_head": "594bd50c2c78ac432f81600d309fdc4e0a92d82c",
+   "repository": "yt-dlp/yt-dlp"
+  }
+ }
+}

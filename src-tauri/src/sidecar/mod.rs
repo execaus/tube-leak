@@ -24,7 +24,7 @@ mod resolve;
 mod version;
 
 pub use error::SidecarError;
-pub use process::{run, stderr_tail, RunOutput};
+pub use process::{run, run_cancellable, stderr_tail, RunHandle, RunOutput};
 // Предел обрезки нужен только тем, кто его проверяет: продакшен-код зовёт
 // `stderr_tail`, а само число сверяют тесты обоих потребителей — команды
 // служебного экрана и классификации разбора.
