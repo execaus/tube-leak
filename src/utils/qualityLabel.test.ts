@@ -9,7 +9,7 @@ function item(partial: Partial<QualityItem> & Pick<QualityItem, 'kind'>): Qualit
 }
 
 describe('qualityLabel', () => {
-  it('labels a standard step by its height', () => {
+  it('labels a standard step using heightPx as the YouTube quality-step number (Р-4)', () => {
     expect(qualityLabel(item({ kind: 'standard', heightPx: 1080 }))).toBe('1080p')
     expect(qualityLabel(item({ kind: 'standard', heightPx: 2160 }))).toBe('2160p')
   })
