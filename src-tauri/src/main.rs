@@ -1,5 +1,6 @@
 mod clock;
 mod commands;
+mod probe;
 mod sidecar;
 mod types;
 mod ytdlp;
