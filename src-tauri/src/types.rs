@@ -7,6 +7,11 @@
 //! дорого чинить постфактум (см. TL-1/TL-2 в эпике E1).
 
 use serde::{Deserialize, Serialize};
+// Генератор TS-зеркала (TL-51). Импорт под `cfg(test)`, потому что и сам
+// `#[derive(TS)]` навешивается только в тестовой сборке — см. `mod bindings`
+// в конце файла и комментарий над зависимостью в `Cargo.toml`.
+#[cfg(test)]
+use ts_rs::TS;
 
 /// Итог попытки проверить один sidecar-бинарник.
 ///
@@ -16,6 +21,7 @@ use serde::{Deserialize, Serialize};
 /// того, что stub-реализация их пока не конструирует.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "sidecar.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub enum SidecarStatus {
     Ok,
@@ -30,6 +36,7 @@ pub enum SidecarStatus {
 /// См. пояснение у [`SidecarStatus`] — варианты заполняются в TL-4/TL-5.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "sidecar.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub enum LaunchFailedReason {
     PermissionDenied,
@@ -44,6 +51,7 @@ pub enum LaunchFailedReason {
 /// `exitCode` — при `nonZeroExit`, `timeoutMs` — при `timeout`); остальные
 /// диагностические поля опциональны независимо от статуса.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "sidecar.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct SidecarCheckResult {
     pub name: String,
@@ -70,6 +78,7 @@ pub struct SidecarCheckResult {
 /// Агрегат результатов проверки обоих sidecar-бинарников, возвращаемый
 /// командой `check_sidecar` (Ф-9 эпика E1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "sidecar.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct SidecarCheckReport {
     pub yt_dlp: SidecarCheckResult,
@@ -89,6 +98,7 @@ pub struct SidecarCheckReport {
 ///
 /// Почему прогрев вообще нужен — см. doc [`crate::ytdlp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "ytdlp.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub enum YtDlpPrepareStage {
     Unpacking,
@@ -101,6 +111,7 @@ pub enum YtDlpPrepareStage {
 /// типизированные, не строки»): по `kind` фронтенд решает, что предложить
 /// пользователю, `message` — диагностика для «Подробнее», не для решения.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "ytdlp.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub enum YtDlpPrepareErrorKind {
     /// Каталог данных приложения недоступен (нет прав, нет тома).
@@ -127,6 +138,7 @@ pub enum YtDlpPrepareErrorKind {
 
 /// Отказ подготовки в сериализуемом виде.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "ytdlp.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct YtDlpPrepareError {
     pub kind: YtDlpPrepareErrorKind,
@@ -150,6 +162,7 @@ pub struct YtDlpPrepareError {
 /// понадобилась** — на «тёплом» запуске (подготовка уже сделана раньше) не
 /// приходит ни одного, и экран подготовки показывать не нужно.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "ytdlp.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct YtDlpPrepareEvent {
     pub stage: YtDlpPrepareStage,
@@ -172,6 +185,7 @@ pub struct YtDlpPrepareEvent {
 /// после установки, после обновления приложения с новой версией yt-dlp и
 /// после того, как ОС забыла результат проверки подписей.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "ytdlp.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct YtDlpPrepared {
     /// Версия yt-dlp, полученная запуском (не из пина).
@@ -208,6 +222,7 @@ pub struct YtDlpPrepared {
 /// Лестница показывает **только доступные** строки: пункта, которого у
 /// ролика нет, в списке нет вовсе — ни выключенного, ни с пометкой (Р-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "probe.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub enum QualityKind {
     /// Обычная ступень лестницы: 2160p / 1440p / 1080p / 720p. Подпись
@@ -243,6 +258,7 @@ pub enum QualityKind {
 /// потокам разбор не может — про это знает агрегация
 /// (`crate::download::aggregate`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "probe.ts", optional_fields))]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum QualitySize {
     /// Сумма размеров агрегированных потоков пункта.
@@ -290,6 +306,7 @@ impl QualitySize {
 /// запрещает, а тип десериализуемый, то есть пустой объект может приехать
 /// и снаружи (`{}` из UI в E3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "probe.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct QualityStreams {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -315,6 +332,7 @@ impl QualityStreams {
 /// Строка лестницы качеств: что это за пункт, сколько примерно весит и что
 /// скачивать, если пользователь выберет именно его.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "probe.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct QualityItem {
     pub kind: QualityKind,
@@ -346,6 +364,7 @@ pub struct QualityItem {
 /// ролика нет превью — соответствующий элемент просто не рисуется
 /// (превью — со статичным плейсхолдером, дизайн E2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "probe.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeResult {
     /// Название как есть, без обрезания и нормализации: К-1 требует
@@ -366,6 +385,7 @@ pub struct ProbeResult {
 /// заголовок, пояснение и наличие кнопки «Повторить» (таблица в дизайне
 /// E2) — тексты живут на стороне UI, в контракте только классификация.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "probe.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub enum ProbeErrorKind {
     /// Ввод не является http(s)-ссылкой (С-4). Единственный класс, который
@@ -403,6 +423,7 @@ pub enum ProbeErrorKind {
 /// Под-причина класса `ytDlpFailure` (С-12): меняет только текст пояснения,
 /// класс остаётся один — тот же приём, что `launchFailed.reason` в E1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "probe.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub enum YtDlpFailureReason {
     /// Ошибка без узнаваемой сигнатуры: «попробуйте ещё раз».
@@ -423,6 +444,7 @@ pub enum YtDlpFailureReason {
 /// [`crate::probe::ProbeFailure::to_contract`]). Иначе фронтенд получил бы
 /// повод нарисовать «Подробнее», за которым пусто.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "probe.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeErrorDetails {
     /// Хвост stderr процесса, обрезанный по длине.
@@ -450,6 +472,7 @@ impl ProbeErrorDetails {
 /// текст на экране: тексты для пользователя задаёт UI по классу (дизайн
 /// E2), и stderr в них не попадает никогда (Н-4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "probe.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeError {
     pub kind: ProbeErrorKind,
@@ -522,6 +545,7 @@ pub struct ProbeError {
 /// наступит или не наступит, — фронтенду нужно уже в момент старта, и
 /// говорит ему это [`DownloadPlan`], а не догадка по числу форматов.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub enum DownloadPhase {
     /// Задача создана, процесс ещё не запускался.
@@ -559,6 +583,7 @@ pub enum DownloadPhase {
 /// клика и держит у себя. Речь именно о правиле, а не об источнике
 /// данных.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub enum DownloadPlan {
     /// Раздельные видео- и аудиопоток: Подготовка → Скачивание → Склейка →
@@ -576,6 +601,7 @@ pub enum DownloadPlan {
 /// меняет ни шаг степпера, ни шкалу процента — процент агрегирован по обоим
 /// потокам сразу и от перехода видео → аудио назад не откатывается (Ф-2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub enum DownloadStream {
     Video,
@@ -602,6 +628,7 @@ pub enum DownloadStream {
 /// На проводе — просто число (`#[serde(transparent)]`): TS-зеркало видит
 /// `number`, отдельного объекта тут нет.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(transparent)]
 pub struct DownloadPercent(u8);
 
@@ -642,6 +669,7 @@ impl DownloadPercent {
 /// любым продвижением байт (С-6), поэтому `number` за долгую загрузку
 /// может доходить до `total` многократно и это не признак близкого отказа.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadAttempt {
     pub number: u32,
@@ -663,6 +691,7 @@ pub struct DownloadAttempt {
 /// таблица «Отмена по фазам»), поэтому либо `removed`, либо
 /// `nothingCreated` — если отменили до старта процесса.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub enum PartialData {
     /// Файлов не появлялось: задача не дошла до приёма байт.
@@ -700,6 +729,7 @@ pub enum PartialData {
 /// А вот под-причина `outdated` у сбоя yt-dlp из E2 переносится и живёт
 /// отдельным полем [`DownloadError::reason`] — почему, написано там же.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub enum DownloadErrorKind {
     /// Соединение потеряно, попытки исчерпаны (С-7).
@@ -764,6 +794,7 @@ impl DownloadErrorKind {
 /// Пустая структура границу не пересекает — см. [`DownloadErrorDetails::is_empty`]
 /// и проекцию `crate::download::DownloadFailure::to_contract`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadErrorDetails {
     /// Хвост stderr процесса (yt-dlp либо ffmpeg), обрезанный по длине.
@@ -798,6 +829,7 @@ impl DownloadErrorDetails {
 /// быть ровно [`DownloadErrorKind::is_retryable`] своего класса, а не
 /// чьим-то мнением на месте вызова.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadError {
     pub kind: DownloadErrorKind,
@@ -862,6 +894,7 @@ pub struct DownloadError {
 /// на провод змеиным регистром посреди camelCase-объекта; поймано
 /// сравнением значения целиком в тестах ниже, а не глазами.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(
     tag = "state",
     rename_all = "camelCase",
@@ -934,6 +967,7 @@ pub enum DownloadingState {
 /// [`DownloadPhase`]; у варианта `downloading` рядом появляется второй тег
 /// `state` ([`DownloadingState`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(
     tag = "phase",
     rename_all = "camelCase",
@@ -1024,6 +1058,7 @@ impl DownloadProgress {
 /// троттлингом. Это поведение ядра (TL-44), а не свойство типа, но
 /// подписчик должен знать, что событий не бывает «на каждый байт».
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadProgressEvent {
     pub task_id: String,
@@ -1056,6 +1091,7 @@ pub struct DownloadProgressEvent {
 /// имя файла из него строит санитизация ядра (Ф-6, TL-40), и пустой
 /// результат санитизации получает запасное имя, выведенное из адреса.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct StartDownloadRequest {
     /// Ссылка на ролик — та же, которую разобрал E2.
@@ -1101,6 +1137,7 @@ pub struct StartDownloadRequest {
 /// Возвращается быстро и не дожидается ни одного байта — вся работа идёт
 /// событиями. Ждать в промисе тут нечего: загрузка длится минуты и часы.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadStarted {
     /// Идентификатор задачи, непрозрачный для фронтенда: он приходит
@@ -1125,6 +1162,7 @@ pub struct DownloadStarted {
 /// типизированы, а не строки: защита на стороне ядра обязана быть
 /// настоящей, а её срабатывание — различимым в логе.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub enum DownloadCommandErrorKind {
     /// Слот занят: уже есть задача в нетерминальной фазе. В E3 активная
@@ -1157,6 +1195,7 @@ pub enum DownloadCommandErrorKind {
 /// `message` — диагностика для лога, как и у [`DownloadError`]: решение
 /// принимается по `kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadCommandError {
     pub kind: DownloadCommandErrorKind,
@@ -1191,6 +1230,13 @@ pub fn stub_report() -> SidecarCheckReport {
         ffmpeg: ok("ffmpeg", "ffmpeg"),
     }
 }
+
+/// Генерация TS-зеркала этого файла и сторожа при ней (TL-51).
+///
+/// Модуль целиком под `#[cfg(test)]`: `ts-rs` — dev-зависимость, и ни
+/// derive, ни вызовы генератора не существуют вне тестовой сборки.
+#[cfg(test)]
+mod bindings;
 
 #[cfg(test)]
 mod tests {
