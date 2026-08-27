@@ -1338,59 +1338,139 @@ fn capabilities_stay_local_and_pinned_to_named_windows() {
 // в имени, самый тихий из отказов этого рода (подписка на
 // `ytdlp://updates` не падает, она просто молчит вечно).
 //
-// Чего не ловит: имя, собранное из динамической строки (то же
-// ограничение, что у скана команд, и та же конвенция против него), и
-// подписку на канал с невиданной схемой — фронтендовый скан считает
-// кандидатами только литералы, чья схема уже встречается в ядре
-// (`https://localhost` из теста разбора ссылок каналом не является).
-// Пробел безвредный: канала с новой схемой никто не эмитит, то есть
-// отказ — «событие не приходит», а не «ACL отклонил вызов».
+// Чего не ловит, и это перечень, а не оговорка. Первое — имя, собранное
+// из динамической строки (`format!("{}://{}", …)`, конкатенация): то же
+// ограничение, что у скана команд, и та же конвенция против него —
+// имена каналов держат в константах. Второе — подписку на канал с
+// невиданной схемой: фронтендовый скан считает кандидатами только
+// литералы, чья схема уже встречается в ядре, иначе в набор попал бы
+// `https://localhost` из теста разбора ссылок. Пробел безвредный: канала
+// с новой схемой никто не эмитит, то есть отказ — «событие не приходит»,
+// а не «ACL отклонил вызов». Третье — канал, названный как адрес: имя с
+// точкой или слешем разбор отнесёт к адресам. Держит это не разбор, а
+// конвенция, и она проверяется отдельно
+// (`declared_channels_keep_the_shape_the_scan_can_recognise`).
+//
+// Чего раздел больше не делает — молча пропускать непонятое. Ровно этим
+// он и подвёл на ревью TL-53: сегмент `update_done` не разбирался,
+// константа исчезала, 24 теста оставались зелёными при двух каналах,
+// которых нет ни в одной capability. Теперь всё, что разбор не смог
+// отнести ни к каналу, ни к адресу, — падение со списком литералов.
 
-/// Форма имени канала: `схема://сегмент`, без точек, слешей и запроса.
+/// Итог разбора одного исходника: найденные каналы и литералы, о которых
+/// разбор не может сказать ничего определённого.
 ///
-/// Правило белое, а не «всё, что не http»: у настоящего адреса есть точка
-/// в хосте либо путь, и под форму он не подходит. Ложное срабатывание
-/// (кто-то напишет в исходнике `"ftp://server"`) — красный тест с
-/// объяснением, а не тихий пропуск; молчаливого «не знаю — значит можно»
-/// здесь нет ни в одну сторону.
-fn channel_literals(content: &str) -> BTreeSet<String> {
+/// Второе поле существует потому, что первая версия его не имела и молча
+/// теряла всё, что не подошло под форму. Ревью TL-53 добавило в ядро
+/// `"ytdlp://update_done"` и `"ytdlp://updateDone"` — сегмент с
+/// подчёркиванием и с заглавной буквой не разбирался, обе константы
+/// пропали, и 24 теста остались зелёными при двух каналах, которых нет ни
+/// в одной capability. Это класс TL-24 целиком: отказ ACL, видимый только
+/// на собранном `.app`.
+#[derive(Default)]
+struct ChannelScan {
+    channels: BTreeSet<String>,
+    /// Литералы, которые не удалось отнести ни к каналу, ни к адресу.
+    /// Обязаны стать падением у вызывающего, а не пропуском.
+    unparsed: Vec<String>,
+}
+
+/// Разбирает литералы с `://` на каналы и адреса.
+///
+/// # Что разбор различает и где проходит его настоящая граница
+///
+/// Кандидат — только содержимое **строкового литерала** в кавычках `"`
+/// или `'`. Обратные кавычки не считаются: ими в JSDoc набраны
+/// упоминания каналов в прозе, а не подписки.
+///
+/// Внутри литерала решает остаток после `://`:
+///
+/// - точка, слеш или двоеточие в остатке — это **адрес** (хост, путь,
+///   порт), и он пропускается: `https://i.ytimg.com/vi/abc.jpg`,
+///   `ftp://example.com/x`. Пустой остаток (`"https://"`, фикстура
+///   разбора ссылок) — тоже не канал;
+/// - остаток из `[A-Za-z0-9_-]` при схеме вида `[a-z][a-z0-9]*` — это
+///   **канал**, и неважно, как он написан: `update`, `update_done`,
+///   `updateDone` разбираются одинаково;
+/// - **всё остальное** (пробел, `?`, `%`, экранированная кавычка,
+///   не-ASCII) — не пропуск, а запись в [`ChannelScan::unparsed`],
+///   то есть падение с объяснением у вызывающего.
+///
+/// Граница здесь ровно одна, и врать о ней не надо: **канал, названный
+/// как адрес** — с точкой или слешем в имени — будет принят за адрес и
+/// пропущен. Держит это не разбор, а конвенция, и она проверяема:
+/// [`declared_channels_keep_the_shape_the_scan_can_recognise`] требует
+/// формы `[a-z][a-z0-9]*://[A-Za-z0-9_-]+` от каждого объявленного
+/// канала, так что имя вне конвенции не сможет тихо появиться в
+/// capability — оно уронит тест раньше, чем разойдётся со сканом.
+fn channel_literals(content: &str) -> ChannelScan {
     const SEPARATOR: &str = "://";
     let bytes = content.as_bytes();
-    let mut channels = BTreeSet::new();
+    let mut scan = ChannelScan::default();
 
     for (at, _) in content.match_indices(SEPARATOR) {
+        // Схема — слева от разделителя, сразу за открывающей кавычкой.
         let scheme_start = bytes[..at]
             .iter()
-            .rposition(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit())
+            .rposition(|c| !c.is_ascii_alphanumeric())
             .map_or(0, |i| i + 1);
-        // Схема начинается с буквы и не пуста, а перед ней — кавычка.
-        if scheme_start == at || !bytes[scheme_start].is_ascii_lowercase() {
+        // Схемы нет вовсе: `scheme + '://' + name` — склейка на месте, а
+        // не литерал (ограничение заявлено в шапке раздела).
+        if scheme_start == at {
             continue;
         }
         let Some(quote) = scheme_start.checked_sub(1).map(|i| bytes[i]) else {
             continue;
         };
-        // Только настоящие строковые литералы. Обратные кавычки не
-        // считаются: ими в JSDoc набраны упоминания каналов в прозе.
         if quote != b'"' && quote != b'\'' {
             continue;
         }
-        let segment_start = at + SEPARATOR.len();
-        let segment_end = bytes[segment_start..]
+
+        // Литерал закрывается той же кавычкой и не переходит на
+        // следующую строку.
+        let body_start = at + SEPARATOR.len();
+        let Some(stop) = bytes[body_start..]
             .iter()
-            .position(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit() && *c != b'-')
-            .map_or(bytes.len(), |i| segment_start + i);
-        if segment_end == segment_start
-            || segment_end >= bytes.len()
-            || bytes[segment_end] != quote
-            || !bytes[segment_start].is_ascii_lowercase()
-        {
+            .position(|c| *c == quote || *c == b'\n')
+            .map(|i| body_start + i)
+        else {
+            scan.unparsed
+                .push(format!("{}… (литерал не закрыт)", &content[scheme_start..]));
+            continue;
+        };
+        if bytes[stop] != quote {
+            scan.unparsed.push(format!(
+                "{} (литерал не закрыт до конца строки)",
+                &content[scheme_start..stop]
+            ));
             continue;
         }
-        channels.insert(content[scheme_start..segment_end].to_string());
+
+        let scheme = &content[scheme_start..at];
+        let body = &content[body_start..stop];
+        let literal = &content[scheme_start..stop];
+
+        // Адрес, а не имя канала. Или вырожденный остаток.
+        if body.is_empty() || body.contains(['.', '/', ':']) {
+            continue;
+        }
+
+        let scheme_ok = scheme.starts_with(|c: char| c.is_ascii_lowercase())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+        let body_ok = body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+
+        if scheme_ok && body_ok {
+            scan.channels.insert(literal.to_string());
+        } else {
+            scan.unparsed.push(literal.to_string());
+        }
     }
 
-    channels
+    scan
 }
 
 /// Схема канала — часть до `://`.
@@ -1429,10 +1509,24 @@ fn core_source_files() -> Vec<PathBuf> {
 /// Каналы, которые эмитит ядро.
 fn core_event_channels() -> BTreeSet<String> {
     let mut channels = BTreeSet::new();
+    let mut unparsed = Vec::new();
     for file in core_source_files() {
         let content = fs::read_to_string(&file).expect("исходник ядра читается");
-        channels.extend(channel_literals(&content));
+        let scan = channel_literals(&content);
+        channels.extend(scan.channels);
+        for literal in scan.unparsed {
+            unparsed.push(format!("{}: {literal}", file.display()));
+        }
     }
+    assert!(
+        unparsed.is_empty(),
+        "в исходниках ядра есть литералы с `://`, которые разбор не смог \
+         отнести ни к каналу, ни к адресу:\n{}\nПропустить их нельзя: \
+         именно так канал, которого нет в capability, остаётся невидимым \
+         до собранного .app (TL-24). Приведите имя к форме \
+         `схема://сегмент` либо научите разбор новой форме осознанно.",
+        unparsed.join("\n")
+    );
     channels
 }
 
@@ -1451,14 +1545,26 @@ fn frontend_event_channels() -> BTreeSet<String> {
         .collect();
     let (_, files) = scanned_files();
     let mut channels = BTreeSet::new();
+    let mut unparsed = Vec::new();
     for file in files {
         let bytes = fs::read(&file).expect("исходник фронтенда читается");
-        for channel in channel_literals(&String::from_utf8_lossy(&bytes)) {
+        let scan = channel_literals(&String::from_utf8_lossy(&bytes));
+        for channel in scan.channels {
             if schemes.contains(scheme_of(&channel)) {
                 channels.insert(channel);
             }
         }
+        for literal in scan.unparsed {
+            unparsed.push(format!("{}: {literal}", file.display()));
+        }
     }
+    assert!(
+        unparsed.is_empty(),
+        "во фронтенде есть литералы с `://`, которые разбор не смог \
+         отнести ни к каналу, ни к адресу:\n{}\nМолчаливый пропуск здесь \
+         означал бы подписку, о которой сторож не знает.",
+        unparsed.join("\n")
+    );
     channels
 }
 
@@ -1573,17 +1679,41 @@ fn the_channel_scan_still_finds_the_channels_that_exist() {
     );
 }
 
-/// Разбор литерала отличает канал от адреса и от прозы.
+/// Разбор литерала отличает канал от адреса, от прозы и от непонятного.
+///
+/// Первые два случая — те самые, на которых ревью TL-53 поймало молчащий
+/// сторож: сегмент с подчёркиванием и сегмент с заглавной буквой
+/// пропадали, и проверка каналов зеленела при двух необъявленных каналах
+/// в ядре.
 #[test]
 fn a_url_in_the_sources_is_not_mistaken_for_an_event_channel() {
-    assert_eq!(
-        channel_literals("const PROGRESS = 'download://progress'\n"),
-        BTreeSet::from(["download://progress".to_string()])
-    );
-    assert_eq!(
-        channel_literals("pub const E: &str = \"ytdlp://update\";\n"),
-        BTreeSet::from(["ytdlp://update".to_string()])
-    );
+    let found = |source: &str| channel_literals(source).channels;
+
+    for (source, expected) in [
+        (
+            "const PROGRESS = 'download://progress'\n",
+            "download://progress",
+        ),
+        (
+            "pub const E: &str = \"ytdlp://update\";\n",
+            "ytdlp://update",
+        ),
+        (
+            "pub const A: &str = \"ytdlp://update_done\";\n",
+            "ytdlp://update_done",
+        ),
+        (
+            "pub const B: &str = \"ytdlp://updateDone\";\n",
+            "ytdlp://updateDone",
+        ),
+    ] {
+        assert_eq!(
+            found(source),
+            BTreeSet::from([expected.to_string()]),
+            "имя канала обязано находиться в любой форме сегмента: {source}"
+        );
+    }
+
     for not_a_channel in [
         "expect(looksLikeUrl('https://i.ytimg.com/vi/abc.jpg')).toBe(true)\n",
         "const partial = 'https://'\n",
@@ -1591,16 +1721,68 @@ fn a_url_in_the_sources_is_not_mistaken_for_an_event_channel() {
         "const built = scheme + '://' + name\n",
     ] {
         assert!(
-            channel_literals(not_a_channel).is_empty(),
+            found(not_a_channel).is_empty(),
             "принято за канал: {not_a_channel}"
         );
     }
+
     assert_eq!(
-        channel_literals("listen('ytdlp://updates', handler)\n"),
+        found("listen('ytdlp://updates', handler)\n"),
         BTreeSet::from(["ytdlp://updates".to_string()]),
         "опечатка в имени обязана остаться кандидатом — ловить её и есть \
          смысл проверки"
     );
+}
+
+/// Непонятная форма — падение с объяснением, а не пропуск.
+///
+/// Оборотная сторона теста выше и главный урок ревью: пропущенный литерал
+/// не оставляет следа, и сторож, который его пропустил, отчитывается
+/// зелёным. Всё, что разбор не смог отнести ни к каналу, ни к адресу,
+/// обязано доехать до вызывающего списком.
+#[test]
+fn a_literal_the_scan_cannot_classify_is_reported_instead_of_skipped() {
+    for suspicious in [
+        "pub const E: &str = \"ytdlp://update done\";\n",
+        "pub const E: &str = \"ytdlp://update?force=1\";\n",
+        "pub const E: &str = \"ytdlp://обновление\";\n",
+        "pub const E: &str = \"Ytdlp://update\";\n",
+    ] {
+        let scan = channel_literals(suspicious);
+        assert!(
+            scan.channels.is_empty() && !scan.unparsed.is_empty(),
+            "разбор промолчал о литерале, которого не понял: {suspicious}"
+        );
+    }
+}
+
+/// Объявленные каналы держатся формы, которую разбор умеет узнавать.
+///
+/// Единственная граница разбора, названная в его doc: канал, названный
+/// как адрес (с точкой или слешем в имени), был бы принят за адрес и
+/// пропущен. Здесь эта граница и охраняется — имя вне конвенции не
+/// сможет тихо появиться в capability, потому что уронит этот тест
+/// раньше, чем разойдётся со сканом.
+#[test]
+fn declared_channels_keep_the_shape_the_scan_can_recognise() {
+    let declared = declared_event_channels();
+    assert!(
+        !declared.is_empty(),
+        "в capability не объявлено ни одного канала — проверка формы \
+         прошла бы вхолостую"
+    );
+    for channel in declared {
+        let scan = channel_literals(&format!("\"{channel}\""));
+        assert_eq!(
+            scan.channels,
+            BTreeSet::from([channel.clone()]),
+            "объявленный канал «{channel}» не разбирается собственным \
+             сканом: имя обязано быть вида `схема://сегмент`, где сегмент \
+             — из [A-Za-z0-9_-]. Имя с точкой или слешем разбор примет за \
+             адрес и пропустит молча, и capability разойдётся с ядром \
+             незаметно."
+        );
+    }
 }
 
 /// Растяжка под ногами: список каналов держим мы, а не Tauri.
