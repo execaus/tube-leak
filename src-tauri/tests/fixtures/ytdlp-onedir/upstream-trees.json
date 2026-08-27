@@ -1,0 +1,121 @@
+{
+  "_capture": {
+    "note": "Форма onedir-деревьев yt-dlp: сколько записей и сколько байт даёт распаковка каждого апстримного ассета. Основание потолков MAX_UNPACKED_BYTES и MAX_ENTRIES в src-tauri/src/ytdlp/unpack.rs (TL-18).",
+    "reality": "live",
+    "method": "Центральный каталог каждого zip прочитан диапазонным запросом к релизному ассету GitHub (Range: bytes=<конец-1MiB>-<конец>) и разобран без скачивания архива целиком; суффиксные диапазоны (bytes=-N) CDN отвечает 501, поэтому границы считаются от размера ассета. Размеры ассетов — из API релизов.",
+    "capturedAt": "2026-08-27",
+    "pinnedRelease": "2026.08.19"
+  },
+  "trees": [
+    {
+      "release": "2026.08.19",
+      "asset": "yt-dlp_macos.zip",
+      "shippedAs": "macos (оба таргета, universal2)",
+      "assetBytes": 53923637,
+      "entries": 162,
+      "files": 134,
+      "directories": 28,
+      "unpackedBytes": 130010634,
+      "compressedBytes": 53887487
+    },
+    {
+      "release": "2026.08.19",
+      "asset": "yt-dlp_linux.zip",
+      "shippedAs": "x86_64-unknown-linux-gnu",
+      "assetBytes": 40516244,
+      "entries": 175,
+      "files": 148,
+      "directories": 27,
+      "unpackedBytes": 95989623,
+      "compressedBytes": 40485614
+    },
+    {
+      "release": "2026.08.19",
+      "asset": "yt-dlp_linux_aarch64.zip",
+      "shippedAs": null,
+      "assetBytes": 40213537,
+      "entries": 173,
+      "files": 146,
+      "directories": 27,
+      "unpackedBytes": 97749893,
+      "compressedBytes": 40183113
+    },
+    {
+      "release": "2026.08.19",
+      "asset": "yt-dlp_musllinux.zip",
+      "shippedAs": null,
+      "assetBytes": 40667591,
+      "entries": 179,
+      "files": 151,
+      "directories": 28,
+      "unpackedBytes": 94138914,
+      "compressedBytes": 40636181
+    },
+    {
+      "release": "2026.08.19",
+      "asset": "yt-dlp_win.zip",
+      "shippedAs": "x86_64-pc-windows-msvc",
+      "assetBytes": 18087041,
+      "entries": 143,
+      "files": 140,
+      "directories": 3,
+      "unpackedBytes": 31081723,
+      "compressedBytes": 18065111
+    },
+    {
+      "release": "2026.08.19",
+      "asset": "yt-dlp_win_arm64.zip",
+      "shippedAs": null,
+      "assetBytes": 21463236,
+      "entries": 139,
+      "files": 136,
+      "directories": 3,
+      "unpackedBytes": 38830410,
+      "compressedBytes": 21441988
+    },
+    {
+      "release": "2026.02.04",
+      "asset": "yt-dlp_macos.zip",
+      "shippedAs": null,
+      "assetBytes": 64489417,
+      "entries": 186,
+      "files": 152,
+      "directories": 34,
+      "unpackedBytes": 152143533,
+      "compressedBytes": 64447865
+    },
+    {
+      "release": "2025.12.08",
+      "asset": "yt-dlp_macos.zip",
+      "shippedAs": null,
+      "assetBytes": 64040476,
+      "entries": 185,
+      "files": 152,
+      "directories": 33,
+      "unpackedBytes": 150622746,
+      "compressedBytes": 63999176
+    },
+    {
+      "release": "2025.09.05",
+      "asset": "yt-dlp_macos.zip",
+      "shippedAs": null,
+      "assetBytes": 60788716,
+      "entries": 179,
+      "files": 150,
+      "directories": 29,
+      "unpackedBytes": 143292669,
+      "compressedBytes": 60749750
+    },
+    {
+      "release": "2024.12.03",
+      "asset": "yt-dlp_macos.zip",
+      "shippedAs": null,
+      "assetBytes": 58875811,
+      "entries": 182,
+      "files": 154,
+      "directories": 28,
+      "unpackedBytes": 150646457,
+      "compressedBytes": 58836315
+    }
+  ]
+}

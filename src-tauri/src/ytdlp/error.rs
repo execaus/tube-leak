@@ -27,8 +27,33 @@ pub enum PrepareError {
     #[error("архив yt-dlp повреждён: {reason}")]
     ArchiveCorrupted { reason: String },
 
-    /// Не удалось записать распакованное дерево: нет места, нет прав,
-    /// отказ файловой системы.
+    /// На томе, где лежит каталог данных приложения, не хватает места под
+    /// распакованное дерево.
+    ///
+    /// Отдельно от [`Self::UnpackFailed`] намеренно: у этого отказа
+    /// единственная причина, она понятна пользователю и она обратима —
+    /// освободить место и повторить. Всё остальное, что мешает записи
+    /// (нет прав, том только для чтения, отказ файловой системы),
+    /// повтором не лечится, и предлагать за него «освободите место»
+    /// значило бы врать.
+    ///
+    /// `needed` — сколько байт ещё должно поместиться, вместе с запасом
+    /// [`super::unpack::SPACE_HEADROOM_BYTES`]; `available` — сколько том
+    /// отдаёт непривилегированному пользователю на момент проверки.
+    #[error(
+        "не хватает места для распаковки yt-dlp: нужно ещё {} МиБ, свободно {} МиБ ({path})",
+        .needed / (1024 * 1024),
+        .available / (1024 * 1024)
+    )]
+    NotEnoughSpace {
+        path: String,
+        needed: u64,
+        available: u64,
+    },
+
+    /// Не удалось записать распакованное дерево: нет прав, отказ файловой
+    /// системы. Нехватка места сюда не относится — у неё свой вариант
+    /// [`Self::NotEnoughSpace`].
     #[error("не удалось распаковать yt-dlp: {reason}")]
     UnpackFailed { reason: String },
 
@@ -51,6 +76,7 @@ impl PrepareError {
             Self::DataDirUnavailable { .. } => YtDlpPrepareErrorKind::DataDirUnavailable,
             Self::ArchiveMissing { .. } => YtDlpPrepareErrorKind::ArchiveMissing,
             Self::ArchiveCorrupted { .. } => YtDlpPrepareErrorKind::ArchiveCorrupted,
+            Self::NotEnoughSpace { .. } => YtDlpPrepareErrorKind::NotEnoughSpace,
             Self::UnpackFailed { .. } => YtDlpPrepareErrorKind::UnpackFailed,
             Self::LayoutUnexpected { .. } => YtDlpPrepareErrorKind::LayoutUnexpected,
             Self::WarmupFailed { .. } => YtDlpPrepareErrorKind::WarmupFailed,
@@ -92,8 +118,16 @@ mod tests {
                 YtDlpPrepareErrorKind::ArchiveCorrupted,
             ),
             (
+                PrepareError::NotEnoughSpace {
+                    path: "/x".to_string(),
+                    needed: 130 * 1024 * 1024,
+                    available: 1024,
+                },
+                YtDlpPrepareErrorKind::NotEnoughSpace,
+            ),
+            (
                 PrepareError::UnpackFailed {
-                    reason: "ENOSPC".to_string(),
+                    reason: "нет прав".to_string(),
                 },
                 YtDlpPrepareErrorKind::UnpackFailed,
             ),

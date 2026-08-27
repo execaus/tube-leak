@@ -46,6 +46,34 @@
 //! Права на распакованные файлы **выводятся**, а не переносятся из
 //! архива: единственное, что берётся из его метаданных, — бит выполнения
 //! (см. [`apply_mode`]).
+//!
+//! # Границы объёма
+//!
+//! Распаковка ограничена сверху и по объёму (TL-18). Как и с именами,
+//! опасное здесь не перечисляется — перечисляется **разрешённое**:
+//! [`MAX_UNPACKED_BYTES`] и [`MAX_ENTRIES`] задают конверт, в который
+//! обязано укладываться любое дерево yt-dlp, и всё, что за него выходит,
+//! отвергается независимо от того, чем оно себя объявляет. Список
+//! «подозрительных» архивов здесь не помог бы: бомба из одного
+//! deflate-потока выглядит как обычная запись, и отличает её только
+//! фактический объём.
+//!
+//! Ключевое свойство сторожа — направление, в котором на него влияют
+//! заголовки. Разрешённый объём считается как `min(заявленный, потолок)`,
+//! поэтому **заголовки могут границу только ужесточить, но не ослабить**.
+//! Проверяется она по ходу записи и *до* того, как очередной кусок уйдёт
+//! на диск: за границу не попадает даже тот байт, на котором её нарушили.
+//! Верить заявленным размерам нельзя — `zip` ограничивает вывод записи
+//! размером её сжатых данных, а не объявленным `size()`, так что
+//! килобайтная запись законно разворачивается в гигабайт (проверено
+//! тестом `refuses_a_deflate_bomb_that_lies_about_its_size`).
+//!
+//! Перед записью проверяется свободное место ([`ensure_room_for`]). Это
+//! не сторож безопасности, а диагностика: без него забитый диск даёт
+//! отказ записи посреди дерева, и пользователю остаётся `ENOSPC` в
+//! «Подробнее» вместо «освободите место». Отказ типизирован отдельно
+//! ([`PrepareError::NotEnoughSpace`]) именно поэтому: это единственная
+//! причина отказа записи, из которой пользователь может выйти сам.
 
 use std::fs::{self, File};
 use std::io;
@@ -55,6 +83,61 @@ use zip::ZipArchive;
 
 use super::error::PrepareError;
 
+/// Потолок суммарного объёма распакованного дерева.
+///
+/// # Откуда 512 МиБ
+///
+/// Из замера всех onedir-ассетов апстрима, а не из круглого числа.
+/// Центральные каталоги релиза 2026.08.19 (того самого, что стоит в
+/// `binaries.lock.json`) прочитаны диапазонными запросами 2026-08-27 и
+/// дают такие деревья: macOS — 124,0 МиБ / 162 записи, linux — 91,5 /
+/// 175, linux_aarch64 — 93,2 / 173, musllinux — 89,8 / 179, win — 29,6 /
+/// 143, win_arm64 — 37,0 / 139. Четыре macOS-релиза за двадцать месяцев
+/// назад (2024.12.03, 2025.09.05, 2025.12.08, 2026.02.04) — 143,7, 136,7,
+/// 143,6 и 145,1 МиБ при 179–186 записях.
+///
+/// То есть самое большое дерево, которое апстрим когда-либо выпускал за
+/// эти двадцать месяцев, — 145,1 МиБ, и колебалось оно в пределах ±17 %.
+/// 512 МиБ — примерно трёхкратный запас над этим максимумом.
+///
+/// Запас выбран щедрым сознательно, и перекос именно в эту сторону. В E6
+/// тем же кодом распаковывается обновление, скачанное на рантайме;
+/// слишком тесный потолок означал бы, что очередной вырост апстрима
+/// ломает обновление сразу у всех пользователей и чинится только выпуском
+/// нового релиза приложения — ровно та беда, ради которой обновление
+/// yt-dlp вынесено из релизного контура. Цена промаха в другую сторону
+/// несопоставимо меньше: враждебный архив успеет записать полгигабайта
+/// и будет остановлен, а не заполнит диск целиком.
+const MAX_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Потолок числа записей в архиве.
+///
+/// Ловит класс, который потолок в байтах пропускает: миллион пустых
+/// файлов не весит ничего, но съедает inode и делает каталог данных
+/// неудаляемым за разумное время. Наблюдалось 139–186 записей (см.
+/// [`MAX_UNPACKED_BYTES`]), взято 4096 — двадцатикратный запас.
+///
+/// Это единственное заявление архива, на которое можно опереться **до**
+/// распаковки, и опереться не по доверию, а по устройству: число записей
+/// центрального каталога — это ровно граница цикла, который мы сами и
+/// крутим (`0..archive.len()`). Соврать в большую сторону здесь нельзя:
+/// сколько заявлено, столько мы и обойдём.
+const MAX_ENTRIES: usize = 4096;
+
+/// Запас свободного места сверх объёма дерева.
+///
+/// Значение выбрано, а не измерено, и это важно не спутать. Сама
+/// распаковка второй копии не требует: дерево пишется в `.staging-*` и
+/// переезжает на рабочее место `rename`'ом в пределах того же тома. Запас
+/// нужен на другое — на то, что происходит сразу после: подготовка
+/// прогревает распакованный yt-dlp, а тот пишет свои кеши и временные
+/// файлы туда же. И на то, что `available_space` — снимок, за который с
+/// нами соревнуются другие процессы.
+///
+/// 64 МиБ — примерно половина дерева. Смысл границы в том, чтобы отказ
+/// случался, пока на томе ещё есть чем дышать, а не ровно в нуле.
+pub(super) const SPACE_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Что получилось после распаковки.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unpacked {
@@ -62,7 +145,9 @@ pub struct Unpacked {
     pub executable: String,
     /// Число распакованных обычных файлов.
     pub file_count: u64,
-    /// Их суммарный размер.
+    /// Сколько байт легло на диск на самом деле, а не сумма заявленных в
+    /// архиве размеров. У целого архива это одно и то же число; у
+    /// вравшего распаковки не будет вовсе — см. «Границы объёма».
     pub total_bytes: u64,
 }
 
@@ -76,6 +161,34 @@ pub fn unpack(
     archive_path: &Path,
     dest: &Path,
     on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Unpacked, PrepareError> {
+    unpack_with_space_probe(archive_path, dest, on_progress, &probe_available_space)
+}
+
+/// Свободное место на томе, где лежит `path`, — или `None`, если файловая
+/// система не ответила.
+///
+/// Берётся именно «доступное непривилегированному пользователю»
+/// (`f_bavail` на Unix, `GetDiskFreeSpaceExW`/`BytesAvailableToCaller` на
+/// Windows), а не «свободное на томе»: приложение работает не под root,
+/// зарезервированные суперпользователю блоки и дисковая квота ему не
+/// достанутся, и считать их своими значило бы обещать место, которого нет.
+fn probe_available_space(path: &Path) -> Option<u64> {
+    fs4::available_space(path).ok()
+}
+
+/// [`unpack`] со швом для проверки свободного места.
+///
+/// Шов существует ради тестов, и другого способа их написать нет: чтобы
+/// проверить отказ по месту честной файловой системой, тесту пришлось бы
+/// создавать том нужного размера — операция привилегированная,
+/// платформозависимая и в CI недоступная. Живьём ветка всё равно проверена
+/// на смонтированном 20-мегабайтном образе, см. отчёт TL-18.
+fn unpack_with_space_probe(
+    archive_path: &Path,
+    dest: &Path,
+    on_progress: &mut dyn FnMut(u64, u64),
+    available_space: &dyn Fn(&Path) -> Option<u64>,
 ) -> Result<Unpacked, PrepareError> {
     let file = File::open(archive_path).map_err(|err| {
         if err.kind() == io::ErrorKind::NotFound {
@@ -93,19 +206,45 @@ pub fn unpack(
         reason: format!("{}: {err}", archive_path.display()),
     })?;
 
+    // Число записей проверяется до обхода заголовков, а не вместе с
+    // объёмом: обход — это `archive.len()` чтений, и на архиве с
+    // миллионом записей отказ должен случиться раньше, чем мы их
+    // прочитаем.
+    check_entry_count(archive.len())?;
+
     // Полный размер дерева нужен до распаковки, чтобы прогресс считался
     // от него, а не «сколько-то из неизвестного». `by_index_raw` не
     // распаковывает данные — только читает заголовок записи.
-    let mut total_bytes = 0_u64;
+    //
+    // Сложение насыщающее: слагаемые приходят из заголовков архива, то
+    // есть из недоверенного ввода, и подобранная пара `size()` по 2^63
+    // переполнила бы `u64` — в отладочной сборке паникой, в релизной
+    // молча обнулив заявленный объём.
+    let mut declared_bytes = 0_u64;
     for index in 0..archive.len() {
         if let Ok(entry) = archive.by_index_raw(index) {
-            total_bytes += entry.size();
+            declared_bytes = declared_bytes.saturating_add(entry.size());
         }
     }
+
+    check_declared_shape(archive.len(), declared_bytes)?;
 
     fs::create_dir_all(dest).map_err(|err| PrepareError::UnpackFailed {
         reason: format!("{}: {err}", dest.display()),
     })?;
+
+    // Проверка места идёт после создания каталога назначения, а не до:
+    // спрашивать файловую систему можно только про существующий путь, а
+    // сам каталог места не занимает. Распаковкой это ещё не является —
+    // ни одного байта содержимого архива на диск не ушло.
+    ensure_room_for(dest, declared_bytes, available_space)?;
+
+    // Разрешённый объём. `min` — то самое «заголовки могут только
+    // ужесточить»: заявленный размер сужает границу, потолок не даёт ей
+    // расшириться. Проверка `declared_bytes > MAX_UNPACKED_BYTES` выше
+    // делает `min` избыточным ровно сейчас; он оставлен намеренно, чтобы
+    // граница держалась и без неё.
+    let mut budget_left = declared_bytes.min(MAX_UNPACKED_BYTES);
 
     let mut written = 0_u64;
     let mut reported = 0_u64;
@@ -165,14 +304,28 @@ pub fn unpack(
         // сверяет CRC32 — вот здесь и ловится повреждённый архив.
         // Прогресс обновляется поэтапно, для этого чтение идёт через
         // счётчик, а не одним вызовом `io::copy`.
-        copy_with_progress(&mut entry, &mut out, &mut |chunk| {
+        //
+        // Копирование и разбор его отказа разнесены на два шага, чтобы у
+        // разбора был доступ к `written`: замыкание прогресса держит его
+        // заимствованным до конца своего выражения.
+        let copied = copy_within_budget(&mut entry, &mut out, &mut budget_left, &mut |chunk| {
             written += chunk;
-            if written - reported >= PROGRESS_STEP_BYTES || written == total_bytes {
+            if written - reported >= PROGRESS_STEP_BYTES || written == declared_bytes {
                 reported = written;
-                on_progress(written, total_bytes);
+                on_progress(written, declared_bytes);
             }
-        })
-        .map_err(|err| classify_copy_error(&target, err))?;
+        });
+
+        copied.map_err(|err| match err {
+            CopyStop::Io(err) => {
+                let remaining = declared_bytes.saturating_sub(written);
+                classify_copy_error(&target, err, dest, remaining, available_space)
+            }
+            CopyStop::OverBudget => over_the_ceiling_error(
+                declared_bytes.min(MAX_UNPACKED_BYTES),
+                "фактически отдаёт больше, чем",
+            ),
+        })?;
 
         drop(out);
         apply_mode(&target, mode)?;
@@ -189,7 +342,7 @@ pub fn unpack(
         }
     }
 
-    on_progress(total_bytes, total_bytes);
+    on_progress(declared_bytes, declared_bytes);
 
     if executables_at_root.len() != 1 {
         return Err(PrepareError::LayoutUnexpected {
@@ -209,8 +362,86 @@ pub fn unpack(
     Ok(Unpacked {
         executable,
         file_count,
-        total_bytes,
+        total_bytes: written,
     })
+}
+
+/// Отвергает архив, чья заявленная форма выходит за разрешённый конверт.
+///
+/// Оба потолка собраны в одну функцию, чтобы тест мог спросить у самой
+/// распаковки «а этот настоящий ассет ты бы пропустила?» её собственным
+/// кодом, а не повторяя арифметику рядом.
+fn check_declared_shape(entries: usize, declared_bytes: u64) -> Result<(), PrepareError> {
+    check_entry_count(entries)?;
+
+    if declared_bytes > MAX_UNPACKED_BYTES {
+        return Err(over_the_ceiling_error(declared_bytes, "заявляет"));
+    }
+
+    Ok(())
+}
+
+fn check_entry_count(entries: usize) -> Result<(), PrepareError> {
+    if entries > MAX_ENTRIES {
+        return Err(PrepareError::ArchiveCorrupted {
+            reason: format!(
+                "в архиве {entries} записей при потолке {MAX_ENTRIES} — \
+                 столько дерево yt-dlp не содержит ни на одной платформе"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Отказ по границе объёма.
+///
+/// Класс — «архив повреждён», а не отдельный: для пользователя это то же
+/// самое, что запись с именем наружу или символическая ссылка внутри, —
+/// архив не тот, за который себя выдаёт, и делать с ним нечего, кроме как
+/// взять другой. Отдельный класс появился бы, только если бы действие
+/// пользователя отличалось; оно не отличается.
+fn over_the_ceiling_error(bound: u64, verb: &str) -> PrepareError {
+    PrepareError::ArchiveCorrupted {
+        reason: format!(
+            "архив {verb} {} МиБ при потолке {} МиБ — \
+             дерево yt-dlp такого размера не бывает",
+            bound / (1024 * 1024),
+            MAX_UNPACKED_BYTES / (1024 * 1024)
+        ),
+    }
+}
+
+/// Отказывает, если на томе назначения не хватает места под дерево.
+///
+/// Не сторож безопасности: враждебный архив ограничен потолком, а не
+/// этой проверкой. Смысл в диагностике — сказать «освободите место»
+/// заранее, вместо `ENOSPC` посреди дерева.
+///
+/// Если файловая система не ответила, отказа нет. Проверка, которая не
+/// смогла состояться, не должна запрещать установку: она не нашла
+/// нехватки места, она вообще ничего не нашла. Забитый диск в этом случае
+/// проявит себя отказом записи, и тот всё равно будет распознан по
+/// [`io::ErrorKind::StorageFull`].
+fn ensure_room_for(
+    dest: &Path,
+    tree_bytes: u64,
+    available_space: &dyn Fn(&Path) -> Option<u64>,
+) -> Result<(), PrepareError> {
+    let Some(available) = available_space(dest) else {
+        return Ok(());
+    };
+
+    let needed = tree_bytes.saturating_add(SPACE_HEADROOM_BYTES);
+    if available < needed {
+        return Err(PrepareError::NotEnoughSpace {
+            path: dest.display().to_string(),
+            needed,
+            available,
+        });
+    }
+
+    Ok(())
 }
 
 /// Насколько должен вырасти объём записанного, чтобы стоило сообщить о
@@ -223,37 +454,87 @@ const PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
 /// размера страницы, заметно меньше кеша L2.
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
-fn copy_with_progress(
+/// Почему копирование остановилось.
+enum CopyStop {
+    /// Отказ чтения из архива или записи на диск.
+    Io(io::Error),
+    /// Разрешённый объём исчерпан: записать этот кусок было бы уже
+    /// нарушением границы.
+    OverBudget,
+}
+
+/// Переливает запись архива в файл, вычитая записанное из общего на всё
+/// дерево бюджета `budget_left`.
+///
+/// Бюджет проверяется **до** `write_all`, а не после: иначе кусок,
+/// нарушивший границу, успевал бы лечь на диск, и сторож объёма
+/// превращался бы в сторож «на 64 КиБ позже». Бюджет один на всё дерево и
+/// живёт между вызовами — иначе архив из тысячи записей по бюджету каждая
+/// обходил бы границу целого.
+fn copy_within_budget(
     reader: &mut impl io::Read,
     writer: &mut impl io::Write,
+    budget_left: &mut u64,
     on_chunk: &mut dyn FnMut(u64),
-) -> io::Result<()> {
+) -> Result<(), CopyStop> {
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = reader.read(&mut buffer).map_err(CopyStop::Io)?;
         if read == 0 {
             return Ok(());
         }
-        writer.write_all(&buffer[..read])?;
-        on_chunk(read as u64);
+
+        let read = read as u64;
+        if read > *budget_left {
+            return Err(CopyStop::OverBudget);
+        }
+
+        writer
+            .write_all(&buffer[..read as usize])
+            .map_err(CopyStop::Io)?;
+        *budget_left -= read;
+        on_chunk(read);
     }
 }
 
-/// Отличает «архив побит» от «диск не принял».
+/// Раскладывает отказ копирования на три разных разговора с
+/// пользователем: «архив побит», «кончилось место», «диск не принял».
 ///
 /// `zip` сообщает о несошедшемся CRC32 как об `io::Error` с
 /// `ErrorKind::InvalidData` — это порча архива, а не отказ файловой
-/// системы, и пользователю про них надо говорить разное: переустановить
-/// приложение против освободить место.
-fn classify_copy_error(target: &Path, err: io::Error) -> PrepareError {
-    if err.kind() == io::ErrorKind::InvalidData {
-        PrepareError::ArchiveCorrupted {
+/// системы: переустановить приложение.
+///
+/// Нехватка места опознаётся по [`io::ErrorKind::StorageFull`] — по
+/// собственной классификации стандартной библиотеки, а не по списку кодов
+/// ОС, который пришлось бы вести самим и который на очередной платформе
+/// оказался бы неполным. На macOS 15 / HFS+ ветка проверена живьём:
+/// запись в смонтированный 20-мегабайтный образ после его заполнения
+/// даёт ровно `StorageFull` (`os error 28`), см. отчёт TL-18.
+///
+/// Числа в отказе значат ровно то же, что и в [`ensure_room_for`]:
+/// `needed` — сколько ещё должно было поместиться (недописанный остаток
+/// дерева плюс тот же запас), `available` — что том отдаёт сейчас. Не
+/// ответил — считаем, что ничего: отказ по `StorageFull` уже состоялся, и
+/// от неудачи второго вопроса он не перестаёт быть нехваткой места.
+fn classify_copy_error(
+    target: &Path,
+    err: io::Error,
+    dest: &Path,
+    remaining: u64,
+    available_space: &dyn Fn(&Path) -> Option<u64>,
+) -> PrepareError {
+    match err.kind() {
+        io::ErrorKind::InvalidData => PrepareError::ArchiveCorrupted {
             reason: format!("{}: {err}", target.display()),
-        }
-    } else {
-        PrepareError::UnpackFailed {
+        },
+        io::ErrorKind::StorageFull => PrepareError::NotEnoughSpace {
+            path: dest.display().to_string(),
+            needed: remaining.saturating_add(SPACE_HEADROOM_BYTES),
+            available: available_space(dest).unwrap_or(0),
+        },
+        _ => PrepareError::UnpackFailed {
             reason: format!("{}: {err}", target.display()),
-        }
+        },
     }
 }
 
@@ -418,6 +699,68 @@ mod tests {
 
     fn unpack_fixture(archive: &Path, dest: &Path) -> Result<Unpacked, PrepareError> {
         unpack(archive, dest, &mut |_, _| {})
+    }
+
+    /// Распаковка со сколь угодно щедрой или скупой файловой системой.
+    fn unpack_with_free_space(
+        archive: &Path,
+        dest: &Path,
+        available: Option<u64>,
+    ) -> Result<Unpacked, PrepareError> {
+        unpack_with_space_probe(archive, dest, &mut |_, _| {}, &|_| available)
+    }
+
+    /// Переписывает в центральном каталоге объявленный размер каждой
+    /// записи, не трогая сами данные.
+    ///
+    /// Это и есть «архив врёт о своём объёме» в чистом виде, и собрать
+    /// такой архив обычным `ZipWriter` нельзя — он честно пишет то, что
+    /// получилось. Правится именно центральный каталог: `zip` берёт
+    /// `size()` оттуда, оттуда же его берёт и наша проверка заявленного.
+    fn overwrite_declared_sizes(archive: &Path, declared: u32) {
+        let mut bytes = fs::read(archive).expect("архив фикстуры обязан читаться");
+
+        let eocd = bytes
+            .windows(4)
+            .rposition(|window| window == b"PK\x05\x06")
+            .expect("хвост центрального каталога обязан найтись");
+        let entries = u16::from_le_bytes([bytes[eocd + 10], bytes[eocd + 11]]) as usize;
+        let mut cursor = u32::from_le_bytes([
+            bytes[eocd + 16],
+            bytes[eocd + 17],
+            bytes[eocd + 18],
+            bytes[eocd + 19],
+        ]) as usize;
+
+        let le16 =
+            |bytes: &[u8], at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
+
+        for _ in 0..entries {
+            assert_eq!(&bytes[cursor..cursor + 4], b"PK\x01\x02", "запись каталога");
+            bytes[cursor + 24..cursor + 28].copy_from_slice(&declared.to_le_bytes());
+            cursor += 46
+                + le16(&bytes, cursor + 28)
+                + le16(&bytes, cursor + 30)
+                + le16(&bytes, cursor + 32);
+        }
+
+        fs::write(archive, &bytes).expect("архив фикстуры обязан писаться");
+    }
+
+    /// Сколько байт лежит в дереве прямо сейчас.
+    fn bytes_on_disk(dir: &Path) -> u64 {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return 0;
+        };
+
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| match entry.file_type() {
+                Ok(kind) if kind.is_dir() => bytes_on_disk(&entry.path()),
+                Ok(_) => entry.metadata().map(|meta| meta.len()).unwrap_or(0),
+                Err(_) => 0,
+            })
+            .sum()
     }
 
     #[test]
@@ -770,6 +1113,311 @@ mod tests {
         found.sort();
 
         assert_eq!(found, vec![".staging-a", ".staging-b"]);
+    }
+
+    #[test]
+    fn refuses_an_archive_that_declares_more_than_the_ceiling() {
+        // Дешёвый отказ по заголовкам: если архив сам говорит, что не
+        // поместится, читать его незачем. Настоящий сторож — не этот, а
+        // тот, что ниже; этот лишь избавляет от бессмысленной работы.
+        let dir = tempdir().expect("tempdir");
+        let archive = dir.path().join("huge.zip");
+        write_onedir_zip(&archive, "yt-dlp_macos", 0o755);
+        overwrite_declared_sizes(&archive, 600 * 1024 * 1024);
+
+        let dest = dir.path().join("staging");
+        let error = unpack_fixture(&archive, &dest).expect_err("дерево такого размера не бывает");
+
+        assert!(
+            matches!(error, PrepareError::ArchiveCorrupted { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            bytes_on_disk(&dest),
+            0,
+            "отказ обязан случиться до первой записи на диск"
+        );
+    }
+
+    #[test]
+    fn refuses_a_deflate_bomb_that_lies_about_its_size() {
+        // Суть требования TL-18. Заявленный размер записи ничего не
+        // ограничивает: `zip` держит `take` на СЖАТОМ потоке
+        // (`read.rs`, `make_crypto_reader`), а сколько из него
+        // развернётся — его не касается. Восемь мегабайт нулей сжимаются
+        // в единицы килобайт, и архив объявляет их одним мегабайтом.
+        //
+        // Поэтому граница считается по фактически записанному, и лишнее
+        // на диск не попадает вовсе.
+        const REAL_BYTES: usize = 8 * 1024 * 1024;
+        const DECLARED_BYTES: u32 = 1024 * 1024;
+
+        let dir = tempdir().expect("tempdir");
+        let archive = dir.path().join("bomb.zip");
+        {
+            let file = File::create(&archive).expect("create");
+            let mut zip = ZipWriter::new(file);
+            let deflated =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zip.start_file("yt-dlp_macos", deflated.unix_permissions(0o755))
+                .expect("start_file");
+            zip.write_all(&vec![0_u8; REAL_BYTES]).expect("write");
+            zip.finish().expect("finish");
+        }
+        let compressed = fs::metadata(&archive).expect("metadata").len();
+        assert!(
+            compressed < u64::from(DECLARED_BYTES),
+            "фикстура обязана быть бомбой: {compressed} сжатых байт не меньше заявленного"
+        );
+        overwrite_declared_sizes(&archive, DECLARED_BYTES);
+
+        let dest = dir.path().join("staging");
+        let error = unpack_fixture(&archive, &dest).expect_err("бомба обязана быть остановлена");
+
+        assert!(
+            matches!(error, PrepareError::ArchiveCorrupted { .. }),
+            "{error}"
+        );
+        let written = bytes_on_disk(&dest);
+        assert!(
+            written <= u64::from(DECLARED_BYTES),
+            "на диск ушло {written} байт при разрешённых {DECLARED_BYTES} — \
+             граница проверяется не по ходу записи"
+        );
+        assert!(
+            written < REAL_BYTES as u64,
+            "распаковалась вся бомба целиком ({written} байт) — сторожа нет"
+        );
+    }
+
+    #[test]
+    fn refuses_more_entries_than_any_tree_of_yt_dlp_has() {
+        // Класс, который потолок в байтах не ловит: записи пустые, весит
+        // дерево ноль, а inode кончаются.
+        let dir = tempdir().expect("tempdir");
+        let archive = dir.path().join("swarm.zip");
+        {
+            let file = File::create(&archive).expect("create");
+            let mut zip = ZipWriter::new(file);
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zip.start_file("yt-dlp_macos", stored.unix_permissions(0o755))
+                .expect("start_file");
+            zip.write_all(b"#!/bin/sh\n").expect("write");
+            for index in 0..MAX_ENTRIES {
+                zip.start_file(format!("_internal/{index}"), stored.unix_permissions(0o644))
+                    .expect("start_file");
+            }
+            zip.finish().expect("finish");
+        }
+
+        let dest = dir.path().join("staging");
+        let error = unpack_fixture(&archive, &dest).expect_err("столько записей не бывает");
+
+        assert!(
+            matches!(error, PrepareError::ArchiveCorrupted { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            bytes_on_disk(&dest),
+            0,
+            "отказ по числу записей обязан случиться до обхода заголовков"
+        );
+    }
+
+    #[test]
+    fn refuses_to_start_when_the_volume_has_no_room_for_the_tree() {
+        let dir = tempdir().expect("tempdir");
+        let archive = dir.path().join("yt-dlp.zip");
+        write_onedir_zip(&archive, "yt-dlp_macos", 0o755);
+
+        let dest = dir.path().join("staging");
+        let error = unpack_with_free_space(&archive, &dest, Some(1024))
+            .expect_err("на килобайте дерево не разложится");
+
+        let PrepareError::NotEnoughSpace {
+            needed, available, ..
+        } = error
+        else {
+            panic!("нехватка места обязана быть отдельным классом, а не общим отказом: {error}");
+        };
+        assert_eq!(available, 1024);
+        assert!(
+            needed >= SPACE_HEADROOM_BYTES,
+            "в требуемое место обязан входить запас: {needed}"
+        );
+        assert_eq!(
+            bytes_on_disk(&dest),
+            0,
+            "проверка места на то и до распаковки, чтобы на диск ничего не ушло"
+        );
+    }
+
+    #[test]
+    fn does_not_confuse_a_full_disk_with_a_disk_that_refuses_to_write() {
+        // Обещание задачи: нехватка места отличима от прочих сбоев
+        // записи не текстом сообщения, а классом. Разбор идёт по
+        // `ErrorKind` стандартной библиотеки; на macOS 15 живьём
+        // проверено, что забитый том даёт ровно `StorageFull`.
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("file");
+
+        let classify = |kind: io::ErrorKind| {
+            classify_copy_error(&target, io::Error::from(kind), dir.path(), 100, &|_| {
+                Some(7)
+            })
+        };
+
+        assert!(matches!(
+            classify(io::ErrorKind::StorageFull),
+            PrepareError::NotEnoughSpace {
+                available: 7,
+                needed,
+                ..
+            } if needed == 100 + SPACE_HEADROOM_BYTES
+        ));
+        assert!(matches!(
+            classify(io::ErrorKind::PermissionDenied),
+            PrepareError::UnpackFailed { .. }
+        ));
+        assert!(matches!(
+            classify(io::ErrorKind::ReadOnlyFilesystem),
+            PrepareError::UnpackFailed { .. }
+        ));
+        assert!(matches!(
+            classify(io::ErrorKind::InvalidData),
+            PrepareError::ArchiveCorrupted { .. }
+        ));
+    }
+
+    #[test]
+    fn a_filesystem_that_will_not_say_how_much_is_free_does_not_block_the_install() {
+        // Проверка, которая не смогла состояться, не нашла нехватки
+        // места — она вообще ничего не нашла, и запрещать по ней
+        // установку значило бы выдумать отказ.
+        let dir = tempdir().expect("tempdir");
+        let archive = dir.path().join("yt-dlp.zip");
+        write_onedir_zip(&archive, "yt-dlp_macos", 0o755);
+
+        let dest = dir.path().join("staging");
+        unpack_with_free_space(&archive, &dest, None).expect("молчание тома — не отказ");
+
+        assert!(dest.join("_internal/lib.so").exists());
+    }
+
+    #[test]
+    fn asks_the_real_filesystem_and_lets_the_happy_path_through() {
+        // Сторож против «шов работает, а настоящий вызов нет»: здесь
+        // свободное место спрашивается у настоящей файловой системы,
+        // тем же кодом, что и в приложении.
+        let dir = tempdir().expect("tempdir");
+        let archive = dir.path().join("yt-dlp.zip");
+        write_onedir_zip(&archive, "yt-dlp_macos", 0o755);
+
+        let dest = dir.path().join("staging");
+        let unpacked = unpack_fixture(&archive, &dest).expect("на рабочей машине место есть");
+
+        assert_eq!(unpacked.file_count, 3);
+        assert!(
+            probe_available_space(dir.path()).is_some(),
+            "том, на котором идут тесты, обязан отвечать о свободном месте"
+        );
+    }
+
+    // --- потолки против настоящих ассетов апстрима ----------------------
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MeasuredTree {
+        release: String,
+        asset: String,
+        entries: usize,
+        unpacked_bytes: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MeasuredCapture {
+        pinned_release: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct UpstreamTrees {
+        #[serde(rename = "_capture")]
+        capture: MeasuredCapture,
+        trees: Vec<MeasuredTree>,
+    }
+
+    fn measured_trees() -> UpstreamTrees {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ytdlp-onedir/upstream-trees.json");
+        let raw = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("{} не читается: {err}", path.display()));
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|err| panic!("{} — не тот конверт: {err}", path.display()))
+    }
+
+    #[test]
+    fn the_pinned_release_is_the_one_the_sizes_were_measured_from() {
+        // Тот же сторож, что у фикстур вывода yt-dlp и ffmpeg: замеры
+        // заморожены, апстрим нет. Смена пина может изменить и форму
+        // дерева, поэтому она обязана ломать этот тест, а не тихо
+        // оставлять потолки стоять на позапрошлой реальности.
+        let measured = measured_trees();
+        let pinned = std::env!("TUBE_LEAK_YTDLP_VERSION");
+
+        assert_eq!(
+            measured.capture.pinned_release, pinned,
+            "замеры сняты с релиза {}, а вкладывается {pinned}. Пин сменили — \
+             переснимите замеры по README рядом с фикстурой, а не правьте эту строку",
+            measured.capture.pinned_release
+        );
+    }
+
+    #[test]
+    fn the_ceilings_clear_every_tree_upstream_has_ever_shipped() {
+        // Запас, а не просто «проходит». Потолок, к которому реальность
+        // подошла вплотную, — это отложенная поломка обновления yt-dlp
+        // сразу у всех пользователей (E6), и заметить её надо здесь.
+        const HEADROOM_FACTOR: u64 = 3;
+
+        let measured = measured_trees();
+        assert!(
+            measured.trees.len() >= 6,
+            "набор замеров подозрительно мал: {}",
+            measured.trees.len()
+        );
+
+        for tree in &measured.trees {
+            let name = format!("{} {}", tree.release, tree.asset);
+            assert!(
+                tree.unpacked_bytes * HEADROOM_FACTOR <= MAX_UNPACKED_BYTES,
+                "{name}: дерево {} МиБ против потолка {} МиБ — запаса меньше \
+                 чем в {HEADROOM_FACTOR} раза",
+                tree.unpacked_bytes / (1024 * 1024),
+                MAX_UNPACKED_BYTES / (1024 * 1024)
+            );
+            assert!(
+                tree.entries * (HEADROOM_FACTOR as usize) <= MAX_ENTRIES,
+                "{name}: {} записей против потолка {MAX_ENTRIES}",
+                tree.entries
+            );
+        }
+    }
+
+    #[test]
+    fn no_measured_tree_is_refused_by_the_unpacker() {
+        // На вопрос «а настоящий ассет мы бы не отвергли?» отвечает код
+        // распаковки, а не арифметика в голове читающего.
+        for tree in measured_trees().trees {
+            let verdict = check_declared_shape(tree.entries, tree.unpacked_bytes);
+            assert!(
+                verdict.is_ok(),
+                "{} {} отвергается собственными потолками: {}",
+                tree.release,
+                tree.asset,
+                verdict.unwrap_err()
+            );
+        }
     }
 
     #[test]
