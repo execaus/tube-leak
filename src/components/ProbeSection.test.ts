@@ -1,7 +1,7 @@
 import { mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { ProbeError, ProbeResult } from '@/types/probe'
+import type { ProbeError, ProbeResult } from '@/types/generated/probe'
 
 const invokeMock = vi.fn()
 

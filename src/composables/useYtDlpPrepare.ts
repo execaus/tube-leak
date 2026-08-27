@@ -2,7 +2,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type Event as TauriEvent, type UnlistenFn } from '@tauri-apps/api/event'
 import { onUnmounted, ref, type Ref } from 'vue'
 
-import type { YtDlpPrepareError, YtDlpPrepareErrorKind, YtDlpPrepareEvent, YtDlpPrepared } from '@/types/ytdlp'
+import type { YtDlpPrepareError, YtDlpPrepareErrorKind, YtDlpPrepareEvent, YtDlpPrepared } from '@/types/generated/ytdlp'
+import { knownKindsOf } from '@/utils/knownKinds'
 
 const PREPARE_YTDLP_COMMAND = 'prepare_ytdlp'
 
@@ -38,15 +39,22 @@ export async function prepareYtDlp(): Promise<YtDlpPrepared> {
  */
 export type PrepareFailure = YtDlpPrepareError | { kind?: undefined; message: string }
 
-const KNOWN_ERROR_KINDS: readonly YtDlpPrepareErrorKind[] = [
-  'dataDirUnavailable',
-  'archiveMissing',
-  'archiveCorrupted',
-  'notEnoughSpace',
-  'unpackFailed',
-  'layoutUnexpected',
-  'warmupFailed',
-]
+/**
+ * Белый список семи классов `YtDlpPrepareErrorKind`, выведенный из
+ * сгенерированного типа (TL-52, см. doc `@/utils/knownKinds`) — тот самый
+ * список, ручная версия которого пропустила `notEnoughSpace` в TL-18 и
+ * тихо подменила текст ошибки заглушкой (см. doc-комментарий
+ * `src-tauri/src/types/bindings.rs`).
+ */
+const KNOWN_ERROR_KINDS = knownKindsOf<YtDlpPrepareErrorKind>({
+  dataDirUnavailable: true,
+  archiveMissing: true,
+  archiveCorrupted: true,
+  notEnoughSpace: true,
+  unpackFailed: true,
+  layoutUnexpected: true,
+  warmupFailed: true,
+})
 
 function isYtDlpPrepareError(value: unknown): value is YtDlpPrepareError {
   if (typeof value !== 'object' || value === null) return false

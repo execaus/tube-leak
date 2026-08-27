@@ -9,7 +9,7 @@
  * качества»). Выбор — только визуальная фиксация текущей карточки: в E2
  * действия «скачать» нет, поэтому наверх ничего не эмитится. Список не
  * сортируется — порядок задаёт ядро (см. doc `ProbeResult.qualities` в
- * `src/types/probe.ts`).
+ * `src/types/generated/probe.ts`).
  *
  * Смена карточки (новый разбор или очистка поля) всегда пересоздаёт
  * список `items` новым массивом — выбор сбрасывается по смене ссылки на
@@ -26,7 +26,7 @@
  */
 import { ref, useId, watch } from 'vue'
 
-import type { QualityItem } from '@/types/probe'
+import type { QualityItem } from '@/types/generated/probe'
 import { formatApproxSize } from '@/utils/formatApproxSize'
 import { qualityLabel } from '@/utils/qualityLabel'
 

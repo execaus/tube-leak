@@ -17,7 +17,7 @@
  */
 import { computed } from 'vue'
 
-import type { DownloadPlan, DownloadProgress } from '@/types/download'
+import type { DownloadPlan, DownloadProgress } from '@/types/generated/download'
 import { formatEtaSecs } from '@/utils/formatEtaSecs'
 import { formatSpeed } from '@/utils/formatSpeed'
 import { getCancelledText, getFailedPartialDataNote } from '@/utils/downloadOutcomeTexts'

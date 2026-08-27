@@ -9,7 +9,7 @@
  */
 import { computed, ref } from 'vue'
 
-import type { SidecarCheckResult } from '@/types/sidecar'
+import type { SidecarCheckResult } from '@/types/generated/sidecar'
 
 const props = defineProps<{
   /**

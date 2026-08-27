@@ -2,7 +2,7 @@ import { storeToRefs } from 'pinia'
 import { onMounted, onScopeDispose, ref, type Ref } from 'vue'
 
 import { useDownloadTaskStore, type DownloadTask } from '@/stores/downloadTask'
-import type { DownloadProgress } from '@/types/download'
+import type { DownloadProgress } from '@/types/generated/download'
 import { windowExitPort as defaultWindowExitPort, type WindowExitPort } from './windowExitPort'
 
 /**

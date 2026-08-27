@@ -1,7 +1,7 @@
 import { getProbeErrorText } from '@/utils/probeErrorTexts'
 
-import type { DownloadErrorKind } from '@/types/download'
-import type { YtDlpFailureReason } from '@/types/probe'
+import type { DownloadErrorKind } from '@/types/generated/download'
+import type { YtDlpFailureReason } from '@/types/generated/probe'
 
 /**
  * Тексты для девяти классов отказа скачивания (Ф-10), строго по таблице
@@ -11,7 +11,7 @@ import type { YtDlpFailureReason } from '@/types/probe'
  *
  * `message` — формулировка ядра для свёрнутого «Подробнее» и лога, не
  * основной текст экрана (см. doc-комментарий `DownloadError.message` в
- * `src/types/download.ts`). Тот же приём, что `getProbeErrorText` в E2
+ * `src/types/generated/download.ts`). Тот же приём, что `getProbeErrorText` в E2
  * (см. `src/utils/probeErrorTexts.ts`): {@link getDownloadErrorText}
  * принимает только `kind` и `reason` — примитивы контракта, не объект
  * ошибки целиком, — так что подать сюда `error.message` вместо `kind` не
@@ -24,7 +24,7 @@ import type { YtDlpFailureReason } from '@/types/probe'
  * показывать ли «Повторить», по `DownloadError.retryable` — полю,
  * присланному ядром (проекция `DownloadErrorKind.is_retryable`), а не по
  * собственной копии таблицы классов (doc-комментарий `retryable` в
- * `src/types/download.ts`). Дублировать здесь ту же таблицу второй раз —
+ * `src/types/generated/download.ts`). Дублировать здесь ту же таблицу второй раз —
  * значит завести два источника истины, которые разойдутся при первом же
  * уточнении дизайна.
  */

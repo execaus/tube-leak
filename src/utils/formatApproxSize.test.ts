@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import type { QualitySize } from '@/types/probe'
+import type { QualitySize } from '@/types/generated/probe'
 
 import { formatApproxSize } from './formatApproxSize'
 

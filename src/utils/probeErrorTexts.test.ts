@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import type { YtDlpFailureReason } from '@/types/probe'
+import type { YtDlpFailureReason } from '@/types/generated/probe'
 
 import { getProbeErrorText, NON_CONTRACTUAL_FAILURE_TEXT, type BlockProbeErrorKind } from './probeErrorTexts'
 

@@ -1,7 +1,7 @@
 import { mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
 
-import type { ProbeResult } from '@/types/probe'
+import type { ProbeResult } from '@/types/generated/probe'
 
 import VideoCard from './VideoCard.vue'
 

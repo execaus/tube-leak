@@ -1,17 +1,22 @@
 import { describe, expect, it } from 'vitest'
 
-import type { DownloadCommandErrorKind } from '@/types/download'
+import type { DownloadCommandErrorKind } from '@/types/generated/download'
+import { knownKindsOf } from '@/utils/knownKinds'
 
 import { getDownloadCommandErrorText } from './downloadCommandErrorTexts'
 
-const ALL_KINDS: DownloadCommandErrorKind[] = [
-  'alreadyActive',
-  'unknownTask',
-  'notFailed',
-  'notRetryable',
-  'noStreamsSelected',
-  'invalidUrl',
-]
+/**
+ * Выведено из типа (TL-52), а не рукописный массив — см. doc
+ * `@/utils/knownKinds`.
+ */
+const ALL_KINDS = knownKindsOf<DownloadCommandErrorKind>({
+  alreadyActive: true,
+  unknownTask: true,
+  notFailed: true,
+  notRetryable: true,
+  noStreamsSelected: true,
+  invalidUrl: true,
+})
 
 describe('getDownloadCommandErrorText — 6 классов отказа команд управления загрузкой', () => {
   it('returns a non-empty title and explanation for every class', () => {

@@ -41,7 +41,7 @@ import { useExitConfirmation } from '@/composables/useExitConfirmation'
 import { useSidecarCheck } from '@/composables/useSidecarCheck'
 import { useYtDlpPrepare } from '@/composables/useYtDlpPrepare'
 import { useDownloadTaskStore } from '@/stores/downloadTask'
-import type { QualitySize, QualityStreams } from '@/types/probe'
+import type { QualitySize, QualityStreams } from '@/types/generated/probe'
 
 // Версия приложения известна локально и не зависит от sidecar (дизайн E1,
 // «Компоновка»). Держим в синхроне с `package.json` вручную — единственное

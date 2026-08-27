@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import type { DownloadProgress } from '@/types/download'
+import type { DownloadProgress } from '@/types/generated/download'
 import { getExitDialogText } from './exitDialogTexts'
 
 const TITLE = '«Как приручить дракона» — 1080p'

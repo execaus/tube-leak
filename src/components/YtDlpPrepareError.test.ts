@@ -2,7 +2,7 @@ import { mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
 
 import type { PrepareFailure } from '@/composables/useYtDlpPrepare'
-import type { YtDlpPrepareError, YtDlpPrepareErrorKind } from '@/types/ytdlp'
+import type { YtDlpPrepareError, YtDlpPrepareErrorKind } from '@/types/generated/ytdlp'
 
 import YtDlpPrepareErrorComponent from './YtDlpPrepareError.vue'
 

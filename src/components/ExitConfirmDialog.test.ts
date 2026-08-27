@@ -1,7 +1,7 @@
 import { mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
 
-import type { DownloadProgress } from '@/types/download'
+import type { DownloadProgress } from '@/types/generated/download'
 import ExitConfirmDialog from './ExitConfirmDialog.vue'
 
 function mountDialog(progress: DownloadProgress, attachTo?: HTMLElement) {

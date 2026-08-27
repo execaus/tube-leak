@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { SidecarCheckReport, SidecarCheckResult } from '@/types/sidecar'
+import type { SidecarCheckReport, SidecarCheckResult } from '@/types/generated/sidecar'
 
 const invokeMock = vi.fn()
 

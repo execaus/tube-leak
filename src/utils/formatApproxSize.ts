@@ -1,4 +1,4 @@
-import type { QualitySize } from '@/types/probe'
+import type { QualitySize } from '@/types/generated/probe'
 
 const KB = 1024
 const MB = KB * 1024

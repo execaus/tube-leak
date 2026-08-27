@@ -1,10 +1,10 @@
-import type { DownloadCommandErrorKind } from '@/types/download'
+import type { DownloadCommandErrorKind } from '@/types/generated/download'
 
 /**
  * Тексты для шести классов отказа команд управления загрузкой
  * (`start_download`/`cancel_download`/`retry_download`,
  * {@link DownloadCommandErrorKind}) — не путать с девятью классами отказа
- * самой задачи ({@link import('@/types/download').DownloadErrorKind}),
+ * самой задачи ({@link import('@/types/generated/download').DownloadErrorKind}),
  * для которых есть `downloadErrorTexts.ts`.
  *
  * Дизайн E3 это состояние не описывает — оно считалось недостижимым
@@ -16,7 +16,7 @@ import type { DownloadCommandErrorKind } from '@/types/download'
  * Показ решён так же, как и остальные ошибки: заголовок и пояснение по
  * классу, без кнопки «Повторить» — для всех шести классов повтор того же
  * вызова не имеет смысла (см. doc {@link DownloadCommandErrorKind}
- * в `src/types/download.ts`): либо гонка уже разрешилась сама
+ * в `src/types/generated/download.ts`): либо гонка уже разрешилась сама
  * (`alreadyActive`/`unknownTask`), либо нужен другой ввод, а не тот же
  * вызов ещё раз (`noStreamsSelected`/`invalidUrl`/`notFailed`/`notRetryable`).
  *

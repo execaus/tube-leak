@@ -19,7 +19,7 @@
  */
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 
-import type { DownloadProgress } from '@/types/download'
+import type { DownloadProgress } from '@/types/generated/download'
 import { getExitDialogText } from '@/utils/exitDialogTexts'
 
 const props = defineProps<{

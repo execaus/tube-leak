@@ -1,20 +1,25 @@
 import { describe, expect, it } from 'vitest'
 
-import type { DownloadErrorKind } from '@/types/download'
+import type { DownloadErrorKind } from '@/types/generated/download'
+import { knownKindsOf } from '@/utils/knownKinds'
 
 import { getDownloadErrorText } from './downloadErrorTexts'
 
-const ALL_KINDS: DownloadErrorKind[] = [
-  'connectionLost',
-  'diskFull',
-  'staleFormat',
-  'mergeFailed',
-  'destinationUnavailable',
-  'videoUnavailable',
-  'signInRequired',
-  'regionBlocked',
-  'ytDlpFailure',
-]
+/**
+ * Выведено из типа (TL-52), а не рукописный массив: пропущенный класс
+ * ронял бы `npm run type-check`, а не тихо выпадал бы из перебора ниже.
+ */
+const ALL_KINDS = knownKindsOf<DownloadErrorKind>({
+  connectionLost: true,
+  diskFull: true,
+  staleFormat: true,
+  mergeFailed: true,
+  destinationUnavailable: true,
+  videoUnavailable: true,
+  signInRequired: true,
+  regionBlocked: true,
+  ytDlpFailure: true,
+})
 
 describe('getDownloadErrorText — 9 классов ошибок скачивания (Ф-10, таблица дизайна E3)', () => {
   it('returns a distinct, non-empty title and explanation for every one of the 9 classes', () => {

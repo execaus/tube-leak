@@ -1,7 +1,7 @@
 import { mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
 
-import type { SidecarCheckResult } from '@/types/sidecar'
+import type { SidecarCheckResult } from '@/types/generated/sidecar'
 
 import SidecarStatusRow from './SidecarStatusRow.vue'
 

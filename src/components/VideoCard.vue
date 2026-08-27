@@ -26,7 +26,7 @@
  */
 import { computed, ref, useId } from 'vue'
 
-import type { ProbeResult, QualityItem, QualitySize, QualityStreams } from '@/types/probe'
+import type { ProbeResult, QualityItem, QualitySize, QualityStreams } from '@/types/generated/probe'
 import { formatDuration } from '@/utils/formatDuration'
 import { qualityLabel } from '@/utils/qualityLabel'
 

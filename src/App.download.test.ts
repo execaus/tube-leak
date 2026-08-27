@@ -2,10 +2,10 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { DownloadProgressEvent, DownloadStarted } from '@/types/download'
-import type { ProbeResult } from '@/types/probe'
-import type { SidecarCheckReport } from '@/types/sidecar'
-import type { YtDlpPrepared } from '@/types/ytdlp'
+import type { DownloadProgressEvent, DownloadStarted } from '@/types/generated/download'
+import type { ProbeResult } from '@/types/generated/probe'
+import type { SidecarCheckReport } from '@/types/generated/sidecar'
+import type { YtDlpPrepared } from '@/types/generated/ytdlp'
 
 /**
  * Интеграционные тесты App.vue ↔ секция «Текущая загрузка» (эпик E3,
