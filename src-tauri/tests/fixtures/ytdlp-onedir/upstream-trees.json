@@ -1,6 +1,6 @@
 {
   "_capture": {
-    "note": "Форма onedir-деревьев yt-dlp: сколько записей и сколько байт даёт распаковка каждого апстримного ассета. Основание потолков MAX_UNPACKED_BYTES и MAX_ENTRIES в src-tauri/src/ytdlp/unpack.rs (TL-18).",
+    "note": "Форма onedir-деревьев yt-dlp: сколько записей, сколько байт, какой глубины пути и какой длины имена даёт каждый апстримный ассет. Основание потолков MAX_UNPACKED_BYTES, MAX_ENTRIES, MAX_PATH_DEPTH и MAX_NAME_BYTES в src-tauri/src/ytdlp/unpack.rs (TL-18).",
     "reality": "live",
     "method": "Центральный каталог каждого zip прочитан диапазонным запросом к релизному ассету GitHub (Range: bytes=<конец-1MiB>-<конец>) и разобран без скачивания архива целиком; суффиксные диапазоны (bytes=-N) CDN отвечает 501, поэтому границы считаются от размера ассета. Размеры ассетов — из API релизов.",
     "capturedAt": "2026-08-27",
@@ -16,7 +16,12 @@
       "files": 134,
       "directories": 28,
       "unpackedBytes": 130010634,
-      "compressedBytes": 53887487
+      "compressedBytes": 53887487,
+      "maxPathDepth": 6,
+      "deepestPath": "_internal/Python.framework/Versions/3.14/Resources/Info.plist",
+      "maxNameBytes": 71,
+      "longestName": "_internal/python3.14/lib-dynload/_posixsubprocess.cpython-314-darwin.so",
+      "maxComponentBytes": 38
     },
     {
       "release": "2026.08.19",
@@ -27,7 +32,12 @@
       "files": 148,
       "directories": 27,
       "unpackedBytes": 95989623,
-      "compressedBytes": 40485614
+      "compressedBytes": 40485614,
+      "maxPathDepth": 5,
+      "deepestPath": "_internal/cryptography/hazmat/bindings/_rust.abi3.so",
+      "maxNameBytes": 81,
+      "longestName": "_internal/python3.14/lib-dynload/_multiprocessing.cpython-314-x86_64-linux-gnu.so",
+      "maxComponentBytes": 48
     },
     {
       "release": "2026.08.19",
@@ -38,7 +48,12 @@
       "files": 146,
       "directories": 27,
       "unpackedBytes": 97749893,
-      "compressedBytes": 40183113
+      "compressedBytes": 40183113,
+      "maxPathDepth": 5,
+      "deepestPath": "_internal/cryptography/hazmat/bindings/_rust.abi3.so",
+      "maxNameBytes": 82,
+      "longestName": "_internal/python3.14/lib-dynload/_multiprocessing.cpython-314-aarch64-linux-gnu.so",
+      "maxComponentBytes": 49
     },
     {
       "release": "2026.08.19",
@@ -49,7 +64,12 @@
       "files": 151,
       "directories": 28,
       "unpackedBytes": 94138914,
-      "compressedBytes": 40636181
+      "compressedBytes": 40636181,
+      "maxPathDepth": 5,
+      "deepestPath": "_internal/cryptography/hazmat/bindings/_rust.abi3.so",
+      "maxNameBytes": 82,
+      "longestName": "_internal/python3.14/lib-dynload/_multiprocessing.cpython-314-x86_64-linux-musl.so",
+      "maxComponentBytes": 49
     },
     {
       "release": "2026.08.19",
@@ -60,7 +80,12 @@
       "files": 140,
       "directories": 3,
       "unpackedBytes": 31081723,
-      "compressedBytes": 18065111
+      "compressedBytes": 18065111,
+      "maxPathDepth": 5,
+      "deepestPath": "_internal/yt_dlp_ejs/yt/solver/core.min.js",
+      "maxNameBytes": 81,
+      "longestName": "_internal/curl_cffi.libs/libcurl-impersonate-ec8ead0e422fe4ae62a99233a63f6007.dll",
+      "maxComponentBytes": 56
     },
     {
       "release": "2026.08.19",
@@ -71,7 +96,12 @@
       "files": 136,
       "directories": 3,
       "unpackedBytes": 38830410,
-      "compressedBytes": 21441988
+      "compressedBytes": 21441988,
+      "maxPathDepth": 5,
+      "deepestPath": "_internal/yt_dlp_ejs/yt/solver/core.min.js",
+      "maxNameBytes": 81,
+      "longestName": "_internal/curl_cffi.libs/libcurl-impersonate-6ec4e467004da7d4e4d97f097e367e59.dll",
+      "maxComponentBytes": 56
     },
     {
       "release": "2026.02.04",
@@ -82,7 +112,12 @@
       "files": 152,
       "directories": 34,
       "unpackedBytes": 152143533,
-      "compressedBytes": 64447865
+      "compressedBytes": 64447865,
+      "maxPathDepth": 6,
+      "deepestPath": "_internal/Python.framework/Versions/3.14/Resources/Info.plist",
+      "maxNameBytes": 80,
+      "longestName": "_internal/setuptools/_vendor/importlib_metadata-8.7.1.dist-info/licenses/LICENSE",
+      "maxComponentBytes": 38
     },
     {
       "release": "2025.12.08",
@@ -93,7 +128,12 @@
       "files": 152,
       "directories": 33,
       "unpackedBytes": 150622746,
-      "compressedBytes": 63999176
+      "compressedBytes": 63999176,
+      "maxPathDepth": 6,
+      "deepestPath": "_internal/Python.framework/Versions/3.14/Resources/Info.plist",
+      "maxNameBytes": 77,
+      "longestName": "_internal/setuptools/_vendor/importlib_metadata-8.0.0.dist-info/top_level.txt",
+      "maxComponentBytes": 38
     },
     {
       "release": "2025.09.05",
@@ -104,7 +144,12 @@
       "files": 150,
       "directories": 29,
       "unpackedBytes": 143292669,
-      "compressedBytes": 60749750
+      "compressedBytes": 60749750,
+      "maxPathDepth": 6,
+      "deepestPath": "_internal/Python.framework/Versions/3.13/Resources/Info.plist",
+      "maxNameBytes": 77,
+      "longestName": "_internal/setuptools/_vendor/importlib_metadata-8.0.0.dist-info/top_level.txt",
+      "maxComponentBytes": 38
     },
     {
       "release": "2024.12.03",
@@ -115,7 +160,12 @@
       "files": 154,
       "directories": 28,
       "unpackedBytes": 150646457,
-      "compressedBytes": 58836315
+      "compressedBytes": 58836315,
+      "maxPathDepth": 6,
+      "deepestPath": "_internal/Python.framework/Versions/3.12/Resources/Info.plist",
+      "maxNameBytes": 77,
+      "longestName": "_internal/setuptools/_vendor/importlib_metadata-8.0.0.dist-info/top_level.txt",
+      "maxComponentBytes": 38
     }
   ]
 }

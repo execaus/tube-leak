@@ -122,7 +122,56 @@ const MAX_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
 /// центрального каталога — это ровно граница цикла, который мы сами и
 /// крутим (`0..archive.len()`). Соврать в большую сторону здесь нельзя:
 /// сколько заявлено, столько мы и обойдём.
+///
+/// Чего этот потолок **не** делает — не ограничивает память на разбор
+/// архива: к моменту проверки центральный каталог уже разобран целиком
+/// (см. комментарий на месте вызова).
 const MAX_ENTRIES: usize = 4096;
+
+/// Потолок глубины пути внутри архива.
+///
+/// Закрывает обход [`MAX_ENTRIES`]: одна запись разворачивается в столько
+/// каталогов, сколько компонентов в её имени, а каталоги не считает ни
+/// один из потолков выше. Воспроизведено при ревью TL-18: архив 696 КБ,
+/// 1001 запись — при потолке 4096 — и имена глубиной 150 дали 151 000
+/// каталогов, `unpack` вернул `Ok`, и дерево уехало в `promote`; 8,5 с на
+/// создание, 12,4 с на удаление. Места на APFS это не ест, ест inode и
+/// время — ровно тот класс, ради которого заведён [`MAX_ENTRIES`].
+///
+/// Измерено (фикстура `tests/fixtures/ytdlp-onedir/`): все десять снятых
+/// деревьев укладываются в шесть уровней и держат эту цифру двадцать
+/// месяцев — macOS 6, linux и windows 5. Самый глубокий путь набора:
+/// `_internal/Python.framework/Versions/3.14/Resources/Info.plist`.
+/// Запас тот же трёхкратный, что у [`MAX_UNPACKED_BYTES`].
+///
+/// Вместе с [`MAX_ENTRIES`] это и есть граница числа создаваемых
+/// каталогов: не больше 4096 × 18 = 73 728. Цена названа здесь явно и
+/// измерена, а не прикинута: архив из 4096 записей глубины 18 — ровно
+/// то, что потолки ещё пропускают, — распаковывается за 3,56 с. Столько
+/// и стоит выбранный запас в худшем разрешённом случае; следующий, кто
+/// станет двигать любой из двух потолков, должен видеть произведение, а
+/// не два сомножителя порознь.
+const MAX_PATH_DEPTH: usize = 18;
+
+/// Потолок длины имени записи в байтах.
+///
+/// Вторая половина того же белого списка: глубина ограничивает число
+/// компонентов пути, длина — их суммарный размер. Без неё запись
+/// остаётся местом, откуда в путь приходит произвольно длинная строка.
+///
+/// Измерено: самое длинное имя в десяти деревьях — 82 байта
+/// (`_internal/python3.14/lib-dynload/_multiprocessing.cpython-314-aarch64-linux-gnu.so`),
+/// самый длинный отдельный компонент — 56. 256 байт — примерно
+/// трёхкратный запас, как и у остальных потолков.
+///
+/// Чего он не гарантирует: на Windows в `MAX_PATH` (260 без включённых
+/// длинных путей) упирается путь целиком — каталог данных плюс имя из
+/// архива, — а этот потолок ограничивает только вторую половину суммы.
+/// Настоящее дерево с его 82 байтами до предела не достаёт с большим
+/// зазором; отдельного сторожа на полную длину здесь нет намеренно, и
+/// отказ такой записи придёт от файловой системы как
+/// [`PrepareError::UnpackFailed`].
+const MAX_NAME_BYTES: usize = 256;
 
 /// Запас свободного места сверх объёма дерева.
 ///
@@ -206,10 +255,19 @@ fn unpack_with_space_probe(
         reason: format!("{}: {err}", archive_path.display()),
     })?;
 
-    // Число записей проверяется до обхода заголовков, а не вместе с
-    // объёмом: обход — это `archive.len()` чтений, и на архиве с
-    // миллионом записей отказ должен случиться раньше, чем мы их
-    // прочитаем.
+    // Потолок числа записей ограничивает то, что уйдёт в файловую
+    // систему, и только это. Расход памяти на разбор самого архива он не
+    // ограничивает и ограничить не может: `ZipArchive::new` строкой выше
+    // уже построил указатель по всему центральному каталогу и вернул
+    // управление только после этого. Измерено при ревью TL-18 на архиве
+    // 218 МБ с 2 000 001 записью — 10 МиБ RSS до открытия и 936 МиБ
+    // сразу после `ZipArchive::new`, амплификация ×4,3 к размеру архива,
+    // и всё это до первой нашей проверки. Отказ ниже честный, но память
+    // к тому моменту уже занята.
+    //
+    // Для E6 отсюда следует практический вывод: ограничивать надо размер
+    // скачанного архива — снаружи, до вызова [`unpack`], — потому что
+    // изнутри этот расход не виден и не управляем.
     check_entry_count(archive.len())?;
 
     // Полный размер дерева нужен до распаковки, чтобы прогресс считался
@@ -222,9 +280,12 @@ fn unpack_with_space_probe(
     // молча обнулив заявленный объём.
     let mut declared_bytes = 0_u64;
     for index in 0..archive.len() {
-        if let Ok(entry) = archive.by_index_raw(index) {
-            declared_bytes = declared_bytes.saturating_add(entry.size());
-        }
+        let Ok(entry) = archive.by_index_raw(index) else {
+            continue;
+        };
+
+        declared_bytes = declared_bytes.saturating_add(entry.size());
+        check_entry_shape(index, entry.name(), entry.enclosed_name().as_deref())?;
     }
 
     check_declared_shape(archive.len(), declared_bytes)?;
@@ -376,6 +437,47 @@ fn check_declared_shape(entries: usize, declared_bytes: u64) -> Result<(), Prepa
 
     if declared_bytes > MAX_UNPACKED_BYTES {
         return Err(over_the_ceiling_error(declared_bytes, "заявляет"));
+    }
+
+    Ok(())
+}
+
+/// Отвергает запись, чьё имя выходит за разрешённую форму.
+///
+/// Проверяется в предпроходе, до `create_dir_all(dest)`, поэтому отказ по
+/// форме имени не оставляет на диске ни одного каталога.
+///
+/// Глубина считается по **обеззараженному** имени (`enclosed_name`), а не
+/// по сырому: создавать каталоги будет именно оно. Запись, у которой
+/// обеззараженного имени нет вовсе, здесь пропускается — её отвергнет
+/// основной цикл со своим сообщением про выход за каталог назначения, и
+/// дублировать этот отказ двумя формулировками незачем.
+fn check_entry_shape(
+    index: usize,
+    name: &str,
+    relative: Option<&Path>,
+) -> Result<(), PrepareError> {
+    if name.len() > MAX_NAME_BYTES {
+        return Err(PrepareError::ArchiveCorrupted {
+            reason: format!(
+                "имя записи {index} — {} байт при потолке {MAX_NAME_BYTES}: \
+                 в дереве yt-dlp таких имён нет",
+                name.len()
+            ),
+        });
+    }
+
+    if let Some(relative) = relative {
+        let depth = relative.components().count();
+        if depth > MAX_PATH_DEPTH {
+            return Err(PrepareError::ArchiveCorrupted {
+                reason: format!(
+                    "запись {index} лежит на глубине {depth} при потолке \
+                     {MAX_PATH_DEPTH}: столько вложенных каталогов дерево \
+                     yt-dlp не заводит ни на одной платформе ({name})"
+                ),
+            });
+        }
     }
 
     Ok(())
@@ -745,6 +847,85 @@ mod tests {
         }
 
         fs::write(archive, &bytes).expect("архив фикстуры обязан писаться");
+    }
+
+    /// Объявляет каждой записи 64-битный размер `declared`, спрятав его
+    /// в zip64-поле центрального каталога.
+    ///
+    /// Одним лишь 32-битным полем такой архив не собрать: в нём
+    /// помещается меньше 4 ГиБ, а для переполнения `u64` нужны слагаемые
+    /// около 2^63. Формат для этого и предусматривает extra-поле
+    /// `0x0001`: 32-битный размер выставляется в `0xFFFFFFFF`, а
+    /// настоящий лежит рядом восемью байтами. `zip` читает его ровно по
+    /// этому признаку (`read.rs`: `len >= 24 || uncompressed_size ==
+    /// ZIP64_BYTES_THR`).
+    fn declare_zip64_sizes(archive: &Path, declared: u64) {
+        const ZIP64_THRESHOLD: u32 = u32::MAX;
+
+        let bytes = fs::read(archive).expect("архив фикстуры обязан читаться");
+        let eocd = bytes
+            .windows(4)
+            .rposition(|window| window == b"PK\x05\x06")
+            .expect("хвост центрального каталога обязан найтись");
+        let le16 =
+            |bytes: &[u8], at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
+        let le32 = |bytes: &[u8], at: usize| {
+            u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize
+        };
+
+        let entries = le16(&bytes, eocd + 10);
+        let directory_at = le32(&bytes, eocd + 16);
+
+        let mut directory = Vec::new();
+        let mut cursor = directory_at;
+        for _ in 0..entries {
+            assert_eq!(&bytes[cursor..cursor + 4], b"PK\x01\x02", "запись каталога");
+            let (name_len, extra_len, comment_len) = (
+                le16(&bytes, cursor + 28),
+                le16(&bytes, cursor + 30),
+                le16(&bytes, cursor + 32),
+            );
+
+            let mut zip64 = Vec::with_capacity(12);
+            zip64.extend_from_slice(&1_u16.to_le_bytes());
+            zip64.extend_from_slice(&8_u16.to_le_bytes());
+            zip64.extend_from_slice(&declared.to_le_bytes());
+
+            let mut header = bytes[cursor..cursor + 46].to_vec();
+            header[24..28].copy_from_slice(&ZIP64_THRESHOLD.to_le_bytes());
+            header[30..32].copy_from_slice(
+                &u16::try_from(extra_len + zip64.len())
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+
+            directory.extend_from_slice(&header);
+            directory.extend_from_slice(&bytes[cursor + 46..cursor + 46 + name_len + extra_len]);
+            directory.extend_from_slice(&zip64);
+            let comment_at = cursor + 46 + name_len + extra_len;
+            directory.extend_from_slice(&bytes[comment_at..comment_at + comment_len]);
+
+            cursor = comment_at + comment_len;
+        }
+
+        let mut tail = bytes[eocd..].to_vec();
+        tail[12..16].copy_from_slice(&u32::try_from(directory.len()).unwrap().to_le_bytes());
+
+        let mut patched = bytes[..directory_at].to_vec();
+        patched.extend_from_slice(&directory);
+        patched.extend_from_slice(&tail);
+        fs::write(archive, &patched).expect("архив фикстуры обязан писаться");
+    }
+
+    /// Архив из одной записи с заданным именем.
+    fn write_single_entry_zip(path: &Path, name: &str) {
+        let file = File::create(path).expect("fixture archive must be creatable");
+        let mut zip = ZipWriter::new(file);
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        zip.start_file(name, stored.unix_permissions(0o755))
+            .expect("start_file");
+        zip.write_all(b"#!/bin/sh\n").expect("write");
+        zip.finish().expect("finish");
     }
 
     /// Сколько байт лежит в дереве прямо сейчас.
@@ -1132,10 +1313,10 @@ mod tests {
             matches!(error, PrepareError::ArchiveCorrupted { .. }),
             "{error}"
         );
-        assert_eq!(
-            bytes_on_disk(&dest),
-            0,
-            "отказ обязан случиться до первой записи на диск"
+        assert!(
+            !dest.exists(),
+            "отказ по заявленному объёму обязан случиться до того, как \
+             появится сам каталог назначения"
         );
     }
 
@@ -1194,6 +1375,14 @@ mod tests {
     fn refuses_more_entries_than_any_tree_of_yt_dlp_has() {
         // Класс, который потолок в байтах не ловит: записи пустые, весит
         // дерево ноль, а inode кончаются.
+        //
+        // Число записей — литерал, а не `MAX_ENTRIES + 1`. Выведенная из
+        // константы фикстура проверяла бы тавтологию «на единицу больше
+        // потолка больше потолка» и оставалась бы зелёной при любом его
+        // значении; ревью TL-18 показало это мутацией `MAX_ENTRIES =
+        // 1_000_000`.
+        const OVER_THE_CEILING: usize = 4097;
+
         let dir = tempdir().expect("tempdir");
         let archive = dir.path().join("swarm.zip");
         {
@@ -1203,7 +1392,7 @@ mod tests {
             zip.start_file("yt-dlp_macos", stored.unix_permissions(0o755))
                 .expect("start_file");
             zip.write_all(b"#!/bin/sh\n").expect("write");
-            for index in 0..MAX_ENTRIES {
+            for index in 0..OVER_THE_CEILING {
                 zip.start_file(format!("_internal/{index}"), stored.unix_permissions(0o644))
                     .expect("start_file");
             }
@@ -1217,10 +1406,140 @@ mod tests {
             matches!(error, PrepareError::ArchiveCorrupted { .. }),
             "{error}"
         );
-        assert_eq!(
-            bytes_on_disk(&dest),
-            0,
-            "отказ по числу записей обязан случиться до обхода заголовков"
+        assert!(
+            !dest.exists(),
+            "отказ по числу записей обязан случиться до создания каталога"
+        );
+    }
+
+    #[test]
+    fn refuses_a_path_deeper_than_any_tree_of_yt_dlp_has() {
+        // Обход потолка записей, найденный ревью TL-18: записей мало,
+        // каталогов из них разворачивается сколько угодно. Глубина —
+        // литерал по той же причине, что и число записей выше.
+        const OVER_THE_CEILING: usize = 19;
+
+        let dir = tempdir().expect("tempdir");
+        let archive = dir.path().join("deep.zip");
+        let name = vec!["nested"; OVER_THE_CEILING].join("/");
+        write_single_entry_zip(&archive, &name);
+
+        let dest = dir.path().join("staging");
+        let error = unpack_fixture(&archive, &dest).expect_err("такой глубины дерево не бывает");
+
+        assert!(
+            matches!(error, PrepareError::ArchiveCorrupted { .. }),
+            "{error}"
+        );
+        assert!(
+            !dest.exists(),
+            "отказ по глубине обязан случиться до создания каталогов — \
+             в них весь смысл отказа"
+        );
+    }
+
+    #[test]
+    fn accepts_a_path_as_deep_as_the_real_tree_goes() {
+        // Вторая половина белого списка: он обязан пропускать то, ради
+        // чего заведён. Шесть уровней — максимум по всем десяти снятым
+        // деревьям, и путь взят настоящий.
+        let deepest = Path::new("_internal/Python.framework/Versions/3.14/Resources/Info.plist");
+        assert_eq!(deepest.components().count(), 6);
+
+        check_entry_shape(0, deepest.to_str().expect("utf-8"), Some(deepest))
+            .expect("настоящий самый глубокий путь апстрима обязан проходить");
+    }
+
+    #[test]
+    fn refuses_a_name_longer_than_any_tree_of_yt_dlp_has() {
+        const OVER_THE_CEILING: usize = 257;
+
+        let dir = tempdir().expect("tempdir");
+        let archive = dir.path().join("verbose.zip");
+        write_single_entry_zip(&archive, &"n".repeat(OVER_THE_CEILING));
+
+        let dest = dir.path().join("staging");
+        let error = unpack_fixture(&archive, &dest).expect_err("таких имён в дереве нет");
+
+        assert!(
+            matches!(error, PrepareError::ArchiveCorrupted { .. }),
+            "{error}"
+        );
+        assert!(!dest.exists(), "отказ по имени — тоже до касания диска");
+    }
+
+    // `assertions_on_constants` здесь именно то, что нужно: тест на то и
+    // существует, чтобы утверждение о константах было записано отдельно
+    // от самих констант и ломалось при их правке. Clippy предполагает,
+    // что такая проверка бесполезна, — здесь она и есть предмет.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn the_ceilings_are_pinned_from_above_as_well_as_from_below() {
+        // Снизу потолки держит `the_ceilings_clear_every_tree_upstream…`:
+        // они обязаны быть не меньше замеров с запасом. Сверху их не
+        // держало ничто — ревью TL-18 показало это мутацией
+        // `MAX_ENTRIES = 1_000_000`, которая оставила набор зелёным.
+        //
+        // Числа здесь литералы намеренно. Это не дубликат объявления, а
+        // вторая подпись под ним: поднять потолок по-прежнему можно, но
+        // не молча — придётся тронуть и это место, а значит объяснить,
+        // откуда взялось новое значение, и переснять замеры в фикстуре.
+        assert!(
+            MAX_UNPACKED_BYTES <= 512 * 1024 * 1024,
+            "потолок объёма поднят выше обоснованного замерами"
+        );
+        assert!(
+            MAX_ENTRIES <= 4096,
+            "потолок числа записей поднят выше обоснованного замерами"
+        );
+        assert!(
+            MAX_PATH_DEPTH <= 18,
+            "потолок глубины поднят выше обоснованного замерами"
+        );
+        assert!(
+            MAX_NAME_BYTES <= 256,
+            "потолок длины имени поднят выше обоснованного замерами"
+        );
+    }
+
+    #[test]
+    fn a_pair_of_entries_cannot_overflow_the_sum_of_declared_sizes() {
+        // Регрессия на насыщающее сложение. Два слагаемых по 2^63 в
+        // сумме дают ровно 2^64: `+=` в отладочной сборке паникует, а
+        // `wrapping_add` возвращает ноль — и ноль этот выглядит как
+        // «архив ничего не обещает», то есть проходит проверку формы.
+        //
+        // Сторож — не текст сообщения, а место отказа. При насыщении
+        // отказ приходит от `check_declared_shape`, до
+        // `create_dir_all(dest)`, и каталога назначения не появляется
+        // вовсе. При заворачивании проверка формы пройдена, каталог
+        // создан, и остановит распаковку уже бюджет — на шаг позже.
+        let dir = tempdir().expect("tempdir");
+        let archive = dir.path().join("overflow.zip");
+        {
+            let file = File::create(&archive).expect("create");
+            let mut zip = ZipWriter::new(file);
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            for name in ["yt-dlp_macos", "_internal/data.txt"] {
+                zip.start_file(name, stored.unix_permissions(0o644))
+                    .expect("start_file");
+                zip.write_all(b"x").expect("write");
+            }
+            zip.finish().expect("finish");
+        }
+        declare_zip64_sizes(&archive, 1_u64 << 63);
+
+        let dest = dir.path().join("staging");
+        let error = unpack_fixture(&archive, &dest).expect_err("два по 2^63 — не дерево yt-dlp");
+
+        assert!(
+            matches!(error, PrepareError::ArchiveCorrupted { .. }),
+            "{error}"
+        );
+        assert!(
+            !dest.exists(),
+            "переполнение обнулило заявленный объём: проверка формы его \
+             пропустила, и отказ пришёл на шаг позже"
         );
     }
 
@@ -1332,6 +1651,10 @@ mod tests {
         asset: String,
         entries: usize,
         unpacked_bytes: u64,
+        max_path_depth: usize,
+        deepest_path: String,
+        max_name_bytes: usize,
+        longest_name: String,
     }
 
     #[derive(serde::Deserialize)]
@@ -1401,6 +1724,16 @@ mod tests {
                 "{name}: {} записей против потолка {MAX_ENTRIES}",
                 tree.entries
             );
+            assert!(
+                tree.max_path_depth * (HEADROOM_FACTOR as usize) <= MAX_PATH_DEPTH,
+                "{name}: глубина {} против потолка {MAX_PATH_DEPTH}",
+                tree.max_path_depth
+            );
+            assert!(
+                tree.max_name_bytes * (HEADROOM_FACTOR as usize) <= MAX_NAME_BYTES,
+                "{name}: имя {} байт против потолка {MAX_NAME_BYTES}",
+                tree.max_name_bytes
+            );
         }
     }
 
@@ -1409,12 +1742,40 @@ mod tests {
         // На вопрос «а настоящий ассет мы бы не отвергли?» отвечает код
         // распаковки, а не арифметика в голове читающего.
         for tree in measured_trees().trees {
+            let where_from = format!("{} {}", tree.release, tree.asset);
+
             let verdict = check_declared_shape(tree.entries, tree.unpacked_bytes);
             assert!(
                 verdict.is_ok(),
-                "{} {} отвергается собственными потолками: {}",
-                tree.release,
-                tree.asset,
+                "{where_from} отвергается по объёму или числу записей: {}",
+                verdict.unwrap_err()
+            );
+
+            // Самый глубокий и самое длинное имя — разные записи, и
+            // проверяются они порознь, каждая своей границей.
+            let deepest = Path::new(&tree.deepest_path);
+            assert_eq!(
+                deepest.components().count(),
+                tree.max_path_depth,
+                "{where_from}: замер глубины и сам путь разошлись"
+            );
+            let verdict = check_entry_shape(0, &tree.deepest_path, Some(deepest));
+            assert!(
+                verdict.is_ok(),
+                "{where_from} отвергается по глубине: {}",
+                verdict.unwrap_err()
+            );
+
+            assert_eq!(
+                tree.longest_name.len(),
+                tree.max_name_bytes,
+                "{where_from}: замер длины имени и само имя разошлись"
+            );
+            let verdict =
+                check_entry_shape(0, &tree.longest_name, Some(Path::new(&tree.longest_name)));
+            assert!(
+                verdict.is_ok(),
+                "{where_from} отвергается по длине имени: {}",
                 verdict.unwrap_err()
             );
         }
