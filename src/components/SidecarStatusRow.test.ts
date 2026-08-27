@@ -1,7 +1,7 @@
 import { mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
 
-import type { SidecarCheckResult } from '@/types/sidecar'
+import type { SidecarCheckResult } from '@/types/generated/sidecar'
 
 import SidecarStatusRow from './SidecarStatusRow.vue'
 
@@ -38,6 +38,19 @@ const launchFailedOtherResult: SidecarCheckResult = {
   path: '/opt/tube-leak/bin/yt-dlp',
   status: 'launchFailed',
   reason: 'other',
+  osErrorCode: 'EUNKNOWN',
+}
+
+/**
+ * `reason` объявлен опциональным во всём контракте (заполняется только
+ * при `status === 'launchFailed'`, но тип этого не запрещает) — фикстура
+ * на случай, если он всё же не пришёл: до ревью TL-52 такое значение
+ * попадало в ту же ветку, что и `corrupted`.
+ */
+const launchFailedMissingReasonResult: SidecarCheckResult = {
+  name: 'yt-dlp',
+  path: '/opt/tube-leak/bin/yt-dlp',
+  status: 'launchFailed',
   osErrorCode: 'EUNKNOWN',
 }
 
@@ -108,13 +121,28 @@ describe('SidecarStatusRow', () => {
     expect(wrapper.text()).toContain('повреждён')
   })
 
-  it('renders the LaunchFailed(other) state with the same "not started" explanation as corrupted', () => {
+  it('renders the LaunchFailed(other) state with a neutral explanation, distinct from corrupted (review TL-52)', () => {
+    // До ревью TL-52 `other` (и отсутствующий `reason`) молча получали тот
+    // же текст, что `corrupted` («похоже, он повреждён») — диагноз,
+    // которого ядро не утверждало. Текст для `other` обязан не называть
+    // причину и при этом не совпадать дословно с текстом `corrupted`.
     const wrapper = mount(SidecarStatusRow, {
       props: { fallbackName: 'yt-dlp', result: launchFailedOtherResult },
     })
 
     expect(wrapper.text()).toContain('не удалось запустить')
-    expect(wrapper.text()).toContain('Файл yt-dlp найден, но не запустился.')
+    expect(wrapper.text()).toContain('Файл yt-dlp найден, но не запустился')
+    expect(wrapper.text()).not.toContain('повреждён')
+  })
+
+  it('renders the same neutral explanation when `reason` is missing entirely (defensive fallback, review TL-52)', () => {
+    const wrapper = mount(SidecarStatusRow, {
+      props: { fallbackName: 'yt-dlp', result: launchFailedMissingReasonResult },
+    })
+
+    expect(wrapper.text()).toContain('не удалось запустить')
+    expect(wrapper.text()).toContain('Файл yt-dlp найден, но не запустился')
+    expect(wrapper.text()).not.toContain('повреждён')
   })
 
   it('renders the LaunchFailed(permissionDenied) state with the chmod explanation', () => {

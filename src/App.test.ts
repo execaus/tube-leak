@@ -2,8 +2,8 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { SidecarCheckReport, SidecarCheckResult } from '@/types/sidecar'
-import type { YtDlpPrepareError, YtDlpPrepareEvent, YtDlpPrepared } from '@/types/ytdlp'
+import type { SidecarCheckReport, SidecarCheckResult } from '@/types/generated/sidecar'
+import type { YtDlpPrepareError, YtDlpPrepareEvent, YtDlpPrepared } from '@/types/generated/ytdlp'
 
 const invokeMock = vi.fn()
 const unlistenMock = vi.fn()

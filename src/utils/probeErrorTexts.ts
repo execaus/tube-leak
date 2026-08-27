@@ -1,4 +1,4 @@
-import type { ProbeErrorKind, YtDlpFailureReason } from '@/types/probe'
+import type { ProbeErrorKind, YtDlpFailureReason } from '@/types/generated/probe'
 
 /**
  * Тексты и правило показа «Повторить» для восьми классов ошибок разбора,
@@ -17,7 +17,7 @@ import type { ProbeErrorKind, YtDlpFailureReason } from '@/types/probe'
  *
  * `message` — формулировка ядра для свёрнутого «Подробнее» и лога, не
  * основной текст экрана (см. doc-комментарий `ProbeError.message` в
- * `src/types/probe.ts` и раздел «Решения по контракту, принятые на TL-27»
+ * `src/types/generated/probe.ts` и раздел «Решения по контракту, принятые на TL-27»
  * эпика E2 — риск подмены реален именно потому, что `message` заполнено
  * читаемым русским текстом и тестами эта подмена сама по себе не ловится).
  *

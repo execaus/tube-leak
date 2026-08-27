@@ -18,7 +18,7 @@
 import { computed, ref } from 'vue'
 
 import type { PrepareFailure } from '@/composables/useYtDlpPrepare'
-import type { YtDlpPrepareErrorKind } from '@/types/ytdlp'
+import type { YtDlpPrepareErrorKind } from '@/types/generated/ytdlp'
 
 const props = defineProps<{
   error: PrepareFailure

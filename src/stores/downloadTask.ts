@@ -12,7 +12,8 @@ import type {
   DownloadProgressEvent,
   DownloadStarted,
   StartDownloadRequest,
-} from '@/types/download'
+} from '@/types/generated/download'
+import { knownKindsOf } from '@/utils/knownKinds'
 
 const START_DOWNLOAD_COMMAND = 'start_download'
 const CANCEL_DOWNLOAD_COMMAND = 'cancel_download'
@@ -37,14 +38,19 @@ export interface DownloadTask {
   displayTitle: string
 }
 
-const KNOWN_COMMAND_ERROR_KINDS: readonly DownloadCommandErrorKind[] = [
-  'alreadyActive',
-  'unknownTask',
-  'notFailed',
-  'notRetryable',
-  'noStreamsSelected',
-  'invalidUrl',
-]
+/**
+ * Белый список шести классов `DownloadCommandErrorKind`, выведенный из
+ * сгенерированного типа (TL-52, см. doc `@/utils/knownKinds`) — тот же
+ * приём, что и `KNOWN_ERROR_KINDS` в `useProbe.ts`/`useYtDlpPrepare.ts`.
+ */
+const KNOWN_COMMAND_ERROR_KINDS = knownKindsOf({
+  alreadyActive: true,
+  unknownTask: true,
+  notFailed: true,
+  notRetryable: true,
+  noStreamsSelected: true,
+  invalidUrl: true,
+} satisfies Record<DownloadCommandErrorKind, true>)
 
 function isDownloadCommandError(value: unknown): value is DownloadCommandError {
   if (typeof value !== 'object' || value === null) return false
@@ -80,7 +86,7 @@ function isTerminalPhase(progress: DownloadProgress): boolean {
 /**
  * Начальное представление задачи сразу после `start_download` — строится
  * по фазе из ответа команды, а не константой (ревью TL-45): doc-комментарий
- * `DownloadStarted.phase` в `src/types/download.ts` прямо требует рисовать
+ * `DownloadStarted.phase` в `src/types/generated/download.ts` прямо требует рисовать
  * по присланному полю, потому что в эпике очереди (E4) задача может
  * реально задержаться в `queued`, ожидая слот.
  *
@@ -126,7 +132,7 @@ function initialProgressForPhase(phase: DownloadPhase): DownloadProgress {
  * `failed` не глушит подписку, `retry()` лишь просит ядро продолжить ту же
  * задачу, а новые события того же `taskId` продолжают приходить в тот же
  * `progress` без каких-либо дополнительных действий на этой стороне (doc
- * `DownloadProgressEvent` в `src/types/download.ts`).
+ * `DownloadProgressEvent` в `src/types/generated/download.ts`).
  *
  * # Отказ команды — виден на экране, не только в консоли (ревью TL-45)
  *

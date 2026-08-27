@@ -10,7 +10,7 @@
  * заголовок и пояснение по классу (`downloadCommandErrorTexts.ts`), без
  * кнопки «Повторить» — ни один из шести классов не решается повтором
  * того же вызова (см. doc `DownloadCommandErrorKind` в
- * `src/types/download.ts`).
+ * `src/types/generated/download.ts`).
  */
 import { computed } from 'vue'
 

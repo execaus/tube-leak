@@ -18,7 +18,7 @@
  */
 import { computed, useId } from 'vue'
 
-import type { QualitySize, QualityStreams } from '@/types/probe'
+import type { QualitySize, QualityStreams } from '@/types/generated/probe'
 import { useLinkProbe } from '@/composables/useProbe'
 
 import ProbeErrorBlock from './ProbeErrorBlock.vue'

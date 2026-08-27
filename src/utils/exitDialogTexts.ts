@@ -1,4 +1,4 @@
-import type { DownloadProgress } from '@/types/download'
+import type { DownloadProgress } from '@/types/generated/download'
 
 /** Заголовок и текст диалога подтверждения выхода (дизайн E3, TL-46). */
 export interface ExitDialogText {
@@ -23,7 +23,7 @@ const HEADING = 'Загрузка ещё не завершена'
  * `fetching`: к моменту склейки оба потока уже скачаны целиком, и назвать
  * это «ещё готовится» значило бы соврать про стадию; числового процента
  * же у склейки нет и не может быть (remux, `DownloadProgress` не несёт
- * поля для `merging` — см. `src/types/download.ts`), поэтому для неё —
+ * поля для `merging` — см. `src/types/generated/download.ts`), поэтому для неё —
  * отдельная честная формулировка, а не выдуманное число.
  */
 function stateFragment(progress: DownloadProgress): string {

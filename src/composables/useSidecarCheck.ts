@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { ref, type Ref } from 'vue'
 
-import type { SidecarCheckReport } from '@/types/sidecar'
+import type { SidecarCheckReport } from '@/types/generated/sidecar'
 
 const CHECK_SIDECAR_COMMAND = 'check_sidecar'
 

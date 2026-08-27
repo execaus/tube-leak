@@ -3,7 +3,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent } from 'vue'
 
-import type { DownloadProgressEvent, DownloadStarted, StartDownloadRequest } from '@/types/download'
+import type { DownloadProgressEvent, DownloadStarted, StartDownloadRequest } from '@/types/generated/download'
 /**
  * Композабл диалога подтверждения выхода (Р-2, эпик E3, TL-46). Оконное
  * событие подставляется фейковым портом — реальная реализация ждёт

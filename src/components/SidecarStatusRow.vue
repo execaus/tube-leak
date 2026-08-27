@@ -9,7 +9,8 @@
  */
 import { computed, ref } from 'vue'
 
-import type { SidecarCheckResult } from '@/types/sidecar'
+import type { LaunchFailedReason, SidecarCheckResult } from '@/types/generated/sidecar'
+import { assertNever } from '@/utils/assertNever'
 
 const props = defineProps<{
   /**
@@ -57,12 +58,45 @@ const statusText = computed(() => {
     case 'timeout':
       return 'не отвечает'
     default:
-      return ''
+      // Пять перечисленных веток покрывают весь `SidecarStatus` — эта
+      // ветка недостижима сегодня и остаётся сторожем: новый вариант
+      // объединения не сузится до `never`, и `npm run type-check`
+      // откажется собирать вызов (TL-52 ревью, дефект класса TL-18).
+      return assertNever(result.status)
   }
 })
 
 function capitalize(value: string): string {
   return value.length === 0 ? value : value.charAt(0).toUpperCase() + value.slice(1)
+}
+
+/**
+ * Тексты `launchFailed` по под-причине (Ф-9): раньше это был `if/else` по
+ * `permissionDenied`, где ветка `else` молча приписывала «похоже, он
+ * повреждён» и варианту `other`, и отсутствующему `reason` — то есть
+ * пользователю называли причину, которую ядро не утверждало (ревью
+ * TL-52). `other` получает отдельный нейтральный текст, который не
+ * называет причину: формулировки `permissionDenied`/`corrupted` не
+ * менялись ни на символ.
+ *
+ * `Record<LaunchFailedReason, ...>` — тот же приём, что `KNOWN_ERROR_KINDS`
+ * в `useProbe.ts`/`useYtDlpPrepare.ts`: пропущенный вариант ловится
+ * `npm run type-check`, а не тихой веткой `else`.
+ */
+const LAUNCH_FAILED_EXPLANATIONS: Record<LaunchFailedReason, (name: string, path: string) => string> = {
+  permissionDenied: (name, path) =>
+    `У файла ${name} нет прав на выполнение. Такое случается, если архив с приложением ` +
+    `распаковывали вручную сторонним инструментом. Решение: выполните в терминале ` +
+    `chmod +x «${path}» либо переустановите tube-leak обычным способом.`,
+  corrupted: (name) =>
+    `Файл ${name} найден, но не запустился. Похоже, он повреждён — например, был усечён ` +
+    `при скачивании или заблокирован антивирусом на лету. Попробуйте переустановить tube-leak.`,
+  // Нейтральный текст: причина не установлена, и здесь она не
+  // додумывается за ядро — в отличие от `corrupted`, ничего не
+  // утверждается про повреждение файла.
+  other: (name) =>
+    `Файл ${name} найден, но не запустился, а точную причину определить не удалось. ` +
+    `Попробуйте переустановить tube-leak; если не поможет — посмотрите код ошибки ОС в «Подробнее» ниже.`,
 }
 
 const explanation = computed(() => {
@@ -71,23 +105,21 @@ const explanation = computed(() => {
   const name = result.name
 
   switch (result.status) {
+    // Проверка `ok` не имеет пояснения — успех ничего не объясняет.
+    case 'ok':
+      return undefined
     case 'notFound':
       return (
         `Не нашли файл ${name} по ожидаемому пути. Возможно, антивирус удалил его в карантин, ` +
         `либо он был случайно удалён вместе с частью установки. Попробуйте переустановить tube-leak.`
       )
     case 'launchFailed':
-      if (result.reason === 'permissionDenied') {
-        return (
-          `У файла ${name} нет прав на выполнение. Такое случается, если архив с приложением ` +
-          `распаковывали вручную сторонним инструментом. Решение: выполните в терминале ` +
-          `chmod +x «${result.path}» либо переустановите tube-leak обычным способом.`
-        )
-      }
-      return (
-        `Файл ${name} найден, но не запустился. Похоже, он повреждён — например, был усечён ` +
-        `при скачивании или заблокирован антивирусом на лету. Попробуйте переустановить tube-leak.`
-      )
+      // `reason` объявлен опциональным во всём контракте (заполняется
+      // только при `status === 'launchFailed'`) — на случай его
+      // фактического отсутствия здесь используется тот же нейтральный
+      // текст, что и для `other`, а не молчаливое приписывание
+      // повреждения.
+      return LAUNCH_FAILED_EXPLANATIONS[result.reason ?? 'other'](name, result.path)
     case 'nonZeroExit':
       return `${capitalize(name)} запустился, но завершился с ошибкой (код выхода: ${result.exitCode ?? '—'}).`
     case 'timeout': {
@@ -99,7 +131,8 @@ const explanation = computed(() => {
       )
     }
     default:
-      return undefined
+      // См. doc `statusText` выше — тот же сторож `assertNever`.
+      return assertNever(result.status)
   }
 })
 

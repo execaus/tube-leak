@@ -8,7 +8,7 @@ import type {
   DownloadProgressEvent,
   DownloadStream,
   PartialData,
-} from './download'
+} from './generated/download'
 
 /**
  * Нормативный тест TL-39 (критерий приёмки issue #41): полный набор

@@ -1,7 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import { onUnmounted, ref, watch, type Ref } from 'vue'
 
-import type { ProbeError, ProbeErrorKind, ProbeResult } from '@/types/probe'
+import type { ProbeError, ProbeErrorKind, ProbeResult } from '@/types/generated/probe'
+import { knownKindsOf } from '@/utils/knownKinds'
 import { looksLikeUrl } from '@/utils/looksLikeUrl'
 
 const PROBE_URL_COMMAND = 'probe_url'
@@ -27,17 +28,24 @@ export async function cancelProbe(): Promise<void> {
   return invoke<void>(CANCEL_PROBE_COMMAND)
 }
 
-const KNOWN_ERROR_KINDS: readonly ProbeErrorKind[] = [
-  'notAUrl',
-  'videoUnavailable',
-  'signInRequired',
-  'regionBlocked',
-  'networkUnavailable',
-  'playlistUnsupported',
-  'liveUnsupported',
-  'ytDlpFailure',
-  'timeout',
-]
+/**
+ * Белый список девяти классов `ProbeErrorKind`, выведенный из
+ * сгенерированного типа (TL-52, см. doc `@/utils/knownKinds`): пропуск
+ * нового варианта в объекте ниже роняет `npm run type-check`, а не
+ * превращает его молча в неконтрактный фолбэк, как это было с ручным
+ * массивом до TL-52.
+ */
+const KNOWN_ERROR_KINDS = knownKindsOf({
+  notAUrl: true,
+  videoUnavailable: true,
+  signInRequired: true,
+  regionBlocked: true,
+  networkUnavailable: true,
+  playlistUnsupported: true,
+  liveUnsupported: true,
+  ytDlpFailure: true,
+  timeout: true,
+} satisfies Record<ProbeErrorKind, true>)
 
 /**
  * То, что реально может оказаться отказом `probe_url`, **кроме** `notAUrl`
@@ -82,6 +90,14 @@ function toProbeFailure(err: unknown): ProbeFailure {
   // автоматически. Каст безопасен: на этой строке рантайм уже гарантировал,
   // что `kind` не `notAUrl`.
   if (isProbeError(err) && err.kind !== 'notAUrl') return err as ProbeFailure
+  // Оборонительная ветка (ревью TL-52): по протоколу `notAUrl` сюда дойти
+  // не должен — вызывающая сторона разводит его раньше (см. doc выше). Но
+  // если протокол всё же нарушен и `err` всё равно оказался контрактным
+  // `ProbeError` (пусть и с `kind === 'notAUrl'`), у него есть настоящий
+  // `message` от ядра — извлечь его строго лучше, чем молча подменить
+  // общей заглушкой. Тот же приём, что `toPrepareFailure`
+  // (`useYtDlpPrepare.ts`) и `toDownloadCommandFailure` (`downloadTask.ts`).
+  if (isProbeError(err)) return { message: err.message }
   if (err instanceof Error) return { message: err.message }
   if (typeof err === 'string' && err.length > 0) return { message: err }
   return { message: 'Разбор ролика завершился нераспознанной ошибкой.' }

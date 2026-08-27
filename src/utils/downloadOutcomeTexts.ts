@@ -1,4 +1,4 @@
-import type { PartialData } from '@/types/download'
+import type { PartialData } from '@/types/generated/download'
 
 /**
  * Тексты о судьбе частично скачанных данных (Ф-8), выведенные строго из
@@ -6,7 +6,7 @@ import type { PartialData } from '@/types/download'
  * диске» дизайна E3 не постоянна (`destinationUnavailable` зависит от
  * того, доступна ли ещё папка), поэтому решает ядро, а UI лишь озвучивает
  * присланное значение (doc-комментарий `DownloadError.partialData` в
- * `src/types/download.ts`).
+ * `src/types/generated/download.ts`).
  */
 
 /** Дополнительное предложение после пояснения ошибки в терминальной панели Failed. */

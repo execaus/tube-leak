@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import type { QualityItem } from '@/types/probe'
+import type { QualityItem } from '@/types/generated/probe'
 
 import { qualityLabel } from './qualityLabel'
 

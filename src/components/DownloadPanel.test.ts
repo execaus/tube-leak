@@ -1,7 +1,7 @@
 import { mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
 
-import type { DownloadErrorKind, DownloadProgress } from '@/types/download'
+import type { DownloadErrorKind, DownloadProgress } from '@/types/generated/download'
 
 import DownloadPanel from './DownloadPanel.vue'
 

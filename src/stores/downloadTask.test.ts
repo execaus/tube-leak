@@ -1,7 +1,7 @@
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { DownloadProgressEvent, DownloadStarted, StartDownloadRequest } from '@/types/download'
+import type { DownloadProgressEvent, DownloadStarted, StartDownloadRequest } from '@/types/generated/download'
 
 const invokeMock = vi.fn()
 const unlistenMock = vi.fn()

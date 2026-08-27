@@ -2,7 +2,7 @@ import { mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent } from 'vue'
 
-import type { YtDlpPrepareError, YtDlpPrepareEvent, YtDlpPrepared } from '@/types/ytdlp'
+import type { YtDlpPrepareError, YtDlpPrepareEvent, YtDlpPrepared } from '@/types/generated/ytdlp'
 
 const invokeMock = vi.fn()
 const unlistenMock = vi.fn()

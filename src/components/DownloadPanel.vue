@@ -17,7 +17,8 @@
  */
 import { computed } from 'vue'
 
-import type { DownloadPlan, DownloadProgress } from '@/types/download'
+import type { DownloadPlan, DownloadProgress } from '@/types/generated/download'
+import { assertNever } from '@/utils/assertNever'
 import { formatEtaSecs } from '@/utils/formatEtaSecs'
 import { formatSpeed } from '@/utils/formatSpeed'
 import { getCancelledText, getFailedPartialDataNote } from '@/utils/downloadOutcomeTexts'
@@ -60,9 +61,23 @@ const steps = computed<{ key: StepKey; label: string }[]>(() => {
   return list
 })
 
-/** Шаг степпера, к которому относится нетерминальная фаза — `undefined` для терминальных (степпер там не рисуется). */
+/**
+ * Шаг степпера, к которому относится нетерминальная фаза — `undefined`
+ * для терминальных (степпер там не рисуется).
+ *
+ * Все семь значений `DownloadPhase` перечислены явно, включая `failed` и
+ * `cancelled` (обе намеренно дают `undefined`) — раньше их накрывал общий
+ * `default: return undefined`, и восьмая фаза, которую добавит очередь
+ * (E4), тихо получила бы тот же `undefined`, не подсветив ни одного шага
+ * степпера, и осталась бы незамеченной: `StepKey | undefined` разрешает
+ * `undefined` уже сегодня, так что падение через конец `switch` не
+ * ловится typecheck'ом сам по себе (ревью TL-52). `assertNever` в `default`
+ * держит эту границу: он недостижим, пока перечислены все семь фаз, и
+ * перестаёт собираться, как только контракт добавит восьмую.
+ */
 const currentStepKey = computed<StepKey | undefined>(() => {
-  switch (props.progress.phase) {
+  const phase = props.progress.phase
+  switch (phase) {
     case 'queued':
     case 'fetching':
       return 'preparing'
@@ -72,8 +87,11 @@ const currentStepKey = computed<StepKey | undefined>(() => {
       return 'merging'
     case 'done':
       return 'done'
-    default:
+    case 'failed':
+    case 'cancelled':
       return undefined
+    default:
+      return assertNever(phase)
   }
 })
 
