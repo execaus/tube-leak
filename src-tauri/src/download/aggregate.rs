@@ -317,7 +317,7 @@ impl ProgressAggregator {
     ///
     /// `attempt` приходит от политики повторов; номер первой попытки
     /// снимается здесь по правилу контракта («только начиная со второй»),
-    /// чтобы обычный путь не рисовал «попытка 1 из 6».
+    /// чтобы обычный путь не рисовал «попытка 1 из N».
     pub fn running(&self, attempt: Option<DownloadAttempt>) -> DownloadingState {
         DownloadingState::Running {
             stream: self.current_stream(),
@@ -996,7 +996,7 @@ mod tests {
         match aggregator.running(Some(first)) {
             DownloadingState::Running { attempt, .. } => assert_eq!(
                 attempt, None,
-                "«попытка 1 из 6» на обычном пути не рисуется"
+                "«попытка 1 из N» на обычном пути не рисуется"
             ),
             other => panic!("ожидалось Running, пришло {other:?}"),
         }

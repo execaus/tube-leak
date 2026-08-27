@@ -137,6 +137,7 @@ pub mod filename;
 mod fixtures;
 #[allow(dead_code)]
 pub mod merge;
+pub mod orchestrate;
 #[allow(dead_code)]
 pub mod progress;
 #[allow(dead_code)]
@@ -145,8 +146,19 @@ pub mod retry;
 // Вызывающих за пределами модуля ещё нет: оркестрация (TL-44) появится
 // отдельной задачей. Реэкспорт объявлен сейчас, потому что он и есть
 // контракт домена, а не удобство импорта.
+// Обе ошибки домена наружу уходят уже спроецированными на контракт
+// (`to_contract`), поэтому импортировать их за пределами домена некому:
+// оркестрация берёт их у соседнего модуля напрямую, а команды видят уже
+// контрактные типы. Реэкспорт объявлен потому, что он и есть контракт
+// домена, а не удобство импорта, — и глушитель здесь на нём, а не на
+// самих типах.
 #[allow(unused_imports)]
 pub use error::{DownloadCommandRejection, DownloadFailure};
+pub use merge::SidecarFfmpeg;
+pub use orchestrate::{
+    cancel_download, retry_download, run_task, start_download, AppSink, DownloadSession,
+    DownloadTask, SidecarDownloader, WorkerSpawn,
+};
 
 /// Имя Tauri-события с ходом одной задачи скачивания (Ф-2).
 ///
@@ -160,6 +172,4 @@ pub use error::{DownloadCommandRejection, DownloadFailure};
 /// Разрешение `core:event:allow-listen`/`allow-unlisten` у основного окна
 /// уже выдано (E1) — новая подписка фронтенда новых разрешений не
 /// требует, но сторож `tests/frontend_acl.rs` проверит это сам.
-// Ещё никто не эмитит: эмиссия появится в TL-44 вместе с оркестрацией.
-#[allow(dead_code)]
 pub const PROGRESS_EVENT: &str = "download://progress";

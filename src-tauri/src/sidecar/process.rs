@@ -10,9 +10,9 @@ use std::io;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -231,6 +231,177 @@ pub async fn run_cancellable(
         }
     }
 }
+
+/// Исход запуска, чей stdout читался построчно ([`run_streaming`]).
+///
+/// Не `RunOutput`, и разница не косметическая: у долгого процесса stdout
+/// уже разобран и выброшен по ходу дела, а ненулевой код завершения —
+/// не ошибка запуска, а предмет классификации
+/// ([`crate::download::classify`]). Поэтому здесь и код, и stderr едут
+/// значением, а `Err` остаётся только за тем, чего не случилось вовсе, —
+/// за неудавшимся `spawn`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedRun {
+    /// Код завершения; `None` — процесс убит сигналом (в том числе нами:
+    /// отменой или сроком бездействия).
+    pub exit_code: Option<i32>,
+    /// stderr целиком. Наружу уходит только хвост ([`stderr_tail`]).
+    pub stderr: String,
+    /// Процесс убит потому, что истёк срок, назначенный вызывающим.
+    ///
+    /// Отдельный признак, а не догадка по отсутствию кода завершения:
+    /// без кода возвращается и процесс, убитый отменой пользователя, и
+    /// процесс, снятый сроком, — а решения по ним противоположные.
+    pub deadline_expired: bool,
+}
+
+/// Запускает `program` и **отдаёт stdout построчно по мере поступления**,
+/// вместо того чтобы копить его до конца процесса.
+///
+/// Нужно ровно там, где вывод процесса — не результат, а ход работы:
+/// строки прогресса yt-dlp разбираются и превращаются в события, пока
+/// загрузка идёт (Ф-2 эпика E3). [`run`] и [`run_cancellable`] для этого
+/// не годятся по устройству: они возвращают вывод одним куском, когда
+/// смотреть на него уже поздно.
+///
+/// # Срок бездействия вместо таймаута
+///
+/// Общего таймаута у этой функции нет и быть не может: у скачивания нет
+/// правдоподобной верхней границы — часовой ролик на медленной сети
+/// законно качается часами. Вместо него — **срок бездействия**: момент,
+/// до которого обязана прийти следующая строка. Первый срок задаёт
+/// `first_deadline`, каждый следующий возвращает сам `on_line`, то есть
+/// таймер **перевооружается на каждой строке**, а чем именно считается
+/// продвижение, решает вызывающий (для скачивания это принятые байты, а
+/// не факт вывода строки, — см. [`crate::download::retry`]).
+/// `on_line`, вернувший `None`, снимает срок вовсе.
+///
+/// Истёкший срок убивает **группу** процессов (см. doc
+/// [`super::registry::group_kill_command`]) и поднимает
+/// [`StreamedRun::deadline_expired`]. Это не отмена: флаг
+/// [`RunHandle::was_cancelled`] при этом не поднимается, и вызывающий
+/// различает «сняли сроком» и «отменил пользователь» без гадания.
+///
+/// # Отмена
+///
+/// Работает так же, как в [`run_cancellable`], и тем же дескриптором:
+/// убийство группы закрывает stdout, чтение упирается в EOF, функция
+/// возвращает обычный исход убитого процесса. Отдельной ветки на отмену
+/// внутри нет намеренно — она была бы вторым источником правды рядом с
+/// уже проверенным механизмом.
+pub async fn run_streaming(
+    program: &Path,
+    args: &[&str],
+    registry: &ChildRegistry,
+    handle: &RunHandle,
+    first_deadline: Instant,
+    on_line: &mut (dyn FnMut(&str) -> Option<Instant> + Send),
+) -> Result<StreamedRun, SidecarError> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command.spawn().map_err(classify_spawn_error)?;
+    let pid = child.id();
+    if let Some(pid) = pid {
+        registry.register(pid);
+    }
+    let _unregister_on_return = pid.map(|pid| UnregisterGuard { registry, pid });
+
+    // Отмена могла прийти между входом в функцию и `spawn` — та же
+    // гонка и то же её закрытие, что в `run_cancellable`: между `spawn`
+    // и этой строкой нет ни одной точки `await`.
+    if !handle.attach(pid) {
+        if let Some(pid) = pid {
+            kill_process_group(pid).await;
+        }
+    }
+    let _finish_on_return = FinishGuard(handle);
+
+    let stdout_pipe = child.stdout.take().expect("stdout must be piped");
+    let stderr_pipe = child.stderr.take().expect("stderr must be piped");
+    // stderr копится целиком: он не ход работы, а материал классификации,
+    // и нужен только в конце.
+    let stderr_task = spawn_reader(stderr_pipe);
+
+    let mut lines = BufReader::new(stdout_pipe).lines();
+    let mut deadline = Some(first_deadline);
+    let mut deadline_expired = false;
+
+    loop {
+        let next = lines.next_line();
+        let line = match deadline {
+            Some(moment) => match time::timeout_at(time::Instant::from_std(moment), next).await {
+                Ok(read) => read,
+                Err(_elapsed) => {
+                    deadline_expired = true;
+                    break;
+                }
+            },
+            None => next.await,
+        };
+
+        match line {
+            Ok(Some(line)) => deadline = on_line(&line),
+            // EOF: процесс закрыл stdout — он завершается сам, отменён
+            // или убит.
+            Ok(None) => break,
+            // Ошибка чтения (разрушенный пайп) — читать больше нечего;
+            // решение принимается по коду завершения, как и при EOF.
+            Err(_) => break,
+        }
+    }
+
+    if deadline_expired {
+        if let Some(pid) = pid {
+            kill_process_group(pid).await;
+        } else {
+            // Практически недостижимо: `pid` берётся сразу после
+            // успешного `spawn`.
+            let _ = child.start_kill();
+        }
+    }
+
+    let status = match time::timeout(EXIT_GRACE, child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        // Процесс закрыл stdout, но сам не ушёл. Так ведёт себя только
+        // зависший потомок: дальше ждать нечего, убиваем группу.
+        Ok(Err(_)) | Err(_) => {
+            if let Some(pid) = pid {
+                kill_process_group(pid).await;
+            }
+            child.wait().await.ok()
+        }
+    };
+
+    // Убитый процесс до EOF на stderr может и не дойти (живой потомок с
+    // унаследованной копией пишущего конца — та же ловушка, что описана
+    // в doc `run`), поэтому на пути убийства берётся снимок накопленного.
+    let stderr = if deadline_expired {
+        stderr_task.snapshot()
+    } else {
+        collect_reader(stderr_task).await
+    };
+
+    Ok(StreamedRun {
+        exit_code: status.and_then(|status| status.code()),
+        stderr,
+        deadline_expired,
+    })
+}
+
+/// Сколько ждать ухода процесса после того, как его stdout закрылся.
+///
+/// Не таймаут работы (её граница — срок бездействия), а страховка от
+/// потомка, который закрыл вывод и завис: у здорового процесса между
+/// EOF и `exit` проходят миллисекунды.
+const EXIT_GRACE: Duration = Duration::from_secs(60);
 
 /// Убивает всю группу процессов `pid` (см. doc
 /// [`super::registry::group_kill_command`], почему группу, а не один PID).
@@ -586,6 +757,271 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(mode))
             .expect("failed to chmod fixture script");
         path
+    }
+
+    /// Почему в скриптах ниже `/bin/echo`, а не встроенный `echo`.
+    ///
+    /// Встроенный пишет через stdio самой оболочки, а он на пайпе
+    /// полностью буферизован: строки выходят одним куском в конце
+    /// процесса, и «построчно, пока процесс жив» проверить на таком
+    /// скрипте нельзя — проверялось бы обратное. Внешний `/bin/echo` —
+    /// отдельный процесс на строку, и его буфер сбрасывается его же
+    /// выходом. Настоящего yt-dlp это не касается: `--newline` он несёт
+    /// именно затем, чтобы писать построчно.
+    const ECHO: &str = "/bin/echo";
+
+    /// Запас на порождение процесса под нагрузкой набора.
+    ///
+    /// Первый срок и срок между строками — разные величины, и смешивать их
+    /// нельзя: первый обязан пережить `sh` плюс `/bin/echo` на загруженной
+    /// машине (замерено до 0,9 с, но потолка у этого нет), а второй должен
+    /// быть коротким, иначе бездействие нечем поймать. Слей их в одно
+    /// число — и тест либо ловит бездействие, либо не флакует, но не то и
+    /// другое сразу.
+    const SPAWN_ALLOWANCE: Duration = Duration::from_secs(30);
+
+    /// Собирает `on_line`, который складывает строки и держит срок
+    /// `silence` от каждой из них.
+    fn collector(
+        seen: &mut Vec<String>,
+        silence: Duration,
+    ) -> impl FnMut(&str) -> Option<Instant> + Send + '_ {
+        move |line: &str| {
+            seen.push(line.to_string());
+            Some(Instant::now() + silence)
+        }
+    }
+
+    #[tokio::test]
+    async fn streams_stdout_line_by_line_while_the_process_is_still_alive() {
+        // Предмет проверки — именно «пока жив»: `run` отдал бы те же
+        // строки, но одним куском в конце, и прогресс скачивания рисовать
+        // было бы уже поздно.
+        let dir = tempdir().expect("failed to create temp dir");
+        let script = write_script(
+            &dir,
+            "lines.sh",
+            &format!("#!/bin/sh\n{ECHO} first\nsleep 0.4\n{ECHO} second\nexit 0\n"),
+            0o755,
+        );
+        let registry = ChildRegistry::new();
+        let handle = RunHandle::new();
+
+        let mut seen: Vec<(String, Duration)> = Vec::new();
+        let started = Instant::now();
+        let mut on_line = |line: &str| -> Option<Instant> {
+            seen.push((line.to_string(), started.elapsed()));
+            Some(Instant::now() + Duration::from_secs(20))
+        };
+
+        let run = run_streaming(
+            &script,
+            &[],
+            &registry,
+            &handle,
+            Instant::now() + SPAWN_ALLOWANCE,
+            &mut on_line,
+        )
+        .await
+        .expect("script must spawn");
+
+        assert_eq!(run.exit_code, Some(0));
+        assert!(!run.deadline_expired);
+        let names: Vec<&str> = seen.iter().map(|(line, _)| line.as_str()).collect();
+        assert_eq!(names, ["first", "second"]);
+        // Проверяется разрыв, а не абсолютный момент: абсолютный зависит
+        // от того, как быстро машина под нагрузкой тестов породила
+        // процесс, а разрыв в 0,4 с между строками может появиться только
+        // если первая приехала до того, как процесс напечатал вторую.
+        // Отдай он их одним куском в конце — разрыва не было бы вовсе.
+        let gap = seen[1].1 - seen[0].1;
+        assert!(
+            gap >= Duration::from_millis(300),
+            "строки приехали вместе (разрыв {gap:?}) — значит не построчно"
+        );
+        assert!(registry.is_empty(), "pid обязан уйти из реестра");
+    }
+
+    #[tokio::test]
+    async fn kills_the_process_when_it_goes_silent_past_the_deadline() {
+        // Сторож С-8 живьём: процесс печатает строку и замолкает, не
+        // закрывая stdout, — то же, что делает замерший поток.
+        let dir = tempdir().expect("failed to create temp dir");
+        let script = write_script(
+            &dir,
+            "stall.sh",
+            &format!("#!/bin/sh\n{ECHO} alive\nsleep 30\n"),
+            0o755,
+        );
+        // Срок между строками — много меньше `sleep 30` внутри скрипта:
+        // сработать он может только по бездействию, а не по концу
+        // процесса. Порождение процесса он не покрывает — для этого есть
+        // отдельный запас.
+        const STALL_DEADLINE: Duration = Duration::from_millis(1_500);
+
+        let registry = ChildRegistry::new();
+        let handle = RunHandle::new();
+
+        let mut seen = Vec::new();
+        let started = Instant::now();
+        let run = run_streaming(
+            &script,
+            &[],
+            &registry,
+            &handle,
+            Instant::now() + SPAWN_ALLOWANCE,
+            &mut collector(&mut seen, STALL_DEADLINE),
+        )
+        .await
+        .expect("script must spawn");
+
+        assert!(run.deadline_expired, "срок обязан сработать");
+        assert!(
+            !handle.was_cancelled(),
+            "срок — не отмена: их различает вызывающий, и путать их нельзя"
+        );
+        assert_eq!(seen, ["alive"]);
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "убийство по сроку не должно ждать конца процесса (sleep 30)"
+        );
+        assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_talking_process_never_reaches_its_deadline() {
+        // Обратная сторона того же: срок перевооружается на каждой
+        // строке, поэтому процесс, который говорит чаще срока, живёт до
+        // собственного конца — даже если строк много, а срок короток.
+        let dir = tempdir().expect("failed to create temp dir");
+        let script = write_script(
+            &dir,
+            "chatty.sh",
+            &format!(
+                "#!/bin/sh\ni=0\nwhile [ $i -lt 8 ]; do {ECHO} tick $i; sleep 0.4; i=$((i+1)); done\nexit 0\n"
+            ),
+            0o755,
+        );
+        // Срок на строку — меньше, чем весь прогон (8 × 0,4 с ≈ 3,2 с), и
+        // больше, чем разрыв между строками даже под нагрузкой набора.
+        // Без перевооружения процесс не дожил бы до конца.
+        const CHATTY_BUDGET: Duration = Duration::from_millis(2_500);
+
+        let registry = ChildRegistry::new();
+        let handle = RunHandle::new();
+
+        let mut seen = Vec::new();
+        let started = Instant::now();
+        let run = run_streaming(
+            &script,
+            &[],
+            &registry,
+            &handle,
+            Instant::now() + SPAWN_ALLOWANCE,
+            &mut collector(&mut seen, CHATTY_BUDGET),
+        )
+        .await
+        .expect("script must spawn");
+
+        assert!(!run.deadline_expired);
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(seen.len(), 8);
+        assert!(
+            started.elapsed() > CHATTY_BUDGET,
+            "прогон обязан быть длиннее одного срока, иначе перевооружение \
+             нечем проверить: он прожил {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_the_stream_and_is_told_apart_from_the_deadline() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let script = write_script(
+            &dir,
+            "long.sh",
+            &format!("#!/bin/sh\n{ECHO} started\nsleep 30\n"),
+            0o755,
+        );
+        let registry = ChildRegistry::new();
+        let handle = Arc::new(RunHandle::new());
+
+        let canceller = Arc::clone(&handle);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            canceller.cancel().await;
+        });
+
+        let mut seen = Vec::new();
+        let run = run_streaming(
+            &script,
+            &[],
+            &registry,
+            &handle,
+            Instant::now() + SPAWN_ALLOWANCE,
+            &mut collector(&mut seen, SPAWN_ALLOWANCE),
+        )
+        .await
+        .expect("script must spawn");
+
+        assert!(handle.was_cancelled());
+        assert!(
+            !run.deadline_expired,
+            "отмена не должна выглядеть как истёкший срок"
+        );
+        assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn keeps_stderr_of_a_failed_run_and_reports_its_exit_code() {
+        // Ненулевой код здесь не ошибка запуска, а предмет классификации
+        // (`crate::download::classify`), поэтому едет значением.
+        let dir = tempdir().expect("failed to create temp dir");
+        let script = write_script(
+            &dir,
+            "fail.sh",
+            &format!("#!/bin/sh\n{ECHO} out\n{ECHO} 'ERROR: nope' >&2\nexit 3\n"),
+            0o755,
+        );
+        let registry = ChildRegistry::new();
+        let handle = RunHandle::new();
+
+        let mut seen = Vec::new();
+        let run = run_streaming(
+            &script,
+            &[],
+            &registry,
+            &handle,
+            Instant::now() + SPAWN_ALLOWANCE,
+            &mut collector(&mut seen, SPAWN_ALLOWANCE),
+        )
+        .await
+        .expect("script must spawn");
+
+        assert_eq!(run.exit_code, Some(3));
+        assert!(run.stderr.contains("ERROR: nope"));
+        assert_eq!(seen, ["out"]);
+    }
+
+    #[tokio::test]
+    async fn a_missing_binary_is_the_only_thing_that_fails_the_call_itself() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let registry = ChildRegistry::new();
+        let handle = RunHandle::new();
+        let mut seen = Vec::new();
+
+        let error = run_streaming(
+            &dir.path().join("does-not-exist"),
+            &[],
+            &registry,
+            &handle,
+            Instant::now() + SPAWN_ALLOWANCE,
+            &mut collector(&mut seen, SPAWN_ALLOWANCE),
+        )
+        .await
+        .expect_err("missing binary must fail the call");
+
+        assert!(matches!(error, SidecarError::NotFound));
     }
 
     #[tokio::test]

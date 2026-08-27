@@ -5,7 +5,9 @@
 //! Разделение по подмодулям отражает независимо тестируемые части:
 //! - [`resolve`] — путь к бинарнику по имени (`externalBin`/target triple);
 //! - [`process`] — запуск с аргументами, захват stdout, таймаут, классификация
-//!   ошибок ОС в типизированные [`error::SidecarError`];
+//!   ошибок ОС в типизированные [`error::SidecarError`]; там же
+//!   построчное чтение stdout идущего процесса ([`run_streaming`]) — для
+//!   скачивания, где вывод это ход работы, а не результат (E3);
 //! - [`registry`] — реестр PID ещё выполняющихся sidecar-процессов и их
 //!   синхронное массовое убийство на выходе из приложения (TL-10);
 //! - [`version`] — разбор строки версии `yt-dlp --version` / `ffmpeg -version`.
@@ -24,7 +26,9 @@ mod resolve;
 mod version;
 
 pub use error::SidecarError;
-pub use process::{run, run_cancellable, stderr_tail, RunHandle, RunOutput};
+pub use process::{
+    run, run_cancellable, run_streaming, stderr_tail, RunHandle, RunOutput, StreamedRun,
+};
 // Предел обрезки нужен только тем, кто его проверяет: продакшен-код зовёт
 // `stderr_tail`, а само число сверяют тесты обоих потребителей — команды
 // служебного экрана и классификации разбора.
