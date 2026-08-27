@@ -27,6 +27,15 @@ export type YtDlpPrepareErrorKind =
   | 'dataDirUnavailable'
   | 'archiveMissing'
   | 'archiveCorrupted'
+  /**
+   * На томе с каталогом данных не хватает места под распакованное дерево
+   * (TL-18). Отдельно от `unpackFailed`: действие пользователя другое и
+   * оно есть — освободить место и повторить, в отличие от прочих отказов
+   * распаковки, которые повтором не лечатся. `message` уже содержит
+   * человекочитаемые «нужно ещё N МиБ, свободно M МиБ» — Rust форматирует
+   * их сам, отдельных полей `path`/`needed`/`available` в контракте нет.
+   */
+  | 'notEnoughSpace'
   | 'unpackFailed'
   | 'layoutUnexpected'
   | 'warmupFailed'

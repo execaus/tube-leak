@@ -42,6 +42,7 @@ const KNOWN_ERROR_KINDS: readonly YtDlpPrepareErrorKind[] = [
   'dataDirUnavailable',
   'archiveMissing',
   'archiveCorrupted',
+  'notEnoughSpace',
   'unpackFailed',
   'layoutUnexpected',
   'warmupFailed',

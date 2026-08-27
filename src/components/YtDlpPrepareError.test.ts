@@ -26,9 +26,15 @@ const explanationFragmentByKind: Record<YtDlpPrepareErrorKind, string> = {
   dataDirUnavailable: 'рабочий каталог приложения',
   archiveMissing: 'отсутствует часть с yt-dlp',
   archiveCorrupted: 'повреждён',
+  notEnoughSpace: 'не хватает места',
   unpackFailed: 'распаковать yt-dlp',
   layoutUnexpected: 'не нашёлся ожидаемый исполняемый файл',
   warmupFailed: 'распаковался, но не запускается',
+}
+
+const notEnoughSpace: YtDlpPrepareError = {
+  kind: 'notEnoughSpace',
+  message: 'не хватает места для распаковки yt-dlp: нужно ещё 130 МиБ, свободно 12 МиБ (/data/ytdlp)',
 }
 
 describe('YtDlpPrepareError', () => {
@@ -58,6 +64,36 @@ describe('YtDlpPrepareError', () => {
     const wrapper = mount(YtDlpPrepareErrorComponent, { props: { error: dataDirUnavailable } })
 
     expect(wrapper.text()).toContain('рабочий каталог приложения')
+  })
+
+  describe('notEnoughSpace (TL-50, TL-18 mirror) — regression', () => {
+    it('recognizes notEnoughSpace as a known kind and keeps the Rust message intact', () => {
+      // До TL-50 `notEnoughSpace` не входил в белый список KNOWN_ERROR_KINDS
+      // (useYtDlpPrepare.ts): composable подменял весь объект заглушкой
+      // «Подготовка yt-dlp не удалась по нераспознанной причине» ещё до
+      // того, как этот компонент получал `error` — числа needed/available
+      // из Rust-сообщения не доезжали даже до «Подробнее».
+      const wrapper = mount(YtDlpPrepareErrorComponent, { props: { error: notEnoughSpace } })
+
+      expect(wrapper.text()).not.toContain('Не удалось разобрать причину отказа')
+      expect(wrapper.text()).toContain('не хватает места')
+    })
+
+    it('advises freeing space and retrying, distinct from the irreversible unpackFailed advice', () => {
+      const wrapper = mount(YtDlpPrepareErrorComponent, { props: { error: notEnoughSpace } })
+
+      expect(wrapper.text()).toContain('освободите место')
+      expect(wrapper.text()).not.toContain('Переустановите tube-leak')
+    })
+
+    it('exposes the Rust-formatted МиБ figures via the details block', async () => {
+      const wrapper = mount(YtDlpPrepareErrorComponent, { props: { error: notEnoughSpace } })
+
+      const detailsButton = wrapper.findAll('button').find((b) => b.text().includes('Подробнее'))
+      await detailsButton?.trigger('click')
+
+      expect(wrapper.text()).toContain('нужно ещё 130 МиБ, свободно 12 МиБ')
+    })
   })
 
   it('reveals kind and message inside the details block on click', async () => {

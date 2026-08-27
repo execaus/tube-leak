@@ -300,6 +300,22 @@ describe('useYtDlpPrepare', () => {
     expect(result.result.value).toStrictEqual(preparedFixture)
   })
 
+  it('recognizes notEnoughSpace (TL-18/TL-50) as a typed contractual error, not a fallback', async () => {
+    // До TL-50 KNOWN_ERROR_KINDS не знал про notEnoughSpace: isYtDlpPrepareError
+    // возвращал false, и toPrepareFailure терял и kind, и Rust-сообщение с
+    // цифрами needed/available, заменяя их общей заглушкой.
+    const notEnoughSpaceError: YtDlpPrepareError = {
+      kind: 'notEnoughSpace',
+      message: 'не хватает места для распаковки yt-dlp: нужно ещё 130 МиБ, свободно 12 МиБ (/data/ytdlp)',
+    }
+    invokeMock.mockRejectedValueOnce(notEnoughSpaceError)
+
+    const { result } = withSetup(() => useYtDlpPrepare())
+    await result.prepare()
+
+    expect(result.error.value).toStrictEqual(notEnoughSpaceError)
+  })
+
   it('falls back to a message-only failure for a non-contractual rejection (no kind), instead of an empty explanation', async () => {
     invokeMock.mockRejectedValueOnce('yt-dlp panicked')
 
