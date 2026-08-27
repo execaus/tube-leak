@@ -117,6 +117,12 @@ struct ScriptedLauncher {
     dir: PathBuf,
     scripts: StdMutex<VecDeque<Script>>,
     calls: StdMutex<Vec<Call>>,
+    /// Как этот запускатель зовётся в общей ленте.
+    tag: &'static str,
+    /// Общая на несколько запускателей лента: кто и в каком порядке
+    /// начал работу. Нужна там, где предмет проверки — порядок, а не
+    /// результат.
+    timeline: Option<Arc<StdMutex<Vec<String>>>>,
 }
 
 impl ScriptedLauncher {
@@ -125,6 +131,21 @@ impl ScriptedLauncher {
             dir: dir.to_path_buf(),
             scripts: StdMutex::new(scripts.into()),
             calls: StdMutex::new(Vec::new()),
+            tag: "yt-dlp",
+            timeline: None,
+        }
+    }
+
+    fn tagged(
+        dir: &Path,
+        scripts: Vec<Script>,
+        tag: &'static str,
+        timeline: &Arc<StdMutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            tag,
+            timeline: Some(Arc::clone(timeline)),
+            ..Self::new(dir, scripts)
         }
     }
 
@@ -142,6 +163,12 @@ impl DownloadLauncher for ScriptedLauncher {
         on_line: &'a mut (dyn FnMut(&str) -> Option<Instant> + Send),
     ) -> Pin<Box<dyn Future<Output = Result<StreamedRun, SidecarError>> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(timeline) = &self.timeline {
+                timeline
+                    .lock()
+                    .unwrap()
+                    .push(format!("запуск {}", self.tag));
+            }
             let script = self
                 .scripts
                 .lock()
@@ -556,21 +583,179 @@ async fn the_url_is_the_last_argument_and_stands_after_the_separator() {
     );
 }
 
-#[test]
-fn a_percent_in_the_title_never_becomes_a_field_of_the_output_template() {
-    // «Скидка 100%(ext)s» без удвоения превратила бы имя файла в шаблон с
-    // чужим полем внутри — то есть чужая программа исполнила бы кусок
-    // пользовательского ввода.
-    let template = output_template("Скидка 100%(ext)s");
+/// Названия, которые шаблон вывода yt-dlp понял бы не как текст.
+///
+/// Каждое снято прямым запуском вложенного бинарника (`--print filename`,
+/// macOS, пин 2026.08.19) — это не выдуманные строки, а измеренные
+/// раскрытия; таблица с результатами в doc `template_safe`.
+const HOSTILE_TITLES: [&str; 9] = [
+    "Скидка 100%(ext)s навсегда",
+    "A$HOME B",
+    "$HOME-leading",
+    "braced ${HOME} here",
+    "double $$HOME",
+    "~",
+    "~/leading",
+    "%HOME% и back\\slash",
+    "$$$%%%~~~",
+];
 
-    assert!(
-        template.starts_with("Скидка 100%%(ext)s."),
-        "процент из названия обязан быть удвоен, а получилось {template}"
+#[test]
+fn nothing_the_template_would_expand_ever_reaches_it() {
+    // Проверяется **класс**, а не случай: у шаблона два механизма
+    // раскрытия — поля (`%`) и переменные окружения с домашним каталогом
+    // (`$`, ведущая `~`), — и оба закрыты одним правилом «в шаблон едет
+    // только заведомо инертное». Перечисление опасного здесь уже
+    // подводило дважды, поэтому утверждение сформулировано о всей
+    // основе целиком, а не о списке символов, которые мы вспомнили.
+    const TAIL: &str = ".f%(format_id)s.%(ext)s";
+
+    for title in HOSTILE_TITLES {
+        let stem = sanitized_stem(title, "aqz-KE-bpKQ");
+        let template = output_template(&download_stem(&stem));
+
+        let head = template
+            .strip_suffix(TAIL)
+            .unwrap_or_else(|| panic!("«{title}»: хвост шаблона обязан быть нашим: {template}"));
+
+        assert!(!head.is_empty(), "«{title}»: основа обязана быть непустой");
+        for ch in head.chars() {
+            assert!(
+                template_safe(ch),
+                "«{title}»: в шаблон уехал символ {ch:?} — шаблон {template}"
+            );
+        }
+        // Прямые следствия таблицы замеров, выписанные отдельно: то, что
+        // уводило файл из папки назначения.
+        assert!(!head.contains('$'), "«{title}»: доллар раскрылся бы");
+        assert!(!head.contains('%'), "«{title}»: процент начал бы поле");
+        assert!(
+            !head.starts_with('~'),
+            "«{title}»: ведущая тильда сделала бы путь домашним"
+        );
+    }
+}
+
+#[test]
+fn a_hostile_title_still_makes_a_deterministic_partial_name() {
+    // Обещание Р-2 держится на детерминированности, а не на совпадении с
+    // финальным именем: вставил ту же ссылку — получил ту же основу.
+    for title in HOSTILE_TITLES {
+        let first = download_stem(&sanitized_stem(title, "aqz-KE-bpKQ"));
+        let second = download_stem(&sanitized_stem(title, "aqz-KE-bpKQ"));
+        assert_eq!(first, second, "«{title}»");
+    }
+}
+
+#[tokio::test]
+async fn a_title_with_a_percent_and_a_dollar_reaches_a_file_inside_the_destination() {
+    // Сквозной тест того самого класса, на котором прошлый точечный не
+    // сработал: название несёт **и** процент, **и** доллар, и проверяется
+    // не строка шаблона, а файл на диске — и то, что рядом с папкой
+    // назначения ничего не появилось.
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("назначение");
+    std::fs::create_dir(&dir).unwrap();
+
+    const TITLE: &str = "Скидка 100%(ext)s и $HOME внутри";
+    let session = Arc::new(DownloadSession::new());
+    let mut req = request(streams(None, Some("140")));
+    req.title = TITLE.to_string();
+    let task = new_task(&session, req).await;
+    let sink = RecordingSink::new();
+
+    // Сценарий кладёт файл ровно туда, куда его положил бы yt-dlp по
+    // нашему шаблону: имя частичного файла тест выводит тем же кодом.
+    let partial = format!(
+        "{}.f140.m4a",
+        download_stem(&sanitized_stem(TITLE, "aqz-KE-bpKQ"))
     );
-    assert!(
-        template.ends_with(".f%(format_id)s.%(ext)s"),
-        "наши поля обязаны остаться полями"
+    let launcher = ScriptedLauncher::new(
+        &dir,
+        vec![Script::ok()
+            .line(&destination_line(&dir, &partial))
+            .creates(&partial)],
     );
+
+    run_task(
+        &session,
+        &task,
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &dir,
+        None,
+    )
+    .await;
+
+    // Финальное имя сохраняет название целиком — и процент, и доллар:
+    // его строит финализация уже после того, как yt-dlp сделал своё дело.
+    let expected = format!("{}.m4a", sanitized_stem(TITLE, "aqz-KE-bpKQ"));
+    assert!(
+        expected.contains('%') && expected.contains('$'),
+        "проверять нечего, если название потеряло опасные символы: {expected}"
+    );
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: expected.clone()
+        }
+    );
+    assert_eq!(dir_listing(&dir), [expected]);
+    assert_eq!(
+        dir_listing(root.path()),
+        ["назначение"],
+        "рядом с папкой назначения не должно появиться ничего: раскрытая \
+         переменная увела бы файл именно сюда"
+    );
+}
+
+#[tokio::test]
+async fn a_hostile_title_is_still_cleaned_up_after_a_cancel() {
+    // Третье последствие дыры было самым тихим: подчистка ищет по
+    // префиксу в папке назначения, а раскрытое имя лежит в другом месте —
+    // файл остаётся, а панель честно говорит «данные удалены». Сторож
+    // именно на это: имя частичного файла обязано быть тем, которое
+    // подчистка потом ищет.
+    let dir = tempfile::tempdir().unwrap();
+    const TITLE: &str = "$HOME-leading 100%(ext)s";
+    let session = Arc::new(DownloadSession::new());
+    let mut req = request(streams(None, Some("140")));
+    req.title = TITLE.to_string();
+    let task = new_task(&session, req).await;
+    let sink = RecordingSink::new();
+
+    let partial = format!(
+        "{}.f140.m4a.part",
+        download_stem(&sanitized_stem(TITLE, "aqz-KE-bpKQ"))
+    );
+    let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().creates(&partial).hangs()]);
+
+    let canceller = Arc::clone(&task);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        canceller.cancel().await;
+    });
+
+    run_task(
+        &session,
+        &task,
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        dir.path(),
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Cancelled {
+            partial_data: PartialData::Removed
+        },
+        "«удалено» обязано означать, что удалять было что"
+    );
+    assert_eq!(dir_listing(dir.path()), Vec::<String>::new());
 }
 
 #[test]
@@ -1605,6 +1790,131 @@ async fn a_missing_destination_folder_fails_the_task_and_not_the_command() {
 }
 
 // ─────────────────────── Слот и команды ───────────────────────
+
+/// Исполнитель, который только запоминает, что ему передали.
+struct CapturingWorker(Arc<StdMutex<Option<Option<Arc<DownloadTask>>>>>);
+
+impl WorkerSpawn for CapturingWorker {
+    fn spawn(
+        self,
+        _session: Arc<DownloadSession>,
+        _task: Arc<DownloadTask>,
+        previous: Option<Arc<DownloadTask>>,
+    ) {
+        *self.0.lock().unwrap() = Some(previous);
+    }
+}
+
+#[tokio::test]
+async fn a_new_task_is_handed_the_one_it_replaces() {
+    // Без этого воркеру нечего добивать: предыдущая задача известна
+    // только слоту, и передать её — обязанность старта.
+    let session = Arc::new(DownloadSession::new());
+    let first = new_task(&session, request(streams(None, Some("140")))).await;
+    first.set_progress(DownloadProgress::Done {
+        file_name: "x.m4a".to_string(),
+    });
+
+    let captured = Arc::new(StdMutex::new(None));
+    start_download(
+        &session,
+        request(streams(None, Some("139"))),
+        CapturingWorker(Arc::clone(&captured)),
+    )
+    .await
+    .expect("слот свободен");
+
+    let previous = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("исполнитель обязан быть позван");
+    assert_eq!(
+        previous.map(|task| task.id.clone()),
+        Some(first.id.clone()),
+        "новая задача обязана получить ту, которую она заменила"
+    );
+}
+
+#[tokio::test]
+async fn a_new_worker_finishes_off_the_previous_one_before_starting_its_own() {
+    // Механизм, ради которого заведена очередь. Слот освобождается в
+    // момент терминального перехода, а предыдущий воркер в этот момент
+    // ещё доубивает свой процесс и подчищает. Не дождись его новый — на
+    // машине оказались бы два yt-dlp сразу, и К-8 («виден один процесс»)
+    // выполнялся бы через раз, в зависимости от расторопности
+    // пользователя.
+    let dir = tempfile::tempdir().unwrap();
+    let session = Arc::new(DownloadSession::new());
+    let first = new_task(&session, request(streams(None, Some("140")))).await;
+    // Вторую задачу слот принимает только после терминального перехода
+    // первой — ровно то состояние, в котором предыдущий воркер ещё жив.
+    let timeline = Arc::new(StdMutex::new(Vec::new()));
+
+    let hanging =
+        ScriptedLauncher::tagged(dir.path(), vec![Script::ok().hangs()], "первый", &timeline);
+    let second_launcher = ScriptedLauncher::tagged(
+        dir.path(),
+        vec![Script::ok()
+            .line(&destination_line(dir.path(), "Big Buck Bunny.f139.m4a"))
+            .creates("Big Buck Bunny.f139.m4a")],
+        "второй",
+        &timeline,
+    );
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let sink = RecordingSink::new();
+
+    let leader = run_task(&session, &first, &hanging, &ffmpeg, &sink, dir.path(), None);
+
+    let follower = async {
+        // Дожидаемся, пока первый действительно занял очередь.
+        while timeline.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        first.set_progress(DownloadProgress::Cancelled {
+            partial_data: PartialData::NothingCreated,
+        });
+        let second = new_task(&session, request(streams(None, Some("139")))).await;
+
+        run_task(
+            &session,
+            &second,
+            &second_launcher,
+            &ffmpeg,
+            &RecordingSink::new(),
+            dir.path(),
+            Some(Arc::clone(&first)),
+        )
+        .await;
+        timeline.lock().unwrap().push("второй закончил".to_string());
+    };
+
+    let leader = async {
+        leader.await;
+        timeline.lock().unwrap().push("первый вернулся".to_string());
+    };
+
+    tokio::join!(leader, follower);
+
+    let timeline = timeline.lock().unwrap().clone();
+    assert_eq!(
+        timeline,
+        [
+            "запуск первый",
+            "первый вернулся",
+            "запуск второй",
+            "второй закончил"
+        ],
+        "второй запускатель обязан быть позван только после того, как \
+         первый воркер вернул управление: {timeline:?}"
+    );
+    assert!(
+        sink.last().is_terminal(),
+        "добитый предшественник обязан дойти до терминальной фазы, а не \
+         зависнуть навсегда: {:?}",
+        sink.last()
+    );
+}
 
 #[tokio::test]
 async fn a_second_start_is_refused_while_the_slot_is_busy() {
