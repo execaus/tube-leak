@@ -13,8 +13,17 @@
  */
 import { computed } from 'vue'
 
+import type { NonTerminalYtDlpPrepareStage } from '@/composables/useYtDlpPrepare'
+import { assertNever } from '@/utils/assertNever'
+
 const props = defineProps<{
-  stage: 'unpacking' | 'warmingUp'
+  /**
+   * Тип — `NonTerminalYtDlpPrepareStage` из `useYtDlpPrepare.ts`, а не
+   * повторённый здесь `'unpacking' | 'warmingUp'` (ревью TL-52: те же два
+   * литерала жили в двух не связанных типами местах — composable и этот
+   * проп могли разойтись молча).
+   */
+  stage: NonTerminalYtDlpPrepareStage
   /** Сквозной прогресс всей подготовки (0..100), не прогресс текущего этапа. */
   percent: number
   etaSecs?: number
@@ -27,7 +36,11 @@ const label = computed(() => {
     case 'warmingUp':
       return 'Готовим yt-dlp к первому запуску…'
     default:
-      return 'Готовим yt-dlp…'
+      // `NonTerminalYtDlpPrepareStage` сегодня — ровно два значения выше;
+      // `assertNever` — тот же сторож, что в `useYtDlpPrepare.ts`
+      // (`isNonTerminalStage`), а не текст-заглушка на случай будущего
+      // варианта.
+      return assertNever(props.stage)
   }
 })
 

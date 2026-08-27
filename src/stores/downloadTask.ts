@@ -43,14 +43,14 @@ export interface DownloadTask {
  * сгенерированного типа (TL-52, см. doc `@/utils/knownKinds`) — тот же
  * приём, что и `KNOWN_ERROR_KINDS` в `useProbe.ts`/`useYtDlpPrepare.ts`.
  */
-const KNOWN_COMMAND_ERROR_KINDS = knownKindsOf<DownloadCommandErrorKind>({
+const KNOWN_COMMAND_ERROR_KINDS = knownKindsOf({
   alreadyActive: true,
   unknownTask: true,
   notFailed: true,
   notRetryable: true,
   noStreamsSelected: true,
   invalidUrl: true,
-})
+} satisfies Record<DownloadCommandErrorKind, true>)
 
 function isDownloadCommandError(value: unknown): value is DownloadCommandError {
   if (typeof value !== 'object' || value === null) return false

@@ -9,14 +9,14 @@ import { getDownloadCommandErrorText } from './downloadCommandErrorTexts'
  * Выведено из типа (TL-52), а не рукописный массив — см. doc
  * `@/utils/knownKinds`.
  */
-const ALL_KINDS = knownKindsOf<DownloadCommandErrorKind>({
+const ALL_KINDS = knownKindsOf({
   alreadyActive: true,
   unknownTask: true,
   notFailed: true,
   notRetryable: true,
   noStreamsSelected: true,
   invalidUrl: true,
-})
+} satisfies Record<DownloadCommandErrorKind, true>)
 
 describe('getDownloadCommandErrorText — 6 классов отказа команд управления загрузкой', () => {
   it('returns a non-empty title and explanation for every class', () => {

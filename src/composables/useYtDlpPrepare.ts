@@ -2,7 +2,14 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type Event as TauriEvent, type UnlistenFn } from '@tauri-apps/api/event'
 import { onUnmounted, ref, type Ref } from 'vue'
 
-import type { YtDlpPrepareError, YtDlpPrepareErrorKind, YtDlpPrepareEvent, YtDlpPrepared } from '@/types/generated/ytdlp'
+import type {
+  YtDlpPrepareError,
+  YtDlpPrepareErrorKind,
+  YtDlpPrepareEvent,
+  YtDlpPrepared,
+  YtDlpPrepareStage,
+} from '@/types/generated/ytdlp'
+import { assertNever } from '@/utils/assertNever'
 import { knownKindsOf } from '@/utils/knownKinds'
 
 const PREPARE_YTDLP_COMMAND = 'prepare_ytdlp'
@@ -46,7 +53,7 @@ export type PrepareFailure = YtDlpPrepareError | { kind?: undefined; message: st
  * тихо подменила текст ошибки заглушкой (см. doc-комментарий
  * `src-tauri/src/types/bindings.rs`).
  */
-const KNOWN_ERROR_KINDS = knownKindsOf<YtDlpPrepareErrorKind>({
+const KNOWN_ERROR_KINDS = knownKindsOf({
   dataDirUnavailable: true,
   archiveMissing: true,
   archiveCorrupted: true,
@@ -54,7 +61,7 @@ const KNOWN_ERROR_KINDS = knownKindsOf<YtDlpPrepareErrorKind>({
   unpackFailed: true,
   layoutUnexpected: true,
   warmupFailed: true,
-})
+} satisfies Record<YtDlpPrepareErrorKind, true>)
 
 function isYtDlpPrepareError(value: unknown): value is YtDlpPrepareError {
   if (typeof value !== 'object' || value === null) return false
@@ -74,13 +81,53 @@ function toPrepareFailure(err: unknown): PrepareFailure {
   return { message: 'Подготовка yt-dlp не удалась по нераспознанной причине.' }
 }
 
+/**
+ * Нетерминальные этапы подготовки — выведены из сгенерированного
+ * `YtDlpPrepareStage` через `Exclude`, а не переписаны как отдельный
+ * литеральный union руками (ревью TL-52: до этой правки `'unpacking' |
+ * 'warmingUp'` были продублированы здесь и ещё раз в проп `YtDlpPrepareScreen.vue`
+ * — два места, которые ничего не связывало на уровне типов). Если Rust
+ * когда-нибудь переименует `ready`/`failed` или добавит третье
+ * терминальное значение, `Exclude` подхватит это без правки, потому что
+ * вычисляется от актуального контракта, а не переписывает его список
+ * вручную.
+ */
+export type NonTerminalYtDlpPrepareStage = Exclude<YtDlpPrepareStage, 'ready' | 'failed'>
+
+/**
+ * Является ли этап нетерминальным — единственное место, решающее это
+ * (используется и здесь, в `handleEvent`, и как источник правды для типа
+ * пропса `YtDlpPrepareScreen.vue`, doc {@link NonTerminalYtDlpPrepareStage}).
+ *
+ * Перечисляет все четыре значения `YtDlpPrepareStage` явно, а не два
+ * нетерминальных через `||` (это и было дырой TL-52: `event.payload.stage
+ * === 'unpacking' || ... === 'warmingUp'` компилировался бы, даже если
+ * контракт обзаведётся новым нетерминальным этапом, и просто никогда не
+ * присваивал бы его в `stage.value` — экран продолжал бы молчать о новом
+ * этапе, а не падать на сборке). `assertNever` в `default` держит границу:
+ * он недостижим, пока перечислены все четыре, и перестаёт собираться, как
+ * только контракт добавит пятое значение.
+ */
+function isNonTerminalStage(stage: YtDlpPrepareStage): stage is NonTerminalYtDlpPrepareStage {
+  switch (stage) {
+    case 'unpacking':
+    case 'warmingUp':
+      return true
+    case 'ready':
+    case 'failed':
+      return false
+    default:
+      return assertNever(stage)
+  }
+}
+
 export interface UseYtDlpPrepareReturn {
   /**
    * Последний нетерминальный этап из события `ytdlp://prepare`;
    * `undefined` — событий ещё не было. Терминальные значения (`ready`,
    * `failed`) сюда намеренно не попадают — см. doc {@link useYtDlpPrepare}.
    */
-  stage: Ref<'unpacking' | 'warmingUp' | undefined>
+  stage: Ref<NonTerminalYtDlpPrepareStage | undefined>
   /** Сквозной прогресс подготовки (0..100), из последнего полученного события. */
   percent: Ref<number>
   etaSecs: Ref<number | undefined>
@@ -125,7 +172,7 @@ export interface UseYtDlpPrepareReturn {
  * этого берётся из `result`/`error` — из промиса, а не из события.
  */
 export function useYtDlpPrepare(): UseYtDlpPrepareReturn {
-  const stage = ref<'unpacking' | 'warmingUp'>()
+  const stage = ref<NonTerminalYtDlpPrepareStage>()
   const percent = ref(0)
   const etaSecs = ref<number>()
   const result = ref<YtDlpPrepared>()
@@ -138,7 +185,7 @@ export function useYtDlpPrepare(): UseYtDlpPrepareReturn {
   function handleEvent(event: TauriEvent<YtDlpPrepareEvent>): void {
     percent.value = event.payload.percent
     etaSecs.value = event.payload.etaSecs
-    if (event.payload.stage === 'unpacking' || event.payload.stage === 'warmingUp') {
+    if (isNonTerminalStage(event.payload.stage)) {
       stage.value = event.payload.stage
     }
   }

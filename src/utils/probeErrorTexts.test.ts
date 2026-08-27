@@ -26,77 +26,100 @@ interface Fixture {
   expectedCanRetry: boolean
 }
 
-const fixtures: Fixture[] = [
-  {
-    kind: 'videoUnavailable',
-    message: DECOY_MESSAGE,
-    expectedTitle: 'Ролик недоступен',
-    expectedExplanation: 'Похоже, он удалён, скрыт или никогда не существовал.',
-    expectedCanRetry: true,
-  },
-  {
-    kind: 'signInRequired',
-    message: DECOY_MESSAGE,
-    expectedTitle: 'Требуется вход в аккаунт YouTube',
-    expectedExplanation:
-      'В этой версии такие ролики не поддерживаются — ни с возрастным ограничением, ни по подписке.',
-    expectedCanRetry: false,
-  },
-  {
-    kind: 'regionBlocked',
-    message: DECOY_MESSAGE,
-    expectedTitle: 'Недоступно в вашем регионе',
-    expectedExplanation: 'Владелец ролика ограничил его показ для вашей страны.',
-    expectedCanRetry: false,
-  },
-  {
-    kind: 'networkUnavailable',
-    message: DECOY_MESSAGE,
-    expectedTitle: 'Нет соединения с интернетом',
-    expectedExplanation: 'Проверьте подключение и попробуйте ещё раз.',
-    expectedCanRetry: true,
-  },
-  {
-    kind: 'playlistUnsupported',
-    message: DECOY_MESSAGE,
-    expectedTitle: 'Плейлисты и каналы пока не поддерживаются',
-    expectedExplanation: 'Вставьте ссылку на отдельный ролик.',
-    expectedCanRetry: false,
-  },
-  {
-    kind: 'liveUnsupported',
-    message: DECOY_MESSAGE,
-    expectedTitle: 'Прямые трансляции не поддерживаются',
-    expectedExplanation: 'Дождитесь окончания эфира — запись обычного ролика разбирается как всегда.',
-    expectedCanRetry: false,
-  },
-  {
-    kind: 'ytDlpFailure',
-    reason: 'generic',
-    message: DECOY_MESSAGE,
-    expectedTitle: 'Не удалось получить данные о ролике',
-    expectedExplanation: 'Попробуйте ещё раз.',
-    expectedCanRetry: true,
-  },
-  {
-    kind: 'ytDlpFailure',
-    reason: 'outdated',
-    message: DECOY_MESSAGE,
-    expectedTitle: 'Не удалось получить данные о ролике',
-    expectedExplanation:
-      'Похоже, встроенный yt-dlp устарел и не понимает текущий ответ YouTube. Обновление появится позже (E6); попробуйте другой ролик.',
-    expectedCanRetry: true,
-  },
-  {
-    kind: 'timeout',
-    timeoutSecs: 30,
-    message: DECOY_MESSAGE,
-    expectedTitle: 'Разбор не завершился',
-    expectedExplanation:
-      'Не удалось получить данные за отведённое время (30 с). Возможно, медленное соединение или временная проблема на стороне YouTube.',
-    expectedCanRetry: true,
-  },
-]
+type FixtureVariant = Omit<Fixture, 'kind'>
+
+/**
+ * Один вариант на класс — кроме `ytDlpFailure`, у которого их два (`reason`
+ * `generic`/`outdated`), поэтому значение — массив, а не голая фикстура
+ * (ревью TL-52 просило `Record<BlockProbeErrorKind, Fixture>`, но у этого
+ * единственного класса структурно два ожидаемых текста, а не один).
+ * Полнота по-прежнему проверяется компилятором: `Record<BlockProbeErrorKind,
+ * FixtureVariant[]>` требует ровно восемь ключей — забытый класс не
+ * скомпилируется, а не тихо выпадет из перебора `it.each`, как было бы с
+ * рукописным плоским массивом.
+ */
+const FIXTURES_BY_KIND: Record<BlockProbeErrorKind, FixtureVariant[]> = {
+  videoUnavailable: [
+    {
+      message: DECOY_MESSAGE,
+      expectedTitle: 'Ролик недоступен',
+      expectedExplanation: 'Похоже, он удалён, скрыт или никогда не существовал.',
+      expectedCanRetry: true,
+    },
+  ],
+  signInRequired: [
+    {
+      message: DECOY_MESSAGE,
+      expectedTitle: 'Требуется вход в аккаунт YouTube',
+      expectedExplanation:
+        'В этой версии такие ролики не поддерживаются — ни с возрастным ограничением, ни по подписке.',
+      expectedCanRetry: false,
+    },
+  ],
+  regionBlocked: [
+    {
+      message: DECOY_MESSAGE,
+      expectedTitle: 'Недоступно в вашем регионе',
+      expectedExplanation: 'Владелец ролика ограничил его показ для вашей страны.',
+      expectedCanRetry: false,
+    },
+  ],
+  networkUnavailable: [
+    {
+      message: DECOY_MESSAGE,
+      expectedTitle: 'Нет соединения с интернетом',
+      expectedExplanation: 'Проверьте подключение и попробуйте ещё раз.',
+      expectedCanRetry: true,
+    },
+  ],
+  playlistUnsupported: [
+    {
+      message: DECOY_MESSAGE,
+      expectedTitle: 'Плейлисты и каналы пока не поддерживаются',
+      expectedExplanation: 'Вставьте ссылку на отдельный ролик.',
+      expectedCanRetry: false,
+    },
+  ],
+  liveUnsupported: [
+    {
+      message: DECOY_MESSAGE,
+      expectedTitle: 'Прямые трансляции не поддерживаются',
+      expectedExplanation: 'Дождитесь окончания эфира — запись обычного ролика разбирается как всегда.',
+      expectedCanRetry: false,
+    },
+  ],
+  ytDlpFailure: [
+    {
+      reason: 'generic',
+      message: DECOY_MESSAGE,
+      expectedTitle: 'Не удалось получить данные о ролике',
+      expectedExplanation: 'Попробуйте ещё раз.',
+      expectedCanRetry: true,
+    },
+    {
+      reason: 'outdated',
+      message: DECOY_MESSAGE,
+      expectedTitle: 'Не удалось получить данные о ролике',
+      expectedExplanation:
+        'Похоже, встроенный yt-dlp устарел и не понимает текущий ответ YouTube. Обновление появится позже (E6); попробуйте другой ролик.',
+      expectedCanRetry: true,
+    },
+  ],
+  timeout: [
+    {
+      timeoutSecs: 30,
+      message: DECOY_MESSAGE,
+      expectedTitle: 'Разбор не завершился',
+      expectedExplanation:
+        'Не удалось получить данные за отведённое время (30 с). Возможно, медленное соединение или временная проблема на стороне YouTube.',
+      expectedCanRetry: true,
+    },
+  ],
+}
+
+const fixtures: Fixture[] = Object.entries(FIXTURES_BY_KIND).flatMap(([kind, variants]) =>
+  variants.map((variant) => ({ kind: kind as BlockProbeErrorKind, ...variant })),
+)
 
 describe('getProbeErrorText — таблица, не message (восемь блочных классов Ф-6)', () => {
   it.each(fixtures)('kind=$kind: заголовок и пояснение из таблицы', (fixture) => {

@@ -9,7 +9,7 @@ import { getDownloadErrorText } from './downloadErrorTexts'
  * Выведено из типа (TL-52), а не рукописный массив: пропущенный класс
  * ронял бы `npm run type-check`, а не тихо выпадал бы из перебора ниже.
  */
-const ALL_KINDS = knownKindsOf<DownloadErrorKind>({
+const ALL_KINDS = knownKindsOf({
   connectionLost: true,
   diskFull: true,
   staleFormat: true,
@@ -19,7 +19,7 @@ const ALL_KINDS = knownKindsOf<DownloadErrorKind>({
   signInRequired: true,
   regionBlocked: true,
   ytDlpFailure: true,
-})
+} satisfies Record<DownloadErrorKind, true>)
 
 describe('getDownloadErrorText — 9 классов ошибок скачивания (Ф-10, таблица дизайна E3)', () => {
   it('returns a distinct, non-empty title and explanation for every one of the 9 classes', () => {
