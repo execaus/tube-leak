@@ -1346,10 +1346,19 @@ fn capabilities_stay_local_and_pinned_to_named_windows() {
 // литералы, чья схема уже встречается в ядре, иначе в набор попал бы
 // `https://localhost` из теста разбора ссылок. Пробел безвредный: канала
 // с новой схемой никто не эмитит, то есть отказ — «событие не приходит»,
-// а не «ACL отклонил вызов». Третье — канал, названный как адрес: имя с
-// точкой или слешем разбор отнесёт к адресам. Держит это не разбор, а
-// конвенция, и она проверяется отдельно
-// (`declared_channels_keep_the_shape_the_scan_can_recognise`).
+// а не «ACL отклонил вызов». Третье — самый первый канал новой схемы,
+// если его сразу назвали как адрес (`queue://a/b` при том, что ни одного
+// правильного `queue://…` в проекте ещё нет): схема становится канальной
+// от первого узнанного имени, и до него отличить такой литерал от адреса
+// не по чему.
+//
+// Чего в этом перечне больше нет — «канал, названный как адрес». Второе
+// ревью TL-53 показало, что `"ytdlp://update.v2"` и `"ytdlp://update/done"`
+// в ядре без записи в capability дают 26 зелёных тестов; проверка формы
+// объявленных каналов туда не дотягивалась по построению — она ходит по
+// объявленным, а забытый канал отсутствует в этом множестве ровно
+// потому, что его забыли. Теперь адрес со схемой, которая уже известна
+// как канальная, — это падение, а не пропуск.
 //
 // Чего раздел больше не делает — молча пропускать непонятое. Ровно этим
 // он и подвёл на ревью TL-53: сегмент `update_done` не разбирался,
@@ -1373,6 +1382,48 @@ struct ChannelScan {
     /// Литералы, которые не удалось отнести ни к каналу, ни к адресу.
     /// Обязаны стать падением у вызывающего, а не пропуском.
     unparsed: Vec<String>,
+    /// Литералы, отнесённые к адресам (`https://i.ytimg.com/vi/abc.jpg`).
+    ///
+    /// Отдаются наружу, а не выбрасываются на месте, потому что решение
+    /// «адрес это или изувеченное имя канала» зависит от схемы, а какие
+    /// схемы канальные — известно только после обхода всех файлов. Разбор
+    /// одного файла этого знать не может и не притворяется, что может;
+    /// взвешивает их [`promote_addresses_with_a_channel_scheme`].
+    addresses: Vec<String>,
+}
+
+/// Адрес со схемой, которая уже известна как канальная, — это не адрес.
+///
+/// Последний молчаливый пропуск раздела, найденный на втором ревью
+/// TL-53: `"ytdlp://update.v2"` и `"ytdlp://update/done"` в ядре **без**
+/// записи в capability давали 26 зелёных тестов. Проверка формы
+/// объявленных каналов сюда не дотягивалась по построению — она ходит по
+/// объявленным, а забытый канал отсутствует в этом множестве ровно
+/// потому, что его забыли.
+///
+/// Ложных срабатываний не будет: настоящих адресов со схемами `ytdlp` и
+/// `download` в проекте нет и быть не может — это наши собственные схемы,
+/// а не сетевые. Адрес с чужой схемой (`https`, `ftp`) по-прежнему
+/// пропускается: он и есть адрес.
+fn promote_addresses_with_a_channel_scheme(
+    channels: &BTreeSet<String>,
+    addresses: Vec<(String, String)>,
+    unparsed: &mut Vec<String>,
+) {
+    let channel_schemes: BTreeSet<&str> = channels.iter().map(|c| scheme_of(c)).collect();
+    // Пара «где» и «что», а не готовая строка: `scheme_of` обязан
+    // смотреть на литерал, а не на путь файла перед ним. Первая версия
+    // склеивала их раньше времени, схемой оказывался хвост пути, и ветка
+    // не срабатывала ни разу — поймано мутацией, не чтением.
+    for (whence, literal) in addresses {
+        let scheme = scheme_of(&literal);
+        if channel_schemes.contains(scheme) {
+            unparsed.push(format!(
+                "{whence}: {literal} (схема `{scheme}` уже используется \
+                 каналами, а имя похоже на адрес)"
+            ));
+        }
+    }
 }
 
 /// Разбирает литералы с `://` на каналы и адреса.
@@ -1385,10 +1436,14 @@ struct ChannelScan {
 ///
 /// Внутри литерала решает остаток после `://`:
 ///
-/// - точка, слеш или двоеточие в остатке — это **адрес** (хост, путь,
-///   порт), и он пропускается: `https://i.ytimg.com/vi/abc.jpg`,
-///   `ftp://example.com/x`. Пустой остаток (`"https://"`, фикстура
-///   разбора ссылок) — тоже не канал;
+/// - точка, слеш или двоеточие в остатке — похоже на **адрес** (хост,
+///   путь, порт). Окончательное решение принимает не разбор, а
+///   вызывающий: адрес с чужой схемой (`https://i.ytimg.com/vi/abc.jpg`,
+///   `ftp://example.com/x`) пропускается, а вот такой же по форме
+///   литерал с уже канальной схемой (`ytdlp://update.v2`) — это
+///   изувеченное имя канала, и он становится падением (см.
+///   [`promote_addresses_with_a_channel_scheme`]). Пустой остаток
+///   (`"https://"`, фикстура разбора ссылок) — не канал и не адрес;
 /// - остаток из `[A-Za-z0-9_-]` при схеме вида `[a-z][a-z0-9]*` — это
 ///   **канал**, и неважно, как он написан: `update`, `update_done`,
 ///   `updateDone` разбираются одинаково;
@@ -1396,13 +1451,15 @@ struct ChannelScan {
 ///   не-ASCII) — не пропуск, а запись в [`ChannelScan::unparsed`],
 ///   то есть падение с объяснением у вызывающего.
 ///
-/// Граница здесь ровно одна, и врать о ней не надо: **канал, названный
-/// как адрес** — с точкой или слешем в имени — будет принят за адрес и
-/// пропущен. Держит это не разбор, а конвенция, и она проверяема:
-/// [`declared_channels_keep_the_shape_the_scan_can_recognise`] требует
-/// формы `[a-z][a-z0-9]*://[A-Za-z0-9_-]+` от каждого объявленного
-/// канала, так что имя вне конвенции не сможет тихо появиться в
-/// capability — оно уронит тест раньше, чем разойдётся со сканом.
+/// Что осталось за границей, сказано точно: **самый первый канал новой
+/// схемы, названный как адрес**. Схема становится канальной оттого, что
+/// с ней уже нашёлся хотя бы один правильно названный канал; пока такого
+/// нет, `queue://a/b` неотличим от адреса. Как только у схемы появится
+/// первое нормальное имя, все её кривые имена начнут падать. Со стороны
+/// объявленных каналов та же конвенция закреплена отдельно
+/// ([`declared_channels_keep_the_shape_the_scan_can_recognise`]): имя вне
+/// формы `[a-z][a-z0-9]*://[A-Za-z0-9_-]+` не сможет тихо появиться в
+/// capability.
 fn channel_literals(content: &str) -> ChannelScan {
     const SEPARATOR: &str = "://";
     let bytes = content.as_bytes();
@@ -1450,8 +1507,15 @@ fn channel_literals(content: &str) -> ChannelScan {
         let body = &content[body_start..stop];
         let literal = &content[scheme_start..stop];
 
-        // Адрес, а не имя канала. Или вырожденный остаток.
-        if body.is_empty() || body.contains(['.', '/', ':']) {
+        // Вырожденный остаток (`"https://"` — фикстура разбора ссылок):
+        // ни канал, ни адрес, и сказать о нём нечего.
+        if body.is_empty() {
+            continue;
+        }
+        // Похоже на адрес: хост, путь или порт. Окончательное решение —
+        // за вызывающим, он один знает канальные схемы.
+        if body.contains(['.', '/', ':']) {
+            scan.addresses.push(literal.to_string());
             continue;
         }
 
@@ -1510,6 +1574,9 @@ fn core_source_files() -> Vec<PathBuf> {
 fn core_event_channels() -> BTreeSet<String> {
     let mut channels = BTreeSet::new();
     let mut unparsed = Vec::new();
+    // Адреса копятся до конца обхода: канальные схемы известны только
+    // после того, как найден последний канал.
+    let mut addresses = Vec::new();
     for file in core_source_files() {
         let content = fs::read_to_string(&file).expect("исходник ядра читается");
         let scan = channel_literals(&content);
@@ -1517,7 +1584,11 @@ fn core_event_channels() -> BTreeSet<String> {
         for literal in scan.unparsed {
             unparsed.push(format!("{}: {literal}", file.display()));
         }
+        for literal in scan.addresses {
+            addresses.push((file.display().to_string(), literal));
+        }
     }
+    promote_addresses_with_a_channel_scheme(&channels, addresses, &mut unparsed);
     assert!(
         unparsed.is_empty(),
         "в исходниках ядра есть литералы с `://`, которые разбор не смог \
@@ -1546,6 +1617,7 @@ fn frontend_event_channels() -> BTreeSet<String> {
     let (_, files) = scanned_files();
     let mut channels = BTreeSet::new();
     let mut unparsed = Vec::new();
+    let mut addresses = Vec::new();
     for file in files {
         let bytes = fs::read(&file).expect("исходник фронтенда читается");
         let scan = channel_literals(&String::from_utf8_lossy(&bytes));
@@ -1557,12 +1629,22 @@ fn frontend_event_channels() -> BTreeSet<String> {
         for literal in scan.unparsed {
             unparsed.push(format!("{}: {literal}", file.display()));
         }
+        for literal in scan.addresses {
+            addresses.push((file.display().to_string(), literal));
+        }
     }
+    // Канальные схемы берутся из ядра — те же, по которым отбирались
+    // сами каналы: `'ytdlp://prepare/x'` во фронтенде такой же тихий
+    // отказ, как в ядре, а `https://…` остаётся адресом.
+    let core = core_event_channels();
+    promote_addresses_with_a_channel_scheme(&core, addresses, &mut unparsed);
     assert!(
         unparsed.is_empty(),
         "во фронтенде есть литералы с `://`, которые разбор не смог \
-         отнести ни к каналу, ни к адресу:\n{}\nМолчаливый пропуск здесь \
-         означал бы подписку, о которой сторож не знает.",
+         отнести ни к каналу, ни к адресу:\n{}\nЕсли это не про подписку \
+         вовсе — литерал всё равно обязан быть разбираемым: молчаливый \
+         пропуск здесь означал бы подписку, о которой сторож не знает, а \
+         отличить одно от другого разбор не может.",
         unparsed.join("\n")
     );
     channels
@@ -1754,6 +1836,45 @@ fn a_literal_the_scan_cannot_classify_is_reported_instead_of_skipped() {
             "разбор промолчал о литерале, которого не понял: {suspicious}"
         );
     }
+}
+
+/// Схема решает, адрес это или изувеченное имя канала.
+///
+/// Единичный тест на ветку, которой закрыт последний молчаливый пропуск
+/// раздела. Обе стороны важны одинаково: наша схема с адресной формой
+/// обязана падать, чужая схема с той же формой — оставаться адресом,
+/// иначе каждый `https://…` в проекте начал бы ронять проверку каналов.
+#[test]
+fn an_address_with_our_own_scheme_is_a_mangled_channel_name() {
+    let channels = BTreeSet::from([
+        "ytdlp://prepare".to_string(),
+        "download://progress".to_string(),
+    ]);
+    let addresses = vec![
+        ("ядро".to_string(), "ytdlp://update.v2".to_string()),
+        ("ядро".to_string(), "ytdlp://update/done".to_string()),
+        (
+            "ядро".to_string(),
+            "https://i.ytimg.com/vi/abc.jpg".to_string(),
+        ),
+        ("ядро".to_string(), "ftp://example.com/x".to_string()),
+    ];
+
+    let mut unparsed = Vec::new();
+    promote_addresses_with_a_channel_scheme(&channels, addresses, &mut unparsed);
+
+    assert_eq!(
+        unparsed.len(),
+        2,
+        "ожидались ровно два повышения — оба с канальной схемой: {unparsed:?}"
+    );
+    assert!(
+        unparsed
+            .iter()
+            .all(|reported| reported.contains("ytdlp://")),
+        "повышен литерал с чужой схемой — каждый адрес в проекте станет \
+         падением: {unparsed:?}"
+    );
 }
 
 /// Объявленные каналы держатся формы, которую разбор умеет узнавать.
