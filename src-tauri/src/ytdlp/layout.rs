@@ -444,7 +444,6 @@ impl Layout {
     ///
     /// Живёт там же и по той же причине, что [`Self::repair_path`], но
     /// отдельным файлом — см. [`UPDATE_ATTEMPT_SUFFIX`].
-    #[allow(dead_code)] // Потребитель — `super::fetch`, его — TL-58.
     pub fn update_attempt_path(&self, build_id: &BuildId) -> PathBuf {
         self.root.join(format!("{build_id}{UPDATE_ATTEMPT_SUFFIX}"))
     }
@@ -453,7 +452,6 @@ impl Layout {
     ///
     /// Почему это третий файл, а не поле в двух существующих, — см.
     /// [`SMOKE_SUFFIX`].
-    #[allow(dead_code)] // Потребитель — `super::smoke`, его — TL-58.
     pub fn smoke_path(&self, build_id: &BuildId) -> PathBuf {
         self.root.join(format!("{build_id}{SMOKE_SUFFIX}"))
     }
@@ -473,7 +471,6 @@ impl Layout {
     /// Сказано прямо, а не спрятано: это осознанный обмен места на память
     /// о запрете, а появляются такие файлы только там, где апстримный
     /// релиз на этой машине не запускается.
-    #[allow(dead_code)] // Зовёт уборка `super::state`, а её — TL-58.
     pub fn is_smoke_journal(name: &str) -> bool {
         name.ends_with(SMOKE_SUFFIX)
     }
@@ -487,7 +484,6 @@ impl Layout {
     /// мы считали своим, и лить в него шестьдесят мегабайт из сети нельзя.
     /// Вместе со случайным суффиксом это и есть гарантия «файл приёма
     /// создали мы».
-    #[allow(dead_code)] // Потребитель — `super::fetch`, его — TL-58.
     pub fn create_download_file(
         &self,
         build_id: &BuildId,
@@ -597,7 +593,6 @@ impl Layout {
     /// установку**, о которой говорит, поэтому уборка сохраняет его
     /// безусловно, отдельным правилом ([`Self::is_smoke_journal`]), а не
     /// по принадлежности к сохраняемому build id.
-    #[allow(dead_code)] // Зовёт уборка `super::state`, а её — TL-58.
     pub fn belongs_to(name: &str, build_id: &BuildId) -> bool {
         let id = build_id.as_str();
 

@@ -1212,10 +1212,10 @@ pub struct DownloadCommandError {
 // секции нет и не будет: оно генерируется (TL-51) в
 // `src/types/generated/update.ts`.
 //
-// До TL-58 типы секции никто не конструирует, и каждый несёт
-// `#[allow(dead_code)]` — тот же приём и та же причина, что были у секций
-// E2 и E3: контракт не должен исчезать из-за того, что реализация
-// отстаёт на задачу. Глушители снимаются по мере появления вызывающих.
+// Глушители `#[allow(dead_code)]`, которыми секция жила до TL-58, сняты
+// вместе с появлением конструирующего кода (`crate::ytdlp::orchestrate` и
+// команды контура): контракт больше не опережает реализацию, и лишнее в
+// нём теперь видно компилятору, а не только читателю.
 //
 // # Три команды
 //
@@ -1282,7 +1282,6 @@ pub struct DownloadCommandError {
 /// `ProbeErrorDetails`: одинаковая форма не делает вещи одной вещью.
 ///
 /// На проводе — просто число (`#[serde(transparent)]`), как и у соседа.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "update.ts", optional_fields))]
 #[serde(transparent)]
@@ -1290,12 +1289,18 @@ pub struct YtDlpUpdatePercent(u8);
 
 impl YtDlpUpdatePercent {
     /// Единственный конструктор: всё, что больше ста, становится сотней.
-    #[allow(dead_code)]
     pub fn new(percent: u8) -> Self {
         Self(percent.min(100))
     }
 
     /// Значение для форматирования на стороне вызывающего.
+    ///
+    /// Глушитель — тот же и по той же причине, что у соседнего
+    /// [`DownloadPercent::value`]: продакшен-путь процент только
+    /// **строит** и сериализует, а разворачивать его обратно в число
+    /// незачем — форматирует его UI по ту сторону границы. Читают его
+    /// отсюда только тесты контура обновления, которые проверяют, что
+    /// показанная полоса доходит до конца и не едет назад.
     #[allow(dead_code)]
     pub fn value(self) -> u8 {
         self.0
@@ -1332,7 +1337,6 @@ impl YtDlpUpdatePercent {
 /// рядом с тегом: так у каждого шага конвейера (TL-55, TL-56, TL-57)
 /// значение остаётся самодостаточным — вернуть класс без диагностики
 /// нельзя.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "update.ts", optional_fields))]
 #[serde(
@@ -1369,7 +1373,6 @@ pub enum YtDlpUpdateFailure {
 impl YtDlpUpdateFailure {
     /// Диагностика для лога — одно место на всех вместо `match` по месту
     /// вызова.
-    #[allow(dead_code)]
     pub fn message(&self) -> &str {
         match self {
             Self::NetworkUnavailable { message }
@@ -1382,7 +1385,6 @@ impl YtDlpUpdateFailure {
 
     /// Версия, о которой шла речь, — у классов, которые её знают и
     /// называют.
-    #[allow(dead_code)]
     pub fn version(&self) -> Option<&str> {
         match self {
             Self::NetworkUnavailable { .. } | Self::SourceUnavailable { .. } => None,
@@ -1440,7 +1442,6 @@ impl YtDlpUpdateFailure {
 /// переименовывает **варианты**, а не поля внутри них. Ровно это ловили в
 /// E3 у [`DownloadingState::WaitingRetry`] сравнением значения целиком,
 /// и ловили не глазами.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "update.ts", optional_fields))]
 #[serde(
@@ -1551,7 +1552,6 @@ impl YtDlpUpdateStatus {
     /// на провод полем [`YtDlpUpdateSnapshot::busy`] — фронтенд не держит
     /// собственной копии списка. `match` без ветки-заглушки: новый
     /// вариант обязан получить решение здесь, а не унаследовать чужое.
-    #[allow(dead_code)]
     pub fn busy(&self) -> bool {
         match self {
             Self::Checking
@@ -1572,7 +1572,6 @@ impl YtDlpUpdateStatus {
 /// контура и полезная нагрузка события `ytdlp://update`.
 ///
 /// Почему одно значение на снимок и на событие — см. шапку секции.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "update.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
@@ -1600,7 +1599,6 @@ pub struct YtDlpUpdateSnapshot {
 
 impl YtDlpUpdateSnapshot {
     /// Собрать снимок, выведя `busy` из статуса.
-    #[allow(dead_code)]
     pub fn new(status: YtDlpUpdateStatus, rollback_target: Option<String>) -> Self {
         Self {
             busy: status.busy(),
@@ -1619,7 +1617,6 @@ impl YtDlpUpdateSnapshot {
 /// менее они типизированы, а не строки: защита на стороне ядра обязана
 /// быть настоящей, а её срабатывание — различимым в логе (тот же довод,
 /// что у [`DownloadCommandErrorKind`]).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "update.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
@@ -1638,7 +1635,6 @@ pub enum YtDlpUpdateCommandErrorKind {
 ///
 /// `message` — диагностика для лога, как и у [`DownloadCommandError`]:
 /// решение принимается по `kind`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "update.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]

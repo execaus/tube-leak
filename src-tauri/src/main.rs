@@ -92,8 +92,9 @@ mod ytdlp;
 use std::sync::Arc;
 
 use commands::{
-    cancel_download, cancel_probe, check_sidecar, prepare_ytdlp, probe_url, retry_download,
-    start_download, start_ytdlp_preparation, PreparationLock,
+    cancel_download, cancel_probe, check_sidecar, check_ytdlp_update, prepare_ytdlp, probe_url,
+    retry_download, roll_back_ytdlp, start_download, start_ytdlp_preparation,
+    start_ytdlp_update_schedule, ytdlp_update_state, PreparationLock,
 };
 use download::DownloadSession;
 use probe::ProbeSession;
@@ -106,13 +107,34 @@ fn main() {
             cancel_download,
             cancel_probe,
             check_sidecar,
+            check_ytdlp_update,
             prepare_ytdlp,
             probe_url,
             retry_download,
-            start_download
+            roll_back_ytdlp,
+            start_download,
+            ytdlp_update_state
         ])
         .manage(ChildRegistry::new())
         .manage(PreparationLock::new())
+        // Отметки «этой установкой yt-dlp прямо сейчас пользуется
+        // процесс» (Ф-7 эпика E6): их ставит резолв пути, а уважает
+        // уборка контура обновления. Состояние одно на процесс —
+        // счётчик, а не флаг, потому что одну установку держат
+        // несколько процессов сразу (E3 запускает yt-dlp дважды на
+        // ролик, #50).
+        .manage(ytdlp::InUse::new())
+        // Один HTTP-клиент контура обновления на всё приложение:
+        // соединения и сессии TLS переиспользуются между проверками, а
+        // заголовок `User-Agent` задан один раз у агента — забыть его
+        // на отдельном запросе нечем (без него API отвечает 403,
+        // измерено в TL-55).
+        .manage(ytdlp::GithubTransport::new())
+        // Состояние контура обновления yt-dlp (E6): статус блока,
+        // расписание и запреты в памяти процесса. `Arc` — потому что
+        // конвейер живёт отдельной задачей рантайма и переживает
+        // возврат из команды, которая его затеяла.
+        .manage(Arc::new(ytdlp::UpdateController::new()))
         // Состояние «идёт разбор ссылки» (E2): одно на приложение —
         // одновременно выполняется не более одного разбора (Ф-8).
         .manage(ProbeSession::new())
@@ -129,6 +151,13 @@ fn main() {
         // сериализована мьютексом (см. `commands::ytdlp`).
         .setup(|app| {
             start_ytdlp_preparation(app.handle());
+            // Контур самообновления yt-dlp (E6) стартует здесь же и по
+            // той же причине, что подготовка: свежесть yt-dlp — условие
+            // работоспособности продукта, а не предпочтение
+            // пользователя (Р-1). Первое обращение к апстриму —
+            // не сразу, а через `STARTUP_CHECK_DELAY`: подготовка
+            // первого запуска в этот момент может греть дерево.
+            start_ytdlp_update_schedule(app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())
