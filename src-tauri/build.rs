@@ -44,6 +44,15 @@
 //! `binaries.lock.json` в первой же смене версии. Поэтому они читаются из
 //! самого пина и пробрасываются в код через `cargo:rustc-env`.
 //!
+//! Тем же способом и по той же причине проброшено имя **апстримного**
+//! ассета (`TUBE_LEAK_YTDLP_UPSTREAM_ASSET`, например `yt-dlp_macos.zip`):
+//! проверка обновления (TL-55) ищет среди двух десятков ассетов релиза
+//! ровно тот, что подходит этой сборке, и знать его имя иначе как из пина
+//! ей неоткуда. Альтернатива — `cfg!(target_os)` на рантайме — была бы
+//! второй правдой о соответствии «тройка → ассет», расходящейся с пином
+//! молча: у macOS обе тройки берут один universal2-архив, а Linux и
+//! Windows выбирают свой каждый.
+//!
 //! # Сверка архива с пином
 //!
 //! Тем же sha256 архив здесь и проверяется — см. [`place_archive`]. Без
@@ -106,6 +115,10 @@ fn main() {
         "cargo:rustc-env=TUBE_LEAK_YTDLP_ARCHIVE_NAME={}",
         pin.archive_name
     );
+    println!(
+        "cargo:rustc-env=TUBE_LEAK_YTDLP_UPSTREAM_ASSET={}",
+        pin.upstream_asset
+    );
 
     let source = manifest_dir.join("binaries").join(&pin.archive_name);
     println!("cargo:rerun-if-changed={}", source.display());
@@ -122,11 +135,32 @@ fn main() {
     tauri_build::build()
 }
 
+/// Начало адреса, которым обязан быть пин yt-dlp (Н-1 эпика E6).
+///
+/// Проверяется здесь, а не только на рантайме, потому что здесь у него
+/// первое употребление: из этого адреса берётся имя апстримного ассета,
+/// которое рантайм ищет в метаданных релиза
+/// (`TUBE_LEAK_YTDLP_UPSTREAM_ASSET`, см. `crate::ytdlp::release`). Пин,
+/// уехавший на чужой хост, сломал бы и поставку, и обновление — а заметить
+/// это на сборке дешевле, чем у пользователя.
+const YTDLP_RELEASE_URL_PREFIX: &str = "https://github.com/yt-dlp/yt-dlp/releases/download/";
+
 /// Данные о вложенном архиве yt-dlp, взятые из пина для текущей тройки.
 struct YtDlpPin {
     version: String,
     sha256: String,
     archive_name: String,
+    /// Имя ассета **у апстрима** (`yt-dlp_macos.zip` и т. п.) — последний
+    /// сегмент пинованного адреса.
+    ///
+    /// Не то же самое, что [`Self::archive_name`]: то — имя файла в
+    /// `binaries/` с суффиксом тройки, наше собственное. Обновлению
+    /// (TL-55) нужно апстримное: именно его оно ищет среди двух десятков
+    /// ассетов релиза. Выводится из того же пина и той же записи, что
+    /// версия и сумма, — второй правды о том, какой ассет нам подходит, в
+    /// проекте не заводится, а `cfg!(target_os)` на рантайме был бы ровно
+    /// ею.
+    upstream_asset: String,
 }
 
 impl YtDlpPin {
@@ -158,10 +192,34 @@ impl YtDlpPin {
             pin_path.display()
         );
 
+        // Адрес пина — единственный источник имени апстримного ассета, и
+        // белый список на него стоит по той же причине, по какой стоит
+        // проверка kind: обе эти строки описывают не сборку, а то, что
+        // приложение потом делает в сети (Н-1) и с диском.
+        assert!(
+            entry.url.starts_with(YTDLP_RELEASE_URL_PREFIX),
+            "{}: url ассета yt-dlp для {target} обязан начинаться с \
+             {YTDLP_RELEASE_URL_PREFIX} — контур обновления ходит только к \
+             официальным релизам yt-dlp/yt-dlp (Н-1 эпика E6), а имя ассета \
+             для поиска в метаданных релиза берётся из этого адреса. \
+             Получено: {url}",
+            pin_path.display(),
+            url = entry.url,
+        );
+
+        let upstream_asset = entry.url.rsplit('/').next().unwrap_or_default().to_owned();
+        assert!(
+            !upstream_asset.is_empty() && upstream_asset.ends_with(".zip"),
+            "{}: последний сегмент url ассета yt-dlp для {target} должен быть \
+             именем onedir-архива (*.zip), а получилось {upstream_asset:?}",
+            pin_path.display(),
+        );
+
         Self {
             version: pin.yt_dlp.version.clone(),
             sha256: entry.sha256.clone(),
             archive_name: entry.binary_name.clone(),
+            upstream_asset,
         }
     }
 }
@@ -180,6 +238,7 @@ struct PinSection {
 
 #[derive(serde::Deserialize)]
 struct PinEntry {
+    url: String,
     sha256: String,
     #[serde(rename = "binaryName")]
     binary_name: String,
