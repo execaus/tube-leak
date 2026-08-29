@@ -27,6 +27,19 @@ function rollbackButton(wrapper: ReturnType<typeof mountBlock>) {
   return wrapper.findAll('button').find((btn) => btn.text().startsWith('Вернуться к'))
 }
 
+/** Кнопка «Вернуться» внутри инлайн-подтверждения (TL-60) — отличается от {@link rollbackButton} точным текстом без «к …». */
+function confirmRollbackButton(wrapper: ReturnType<typeof mountBlock>) {
+  return wrapper.findAll('button').find((btn) => btn.text() === 'Вернуться')
+}
+
+function cancelRollbackButton(wrapper: ReturnType<typeof mountBlock>) {
+  return wrapper.findAll('button').find((btn) => btn.text() === 'Отмена')
+}
+
+function rollbackConfirmPanel(wrapper: ReturnType<typeof mountBlock>) {
+  return wrapper.find('.ytdlp-update-block__rollback-confirm')
+}
+
 describe('YtDlpUpdateBlock — 14 состояний таблицы «Все состояния» дизайна E6', () => {
   it('row 1 — neverChecked: только «Проверить сейчас», активна', () => {
     const wrapper = mountBlock({
@@ -311,7 +324,7 @@ describe('YtDlpUpdateBlock — клики', () => {
     expect(wrapper.emitted('check')).toHaveLength(1)
   })
 
-  it('emits "rollback" when the rollback button is clicked', async () => {
+  it('clicking the toggle button does NOT emit "rollback" immediately (Р-3: it opens the inline confirmation instead)', async () => {
     const wrapper = mountBlock({
       snapshot: { busy: false, status: 'neverChecked', rollbackTarget: '2026.07.11' },
       activeVersion: ACTIVE_VERSION,
@@ -319,7 +332,7 @@ describe('YtDlpUpdateBlock — клики', () => {
 
     await rollbackButton(wrapper)?.trigger('click')
 
-    expect(wrapper.emitted('rollback')).toHaveLength(1)
+    expect(wrapper.emitted('rollback')).toBeUndefined()
   })
 
   it('does not emit "check" when the button is disabled', async () => {
@@ -331,6 +344,138 @@ describe('YtDlpUpdateBlock — клики', () => {
     await checkButton(wrapper)?.trigger('click')
 
     expect(wrapper.emitted('check')).toBeUndefined()
+  })
+})
+
+/*
+ * TL-60 (Р-3, issue execaus/tube-leak#62): инлайн-подтверждение отката.
+ * «Клик по «Вернуться к {версия}» разворачивает инлайн-подтверждение на
+ * месте блока (текст с версиями, кнопки «Вернуться»/«Отмена»), без
+ * role="dialog"» — критерии приёмки задачи закрываются здесь: «Отмена»
+ * не вызывает команду отката и не меняет статус-строку; во время
+ * активной загрузки клик «Вернуться» переводит блок в состояние 14, не
+ * в 13 немедленно.
+ */
+describe('YtDlpUpdateBlock — инлайн-подтверждение отката (TL-60, Р-3)', () => {
+  const snapshotWithTarget: YtDlpUpdateSnapshot = {
+    busy: false,
+    status: 'upToDate',
+    at: '2026-08-25T12:00:00Z',
+    rollbackTarget: '2026.07.11',
+  }
+
+  it('is not rendered before the toggle button is clicked', () => {
+    const wrapper = mountBlock({ snapshot: snapshotWithTarget, activeVersion: ACTIVE_VERSION })
+
+    expect(rollbackConfirmPanel(wrapper).exists()).toBe(false)
+  })
+
+  it('clicking "Вернуться к …" reveals the confirmation with both versions named, and no role="dialog" anywhere in the block', async () => {
+    const wrapper = mountBlock({ snapshot: snapshotWithTarget, activeVersion: ACTIVE_VERSION })
+
+    await rollbackButton(wrapper)?.trigger('click')
+
+    const panel = rollbackConfirmPanel(wrapper)
+    expect(panel.exists()).toBe(true)
+    expect(panel.text()).toContain('2026.07.11')
+    expect(panel.text()).toContain(ACTIVE_VERSION)
+    expect(confirmRollbackButton(wrapper)).toBeDefined()
+    expect(cancelRollbackButton(wrapper)).toBeDefined()
+    // Design, «Ручной откат — полный путь»: инлайн-раскрытие, не модалка.
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+  })
+
+  it('clicking the toggle button again collapses an already-open confirmation', async () => {
+    const wrapper = mountBlock({ snapshot: snapshotWithTarget, activeVersion: ACTIVE_VERSION })
+
+    await rollbackButton(wrapper)?.trigger('click')
+    expect(rollbackConfirmPanel(wrapper).exists()).toBe(true)
+
+    await rollbackButton(wrapper)?.trigger('click')
+    expect(rollbackConfirmPanel(wrapper).exists()).toBe(false)
+  })
+
+  /* Критерий приёмки: «Отмена» не вызывает команду отката и не меняет статус-строку. */
+  it('"Отмена" closes the confirmation without emitting "rollback" and without changing the status text', async () => {
+    const wrapper = mountBlock({ snapshot: snapshotWithTarget, activeVersion: ACTIVE_VERSION })
+    const textBefore = statusText(wrapper)
+
+    await rollbackButton(wrapper)?.trigger('click')
+    await cancelRollbackButton(wrapper)?.trigger('click')
+
+    expect(rollbackConfirmPanel(wrapper).exists()).toBe(false)
+    expect(wrapper.emitted('rollback')).toBeUndefined()
+    expect(statusText(wrapper)).toBe(textBefore)
+  })
+
+  it('"Вернуться" inside the confirmation emits "rollback" exactly once and closes the panel', async () => {
+    const wrapper = mountBlock({ snapshot: snapshotWithTarget, activeVersion: ACTIVE_VERSION })
+
+    await rollbackButton(wrapper)?.trigger('click')
+    await confirmRollbackButton(wrapper)?.trigger('click')
+
+    expect(wrapper.emitted('rollback')).toHaveLength(1)
+    expect(rollbackConfirmPanel(wrapper).exists()).toBe(false)
+  })
+
+  /*
+   * Критерий приёмки: «во время активной загрузки клик «Вернуться»
+   * переводит блок в состояние 14 (ожидание границы), не в 13 (уже
+   * применено) немедленно». Компонент не решает это сам (doc компонента,
+   * «Инлайн-подтверждение отката») — он только эмитит и ждёт снимок от
+   * родителя. Доказывается в два шага: сразу после клика (до того, как
+   * родитель успел бы что-то прислать) блок ещё не утверждает ничего
+   * нового — старый статус-текст на месте, никакого локального прыжка
+   * в «применено»; когда родитель присылает `rollbackWaiting` (то, что
+   * вернула бы команда при активной загрузке — Ф-7), блок показывает
+   * ровно строку 14, а не строку 13.
+   */
+  it('does not locally jump to "applied" (row 13) on click — reflects rollbackWaiting (row 14) only once that snapshot arrives via props', async () => {
+    const wrapper = mountBlock({ snapshot: snapshotWithTarget, activeVersion: ACTIVE_VERSION })
+    const textBeforeClick = statusText(wrapper)
+
+    await rollbackButton(wrapper)?.trigger('click')
+    await confirmRollbackButton(wrapper)?.trigger('click')
+
+    // Синхронно после клика — ещё ничего не известно об исходе, никакого
+    // локального предположения о «применено немедленно».
+    expect(statusText(wrapper)).toBe(textBeforeClick)
+    expect(statusText(wrapper)).not.toContain('Возврат выполнен')
+
+    // Родитель получил ответ команды (busy: активная загрузка идёт,
+    // Ф-7) и прислал новый снимок — ровно то, что делает `rollback()`
+    // composable.
+    await wrapper.setProps({
+      snapshot: {
+        busy: true,
+        status: 'rollbackWaiting',
+        version: '2026.07.11',
+        rollbackTarget: ACTIVE_VERSION,
+      },
+      activeVersion: ACTIVE_VERSION,
+    })
+
+    expect(statusText(wrapper)).toBe(
+      'Возврат к 2026.07.11 принят — применится, когда закончится текущая загрузка.',
+    )
+    expect(statusText(wrapper)).not.toContain('Возврат выполнен')
+    expect(checkButton(wrapper)?.attributes('disabled')).toBeDefined()
+    expect(rollbackButton(wrapper)?.attributes('disabled')).toBeDefined()
+  })
+
+  it('resets the confirmation if the rollback target disappears from a newly arrived snapshot', async () => {
+    const wrapper = mountBlock({ snapshot: snapshotWithTarget, activeVersion: ACTIVE_VERSION })
+
+    await rollbackButton(wrapper)?.trigger('click')
+    expect(rollbackConfirmPanel(wrapper).exists()).toBe(true)
+
+    await wrapper.setProps({
+      snapshot: { busy: false, status: 'upToDate', at: '2026-08-25T12:05:00Z' },
+      activeVersion: ACTIVE_VERSION,
+    })
+
+    expect(rollbackConfirmPanel(wrapper).exists()).toBe(false)
+    expect(rollbackButton(wrapper)).toBeUndefined()
   })
 })
 
