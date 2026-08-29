@@ -290,7 +290,7 @@ async fn prepare_inner(
 ) -> Result<YtDlpPrepared, PrepareError> {
     let layout = Layout::new(data_dir);
     layout.create_root()?;
-    let build_id = layout::bundled_build_id();
+    let build_id = layout::bundled_build_id()?;
 
     // Мусор от подготовок, прерванных на середине: полураспакованное
     // дерево под именем `.staging-*`. Оно никогда не считается установкой
@@ -302,6 +302,22 @@ async fn prepare_inner(
             stale.display()
         );
         unpack::remove_dir_if_exists(&stale)?;
+    }
+
+    // То же самое для недокачанного архива обновления (С-7): прерванное
+    // скачивание оставляет `.download-*` до шестидесяти мегабайт, и
+    // убирать его надо там же, где убирается `.staging-*`, — на старте,
+    // единственном моменте, когда заведомо никто не пишет в каталог
+    // данных. Отказ уборки здесь не роняет подготовку: остаток мешает
+    // месту на диске, а не работе.
+    for stale in layout.stale_downloads() {
+        eprintln!(
+            "yt-dlp: убираю недокачанный архив обновления {}",
+            stale.display()
+        );
+        if let Err(err) = std::fs::remove_file(&stale) {
+            eprintln!("yt-dlp: не удалось убрать {}: {err}", stale.display());
+        }
     }
 
     let repair_path = layout.repair_path(&build_id);
@@ -362,16 +378,8 @@ async fn prepare_inner(
         }
         Err(invalid) => {
             eprintln!("yt-dlp: установка непригодна ({invalid}), распаковываю заново");
-            let prepared = install_and_warm(
-                archive_path,
-                &layout,
-                &build_id,
-                registry,
-                sink,
-                started,
-                timeouts,
-            )
-            .await?;
+            let prepared =
+                install_and_warm(archive_path, &layout, registry, sink, started, timeouts).await?;
             RepairLog::clear(&repair_path);
             Ok(prepared)
         }
@@ -399,7 +407,7 @@ async fn repair(
     reason: &str,
     archive_path: &Path,
     layout: &Layout,
-    build_id: &str,
+    build_id: &layout::BuildId,
     registry: &ChildRegistry,
     sink: &dyn ProgressSink,
     started: Instant,
@@ -435,16 +443,7 @@ async fn repair(
         eprintln!("yt-dlp: не удалось записать историю починки: {err}");
     }
 
-    let outcome = install_and_warm(
-        archive_path,
-        layout,
-        build_id,
-        registry,
-        sink,
-        started,
-        timeouts,
-    )
-    .await;
+    let outcome = install_and_warm(archive_path, layout, registry, sink, started, timeouts).await;
 
     match &outcome {
         Ok(_) => RepairLog::clear(&repair_path),
@@ -479,13 +478,18 @@ fn repair_exhausted(history: &RepairLog, now_unix: u64) -> bool {
 async fn install_and_warm(
     archive_path: &Path,
     layout: &Layout,
-    build_id: &str,
     registry: &ChildRegistry,
     sink: &dyn ProgressSink,
     started: Instant,
     timeouts: Timeouts,
 ) -> Result<YtDlpPrepared, PrepareError> {
-    let installed = install(archive_path, layout, build_id, sink)?;
+    let unpack_started = Instant::now();
+    let installed = install(
+        archive_path,
+        layout,
+        layout::ArchiveIdentity::bundled(),
+        &mut |done, total| sink.emit(unpacking_event(done, total, unpack_started)),
+    )?;
     let file_count = count_tree_files(&installed);
     let version = warm_up(
         &installed,
@@ -506,19 +510,38 @@ async fn install_and_warm(
 }
 
 /// Распаковка в `.staging-*`, атомарный перенос, запись манифеста.
-fn install(
+///
+/// Единственная реализация установки на весь проект: обновление yt-dlp
+/// (TL-56) вызывает **эту** функцию, а не свою копию (Ф-4). Отсюда два
+/// её свойства, которых у неё не было до E6.
+///
+/// Первое — `identity` вместо констант пина: build id, каталог и манифест
+/// адресуются тем, чем архив себя называет, а вложен он в бандл или
+/// скачан из сети, установке безразлично.
+///
+/// Второе — `on_progress` вместо [`ProgressSink`]. Здесь сменился не
+/// стиль, а адресат: подготовка первого запуска эмитит ход в
+/// `ytdlp://prepare`, а фоновое обновление обязано **не** эмитить туда
+/// ничего — на этом канале поднимается полноэкранный блокирующий
+/// `YtDlpPrepareScreen`, и его появление посреди фоновой работы было бы
+/// прямой регрессией Р-1 («никаких прерывающих уведомлений»). Пока сюда
+/// передавался `&dyn ProgressSink`, единственным способом это соблюсти
+/// была дисциплина вызывающего; с замыканием канал выбирает тот, кто
+/// установку затеял, и выбрать чужой не может.
+pub(super) fn install(
     archive_path: &Path,
     layout: &Layout,
-    build_id: &str,
-    sink: &dyn ProgressSink,
+    identity: layout::ArchiveIdentity<'_>,
+    on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Installed, PrepareError> {
-    let install_dir = layout.install_dir(build_id);
-    let manifest_path = layout.manifest_path(build_id);
+    let build_id = identity.build_id()?;
+    let install_dir = layout.install_dir(&build_id);
+    let manifest_path = layout.manifest_path(&build_id);
 
     // Каталог распаковки создаётся здесь и под непредсказуемым именем
     // (см. doc `super::layout`), поэтому «убрать прежний staging» не
     // требуется: своего у нас ещё нет, а чужой — не наш.
-    let staging = layout.create_staging_dir(build_id)?;
+    let staging = layout.create_staging_dir(&build_id)?;
 
     // Прежняя установка этого же build id могла остаться непригодной
     // (`validate` уже сказала, что она не годится) — переименование в
@@ -526,11 +549,7 @@ fn install(
     unpack::remove_dir_if_exists(&install_dir)?;
     let _ = std::fs::remove_file(&manifest_path);
 
-    let unpack_started = Instant::now();
-    let unpacked = unpack::unpack(archive_path, &staging, &mut |done, total| {
-        sink.emit(unpacking_event(done, total, unpack_started));
-    })
-    .inspect_err(|_| {
+    let unpacked = unpack::unpack(archive_path, &staging, on_progress).inspect_err(|_| {
         // Полураспакованное дерево не должно пережить неудачу — иначе
         // следующий запуск найдёт мусор на 124 МиБ и будет чистить его
         // «за прошлый раз».
@@ -539,7 +558,7 @@ fn install(
 
     unpack::promote(&staging, &install_dir)?;
 
-    let manifest = layout::manifest_for(&install_dir, &unpacked.executable)?;
+    let manifest = layout::manifest_for(&install_dir, &unpacked.executable, identity)?;
     manifest.write_atomic(&manifest_path)?;
 
     Ok(Installed {
@@ -709,7 +728,7 @@ fn elapsed_ms(started: Instant) -> u64 {
 /// не сбой, а нормальное состояние до первого вызова `prepare_ytdlp`.
 pub fn installed_executable(data_dir: &Path) -> Result<PathBuf, PrepareError> {
     let layout = Layout::new(data_dir);
-    layout::validate(&layout, &layout::bundled_build_id())
+    layout::validate(&layout, &layout::bundled_build_id()?)
         .map(|installed| installed.executable)
         .map_err(|invalid| PrepareError::LayoutUnexpected {
             reason: invalid.to_string(),
@@ -719,6 +738,21 @@ pub fn installed_executable(data_dir: &Path) -> Result<PathBuf, PrepareError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Идентификатор вложенной сборки для тестов. Отдельный хелпер, а не
+    /// `unwrap` по месту: пин обязан проходить ту же проверку, что и
+    /// кандидат из сети, и «обязан» здесь означает падение теста, а не
+    /// молчаливое `unwrap_or`.
+    fn pinned_build_id() -> layout::BuildId {
+        layout::bundled_build_id().expect("пин обязан проходить проверку идентификатора")
+    }
+
+    /// Идентификатор чужой установки — той, что не совпадает с пином.
+    /// Нужен там, где предмет проверки — остаток от **другой** сборки.
+    fn other_build_id() -> layout::BuildId {
+        layout::BuildId::new("2000.01.01", &"de".repeat(32))
+            .expect("образец обязан проходить проверку")
+    }
     use std::fs::{self, File};
     use std::io::Write;
     use std::sync::Mutex;
@@ -833,7 +867,7 @@ mod tests {
         }
 
         fn repair_path(&self) -> PathBuf {
-            self.layout().repair_path(&layout::bundled_build_id())
+            self.layout().repair_path(&pinned_build_id())
         }
 
         fn manifest_modified(&self) -> std::time::SystemTime {
@@ -848,11 +882,11 @@ mod tests {
         }
 
         fn install_dir(&self) -> PathBuf {
-            self.layout().install_dir(&layout::bundled_build_id())
+            self.layout().install_dir(&pinned_build_id())
         }
 
         fn manifest_path(&self) -> PathBuf {
-            self.layout().manifest_path(&layout::bundled_build_id())
+            self.layout().manifest_path(&pinned_build_id())
         }
     }
 
@@ -984,7 +1018,7 @@ mod tests {
         // Дешёвая сверка такой порчи не видит — иначе ветки `Broken` не
         // существовало бы вовсе.
         assert!(
-            layout::validate(&fixture.layout(), &layout::bundled_build_id()).is_ok(),
+            layout::validate(&fixture.layout(), &pinned_build_id()).is_ok(),
             "подмена обязана быть незаметной для сверки с манифестом"
         );
 
@@ -1238,7 +1272,7 @@ mod tests {
         let layout = fixture.layout();
         layout.create_root().expect("создать корень");
         let stale = layout
-            .create_staging_dir("2000.01.01-deadbeefdead")
+            .create_staging_dir(&other_build_id())
             .expect("создать каталог распаковки");
         fs::create_dir_all(stale.join("_internal")).expect("создать мусор");
         fs::write(stale.join("half-written"), b"...").expect("записать мусор");
@@ -1251,6 +1285,44 @@ mod tests {
         assert!(
             !stale.exists(),
             "мусор прерванной подготовки обязан исчезнуть"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_half_downloaded_update_archive_is_removed_too() {
+        // С-7: обрыв во время скачивания обновления оставляет
+        // `.download-*` — до шестидесяти мегабайт, — и убирать его надо
+        // там же, где `.staging-*`: на старте, единственном моменте,
+        // когда в каталог данных заведомо никто не пишет. До TL-56
+        // уборка знала только про каталоги распаковки, и остаток
+        // скачивания пережил бы сколько угодно запусков.
+        let fixture = fixture(PRINTS_VERSION);
+        let layout = fixture.layout();
+        layout.create_root().expect("создать корень");
+        let (partial, file) = layout
+            .create_download_file(&other_build_id())
+            .expect("создать файл приёма");
+        drop(file);
+        fs::write(&partial, vec![0_u8; 4096]).expect("записать недокачанное");
+
+        assert_eq!(
+            layout.stale_downloads(),
+            vec![partial.clone()],
+            "остаток обязан быть виден уборке до подготовки"
+        );
+
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("подготовка обязана пройти");
+
+        assert!(
+            !partial.exists(),
+            "недокачанный архив обновления обязан исчезнуть"
+        );
+        assert!(
+            fixture.install_dir().exists(),
+            "уборка чужого остатка не должна мешать самой подготовке"
         );
     }
 
