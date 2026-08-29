@@ -127,22 +127,232 @@ fn random_suffix() -> u64 {
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// Идентификатор сборки yt-dlp, вложенной в это приложение.
-pub fn bundled_build_id() -> String {
-    build_id(BUNDLED_VERSION, BUNDLED_SHA256)
+///
+/// `Result`, а не готовая строка, потому что пин — такой же вход, как
+/// метаданные релиза: [`BUNDLED_VERSION`] и [`BUNDLED_SHA256`] приходят
+/// из `binaries.lock.json` через `build.rs`, и «свой» файл ошибается не
+/// реже чужого. Форточки для него не заведено намеренно: одна проверка на
+/// оба источника — единственный способ не иметь второй, которая с ней
+/// разойдётся. Что пин её проходит, держит сторож
+/// `the_pinned_constants_pass_the_very_same_check`.
+pub fn bundled_build_id() -> Result<BuildId, PrepareError> {
+    BuildId::new(BUNDLED_VERSION, BUNDLED_SHA256)
 }
 
-/// Идентификатор сборки yt-dlp: версия апстрима плюс начало суммы её
-/// архива.
-///
-/// Публичный, а не внутренний, с TL-56: обновление знает версию и сумму
-/// кандидата из метаданных релиза до того, как хоть байт скачан, и
-/// адресует ими и каталог установки, и журнал попыток. Считать этот
-/// идентификатор вторым способом рядом значило бы завести второе место,
-/// где раскладка каталога данных описана.
-pub fn build_id(version: &str, sha256: &str) -> String {
-    let short = sha256.get(..12).unwrap_or(sha256);
-    format!("{version}-{short}")
+/// Сколько символов суммы попадает в идентификатор сборки.
+const SHORT_SHA_CHARS: usize = 12;
+
+/// Сколько символов в шестнадцатеричной записи sha256. Ровно, не «хотя бы».
+const SHA256_HEX_CHARS: usize = 64;
+
+/// Потолок длины версии. Апстрим пишет `YYYY.MM.DD` (десять символов) и
+/// в ночных сборках `YYYY.MM.DD.HHMMSS` (семнадцать); тридцать два — тот
+/// же запас «в три раза», которым выбраны потолки объёма, и заодно
+/// граница, за которой имя каталога перестаёт быть именем каталога.
+const MAX_VERSION_CHARS: usize = 32;
+
+/// Скорлупа вокруг [`BuildId`]: единственное, ради чего заведён
+/// отдельный модуль, — сделать поле недоступным даже остальному
+/// `layout`, чтобы второго конструктора нельзя было написать по
+/// недосмотру. Ничего, кроме типа и его проверок, здесь нет.
+mod checked {
+    use super::{PrepareError, MAX_VERSION_CHARS, SHA256_HEX_CHARS, SHORT_SHA_CHARS};
+
+    /// Проверенный идентификатор установки — **единственная** строка, из
+    /// которой раскладка строит имена в каталоге данных.
+    ///
+    /// # Зачем тип, а не проверка в начале каждой функции
+    ///
+    /// Версия и сумма приезжают из метаданных релиза апстрима, то есть это
+    /// непроверенный ввод в чистом виде, а CLAUDE.md запрещает строить из
+    /// такого компоненты пути безусловно. Пока идентификатор был `String`,
+    /// проверку можно было обойти, просто не позвав её: `install_dir`,
+    /// `manifest_path`, `update_attempt_path` и `create_download_file`
+    /// принимали любую строку. Ревью TL-56 это и показало запуском —
+    /// `version = "/абсолютный/путь/OWNED"` уводил журнал попыток по
+    /// абсолютному пути (`Path::join` с абсолютным аргументом отбрасывает
+    /// корень целиком), а `version = "../PWNED"` — уровнем выше корня
+    /// установок. Каталог установки при этом не появлялся только по
+    /// случайности формы префикса `.download-`, то есть защищала не проверка.
+    ///
+    /// Отсюда форма: поле приватно, тип объявлен в собственном модуле
+    /// (`mod checked`, который его окружает), и единственный способ
+    /// получить значение —
+    /// [`BuildId::new`], который проверяет. Обойти его нельзя не по
+    /// договорённости, а потому, что второго конструктора не существует —
+    /// его не видит даже остальной `layout`.
+    ///
+    /// # Белый список, а не чёрный
+    ///
+    /// Перечислено разрешённое, а не запрещённое, и это прямой урок E3, где
+    /// чёрный список подводил дважды подряд. Запрещать пришлось бы `/`, `\`,
+    /// `..`, `:` (диски и ADS Windows), управляющие символы, `NUL`,
+    /// нормализацию Unicode, хвостовые точки и пробелы Win32 — список,
+    /// который заведомо неполон и молчит о том, чего в нём нет.
+    ///
+    /// Разрешено:
+    ///
+    /// - **сумма** — ровно [`SHA256_HEX_CHARS`] символов `0-9 a-f A-F`;
+    ///   ни короче, ни длиннее, ни с чем-то ещё;
+    /// - **версия** — от одного до [`MAX_VERSION_CHARS`] символов, первый
+    ///   ASCII-буквенно-цифровой, остальные ASCII-буквенно-цифровые либо
+    ///   `.`, `-`, `_`.
+    ///
+    /// Из этого следуют свойства, ради которых список такой:
+    ///
+    /// 1. Ни `/`, ни `\`, ни `:` не проходят, поэтому идентификатор всегда
+    ///    ровно **один** компонент пути, на любой из трёх платформ.
+    /// 2. Идентификатор не бывает `.` или `..`: он всегда кончается на
+    ///    двенадцать шестнадцатеричных символов через дефис, то есть длиннее
+    ///    тринадцати символов и кончается буквенно-цифровым.
+    /// 3. Идентификатор не начинается с точки, поэтому не притворяется
+    ///    остатком работы: уборка адресует `.staging-*` и `.download-*` по
+    ///    ведущей точке, и установка с именем `.staging-…` была бы удалена
+    ///    как мусор.
+    /// 4. На Windows не остаётся ни хвостовой точки, ни хвостового пробела
+    ///    (Win32 их молча срезает, и имя перестаёт совпадать с тем, что
+    ///    записали), ни зарезервированного имени вроде `CON`: суффикс
+    ///    `-<12 hex>` делает совпадение невыразимым.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct BuildId(String);
+
+    impl BuildId {
+        /// Единственный конструктор: проверяет обе строки и только потом
+        /// склеивает.
+        ///
+        /// Отказ — [`PrepareError::ArchiveCorrupted`], и это не «ближайший
+        /// подходящий», а тот же класс, которым оба контура называют одно
+        /// и то же событие: на границе подготовки он проецируется в
+        /// `archiveCorrupted`, на границе обновления — тоже
+        /// (`FetchError::Archive` → `YtDlpUpdateFailure::ArchiveCorrupted`,
+        /// класс Ф-9 «скачанное отброшено до того, как что-либо тронуло
+        /// активную установку»). Архив, который называет себя тем, из чего
+        /// нельзя составить имя каталога, к установке не пригоден ровно так
+        /// же, как архив с несошедшейся суммой, и лечится тем же — отбросить.
+        pub fn new(version: &str, sha256: &str) -> Result<Self, PrepareError> {
+            check_sha256(sha256)?;
+            check_version(version)?;
+
+            let short = &sha256[..SHORT_SHA_CHARS];
+            Ok(Self(format!("{version}-{short}")))
+        }
+
+        /// Строка идентификатора — для форматирования и сравнения, но не
+        /// для того, чтобы собрать из неё путь мимо [`super::Layout`]:
+        /// пути строит только он.
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl std::fmt::Display for BuildId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    /// Сумма: ровно 64 шестнадцатеричных символа.
+    ///
+    /// Длина проверяется по символам, а не по байтам, и именно поэтому
+    /// сначала считается число символов, а срез `[..12]` берётся уже
+    /// после: у ASCII-подмножества, которое прошло проверку, символ равен
+    /// байту, и срез не может попасть в середину кодовой точки.
+    fn check_sha256(sha256: &str) -> Result<(), PrepareError> {
+        let length = sha256.chars().count();
+        if length != SHA256_HEX_CHARS {
+            return Err(PrepareError::ArchiveCorrupted {
+                reason: format!(
+                    "sha256 архива обязана быть из {SHA256_HEX_CHARS} шестнадцатеричных \
+                     символов, а в ней {length}: {}",
+                    elide(sha256)
+                ),
+            });
+        }
+
+        if let Some(bad) = sha256.chars().find(|c| !c.is_ascii_hexdigit()) {
+            return Err(PrepareError::ArchiveCorrupted {
+                reason: format!(
+                    "sha256 архива содержит {} — не шестнадцатеричный символ: {}",
+                    describe_char(bad),
+                    elide(sha256)
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Версия: белый список символов плюс границы длины.
+    fn check_version(version: &str) -> Result<(), PrepareError> {
+        let length = version.chars().count();
+        if length == 0 || length > MAX_VERSION_CHARS {
+            return Err(PrepareError::ArchiveCorrupted {
+                reason: format!(
+                    "версия yt-dlp обязана быть длиной от 1 до {MAX_VERSION_CHARS} символов, \
+                     а в ней {length}: {}",
+                    elide(version)
+                ),
+            });
+        }
+
+        // Первый символ отдельно: с него начинается имя каталога, и
+        // ведущая точка сделала бы установку похожей на остаток работы
+        // (`.staging-*`, `.download-*`), который уборка удаляет.
+        let first = version.chars().next().unwrap_or('\0');
+        if !first.is_ascii_alphanumeric() {
+            return Err(PrepareError::ArchiveCorrupted {
+                reason: format!(
+                    "версия yt-dlp обязана начинаться с латинской буквы или цифры, а начинается \
+                     с {}: {}",
+                    describe_char(first),
+                    elide(version)
+                ),
+            });
+        }
+
+        if let Some(bad) = version
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+        {
+            return Err(PrepareError::ArchiveCorrupted {
+                reason: format!(
+                    "версия yt-dlp содержит {}; разрешены латинские буквы, цифры, точка, \
+                     дефис и подчёркивание: {}",
+                    describe_char(bad),
+                    elide(version)
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Символ в диагностике: печатный — как есть, остальные — кодом.
+    /// Иначе управляющий символ или `NUL` в сообщении выглядел бы
+    /// пустотой, и читатель лога не понял бы, на что жалуются.
+    fn describe_char(c: char) -> String {
+        if c.is_ascii_graphic() {
+            format!("«{c}»")
+        } else {
+            format!("U+{:04X}", c as u32)
+        }
+    }
+
+    /// Обрезает чужую строку для сообщения: она пришла снаружи, и
+    /// вываливать её в лог целиком незачем.
+    fn elide(value: &str) -> String {
+        const LIMIT: usize = 48;
+
+        let shown: String = value.chars().take(LIMIT).collect();
+        if shown.chars().count() < value.chars().count() {
+            format!("«{shown}…»")
+        } else {
+            format!("«{shown}»")
+        }
+    }
 }
+
+pub use checked::BuildId;
 
 /// Пути установки yt-dlp внутри каталога данных приложения.
 #[derive(Debug, Clone)]
@@ -165,12 +375,12 @@ impl Layout {
     }
 
     /// Каталог конкретной установки.
-    pub fn install_dir(&self, build_id: &str) -> PathBuf {
-        self.root.join(build_id)
+    pub fn install_dir(&self, build_id: &BuildId) -> PathBuf {
+        self.root.join(build_id.as_str())
     }
 
     /// Файл манифеста конкретной установки.
-    pub fn manifest_path(&self, build_id: &str) -> PathBuf {
+    pub fn manifest_path(&self, build_id: &BuildId) -> PathBuf {
         self.root.join(format!("{build_id}.json"))
     }
 
@@ -179,7 +389,7 @@ impl Layout {
     /// Лежит рядом с манифестом, а не внутри каталога установки: каталог
     /// сносится на каждой переустановке, а счётчик обязан её пережить —
     /// в этом весь его смысл.
-    pub fn repair_path(&self, build_id: &str) -> PathBuf {
+    pub fn repair_path(&self, build_id: &BuildId) -> PathBuf {
         self.root.join(format!("{build_id}{REPAIR_SUFFIX}"))
     }
 
@@ -189,7 +399,7 @@ impl Layout {
     /// Живёт там же и по той же причине, что [`Self::repair_path`], но
     /// отдельным файлом — см. [`UPDATE_ATTEMPT_SUFFIX`].
     #[allow(dead_code)] // Потребитель — `super::fetch`, его — TL-58.
-    pub fn update_attempt_path(&self, build_id: &str) -> PathBuf {
+    pub fn update_attempt_path(&self, build_id: &BuildId) -> PathBuf {
         self.root.join(format!("{build_id}{UPDATE_ATTEMPT_SUFFIX}"))
     }
 
@@ -205,7 +415,7 @@ impl Layout {
     #[allow(dead_code)] // Потребитель — `super::fetch`, его — TL-58.
     pub fn create_download_file(
         &self,
-        build_id: &str,
+        build_id: &BuildId,
     ) -> Result<(PathBuf, fs::File), PrepareError> {
         let mut last_error = None;
 
@@ -262,7 +472,7 @@ impl Layout {
     /// своим, и распаковываться в него нельзя. Вместе со случайным
     /// суффиксом это и есть гарантия «каталог распаковки создали мы»
     /// (см. doc модуля).
-    pub fn create_staging_dir(&self, build_id: &str) -> Result<PathBuf, PrepareError> {
+    pub fn create_staging_dir(&self, build_id: &BuildId) -> Result<PathBuf, PrepareError> {
         let mut last_error = None;
 
         // Несколько попыток — не про вероятность столкнуться суффиксами
@@ -461,7 +671,7 @@ pub struct Installed {
 /// перезапись меняют либо число файлов, либо суммарный размер), а порча
 /// при самой распаковке — CRC32 каждой записи архива (см.
 /// [`super::unpack`]).
-pub fn validate(layout: &Layout, build_id: &str) -> Result<Installed, InvalidInstall> {
+pub fn validate(layout: &Layout, build_id: &BuildId) -> Result<Installed, InvalidInstall> {
     let manifest_path = layout.manifest_path(build_id);
     let Some(manifest) = Manifest::read(&manifest_path) else {
         return Err(InvalidInstall::NoManifest);
@@ -574,8 +784,12 @@ impl ArchiveIdentity<'static> {
 impl ArchiveIdentity<'_> {
     /// Идентификатор сборки, которым адресуются каталог установки, её
     /// манифест и журналы рядом.
-    pub fn build_id(&self) -> String {
-        build_id(self.version, self.sha256)
+    ///
+    /// `Result`, потому что обе строки — непроверенный ввод: у кандидата
+    /// они приезжают из метаданных релиза апстрима. Проверка живёт в
+    /// [`BuildId::new`] и обойти её нечем — см. его doc.
+    pub fn build_id(&self) -> Result<BuildId, PrepareError> {
+        BuildId::new(self.version, self.sha256)
     }
 }
 
@@ -673,11 +887,17 @@ mod tests {
         let _ = executable;
     }
 
+    /// Идентификатор для тестов, которым безразлично, что именно в нём
+    /// написано, — важно лишь, что он проверен.
+    fn some_build_id() -> BuildId {
+        BuildId::new("2026.09.01", &"ab".repeat(32)).expect("образец обязан проходить проверку")
+    }
+
     /// Раскладывает правдоподобную установку и возвращает её build id.
-    fn install_fixture(data_dir: &Path) -> (Layout, String) {
+    fn install_fixture(data_dir: &Path) -> (Layout, BuildId) {
         let layout = Layout::new(data_dir);
         layout.create_root().expect("root must be creatable");
-        let build_id = bundled_build_id();
+        let build_id = bundled_build_id().expect("пин обязан проходить проверку идентификатора");
         let dir = layout.install_dir(&build_id);
 
         write_file(&dir.join("yt-dlp-test"), b"#!/bin/sh\n", true);
@@ -694,15 +914,105 @@ mod tests {
 
     #[test]
     fn build_id_combines_version_with_a_short_archive_hash() {
-        assert_eq!(
-            build_id("2026.08.19", "07e54b0865303c864006925913bce2604f8"),
-            "2026.08.19-07e54b086530"
-        );
+        let id = BuildId::new("2026.08.19", &format!("07e54b086530{}", "9".repeat(52)))
+            .expect("настоящая пара обязана проходить");
+
+        assert_eq!(id.as_str(), "2026.08.19-07e54b086530");
+        assert_eq!(id.to_string(), "2026.08.19-07e54b086530");
     }
 
     #[test]
-    fn build_id_tolerates_a_hash_shorter_than_the_prefix_it_takes() {
-        assert_eq!(build_id("1.0", "abc"), "1.0-abc");
+    fn the_pinned_constants_pass_the_very_same_check() {
+        // Пин — такой же вход, как метаданные релиза, и проверка у него
+        // та же. Этот сторож стоит между `binaries.lock.json` и первым
+        // запуском: пин, из которого нельзя составить имя каталога,
+        // обязан быть виден здесь, а не в отказе подготовки у
+        // пользователя.
+        let id = bundled_build_id().unwrap_or_else(|err| {
+            panic!("пин {BUNDLED_VERSION} / {BUNDLED_SHA256} не проходит проверку: {err}")
+        });
+        assert!(id.as_str().starts_with(BUNDLED_VERSION));
+    }
+
+    #[test]
+    fn a_hostile_version_or_hash_never_becomes_a_build_id() {
+        // Белый список проверяется с обеих сторон: сначала то, что он
+        // обязан пропускать, потом то, что обязан отвергать. Одного
+        // второго мало — сторож, отвергающий всё, тоже «зелёный».
+        for (version, sha256) in [
+            ("2026.08.19", &format!("07e54b086530{}", "9".repeat(52))),
+            ("2026.08.19.232919", &"F".repeat(64)),
+            ("1", &"0".repeat(64)),
+            ("a_b-c.d", &"0123456789abcdef".repeat(4)),
+            (&"9".repeat(MAX_VERSION_CHARS), &"a".repeat(64)),
+        ] {
+            let id = BuildId::new(version, sha256)
+                .unwrap_or_else(|err| panic!("«{version}» обязана проходить: {err}"));
+
+            // Утверждения doc проверяются наравне с тем, что они
+            // охраняют: принятый идентификатор обязан быть ровно одним
+            // компонентом пути, не уводить из корня установок и не
+            // начинаться с точки (иначе уборка приняла бы установку за
+            // остаток `.staging-*`/`.download-*` и удалила её). Если
+            // белый список однажды расширят, покраснеет здесь.
+            let root = Path::new("/data/yt-dlp");
+            assert_eq!(
+                Path::new(id.as_str()).components().count(),
+                1,
+                "идентификатор обязан быть одним компонентом пути: {id}"
+            );
+            assert_eq!(
+                root.join(id.as_str()).parent(),
+                Some(root),
+                "идентификатор не должен уводить из корня установок: {id}"
+            );
+            assert!(
+                !id.as_str().starts_with('.'),
+                "идентификатор не должен выглядеть остатком прерванной работы: {id}"
+            );
+        }
+
+        let good_sha = "0".repeat(64);
+        let hostile: [(&str, &str, &str); 15] = [
+            ("абсолютный путь", "/tmp/OWNED", &good_sha),
+            ("выход на уровень выше", "../PWNED", &good_sha),
+            ("то же с обратным слэшем", "..\\PWNED", &good_sha),
+            ("обратный слэш", "a\\b", &good_sha),
+            ("прямой слэш", "a/b", &good_sha),
+            ("диск Windows", "C:", &good_sha),
+            ("пустая версия", "", &good_sha),
+            ("ведущая точка", ".staging-x", &good_sha),
+            ("ведущий дефис", "-2026.08.19", &good_sha),
+            ("пробел", "2026.08.19 ", &good_sha),
+            ("NUL", "2026\u{0}19", &good_sha),
+            ("не-ASCII", "2026.08.19\u{202e}", &good_sha),
+            (
+                "версия длиннее потолка",
+                "9999999999999999999999999999999999",
+                &good_sha,
+            ),
+            (
+                "не-hex в сумме",
+                "2026.08.19",
+                "zz00000000000000000000000000000000000000000000000000000000000000",
+            ),
+            ("сумма не той длины", "2026.08.19", "abcdef"),
+        ];
+
+        for (what, version, sha256) in hostile {
+            let error = BuildId::new(version, sha256).expect_err(&format!(
+                "{what} обязано быть отвергнуто: {version:?} / {sha256:?}"
+            ));
+            assert!(
+                matches!(error, PrepareError::ArchiveCorrupted { .. }),
+                "{what}: класс отказа обязан быть тем же, что у архива с несошедшейся суммой,                  а не {error}"
+            );
+        }
+
+        // Отдельно — сумма длиннее потолка: сдвиг границы «ровно 64» в
+        // любую сторону обязан быть отказом.
+        assert!(BuildId::new("2026.08.19", &"a".repeat(65)).is_err());
+        assert!(BuildId::new("2026.08.19", &"a".repeat(63)).is_err());
     }
 
     #[test]
@@ -712,15 +1022,18 @@ mod tests {
         layout.create_root().expect("root must be creatable");
 
         let staging = layout
-            .create_staging_dir("build")
+            .create_staging_dir(&some_build_id())
             .expect("staging must be creatable");
 
         assert_ne!(
             staging,
-            layout.install_dir("build"),
+            layout.install_dir(&some_build_id()),
             "распаковка идёт рядом с целевым каталогом, а не в него"
         );
-        assert_eq!(layout.install_dir("build").parent(), Some(layout.root()));
+        assert_eq!(
+            layout.install_dir(&some_build_id()).parent(),
+            Some(layout.root())
+        );
         assert_eq!(staging.parent(), Some(layout.root()));
         assert!(staging.is_dir(), "каталог распаковки обязан быть создан");
     }
@@ -736,7 +1049,7 @@ mod tests {
         let names: std::collections::HashSet<String> = (0..8)
             .map(|_| {
                 layout
-                    .create_staging_dir("build")
+                    .create_staging_dir(&some_build_id())
                     .expect("staging must be creatable")
                     .file_name()
                     .expect("staging path has a file name")
@@ -749,7 +1062,7 @@ mod tests {
         assert!(
             names
                 .iter()
-                .all(|name| name.starts_with(&format!("{STAGING_PREFIX}build-"))),
+                .all(|name| name.starts_with(&format!("{STAGING_PREFIX}{}-", some_build_id()))),
             "уборка остатков ищет их по префиксу: {names:?}"
         );
     }
@@ -762,7 +1075,7 @@ mod tests {
         let layout = Layout::new(dir.path());
 
         let error = layout
-            .create_staging_dir("build")
+            .create_staging_dir(&some_build_id())
             .expect_err("без корневого каталога создавать негде");
 
         assert!(
@@ -774,14 +1087,14 @@ mod tests {
     #[test]
     fn the_repair_log_lives_next_to_the_manifest_and_not_inside_the_tree() {
         let layout = Layout::new(Path::new("/data"));
-        let repair = layout.repair_path("build");
+        let repair = layout.repair_path(&some_build_id());
 
         assert_eq!(repair.parent(), Some(layout.root()));
         assert!(
-            !repair.starts_with(layout.install_dir("build")),
+            !repair.starts_with(layout.install_dir(&some_build_id())),
             "иначе переустановка стирала бы память о своих же неудачах"
         );
-        assert_ne!(repair, layout.manifest_path("build"));
+        assert_ne!(repair, layout.manifest_path(&some_build_id()));
     }
 
     #[test]

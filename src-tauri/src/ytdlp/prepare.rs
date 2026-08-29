@@ -290,7 +290,7 @@ async fn prepare_inner(
 ) -> Result<YtDlpPrepared, PrepareError> {
     let layout = Layout::new(data_dir);
     layout.create_root()?;
-    let build_id = layout::bundled_build_id();
+    let build_id = layout::bundled_build_id()?;
 
     // Мусор от подготовок, прерванных на середине: полураспакованное
     // дерево под именем `.staging-*`. Оно никогда не считается установкой
@@ -407,7 +407,7 @@ async fn repair(
     reason: &str,
     archive_path: &Path,
     layout: &Layout,
-    build_id: &str,
+    build_id: &layout::BuildId,
     registry: &ChildRegistry,
     sink: &dyn ProgressSink,
     started: Instant,
@@ -534,15 +534,14 @@ pub(super) fn install(
     identity: layout::ArchiveIdentity<'_>,
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Installed, PrepareError> {
-    let build_id = identity.build_id();
-    let build_id = build_id.as_str();
-    let install_dir = layout.install_dir(build_id);
-    let manifest_path = layout.manifest_path(build_id);
+    let build_id = identity.build_id()?;
+    let install_dir = layout.install_dir(&build_id);
+    let manifest_path = layout.manifest_path(&build_id);
 
     // Каталог распаковки создаётся здесь и под непредсказуемым именем
     // (см. doc `super::layout`), поэтому «убрать прежний staging» не
     // требуется: своего у нас ещё нет, а чужой — не наш.
-    let staging = layout.create_staging_dir(build_id)?;
+    let staging = layout.create_staging_dir(&build_id)?;
 
     // Прежняя установка этого же build id могла остаться непригодной
     // (`validate` уже сказала, что она не годится) — переименование в
@@ -729,7 +728,7 @@ fn elapsed_ms(started: Instant) -> u64 {
 /// не сбой, а нормальное состояние до первого вызова `prepare_ytdlp`.
 pub fn installed_executable(data_dir: &Path) -> Result<PathBuf, PrepareError> {
     let layout = Layout::new(data_dir);
-    layout::validate(&layout, &layout::bundled_build_id())
+    layout::validate(&layout, &layout::bundled_build_id()?)
         .map(|installed| installed.executable)
         .map_err(|invalid| PrepareError::LayoutUnexpected {
             reason: invalid.to_string(),
@@ -739,6 +738,21 @@ pub fn installed_executable(data_dir: &Path) -> Result<PathBuf, PrepareError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Идентификатор вложенной сборки для тестов. Отдельный хелпер, а не
+    /// `unwrap` по месту: пин обязан проходить ту же проверку, что и
+    /// кандидат из сети, и «обязан» здесь означает падение теста, а не
+    /// молчаливое `unwrap_or`.
+    fn pinned_build_id() -> layout::BuildId {
+        layout::bundled_build_id().expect("пин обязан проходить проверку идентификатора")
+    }
+
+    /// Идентификатор чужой установки — той, что не совпадает с пином.
+    /// Нужен там, где предмет проверки — остаток от **другой** сборки.
+    fn other_build_id() -> layout::BuildId {
+        layout::BuildId::new("2000.01.01", &"de".repeat(32))
+            .expect("образец обязан проходить проверку")
+    }
     use std::fs::{self, File};
     use std::io::Write;
     use std::sync::Mutex;
@@ -853,7 +867,7 @@ mod tests {
         }
 
         fn repair_path(&self) -> PathBuf {
-            self.layout().repair_path(&layout::bundled_build_id())
+            self.layout().repair_path(&pinned_build_id())
         }
 
         fn manifest_modified(&self) -> std::time::SystemTime {
@@ -868,11 +882,11 @@ mod tests {
         }
 
         fn install_dir(&self) -> PathBuf {
-            self.layout().install_dir(&layout::bundled_build_id())
+            self.layout().install_dir(&pinned_build_id())
         }
 
         fn manifest_path(&self) -> PathBuf {
-            self.layout().manifest_path(&layout::bundled_build_id())
+            self.layout().manifest_path(&pinned_build_id())
         }
     }
 
@@ -1004,7 +1018,7 @@ mod tests {
         // Дешёвая сверка такой порчи не видит — иначе ветки `Broken` не
         // существовало бы вовсе.
         assert!(
-            layout::validate(&fixture.layout(), &layout::bundled_build_id()).is_ok(),
+            layout::validate(&fixture.layout(), &pinned_build_id()).is_ok(),
             "подмена обязана быть незаметной для сверки с манифестом"
         );
 
@@ -1258,7 +1272,7 @@ mod tests {
         let layout = fixture.layout();
         layout.create_root().expect("создать корень");
         let stale = layout
-            .create_staging_dir("2000.01.01-deadbeefdead")
+            .create_staging_dir(&other_build_id())
             .expect("создать каталог распаковки");
         fs::create_dir_all(stale.join("_internal")).expect("создать мусор");
         fs::write(stale.join("half-written"), b"...").expect("записать мусор");
@@ -1286,7 +1300,7 @@ mod tests {
         let layout = fixture.layout();
         layout.create_root().expect("создать корень");
         let (partial, file) = layout
-            .create_download_file("2000.01.01-deadbeefdead")
+            .create_download_file(&other_build_id())
             .expect("создать файл приёма");
         drop(file);
         fs::write(&partial, vec![0_u8; 4096]).expect("записать недокачанное");

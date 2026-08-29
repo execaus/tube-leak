@@ -53,11 +53,12 @@
 //! # Чего здесь нет
 //!
 //! - **Транспорта.** [`ArchiveSource`] — абстракция над потоком байт с
-//!   объявленным размером; сетевой источник получается из неё в одну
-//!   строку, как только выбран HTTP-клиент (см. [`StreamArchive`]). Выбор
-//!   клиента — решение уровня зависимостей проекта, не этой задачи:
-//!   любой из них вводит в релизный граф TLS-стек с C-сборкой, а собрать
-//!   Linux и Windows сейчас некому.
+//!   объявленным размером; сетевой источник из неё уже собран
+//!   ([`network_source`] по [`super::update::UpdateAsset`]), и незакрытым
+//!   остаётся ровно одно место — замыкание `open`, делающее сам запрос.
+//!   Выбор HTTP-клиента — решение уровня зависимостей проекта, не этой
+//!   задачи: любой из них вводит в релизный граф TLS-стек с C-сборкой, а
+//!   собрать Linux и Windows сейчас некому.
 //! - **Политики повторов.** Неудачная попытка записывается в журнал рядом
 //!   с установкой ([`super::layout::Layout::update_attempt_path`]) — это
 //!   та точка, куда TL-58 подключает троттлинг разных классов отказа.
@@ -73,8 +74,9 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::error::PrepareError;
-use super::layout::{ArchiveIdentity, Layout, RepairLog};
+use super::layout::{ArchiveIdentity, BuildId, Layout, RepairLog};
 use super::prepare;
+use super::update::UpdateAsset;
 use crate::types::YtDlpUpdateFailure;
 
 /// Потолок размера входного архива.
@@ -115,10 +117,18 @@ use crate::types::YtDlpUpdateFailure;
 ///
 /// Значение согласовано с потолком распаковки, а не выбрано отдельно:
 /// настоящее дерево yt-dlp разворачивается из архива примерно в 2,4 раза
-/// (130,0 МиБ из 51,4 МиБ у пинованного macOS-ассета), то есть архив
-/// «по потолку» честной формы дал бы около 460 МиБ дерева — под
+/// (124,0 МиБ дерева из 51,4 МиБ архива у пинованного macOS-ассета —
+/// 130 010 634 и 53 923 637 байт, отношение 2,41), то есть архив «по
+/// потолку» честной формы дал бы около 462 МиБ дерева — под
 /// `MAX_UNPACKED_BYTES` (512 МиБ). Потолки не спорят друг с другом: тот,
 /// кто станет двигать любой, обязан видеть оба.
+///
+/// Единицы здесь МиБ (1024²) везде, и это не педантизм: `unpackedBytes`
+/// пинованного ассета — 130,0 **МБ**, то есть 124,0 МиБ, и в первой
+/// редакции этого doc два числа сравнивались в разных единицах. Сравнение
+/// от этого не сломалось (отношение единиц не зависит), но читатель,
+/// проверяющий 2,4 по этим двум числам, получал 2,53 и не сходился ни с
+/// чем.
 pub const MAX_ARCHIVE_BYTES: u64 = 192 * 1024 * 1024;
 
 /// Насколько должен вырасти объём принятого, чтобы стоило сообщить о
@@ -267,6 +277,45 @@ where
     }
 }
 
+/// Раскладывает метаданные релизного ассета (TL-55) на идентификатор,
+/// которым адресуется установка.
+///
+/// Три строки кода, а заведены они отдельно и с тестом ровно потому, что
+/// перепутать здесь нечего только на вид: `version` и `sha256` — обе
+/// строки, и компилятор поменять их местами не мешает. До TL-56
+/// «`UpdateAsset` потребляется напрямую» было утверждением задачи, а не
+/// кодом: тип упоминался в комментариях, а склейку предстояло написать
+/// TL-58 — то есть в третьем месте, без сторожа. Теперь она одна, здесь,
+/// и её держит `an_update_asset_is_taken_apart_field_by_field`.
+///
+/// Цена ошибки после правки ревью — не тихий дефект, а отказ: сумма,
+/// попавшая в поле версии, не проходит белый список [`BuildId`]. Это
+/// хорошо (ломается громко), но полагаться на это как на проверку
+/// нельзя — она про форму, а не про смысл.
+impl<'a> From<&'a UpdateAsset> for ArchiveIdentity<'a> {
+    fn from(asset: &'a UpdateAsset) -> Self {
+        Self {
+            version: &asset.version,
+            sha256: &asset.sha256,
+        }
+    }
+}
+
+/// Источник поверх релизного ассета: `size_bytes` становится объявленным
+/// размером, `url` — адресом для лога и диагностики.
+///
+/// `open` приходит снаружи и делает сам запрос — транспорта здесь нет
+/// (см. doc модуля). Смысл функции в том, что **знаменатель полосы и
+/// первый потолок берутся из метаданных, а не из заголовков ответа**:
+/// объявленный размер обязан быть известен до открытия потока, иначе
+/// проверка «отказ до запроса» не выражается вовсе.
+pub fn network_source<F>(asset: &UpdateAsset, open: F) -> StreamArchive<F>
+where
+    F: Fn() -> io::Result<Box<dyn Read>>,
+{
+    StreamArchive::new(Origin::Network, asset.url.clone(), asset.size_bytes, open)
+}
+
 /// Почему обновление не установилось.
 ///
 /// Домейн говорит `thiserror`-ошибкой, граница конвертирует её в
@@ -284,9 +333,54 @@ pub enum FetchError {
     #[error("источник отдал не то, что обещал: {reason}")]
     Source { reason: String },
 
-    /// Архив отброшен до того, как что-либо тронуло активную установку
-    /// (С-4): сумма не сошлась, превышен потолок, архив не читается, в
-    /// корне не ровно один исполняемый файл.
+    /// Архив признан негодным: сумма не сошлась, превышен потолок, архив
+    /// не читается, в корне не ровно один исполняемый файл, версия или
+    /// сумма не годятся в имя каталога.
+    ///
+    /// # Когда именно случился отказ — до установки или уже в ней
+    ///
+    /// Раньше здесь стояло «архив отброшен до того, как что-либо тронуло
+    /// активную установку (С-4)». Это неверно, и ревью TL-56 показало
+    /// запуском: в этот класс через [`From<PrepareError>`] попадают и
+    /// отказы **установки**, а [`super::prepare::install`] перед
+    /// распаковкой сносит каталог установки и манифест того build id, в
+    /// который ставит. Отказ после этого оставляет каталог данных без
+    /// установки, а не «нетронутым».
+    ///
+    /// Что приходит **до** того, как установка начата (активная не
+    /// тронута ничем, и это проверяется `assert_no_debris` в каждом из
+    /// тестов):
+    ///
+    /// - идентификатор кандидата не годится в имя каталога
+    ///   ([`super::layout::BuildId`]);
+    /// - объявленный размер за потолком либо нулевой у ресурса бандла;
+    /// - поток перерос [`MAX_ARCHIVE_BYTES`];
+    /// - файл приёма не создался или не пишется;
+    /// - ресурс бандла не читается или кончился раньше объявленного;
+    /// - **sha256 не сошлась** — сверка стоит до распаковки (Ф-3).
+    ///
+    /// Что приходит **после** того, как установка началась, то есть уже
+    /// после сноса каталога и манифеста целевого build id (всё, что
+    /// пришло из [`PrepareError`], кроме нехватки места):
+    ///
+    /// - архив не открывается как zip, CRC32 записи не сошёлся;
+    /// - в корне дерева не ровно один исполняемый файл;
+    /// - запись дерева не удалась (нет прав, отказ файловой системы).
+    ///
+    /// # Предусловие, которым гарантия С-4 держится
+    ///
+    /// **[`fetch_and_install`] нельзя звать с build id активной
+    /// установки.** В сетевом сценарии это выполняется само: кандидат
+    /// имеет другую версию и другую сумму, значит другой каталог, и снос
+    /// в `install` касается пустого места. Но С-10 (архив из бандла) —
+    /// ровно тот случай, где идентификаторы могут совпасть, и тогда
+    /// неудачная распаковка уносит рабочую установку.
+    ///
+    /// Удерживать предусловие обязана оркестрация (TL-58): она владеет
+    /// вызовом и знает, какая установка активна. Здесь оно записано, а
+    /// не проверено, намеренно — этому модулю не с чем сравнивать: он
+    /// получает `layout` и `identity`, а «какая установка активна»
+    /// хранится записью TL-54, до которой ему нет дела.
     #[error("архив обновления отброшен: {reason}")]
     Archive { reason: String },
 
@@ -357,7 +451,11 @@ pub enum FetchStage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedCandidate {
     /// `<версия>-<sha12>` — имя каталога установки и адрес журналов рядом.
-    pub build_id: String,
+    ///
+    /// Проверенным типом, а не строкой: отдай этот шаг `String`, и TL-58
+    /// смог бы собрать из неё путь мимо проверки — ровно та дыра, которую
+    /// [`BuildId`] и закрывает.
+    pub build_id: BuildId,
     /// Версия yt-dlp, которую обещали метаданные релиза. Что скажет сам
     /// бинарник — выясняет smoke-проверка (TL-57).
     pub version: String,
@@ -379,17 +477,35 @@ pub struct PreparedCandidate {
 /// которых про него не говорит.
 ///
 /// Порядок шагов задан Ф-3 и проверяется тестами по отдельности:
-/// потолок по объявленному → место под архив → приём с потолком по факту
-/// и sha256 на лету → сверка суммы → распаковка. Ни один побочный файл не
-/// переживает отказ на любом из них.
+/// проверка идентификатора → потолок по объявленному → место под архив →
+/// приём с потолком по факту и sha256 на лету → сверка суммы →
+/// распаковка. Ни один побочный файл не переживает отказ на любом из них.
+///
+/// # Предусловие
+///
+/// `identity` **не должен** совпадать с идентификатором активной
+/// установки. Начиная с распаковки шаг необратим: `install` сносит
+/// каталог и манифест целевого build id до того, как появится новое
+/// дерево, — то есть отказ на нём уносит установку с тем же именем.
+/// Держит это оркестрация (TL-58), которая владеет вызовом и знает
+/// активную установку; подробности и полный разбор «что до, что после» —
+/// в doc [`FetchError::Archive`].
 pub fn fetch_and_install(
     source: &dyn ArchiveSource,
     identity: ArchiveIdentity<'_>,
     layout: &Layout,
     on_progress: &mut dyn FnMut(FetchStage, u64, u64),
 ) -> Result<PreparedCandidate, FetchError> {
-    let build_id = identity.build_id();
-    let outcome = fetch_and_install_inner(source, identity, layout, on_progress);
+    // Идентификатор — самое первое, что здесь делается, и это не порядок
+    // ради порядка. Из него строится **каждый** путь ниже, включая путь
+    // журнала неудачных попыток: пока проверки не было, отказ на любом
+    // шаге уводил `record_failed_attempt` туда, куда указала версия из
+    // чужих метаданных (ревью TL-56 — абсолютный путь и `../`). Поэтому
+    // журнал ведётся уже проверенным значением, а неприемлемый
+    // идентификатор возвращается до него и не пишет ничего никуда: писать
+    // о нём было бы некуда.
+    let build_id = identity.build_id()?;
+    let outcome = fetch_and_install_inner(source, identity, &build_id, layout, on_progress);
 
     if let Err(error) = &outcome {
         record_failed_attempt(layout, &build_id, error);
@@ -401,6 +517,7 @@ pub fn fetch_and_install(
 fn fetch_and_install_inner(
     source: &dyn ArchiveSource,
     identity: ArchiveIdentity<'_>,
+    build_id: &BuildId,
     layout: &Layout,
     on_progress: &mut dyn FnMut(FetchStage, u64, u64),
 ) -> Result<PreparedCandidate, FetchError> {
@@ -418,7 +535,7 @@ fn fetch_and_install_inner(
     ensure_room_for_archive(layout.root(), declared)?;
 
     let (archive_path, archive_file) = layout
-        .create_download_file(&identity.build_id())
+        .create_download_file(build_id)
         .map_err(FetchError::from)?;
 
     let received = receive(source, declared, archive_file, &archive_path, on_progress);
@@ -458,7 +575,7 @@ fn fetch_and_install_inner(
     let installed = installed?;
 
     Ok(PreparedCandidate {
-        build_id: identity.build_id(),
+        build_id: build_id.clone(),
         version: identity.version.to_string(),
         dir: installed.dir,
         executable: installed.executable,
@@ -736,7 +853,7 @@ fn read_failure(source: &dyn ArchiveSource, err: &io::Error) -> FetchError {
 ///
 /// Неудача записи журнала не превращается в неудачу обновления: журнал —
 /// страховка от долбления, а не условие работы.
-fn record_failed_attempt(layout: &Layout, build_id: &str, error: &FetchError) {
+fn record_failed_attempt(layout: &Layout, build_id: &BuildId, error: &FetchError) {
     let path = layout.update_attempt_path(build_id);
     let history = RepairLog::read(&path);
     let attempted = history.with_attempt(&error.to_string(), crate::clock::now_unix_secs());
@@ -757,9 +874,26 @@ mod tests {
     /// подставляется настоящая — её считает [`sha256_of`].
     const CANDIDATE_VERSION: &str = "2026.09.01";
 
+    /// Сумма правильной формы, которой заведомо не совпадёт ни один архив.
+    /// Форма важна: с TL-56 сумма не той формы отбраковывается раньше, чем
+    /// начинается приём, и тест про обрыв потока перестал бы проверять
+    /// обрыв.
+    const WRONG_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// Идентификатор заведомо приемлемой пары «версия + сумма».
+    ///
+    /// `expect`, а не тихий `unwrap_or`: если фикстура перестала проходить
+    /// проверку, тест обязан упасть здесь и назвать причину, а не тихо
+    /// проверять что-то другое.
+    fn build_id_of(identity: ArchiveIdentity<'_>) -> BuildId {
+        identity
+            .build_id()
+            .expect("идентификатор фикстуры обязан проходить проверку")
+    }
+
     /// Готовый каталог данных с созданным корнем установок.
     struct Fixture {
-        _dir: TempDir,
+        dir: TempDir,
         layout: Layout,
     }
 
@@ -768,29 +902,30 @@ mod tests {
             let dir = tempdir().expect("tempdir");
             let layout = Layout::new(dir.path());
             layout.create_root().expect("корень создаётся");
-            Self { _dir: dir, layout }
+            Self { dir, layout }
         }
 
         fn layout(&self) -> &Layout {
             &self.layout
         }
 
+        /// Каталог данных приложения — тот, **внутри** которого лежит
+        /// корень установок. Нужен там, где предмет проверки — что отказ
+        /// не написал ничего уровнем выше корня.
+        fn data_dir(&self) -> &Path {
+            self.dir.path()
+        }
+
         /// Имена всего, что лежит в корне установок.
         fn root_entries(&self) -> Vec<String> {
-            let mut names: Vec<String> = fs::read_dir(self.layout.root())
-                .expect("корень читается")
-                .filter_map(Result::ok)
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect();
-            names.sort();
-            names
+            entries_of(self.layout.root())
         }
 
         /// Никакого мусора: ни каталога установки, ни `.staging-*`, ни
         /// недокачанного архива. Журнал попыток исключён намеренно — он
         /// не побочный след, а объявленный результат отказа (точка
         /// троттлинга), и его отсутствие проверяется отдельным тестом.
-        fn assert_no_debris(&self, build_id: &str) {
+        fn assert_no_debris(&self, build_id: &BuildId) {
             assert!(
                 !self.layout.install_dir(build_id).exists(),
                 "каталог установки не должен появиться: {:?}",
@@ -812,6 +947,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Отсортированные имена всего, что лежит в каталоге.
+    ///
+    /// Отдельной функцией, а не методом фикстуры, потому что тот же
+    /// вопрос задаётся трём разным каталогам: корню установок, каталогу
+    /// данных над ним и постороннему каталогу, в который целится
+    /// враждебный абсолютный путь.
+    fn entries_of(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("{} читается: {err}", dir.display()))
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     /// Поток, который не кончается никогда. Ровно то, чем прикидывается
@@ -912,6 +1063,154 @@ mod tests {
         );
     }
 
+    // --- склейка с метаданными релиза ------------------------------------
+
+    #[test]
+    fn an_update_asset_is_taken_apart_field_by_field() {
+        // Сторож ровно на одну ошибку — перепутанные местами поля. Обе
+        // строки `UpdateAsset` это строки, оба размера это числа, и
+        // компилятор здесь не помогает ничем: `version: &asset.sha256`
+        // соберётся молча. Значения подобраны так, чтобы подмена была
+        // видна не «по типу», а по значению.
+        let asset = UpdateAsset {
+            version: "2026.09.01".to_string(),
+            url: "https://example.invalid/yt-dlp_macos.zip".to_string(),
+            sha256: "a1b2c3d4e5f6".repeat(5) + "0123",
+            size_bytes: 53_923_637,
+        };
+
+        let identity = ArchiveIdentity::from(&asset);
+        assert_eq!(
+            identity.version, asset.version,
+            "версия обязана прийти из version, а не из sha256"
+        );
+        assert_eq!(
+            identity.sha256, asset.sha256,
+            "сумма обязана прийти из sha256, а не из version"
+        );
+        assert_eq!(
+            build_id_of(identity).as_str(),
+            "2026.09.01-a1b2c3d4e5f6",
+            "идентификатор собирается из версии и первых двенадцати символов суммы"
+        );
+
+        let source = network_source(&asset, || {
+            unreachable!("склейка метаданных потока не открывает")
+        });
+        assert_eq!(source.origin(), Origin::Network);
+        assert_eq!(
+            source.declared_bytes(),
+            asset.size_bytes,
+            "объявленный размер обязан прийти из size_bytes: на нём стоят и \
+             знаменатель полосы, и первый потолок"
+        );
+        assert_eq!(
+            source.describe(),
+            asset.url,
+            "в диагностике обязан быть адрес ассета"
+        );
+    }
+
+    // --- идентификатор кандидата как компонент пути -----------------------
+
+    #[test]
+    fn a_hostile_identity_never_becomes_a_path_and_never_opens_a_stream() {
+        // Правка ревью TL-56 и её главный сторож. Версия и сумма приезжают
+        // из метаданных релиза апстрима, то есть это непроверенный ввод, а
+        // раскладка строит из них имена в каталоге данных. До проверки
+        // ревью показало запуском: `version = "<абсолютный путь>/OWNED"`
+        // уводил журнал попыток по абсолютному пути (`Path::join` с
+        // абсолютным аргументом отбрасывает корень целиком), а
+        // `version = "../PWNED"` — уровнем выше корня установок.
+        //
+        // Поэтому предмет проверки здесь **не текст ошибки**: он был
+        // верным и тогда, когда файл уже лежал не там. Проверяются три
+        // каталога, в которых после отказа не должно появиться ничего:
+        // корень установок, каталог данных над ним и посторонний каталог,
+        // в который целится абсолютный путь.
+        let outside = tempdir().expect("tempdir");
+        let body = onedir_zip();
+        let good_sha = sha256_of(&body);
+        let owned = outside.path().join("OWNED").display().to_string();
+
+        let hostile: Vec<(&str, String, String)> = vec![
+            ("абсолютный путь", owned, good_sha.clone()),
+            (
+                "выход на уровень выше",
+                "../PWNED".to_string(),
+                good_sha.clone(),
+            ),
+            (
+                "то же под Windows",
+                "..\\PWNED".to_string(),
+                good_sha.clone(),
+            ),
+            ("обратный слэш", "a\\b".to_string(), good_sha.clone()),
+            ("пустая версия", String::new(), good_sha.clone()),
+            (
+                "ведущая точка — маскировка под остаток работы",
+                ".staging-2026.09.01".to_string(),
+                good_sha.clone(),
+            ),
+            (
+                "не-hex в сумме",
+                CANDIDATE_VERSION.to_string(),
+                format!("zz{}", &good_sha[2..]),
+            ),
+            (
+                "сумма короче 64",
+                CANDIDATE_VERSION.to_string(),
+                good_sha[..12].to_string(),
+            ),
+            (
+                "сумма длиннее 64",
+                CANDIDATE_VERSION.to_string(),
+                format!("{good_sha}00"),
+            ),
+        ];
+
+        for (what, version, sha256) in hostile {
+            let fixture = Fixture::new();
+            let opened = Cell::new(0);
+            let source = source_of(Origin::Network, body.len() as u64, &body, &opened);
+            let identity = ArchiveIdentity {
+                version: &version,
+                sha256: &sha256,
+            };
+
+            let error = fetch_and_install(&source, identity, fixture.layout(), &mut |_, _, _| {})
+                .expect_err(&format!(
+                    "{what}: такой идентификатор обязан быть отвергнут"
+                ));
+
+            assert!(
+                matches!(error, FetchError::Archive { .. }),
+                "{what}: отказ обязан быть одним из пяти классов Ф-9, а не паникой: {error}"
+            );
+            assert_eq!(
+                opened.get(),
+                0,
+                "{what}: поток открывать незачем — из такого идентификатора всё равно \
+                 нечего адресовать"
+            );
+            assert!(
+                fixture.root_entries().is_empty(),
+                "{what}: в корне установок не должно появиться ничего, а там {:?}",
+                fixture.root_entries()
+            );
+            assert_eq!(
+                entries_of(fixture.data_dir()),
+                vec!["yt-dlp".to_string()],
+                "{what}: уровнем выше корня установок не должно появиться ничего"
+            );
+            assert!(
+                entries_of(outside.path()).is_empty(),
+                "{what}: в постороннем каталоге не должно появиться ничего, а там {:?}",
+                entries_of(outside.path())
+            );
+        }
+    }
+
     // --- потолок, проверка первая: по объявленному размеру ---------------
 
     #[test]
@@ -938,7 +1237,7 @@ mod tests {
             0,
             "поток не должен открываться: отказ обязан случиться до запроса"
         );
-        fixture.assert_no_debris(&identity.build_id());
+        fixture.assert_no_debris(&build_id_of(identity));
     }
 
     #[test]
@@ -1035,7 +1334,7 @@ mod tests {
         let declared = 4 * PROGRESS_STEP_BYTES;
         let identity = ArchiveIdentity {
             version: CANDIDATE_VERSION,
-            sha256: "00",
+            sha256: WRONG_SHA256,
         };
         let source = StreamArchive::new(
             Origin::Network,
@@ -1062,7 +1361,7 @@ mod tests {
             seen <= declared,
             "прогресс не должен уходить за объявленный размер: {seen} из {declared}"
         );
-        fixture.assert_no_debris(&identity.build_id());
+        fixture.assert_no_debris(&build_id_of(identity));
     }
 
     // --- сумма и распаковка ---------------------------------------------
@@ -1078,7 +1377,7 @@ mod tests {
         let source = source_of(Origin::Network, body.len() as u64, &body, &opened);
         let identity = ArchiveIdentity {
             version: CANDIDATE_VERSION,
-            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            sha256: WRONG_SHA256,
         };
 
         let error = fetch_and_install(&source, identity, fixture.layout(), &mut |_, _, _| {})
@@ -1090,7 +1389,7 @@ mod tests {
             "в диагностике обязана быть фактическая сумма: {error}"
         );
         assert_eq!(opened.get(), 1, "поток открывался ровно один раз");
-        fixture.assert_no_debris(&identity.build_id());
+        fixture.assert_no_debris(&build_id_of(identity));
     }
 
     #[test]
@@ -1110,7 +1409,7 @@ mod tests {
             .expect_err("это не архив");
 
         assert!(matches!(error, FetchError::Archive { .. }), "{error}");
-        fixture.assert_no_debris(&identity.build_id());
+        fixture.assert_no_debris(&build_id_of(identity));
     }
 
     // --- успешный путь, оба источника ------------------------------------
@@ -1136,7 +1435,7 @@ mod tests {
             })
             .expect("целый архив с сошедшейся суммой обязан установиться");
 
-        assert_eq!(prepared.build_id, identity.build_id());
+        assert_eq!(prepared.build_id, build_id_of(identity));
         assert_eq!(prepared.version, CANDIDATE_VERSION);
         assert_eq!(
             prepared.dir,
@@ -1217,7 +1516,7 @@ mod tests {
         let prepared = fetch_and_install(&source, identity, fixture.layout(), &mut |_, _, _| {})
             .expect("ресурс бандла обязан ставиться тем же путём");
 
-        assert_eq!(prepared.build_id, identity.build_id());
+        assert_eq!(prepared.build_id, build_id_of(identity));
         assert!(prepared.executable.is_file());
         assert!(
             archive.is_file(),
@@ -1246,7 +1545,7 @@ mod tests {
             .expect_err("недополученный поток — не установка");
 
         assert!(matches!(error, FetchError::Network { .. }), "{error}");
-        fixture.assert_no_debris(&identity.build_id());
+        fixture.assert_no_debris(&build_id_of(identity));
     }
 
     #[test]
@@ -1273,7 +1572,7 @@ mod tests {
         let fixture = Fixture::new();
         let identity = ArchiveIdentity {
             version: CANDIDATE_VERSION,
-            sha256: "00",
+            sha256: WRONG_SHA256,
         };
 
         for (origin, expect_network) in [(Origin::Network, true), (Origin::Bundled, false)] {
@@ -1412,7 +1711,7 @@ mod tests {
         let opened = Cell::new(0);
         let identity = ArchiveIdentity {
             version: CANDIDATE_VERSION,
-            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            sha256: WRONG_SHA256,
         };
 
         for expected in 1..=2 {
@@ -1420,7 +1719,8 @@ mod tests {
             fetch_and_install(&source, identity, fixture.layout(), &mut |_, _, _| {})
                 .expect_err("сумма не сошлась");
 
-            let log = RepairLog::read(&fixture.layout().update_attempt_path(&identity.build_id()));
+            let log =
+                RepairLog::read(&fixture.layout().update_attempt_path(&build_id_of(identity)));
             assert_eq!(
                 log.attempts, expected,
                 "попытки обязаны накапливаться — иначе троттлингу TL-58 не на чем стоять"
@@ -1429,7 +1729,10 @@ mod tests {
         }
 
         assert!(
-            !fixture.layout().repair_path(&identity.build_id()).exists(),
+            !fixture
+                .layout()
+                .repair_path(&build_id_of(identity))
+                .exists(),
             "журнал починки подготовки трогать нельзя"
         );
     }
@@ -1452,7 +1755,7 @@ mod tests {
         assert!(
             !fixture
                 .layout()
-                .update_attempt_path(&identity.build_id())
+                .update_attempt_path(&build_id_of(identity))
                 .exists(),
             "удачная установка не должна оставлять записи о неудаче"
         );
@@ -1528,10 +1831,18 @@ mod tests {
             "потолок размера архива поднят выше обоснованного замерами"
         );
         // И сходимость с соседом: архив честной формы разворачивается
-        // примерно в 2,4 раза (130,0 МиБ дерева из 51,4 МиБ архива у
+        // примерно в 2,4 раза (124,0 МиБ дерева из 51,4 МиБ архива у
         // пинованного macOS-ассета), поэтому архив «по потолку» обязан
         // укладываться в потолок распаковки. Двинуть один потолок, не
         // взглянув на другой, этот assert не даст.
+        //
+        // Множитель 12/5 назван честно: это отношение пинованного
+        // ассета, округлённое вниз (настоящее — 2,41), а не худшее из
+        // замеров. Худшее по набору `upstream-trees.json` — 2,56
+        // (2024.12.03, macOS), и на нём 192 МиБ дали бы 491 МиБ, что в
+        // 512 МиБ всё ещё влезает, то есть вывод не меняется. Но
+        // консервативной границей было бы 2,56, а не 2,4; правка
+        // множителя — решение ведущего, не исполнителя (ревью TL-56).
         assert!(
             MAX_ARCHIVE_BYTES * 12 / 5 <= super::super::unpack::MAX_UNPACKED_BYTES,
             "потолок архива разошёлся с потолком распаковки: {} МиБ × 2,4 не влезает \
