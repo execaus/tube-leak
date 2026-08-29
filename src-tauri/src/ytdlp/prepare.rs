@@ -145,7 +145,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// экран подготовки — отдельный этап, он показывает ход и не обязан
 /// уложиться в бюджет запуска. Служебный экран после подготовки видит уже
 /// тёплое дерево, и его таймауты живут в `crate::commands::sidecar`.
-const WARMUP_TIMEOUT: Duration = Duration::from_secs(120);
+pub(super) const WARMUP_TIMEOUT: Duration = Duration::from_secs(120);
 
 // Соотношение сторожится на этапе компиляции: проверка «тёплое ли дерево»
 // обязана быть заметно короче прогрева, иначе она перестаёт отличать одно
