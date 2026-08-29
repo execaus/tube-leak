@@ -22,7 +22,7 @@ use tauri::{AppHandle, Manager, State};
 use crate::clock::now_iso8601;
 use crate::sidecar::{self, stderr_tail, ChildRegistry, SidecarError};
 use crate::types::{LaunchFailedReason, SidecarCheckReport, SidecarCheckResult, SidecarStatus};
-use crate::ytdlp;
+use crate::ytdlp::{self, InUse, InUseGuard};
 
 /// Верхняя граница времени служебного экрана по Н-2: версия должна
 /// появиться не позже, чем через 10 секунд после старта. Обе проверки идут
@@ -118,15 +118,40 @@ pub async fn check_sidecar(
     app: AppHandle,
     registry: State<'_, ChildRegistry>,
 ) -> Result<SidecarCheckReport, ()> {
+    // Страж занятости живёт до конца проверки: между резолвом и запуском
+    // `--version` уборка контура обновления не должна унести дерево,
+    // путь к которому мы только что отдали (Ф-7).
+    let (yt_dlp_path, _in_use) = match resolve_ytdlp_path(&app) {
+        Ok((path, guard)) => (Ok(path), Some(guard)),
+        Err(error) => (Err(error), None),
+    };
+
     Ok(check_report(
-        resolve_ytdlp_path(&app),
+        yt_dlp_path,
         sidecar::resolve_sidecar_path("ffmpeg"),
         &registry,
     )
     .await)
 }
 
-/// Путь к yt-dlp — в каталоге данных, а не рядом с приложением (TL-12).
+/// Путь к yt-dlp — в каталоге данных, а не рядом с приложением (TL-12),
+/// вместе со стражем занятости этой установки.
+///
+/// # Зачем страж и почему он неотделим от пути
+///
+/// Контур обновления (E6) держит на диске две установки и убирает всё
+/// прочее, а переключается на границе задач (Р-2) — значит бывают
+/// моменты, когда работающий процесс запущен из установки, которую
+/// запись уже не называет ни активной, ни известно-хорошей. Ф-7 и Ф-8
+/// требуют безусловного: такую установку уборка не трогает. Держится
+/// это отметкой, которую ставит **резолв**: получить путь мимо него
+/// нельзя, поэтому «кто получил путь — тот и держит установку» —
+/// свойство кода, а не договорённость.
+///
+/// Вызывающий обязан держать [`InUseGuard`] всё время, пока может
+/// запуститься процесс: у команды служебного экрана — на время
+/// проверки, у воркера задачи скачивания — на всю задачу вместе с
+/// повторами.
 ///
 /// Любая причина, по которой готовой установки нет (подготовка ещё не
 /// выполнялась, дерево не сошлось с манифестом, каталог данных
@@ -135,13 +160,17 @@ pub async fn check_sidecar(
 /// тот же статус, что у отсутствующего sidecar-файла, с той же подсказкой
 /// пользователю. Подробную причину знает и показывает экран подготовки
 /// (`prepare_ytdlp`), дублировать её здесь незачем.
-pub(super) fn resolve_ytdlp_path(app: &AppHandle) -> Result<PathBuf, SidecarError> {
+pub(super) fn resolve_ytdlp_path(
+    app: &AppHandle,
+) -> Result<(PathBuf, InUseGuard<'_>), SidecarError> {
     let data_dir = app.path().app_data_dir().map_err(|err| {
         eprintln!("yt-dlp: каталог данных приложения не определяется: {err}");
         SidecarError::NotFound
     })?;
 
-    ytdlp::installed_executable(&data_dir).map_err(|err| {
+    let in_use = app.state::<InUse>().inner();
+
+    ytdlp::installed_executable(&data_dir, in_use).map_err(|err| {
         eprintln!("yt-dlp: готовой установки нет: {err}");
         SidecarError::NotFound
     })

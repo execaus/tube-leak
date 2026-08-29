@@ -223,7 +223,6 @@ impl SmokeError {
     /// Пробовали ли на самом деле запускать. Нужно вызывающему для лога:
     /// «проверили и не вышло» и «даже не пробовали» — разные строки, и
     /// различать их по тексту сообщения было бы гаданием.
-    #[allow(dead_code)] // Читает оркестрация (TL-58).
     pub fn was_attempted(&self) -> bool {
         !matches!(self, Self::AlreadyFailed { .. })
     }
@@ -356,7 +355,6 @@ async fn run_and_judge(
 /// же build id не устанавливается повторно») исполнен не был. Спросить
 /// **до** скачивания может только тот, кто скачивание и затевает, — то
 /// есть оркестрация.
-#[allow(dead_code)] // Спрашивает оркестрация (TL-58) до скачивания.
 pub fn previous_failure(layout: &Layout, build_id: &BuildId) -> Option<RepairLog> {
     let log = RepairLog::read(&layout.smoke_path(build_id));
     (log.attempts >= MAX_SMOKE_ATTEMPTS).then_some(log)
@@ -369,7 +367,6 @@ pub fn previous_failure(layout: &Layout, build_id: &BuildId) -> Option<RepairLog
 /// ручная проверка обновлений или ручной откат, — решает TL-58; здесь
 /// объявлено, что такой выход есть, потому что без него запрет вечен, а
 /// С-5 обещает обратное.
-#[allow(dead_code)] // Зовёт ручное действие пользователя (TL-58).
 pub fn forget(layout: &Layout, build_id: &BuildId) {
     RepairLog::clear(&layout.smoke_path(build_id));
 }

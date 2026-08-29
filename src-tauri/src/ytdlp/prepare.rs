@@ -92,7 +92,7 @@ use tauri::{AppHandle, Emitter};
 
 use super::error::PrepareError;
 use super::layout::{self, Installed, Layout, RepairLog};
-use super::state::{self, InstallEntry, InstallState};
+use super::state::{self, InUse, InUseGuard, InstallEntry, InstallState};
 use super::unpack;
 use crate::sidecar::{self, ChildRegistry, SidecarError};
 use crate::types::{YtDlpPrepareEvent, YtDlpPrepareStage, YtDlpPrepared};
@@ -661,6 +661,27 @@ async fn install_and_warm(
 /// передавался `&dyn ProgressSink`, единственным способом это соблюсти
 /// была дисциплина вызывающего; с замыканием канал выбирает тот, кто
 /// установку затеял, и выбрать чужой не может.
+///
+/// # Порядок шагов: распаковать, и только потом сносить прежнее
+///
+/// Прежний каталог установки и его манифест удаляются **после** того,
+/// как распаковка в `.staging-*` дошла до конца, а не до неё. Разница
+/// не косметическая: до TL-58 снос стоял первым, и отказ распаковки —
+/// битый архив, потолок объёма, «не ровно один исполняемый в корне» —
+/// уносил рабочую установку с тем же идентификатором. Ревью TL-56
+/// показало это запуском: после отказа на битом архиве не оставалось ни
+/// каталога, ни исполняемого файла, ни манифеста.
+///
+/// Отсюда гарантия С-4 («активная установка не тронута ничем»)
+/// становится свойством конструкции, а не договорённостью о том, с
+/// каким идентификатором сюда можно звать. Незащищённым остаётся одно
+/// окно — между сносом и `rename`, то есть между двумя операциями
+/// файловой системы; прежде оно длилось всю распаковку.
+///
+/// Цена названа: в момент промоушена на диске лежат оба дерева сразу,
+/// пик расхода — на одну установку (около 124 МиБ) больше прежнего.
+/// Н-4 этот пик уже закладывает («активная + известно-хорошая +
+/// подготавливаемая + архив»).
 pub(super) fn install(
     archive_path: &Path,
     layout: &Layout,
@@ -676,18 +697,24 @@ pub(super) fn install(
     // требуется: своего у нас ещё нет, а чужой — не наш.
     let staging = layout.create_staging_dir(&build_id)?;
 
-    // Прежняя установка этого же build id могла остаться непригодной
-    // (`validate` уже сказала, что она не годится) — переименование в
-    // занятый путь не пройдёт, поэтому её надо убрать до распаковки.
-    unpack::remove_dir_if_exists(&install_dir)?;
-    let _ = std::fs::remove_file(&manifest_path);
-
     let unpacked = unpack::unpack(archive_path, &staging, on_progress).inspect_err(|_| {
         // Полураспакованное дерево не должно пережить неудачу — иначе
         // следующий запуск найдёт мусор на 124 МиБ и будет чистить его
         // «за прошлый раз».
         let _ = unpack::remove_dir_if_exists(&staging);
     })?;
+
+    // Прежняя установка этого же build id могла остаться непригодной
+    // (`validate` уже сказала, что она не годится) — переименование в
+    // занятый путь не пройдёт, поэтому её надо убрать. Убирается она
+    // **после** распаковки, и порядок здесь несущий — см. «Порядок
+    // шагов» в doc функции. Отказ сноса оставляет `.staging-*` на диске:
+    // его уберёт следующий запуск (`prepare_inner` чистит остатки), а
+    // рабочее дерево при этом цело.
+    unpack::remove_dir_if_exists(&install_dir).inspect_err(|_| {
+        let _ = unpack::remove_dir_if_exists(&staging);
+    })?;
+    let _ = std::fs::remove_file(&manifest_path);
 
     unpack::promote(&staging, &install_dir)?;
 
@@ -867,7 +894,20 @@ fn elapsed_ms(started: Instant) -> u64 {
 ///
 /// `Err` означает «подготовка не выполнена или дерево непригодно» — это
 /// не сбой, а нормальное состояние до первого вызова `prepare_ytdlp`.
-pub fn installed_executable(data_dir: &Path) -> Result<PathBuf, PrepareError> {
+///
+/// # Почему вместе с путём отдаётся страж
+///
+/// Ф-7 требует безусловного: установка, из которой запущен работающий
+/// процесс, не удаляется — даже если она уже не активна и не
+/// известно-хорошая. Такое состояние не экзотика, а прямое следствие
+/// Р-2: контур переключает активную запись на границе задач, а
+/// работающая задача продолжает жить в прежнем дереве. Пока
+/// [`InUseGuard`] жив, уборка ([`state::cleanup`]) это дерево не
+/// трогает; когда он уронен, защита снимается сама.
+pub fn installed_executable<'a>(
+    data_dir: &Path,
+    in_use: &'a InUse,
+) -> Result<(PathBuf, InUseGuard<'a>), PrepareError> {
     let layout = Layout::new(data_dir);
     let state = InstallState::load(&layout);
     let resolved = state::resolve(&layout, &state)?;
@@ -885,12 +925,26 @@ pub fn installed_executable(data_dir: &Path) -> Result<PathBuf, PrepareError> {
         );
     }
 
-    Ok(resolved.installed.executable)
+    // Отметка занятости ставится здесь, и это единственное место, где
+    // путь к yt-dlp вообще берётся (Ф-5). Совпадение не случайное:
+    // правило «кто получил путь, тот и держит установку» верно ровно
+    // тогда, когда получить путь мимо этой функции нельзя. Разъедини их
+    // — и появится вызывающий, который отметить забыл, а следом уборка,
+    // снёсшая дерево под работающим процессом (Ф-7, Ф-8).
+    //
+    // Страж живёт столько, сколько его держит вызывающий: у команды
+    // служебного экрана — на время одного запуска, у воркера задачи
+    // скачивания — на всю задачу, включая повторы (Р-2: «задача доходит
+    // до конца на той версии, на которой началась»).
+    let guard = in_use.mark(&resolved.build_id);
+
+    Ok((resolved.installed.executable, guard))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     /// Идентификатор вложенной сборки для тестов. Отдельный хелпер, а не
     /// `unwrap` по месту: пин обязан проходить ту же проверку, что и
@@ -1601,16 +1655,121 @@ mod tests {
     #[tokio::test]
     async fn resolving_the_executable_requires_a_finished_preparation() {
         let fixture = fixture(PRINTS_VERSION);
+        let in_use = InUse::new();
 
-        installed_executable(&fixture.data_dir).expect_err("до подготовки резолвить нечего");
+        installed_executable(&fixture.data_dir, &in_use)
+            .expect_err("до подготовки резолвить нечего");
 
         fixture
             .prepare(&RecordingSink::default())
             .await
             .expect("подготовка");
 
-        let path = installed_executable(&fixture.data_dir).expect("после подготовки путь есть");
+        let (path, _guard) =
+            installed_executable(&fixture.data_dir, &in_use).expect("после подготовки путь есть");
         assert!(path.ends_with(EXECUTABLE_NAME));
+    }
+
+    #[test]
+    fn a_failed_unpack_leaves_the_previous_installation_of_the_same_id_alone() {
+        // Гарантия С-4 в её конструктивной форме (TL-58): распаковка идёт
+        // в `.staging-*` целиком, и прежнее дерево сносится только после
+        // её успеха. До этой правки порядок был обратным, и ревью TL-56
+        // показало запуском, что отказ на битом архиве не оставлял ни
+        // каталога, ни исполняемого файла, ни манифеста — то есть уносил
+        // рабочую установку.
+        //
+        // Тест зовёт `install` напрямую: через контур этот путь закрыт
+        // отдельной проверкой («ставить поверх активной нечего»), а
+        // предмет здесь — сама установка, у которой два вызывающих.
+        let dir = tempdir().expect("tempdir");
+        let data_dir = dir.path().join("app-data");
+        let layout = Layout::new(&data_dir);
+        layout.create_root().expect("корень обязан создаваться");
+
+        let identity = layout::ArchiveIdentity::bundled();
+        let build_id = pinned_build_id();
+        let install_dir = layout.install_dir(&build_id);
+        let manifest_path = layout.manifest_path(&build_id);
+
+        // Рабочая установка того же build id — та, которую отказ не имеет
+        // права тронуть.
+        let good = dir.path().join("good.zip");
+        write_fake_ytdlp_zip(&good, PRINTS_VERSION);
+        install(&good, &layout, identity, &mut |_, _| {}).expect("первая установка");
+        assert!(install_dir.join(EXECUTABLE_NAME).exists());
+        let before = fs::read(install_dir.join(EXECUTABLE_NAME)).expect("файл читается");
+
+        // Архив, который не открывается как zip: отказ приходит из
+        // распаковки, то есть ровно оттуда, где раньше стоял снос.
+        let broken = dir.path().join("broken.zip");
+        fs::write(&broken, b"not a zip at all").expect("битый архив");
+
+        let error = install(&broken, &layout, identity, &mut |_, _| {})
+            .expect_err("битый архив обязан быть отвергнут");
+
+        assert!(
+            install_dir.exists(),
+            "каталог рабочей установки обязан пережить отказ ({error})"
+        );
+        assert!(
+            manifest_path.exists(),
+            "манифест рабочей установки обязан пережить отказ ({error})"
+        );
+        assert_eq!(
+            fs::read(install_dir.join(EXECUTABLE_NAME)).expect("файл читается"),
+            before,
+            "исполняемый файл обязан остаться тем же байт в байт"
+        );
+        assert!(
+            layout::validate(&layout, &build_id).is_ok(),
+            "установка обязана остаться пригодной к запуску"
+        );
+
+        // И ни одного полураспакованного дерева рядом: неудача не
+        // оставляет за собой 124 МиБ.
+        for entry in fs::read_dir(layout.root()).expect("корень читается") {
+            let name = entry.expect("запись").file_name();
+            assert!(
+                !name.to_string_lossy().starts_with(".staging-"),
+                "остался каталог распаковки {name:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolving_the_executable_marks_the_installation_as_in_use() {
+        // Ф-7: установка, из которой запущен процесс, не удаляется. Эта
+        // функция отвечает за половину утверждения — «контур знает, какая
+        // установка занята», — и знает он ровно потому, что путь берётся
+        // только здесь. Вторая половина (уборка отметки уважает) живёт и
+        // проверена в `super::state`, и повторять её здесь нечем: тест,
+        // который сносит дерево, проверял бы чужую гарантию, а не эту.
+        let fixture = fixture(PRINTS_VERSION);
+        let in_use = InUse::new();
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("подготовка");
+
+        assert!(
+            in_use.snapshot().is_empty(),
+            "до резолва занятых установок нет"
+        );
+
+        let (_path, guard) =
+            installed_executable(&fixture.data_dir, &in_use).expect("путь обязан находиться");
+        assert_eq!(
+            in_use.snapshot(),
+            BTreeSet::from([pinned_build_id()]),
+            "отмеченной обязана быть ровно та установка, путь к которой отдан"
+        );
+
+        drop(guard);
+        assert!(
+            in_use.snapshot().is_empty(),
+            "отметка держится стражем и снимается вместе с ним"
+        );
     }
 
     #[tokio::test]
@@ -1692,7 +1851,9 @@ mod tests {
 
         // И то же самое для всех потребителей пути (служебный экран,
         // разбор ссылки, скачивание): они ходят через тот же резолв.
-        let resolved = installed_executable(&fixture.data_dir).expect("путь обязан находиться");
+        let in_use = InUse::new();
+        let (resolved, _guard) =
+            installed_executable(&fixture.data_dir, &in_use).expect("путь обязан находиться");
         assert_eq!(
             resolved,
             fixture
