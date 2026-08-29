@@ -1312,3 +1312,626 @@ fn capabilities_stay_local_and_pinned_to_named_windows() {
         }
     }
 }
+
+// ───────────────────────── каналы событий (TL-53) ─────────────────────────
+//
+// Вторая ось того же вопроса «что пересекает границу окна». Первая —
+// команды: их ACL действительно проверяет, и тесты выше опираются на
+// настоящую резолюцию `RuntimeAuthority`. С каналами так не выйдет, и это
+// проверено, а не взято из документации: в ACL-манифесте `core:event`
+// поле `global_scope_schema` пустое, а команда `listen` в tauri 2.11.5
+// объявлена без `CommandScope` (`src/event/plugin.rs`) — то есть
+// `allow-listen` работает по принципу «все каналы или ни одного».
+//
+// Отсюда разделение труда: разрешение `plugin:event|listen` держат тесты
+// выше, а **какие именно каналы** существуют — этот раздел. Список живёт
+// в scope у `core:event:allow-listen` в capability основного окна: место
+// выбрано потому, что ответ на вопрос «что пересекает границу» должен
+// быть в одном файле, а не в двух. Tauri этот scope игнорирует; сторож
+// здесь — тест, а не рантайм, и `the_event_permission_still_carries_no_scope_of_its_own`
+// покраснеет в тот день, когда это перестанет быть правдой.
+//
+// Что раздел ловит: канал, который ядро эмитит, а capability не
+// объявляет (класс TL-24 — разрешение появилось позже подписчика);
+// запись без эмитента (выданное потом трудно забрать); подписку
+// фронтенда на канал, которого никто не объявлял, — в том числе опечатку
+// в имени, самый тихий из отказов этого рода (подписка на
+// `ytdlp://updates` не падает, она просто молчит вечно).
+//
+// Чего не ловит, и это перечень, а не оговорка. Первое — имя, собранное
+// из динамической строки (`format!("{}://{}", …)`, конкатенация): то же
+// ограничение, что у скана команд, и та же конвенция против него —
+// имена каналов держат в константах. Второе — подписку на канал с
+// невиданной схемой: фронтендовый скан считает кандидатами только
+// литералы, чья схема уже встречается в ядре, иначе в набор попал бы
+// `https://localhost` из теста разбора ссылок. Пробел безвредный: канала
+// с новой схемой никто не эмитит, то есть отказ — «событие не приходит»,
+// а не «ACL отклонил вызов». Третье — самый первый канал новой схемы,
+// если его сразу назвали как адрес (`queue://a/b` при том, что ни одного
+// правильного `queue://…` в проекте ещё нет): схема становится канальной
+// от первого узнанного имени, и до него отличить такой литерал от адреса
+// не по чему.
+//
+// Чего в этом перечне больше нет — «канал, названный как адрес». Второе
+// ревью TL-53 показало, что `"ytdlp://update.v2"` и `"ytdlp://update/done"`
+// в ядре без записи в capability дают 26 зелёных тестов; проверка формы
+// объявленных каналов туда не дотягивалась по построению — она ходит по
+// объявленным, а забытый канал отсутствует в этом множестве ровно
+// потому, что его забыли. Теперь адрес со схемой, которая уже известна
+// как канальная, — это падение, а не пропуск.
+//
+// Чего раздел больше не делает — молча пропускать непонятое. Ровно этим
+// он и подвёл на ревью TL-53: сегмент `update_done` не разбирался,
+// константа исчезала, 24 теста оставались зелёными при двух каналах,
+// которых нет ни в одной capability. Теперь всё, что разбор не смог
+// отнести ни к каналу, ни к адресу, — падение со списком литералов.
+
+/// Итог разбора одного исходника: найденные каналы и литералы, о которых
+/// разбор не может сказать ничего определённого.
+///
+/// Второе поле существует потому, что первая версия его не имела и молча
+/// теряла всё, что не подошло под форму. Ревью TL-53 добавило в ядро
+/// `"ytdlp://update_done"` и `"ytdlp://updateDone"` — сегмент с
+/// подчёркиванием и с заглавной буквой не разбирался, обе константы
+/// пропали, и 24 теста остались зелёными при двух каналах, которых нет ни
+/// в одной capability. Это класс TL-24 целиком: отказ ACL, видимый только
+/// на собранном `.app`.
+#[derive(Default)]
+struct ChannelScan {
+    channels: BTreeSet<String>,
+    /// Литералы, которые не удалось отнести ни к каналу, ни к адресу.
+    /// Обязаны стать падением у вызывающего, а не пропуском.
+    unparsed: Vec<String>,
+    /// Литералы, отнесённые к адресам (`https://i.ytimg.com/vi/abc.jpg`).
+    ///
+    /// Отдаются наружу, а не выбрасываются на месте, потому что решение
+    /// «адрес это или изувеченное имя канала» зависит от схемы, а какие
+    /// схемы канальные — известно только после обхода всех файлов. Разбор
+    /// одного файла этого знать не может и не притворяется, что может;
+    /// взвешивает их [`promote_addresses_with_a_channel_scheme`].
+    addresses: Vec<String>,
+}
+
+/// Адрес со схемой, которая уже известна как канальная, — это не адрес.
+///
+/// Последний молчаливый пропуск раздела, найденный на втором ревью
+/// TL-53: `"ytdlp://update.v2"` и `"ytdlp://update/done"` в ядре **без**
+/// записи в capability давали 26 зелёных тестов. Проверка формы
+/// объявленных каналов сюда не дотягивалась по построению — она ходит по
+/// объявленным, а забытый канал отсутствует в этом множестве ровно
+/// потому, что его забыли.
+///
+/// Ложных срабатываний не будет: настоящих адресов со схемами `ytdlp` и
+/// `download` в проекте нет и быть не может — это наши собственные схемы,
+/// а не сетевые. Адрес с чужой схемой (`https`, `ftp`) по-прежнему
+/// пропускается: он и есть адрес.
+fn promote_addresses_with_a_channel_scheme(
+    channels: &BTreeSet<String>,
+    addresses: Vec<(String, String)>,
+    unparsed: &mut Vec<String>,
+) {
+    let channel_schemes: BTreeSet<&str> = channels.iter().map(|c| scheme_of(c)).collect();
+    // Пара «где» и «что», а не готовая строка: `scheme_of` обязан
+    // смотреть на литерал, а не на путь файла перед ним. Первая версия
+    // склеивала их раньше времени, схемой оказывался хвост пути, и ветка
+    // не срабатывала ни разу — поймано мутацией, не чтением.
+    for (whence, literal) in addresses {
+        let scheme = scheme_of(&literal);
+        if channel_schemes.contains(scheme) {
+            unparsed.push(format!(
+                "{whence}: {literal} (схема `{scheme}` уже используется \
+                 каналами, а имя похоже на адрес)"
+            ));
+        }
+    }
+}
+
+/// Разбирает литералы с `://` на каналы и адреса.
+///
+/// # Что разбор различает и где проходит его настоящая граница
+///
+/// Кандидат — только содержимое **строкового литерала** в кавычках `"`
+/// или `'`. Обратные кавычки не считаются: ими в JSDoc набраны
+/// упоминания каналов в прозе, а не подписки.
+///
+/// Внутри литерала решает остаток после `://`:
+///
+/// - точка, слеш или двоеточие в остатке — похоже на **адрес** (хост,
+///   путь, порт). Окончательное решение принимает не разбор, а
+///   вызывающий: адрес с чужой схемой (`https://i.ytimg.com/vi/abc.jpg`,
+///   `ftp://example.com/x`) пропускается, а вот такой же по форме
+///   литерал с уже канальной схемой (`ytdlp://update.v2`) — это
+///   изувеченное имя канала, и он становится падением (см.
+///   [`promote_addresses_with_a_channel_scheme`]). Пустой остаток
+///   (`"https://"`, фикстура разбора ссылок) — не канал и не адрес;
+/// - остаток из `[A-Za-z0-9_-]` при схеме вида `[a-z][a-z0-9]*` — это
+///   **канал**, и неважно, как он написан: `update`, `update_done`,
+///   `updateDone` разбираются одинаково;
+/// - **всё остальное** (пробел, `?`, `%`, экранированная кавычка,
+///   не-ASCII) — не пропуск, а запись в [`ChannelScan::unparsed`],
+///   то есть падение с объяснением у вызывающего.
+///
+/// Что осталось за границей, сказано точно: **самый первый канал новой
+/// схемы, названный как адрес**. Схема становится канальной оттого, что
+/// с ней уже нашёлся хотя бы один правильно названный канал; пока такого
+/// нет, `queue://a/b` неотличим от адреса. Как только у схемы появится
+/// первое нормальное имя, все её кривые имена начнут падать. Со стороны
+/// объявленных каналов та же конвенция закреплена отдельно
+/// ([`declared_channels_keep_the_shape_the_scan_can_recognise`]): имя вне
+/// формы `[a-z][a-z0-9]*://[A-Za-z0-9_-]+` не сможет тихо появиться в
+/// capability.
+fn channel_literals(content: &str) -> ChannelScan {
+    const SEPARATOR: &str = "://";
+    let bytes = content.as_bytes();
+    let mut scan = ChannelScan::default();
+
+    for (at, _) in content.match_indices(SEPARATOR) {
+        // Схема — слева от разделителя, сразу за открывающей кавычкой.
+        let scheme_start = bytes[..at]
+            .iter()
+            .rposition(|c| !c.is_ascii_alphanumeric())
+            .map_or(0, |i| i + 1);
+        // Схемы нет вовсе: `scheme + '://' + name` — склейка на месте, а
+        // не литерал (ограничение заявлено в шапке раздела).
+        if scheme_start == at {
+            continue;
+        }
+        let Some(quote) = scheme_start.checked_sub(1).map(|i| bytes[i]) else {
+            continue;
+        };
+        if quote != b'"' && quote != b'\'' {
+            continue;
+        }
+
+        // Литерал закрывается той же кавычкой и не переходит на
+        // следующую строку.
+        let body_start = at + SEPARATOR.len();
+        let Some(stop) = bytes[body_start..]
+            .iter()
+            .position(|c| *c == quote || *c == b'\n')
+            .map(|i| body_start + i)
+        else {
+            scan.unparsed
+                .push(format!("{}… (литерал не закрыт)", &content[scheme_start..]));
+            continue;
+        };
+        if bytes[stop] != quote {
+            scan.unparsed.push(format!(
+                "{} (литерал не закрыт до конца строки)",
+                &content[scheme_start..stop]
+            ));
+            continue;
+        }
+
+        let scheme = &content[scheme_start..at];
+        let body = &content[body_start..stop];
+        let literal = &content[scheme_start..stop];
+
+        // Вырожденный остаток (`"https://"` — фикстура разбора ссылок):
+        // ни канал, ни адрес, и сказать о нём нечего.
+        if body.is_empty() {
+            continue;
+        }
+        // Похоже на адрес: хост, путь или порт. Окончательное решение —
+        // за вызывающим, он один знает канальные схемы.
+        if body.contains(['.', '/', ':']) {
+            scan.addresses.push(literal.to_string());
+            continue;
+        }
+
+        let scheme_ok = scheme.starts_with(|c: char| c.is_ascii_lowercase())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+        let body_ok = body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+
+        if scheme_ok && body_ok {
+            scan.channels.insert(literal.to_string());
+        } else {
+            scan.unparsed.push(literal.to_string());
+        }
+    }
+
+    scan
+}
+
+/// Схема канала — часть до `://`.
+fn scheme_of(channel: &str) -> &str {
+    channel
+        .split_once("://")
+        .map_or(channel, |(scheme, _)| scheme)
+}
+
+/// Все исходники ядра.
+fn core_source_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
+        let entries = fs::read_dir(dir).unwrap_or_else(|err| panic!("{dir:?} не читается ({err})"));
+        for entry in entries {
+            let path = entry.expect("запись каталога ядра читается").path();
+            if path.is_dir() {
+                walk(&path, files);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                files.push(path);
+            }
+        }
+    }
+    walk(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    assert!(
+        !files.is_empty(),
+        "в src-tauri/src не нашлось ни одного .rs — скан каналов ядра \
+         молча не нашёл бы ничего"
+    );
+    files
+}
+
+/// Каналы, которые эмитит ядро.
+fn core_event_channels() -> BTreeSet<String> {
+    let mut channels = BTreeSet::new();
+    let mut unparsed = Vec::new();
+    // Адреса копятся до конца обхода: канальные схемы известны только
+    // после того, как найден последний канал.
+    let mut addresses = Vec::new();
+    for file in core_source_files() {
+        let content = fs::read_to_string(&file).expect("исходник ядра читается");
+        let scan = channel_literals(&content);
+        channels.extend(scan.channels);
+        for literal in scan.unparsed {
+            unparsed.push(format!("{}: {literal}", file.display()));
+        }
+        for literal in scan.addresses {
+            addresses.push((file.display().to_string(), literal));
+        }
+    }
+    promote_addresses_with_a_channel_scheme(&channels, addresses, &mut unparsed);
+    assert!(
+        unparsed.is_empty(),
+        "в исходниках ядра есть литералы с `://`, которые разбор не смог \
+         отнести ни к каналу, ни к адресу:\n{}\nПропустить их нельзя: \
+         именно так канал, которого нет в capability, остаётся невидимым \
+         до собранного .app (TL-24). Приведите имя к форме \
+         `схема://сегмент` либо научите разбор новой форме осознанно.",
+        unparsed.join("\n")
+    );
+    channels
+}
+
+/// Каналы, на которые подписывается фронтенд.
+///
+/// Кандидатами считаются литералы, чья схема уже встречается в ядре:
+/// иначе в набор попал бы `https://localhost` из теста разбора ссылок, и
+/// сторож требовал бы объявить его каналом. Схемы берутся именно из ядра,
+/// а не из capability: возьми мы их оттуда, канал, забытый в capability,
+/// перестал бы быть кандидатом ровно потому, что его забыли, — и
+/// проверка выключала бы себя сама на том случае, ради которого написана.
+fn frontend_event_channels() -> BTreeSet<String> {
+    let schemes: BTreeSet<String> = core_event_channels()
+        .iter()
+        .map(|channel| scheme_of(channel).to_string())
+        .collect();
+    let (_, files) = scanned_files();
+    let mut channels = BTreeSet::new();
+    let mut unparsed = Vec::new();
+    let mut addresses = Vec::new();
+    for file in files {
+        let bytes = fs::read(&file).expect("исходник фронтенда читается");
+        let scan = channel_literals(&String::from_utf8_lossy(&bytes));
+        for channel in scan.channels {
+            if schemes.contains(scheme_of(&channel)) {
+                channels.insert(channel);
+            }
+        }
+        for literal in scan.unparsed {
+            unparsed.push(format!("{}: {literal}", file.display()));
+        }
+        for literal in scan.addresses {
+            addresses.push((file.display().to_string(), literal));
+        }
+    }
+    // Канальные схемы берутся из ядра — те же, по которым отбирались
+    // сами каналы: `'ytdlp://prepare/x'` во фронтенде такой же тихий
+    // отказ, как в ядре, а `https://…` остаётся адресом.
+    let core = core_event_channels();
+    promote_addresses_with_a_channel_scheme(&core, addresses, &mut unparsed);
+    assert!(
+        unparsed.is_empty(),
+        "во фронтенде есть литералы с `://`, которые разбор не смог \
+         отнести ни к каналу, ни к адресу:\n{}\nЕсли это не про подписку \
+         вовсе — литерал всё равно обязан быть разбираемым: молчаливый \
+         пропуск здесь означал бы подписку, о которой сторож не знает, а \
+         отличить одно от другого разбор не может.",
+        unparsed.join("\n")
+    );
+    channels
+}
+
+/// Каналы, объявленные в capability основного окна.
+///
+/// Читаются из обоих файлов сразу — из исходного `capabilities/main.json`
+/// и из `gen/schemas/capabilities.json`, который собирает `tauri-build`.
+/// Сверка между ними не педантизм: в приложение уезжает второй, и
+/// объявление, застрявшее в первом, было бы объявлением, которого в
+/// сборке нет.
+fn declared_event_channels() -> BTreeSet<String> {
+    fn scope_events(capability: &serde_json::Value) -> BTreeSet<String> {
+        let mut events = BTreeSet::new();
+        for entry in capability["permissions"].as_array().unwrap_or(&Vec::new()) {
+            for allowed in entry["allow"].as_array().unwrap_or(&Vec::new()) {
+                if let Some(event) = allowed["event"].as_str() {
+                    events.insert(event.to_string());
+                }
+            }
+        }
+        events
+    }
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(manifest_dir.join("capabilities/main.json"))
+            .expect("capabilities/main.json читается"),
+    )
+    .expect("capabilities/main.json — валидный JSON");
+    let generated: BTreeMap<String, serde_json::Value> = serde_json::from_str(
+        &fs::read_to_string(manifest_dir.join("gen/schemas/capabilities.json"))
+            .expect("gen/schemas/capabilities.json читается"),
+    )
+    .expect("capabilities.json — валидный JSON");
+
+    let declared = scope_events(&source);
+    let shipped: BTreeSet<String> = generated.values().flat_map(scope_events).collect();
+    assert_eq!(
+        declared, shipped,
+        "capabilities/main.json и сгенерированный gen/schemas/capabilities.json \
+         объявляют разные наборы каналов. В приложение уезжает второй; если \
+         правку исходника не подхватили — пересоберите (tauri-build \
+         перегенерирует его сам)."
+    );
+    declared
+}
+
+/// Ядро и capability говорят об одном и том же наборе каналов.
+///
+/// Недостача — тот самый TL-24: канал существует, разрешения нет, и в
+/// dev-режиме это не проявляется. Избыток — запись без эмитента: она
+/// переживёт удаление канала и останется молча разрешать то, чего нет.
+#[test]
+fn every_event_channel_the_core_emits_is_declared_in_the_capability() {
+    let emitted = core_event_channels();
+    let declared = declared_event_channels();
+
+    let missing: Vec<&String> = emitted.difference(&declared).collect();
+    assert!(
+        missing.is_empty(),
+        "ядро эмитит каналы, которых нет в capabilities/main.json: {missing:?}\n\
+         Объявление обязано появляться в том же изменении, что и канал, и \
+         раньше первого подписчика — иначе подписка молча отклоняется ACL \
+         только в собранном .app (TL-24)."
+    );
+
+    let stale: Vec<&String> = declared.difference(&emitted).collect();
+    assert!(
+        stale.is_empty(),
+        "в capabilities/main.json объявлены каналы, которых ядро не эмитит: \
+         {stale:?}\nЛибо канал переименовали и запись осталась мёртвой, либо \
+         объявление опередило не только подписчика, но и сам эмитент."
+    );
+}
+
+/// Фронтенд подписывается только на объявленные каналы.
+#[test]
+fn the_frontend_listens_only_on_declared_event_channels() {
+    let declared = declared_event_channels();
+    let undeclared: Vec<String> = frontend_event_channels()
+        .into_iter()
+        .filter(|channel| !declared.contains(channel))
+        .collect();
+
+    assert!(
+        undeclared.is_empty(),
+        "фронтенд подписывается на каналы, которых никто не объявлял: \
+         {undeclared:?}\nТакая подписка не падает — она молчит вечно, и \
+         опечатка в имени выясняется только тем, что экран не оживает."
+    );
+}
+
+/// Скан всё ещё видит каналы, которые в проекте точно есть.
+///
+/// Без канарейки обе проверки выше вырождаются в «пусто равно пусту»:
+/// сломанный разбор литералов дал бы зелёный тест на любом наборе
+/// объявлений.
+#[test]
+fn the_channel_scan_still_finds_the_channels_that_exist() {
+    let emitted = core_event_channels();
+    for channel in ["ytdlp://prepare", "download://progress", "ytdlp://update"] {
+        assert!(
+            emitted.contains(channel),
+            "скан ядра не нашёл {channel} — разбор литералов сломан, и обе \
+             проверки каналов ничего не проверяют"
+        );
+    }
+    assert!(
+        frontend_event_channels().contains("ytdlp://prepare"),
+        "скан фронтенда не нашёл подписку экрана подготовки, хотя \
+         src/composables/useYtDlpPrepare.ts её делает"
+    );
+}
+
+/// Разбор литерала отличает канал от адреса, от прозы и от непонятного.
+///
+/// Первые два случая — те самые, на которых ревью TL-53 поймало молчащий
+/// сторож: сегмент с подчёркиванием и сегмент с заглавной буквой
+/// пропадали, и проверка каналов зеленела при двух необъявленных каналах
+/// в ядре.
+#[test]
+fn a_url_in_the_sources_is_not_mistaken_for_an_event_channel() {
+    let found = |source: &str| channel_literals(source).channels;
+
+    for (source, expected) in [
+        (
+            "const PROGRESS = 'download://progress'\n",
+            "download://progress",
+        ),
+        (
+            "pub const E: &str = \"ytdlp://update\";\n",
+            "ytdlp://update",
+        ),
+        (
+            "pub const A: &str = \"ytdlp://update_done\";\n",
+            "ytdlp://update_done",
+        ),
+        (
+            "pub const B: &str = \"ytdlp://updateDone\";\n",
+            "ytdlp://updateDone",
+        ),
+    ] {
+        assert_eq!(
+            found(source),
+            BTreeSet::from([expected.to_string()]),
+            "имя канала обязано находиться в любой форме сегмента: {source}"
+        );
+    }
+
+    for not_a_channel in [
+        "expect(looksLikeUrl('https://i.ytimg.com/vi/abc.jpg')).toBe(true)\n",
+        "const partial = 'https://'\n",
+        "/// Событие `ytdlp://update` — упоминание в прозе, не литерал\n",
+        "const built = scheme + '://' + name\n",
+    ] {
+        assert!(
+            found(not_a_channel).is_empty(),
+            "принято за канал: {not_a_channel}"
+        );
+    }
+
+    assert_eq!(
+        found("listen('ytdlp://updates', handler)\n"),
+        BTreeSet::from(["ytdlp://updates".to_string()]),
+        "опечатка в имени обязана остаться кандидатом — ловить её и есть \
+         смысл проверки"
+    );
+}
+
+/// Непонятная форма — падение с объяснением, а не пропуск.
+///
+/// Оборотная сторона теста выше и главный урок ревью: пропущенный литерал
+/// не оставляет следа, и сторож, который его пропустил, отчитывается
+/// зелёным. Всё, что разбор не смог отнести ни к каналу, ни к адресу,
+/// обязано доехать до вызывающего списком.
+#[test]
+fn a_literal_the_scan_cannot_classify_is_reported_instead_of_skipped() {
+    for suspicious in [
+        "pub const E: &str = \"ytdlp://update done\";\n",
+        "pub const E: &str = \"ytdlp://update?force=1\";\n",
+        "pub const E: &str = \"ytdlp://обновление\";\n",
+        "pub const E: &str = \"Ytdlp://update\";\n",
+    ] {
+        let scan = channel_literals(suspicious);
+        assert!(
+            scan.channels.is_empty() && !scan.unparsed.is_empty(),
+            "разбор промолчал о литерале, которого не понял: {suspicious}"
+        );
+    }
+}
+
+/// Схема решает, адрес это или изувеченное имя канала.
+///
+/// Единичный тест на ветку, которой закрыт последний молчаливый пропуск
+/// раздела. Обе стороны важны одинаково: наша схема с адресной формой
+/// обязана падать, чужая схема с той же формой — оставаться адресом,
+/// иначе каждый `https://…` в проекте начал бы ронять проверку каналов.
+#[test]
+fn an_address_with_our_own_scheme_is_a_mangled_channel_name() {
+    let channels = BTreeSet::from([
+        "ytdlp://prepare".to_string(),
+        "download://progress".to_string(),
+    ]);
+    let addresses = vec![
+        ("ядро".to_string(), "ytdlp://update.v2".to_string()),
+        ("ядро".to_string(), "ytdlp://update/done".to_string()),
+        (
+            "ядро".to_string(),
+            "https://i.ytimg.com/vi/abc.jpg".to_string(),
+        ),
+        ("ядро".to_string(), "ftp://example.com/x".to_string()),
+    ];
+
+    let mut unparsed = Vec::new();
+    promote_addresses_with_a_channel_scheme(&channels, addresses, &mut unparsed);
+
+    assert_eq!(
+        unparsed.len(),
+        2,
+        "ожидались ровно два повышения — оба с канальной схемой: {unparsed:?}"
+    );
+    assert!(
+        unparsed
+            .iter()
+            .all(|reported| reported.contains("ytdlp://")),
+        "повышен литерал с чужой схемой — каждый адрес в проекте станет \
+         падением: {unparsed:?}"
+    );
+}
+
+/// Объявленные каналы держатся формы, которую разбор умеет узнавать.
+///
+/// Единственная граница разбора, названная в его doc: канал, названный
+/// как адрес (с точкой или слешем в имени), был бы принят за адрес и
+/// пропущен. Здесь эта граница и охраняется — имя вне конвенции не
+/// сможет тихо появиться в capability, потому что уронит этот тест
+/// раньше, чем разойдётся со сканом.
+#[test]
+fn declared_channels_keep_the_shape_the_scan_can_recognise() {
+    let declared = declared_event_channels();
+    assert!(
+        !declared.is_empty(),
+        "в capability не объявлено ни одного канала — проверка формы \
+         прошла бы вхолостую"
+    );
+    for channel in declared {
+        let scan = channel_literals(&format!("\"{channel}\""));
+        assert_eq!(
+            scan.channels,
+            BTreeSet::from([channel.clone()]),
+            "объявленный канал «{channel}» не разбирается собственным \
+             сканом: имя обязано быть вида `схема://сегмент`, где сегмент \
+             — из [A-Za-z0-9_-]. Имя с точкой или слешем разбор примет за \
+             адрес и пропустит молча, и capability разойдётся с ядром \
+             незаметно."
+        );
+    }
+}
+
+/// Растяжка под ногами: список каналов держим мы, а не Tauri.
+///
+/// Если у `core:event` появится собственная схема scope, наши записи
+/// начнёт разбирать чужой валидатор — и совпадение формы (`{"event": …}`)
+/// с его схемой станет вопросом, на который нужен ответ, а не догадка.
+/// Тот же тест защищает и от обратного прочтения: увидев scope в
+/// capability, легко решить, что подписку на посторонний канал отклонит
+/// рантайм. Не отклонит.
+#[test]
+fn the_event_permission_still_carries_no_scope_of_its_own() {
+    let manifests = acl_manifests();
+    let event = manifests
+        .get("core:event")
+        .expect("в ACL-манифестах нет core:event");
+
+    assert!(
+        event["global_scope_schema"].is_null(),
+        "у core:event появилась схема scope — значит Tauri научился сужать \
+         события по имени. Сверь форму записей в capabilities/main.json с \
+         этой схемой и перепиши доводы здесь: сторожем каналов перестал \
+         быть только тест."
+    );
+    assert!(
+        event["permissions"]["allow-listen"]
+            .get("scope")
+            .is_none_or(serde_json::Value::is_null),
+        "у разрешения allow-listen появился собственный scope — см. выше"
+    );
+}

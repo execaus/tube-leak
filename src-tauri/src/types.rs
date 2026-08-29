@@ -1202,6 +1202,451 @@ pub struct DownloadCommandError {
     pub message: String,
 }
 
+// ────────────────── самообновление yt-dlp (TL-53, эпик E6) ──────────────────
+//
+// Контракт контура обновления: чем ядро отчитывается о состоянии блока
+// «Обновление yt-dlp» на служебном экране и что принимают его команды.
+// Реализация — TL-55 (проверка по метаданным релиза), TL-56 (скачивание и
+// проверка архива), TL-57 (smoke-проверка), TL-58 (оркестрация и сами
+// команды); здесь только объявление типов. Второго, ручного TS-зеркала у
+// секции нет и не будет: оно генерируется (TL-51) в
+// `src/types/generated/update.ts`.
+//
+// До TL-58 типы секции никто не конструирует, и каждый несёт
+// `#[allow(dead_code)]` — тот же приём и та же причина, что были у секций
+// E2 и E3: контракт не должен исчезать из-за того, что реализация
+// отстаёт на задачу. Глушители снимаются по мере появления вызывающих.
+//
+// # Три команды
+//
+// Имена фиксируются здесь, а не в задаче оркестрации, потому что на них
+// опирается ui-задача TL-59 — она стартует сразу после этой и работает на
+// замоканном `invoke` задолго до появления настоящих команд:
+//
+// - `ytdlp_update_state() -> YtDlpUpdateSnapshot` — снимок при открытии
+//   служебного экрана, разовый запрос по образцу `check_sidecar`, не
+//   polling. Не отказывает ничем: «ничего ещё не происходило» — это
+//   значение [`YtDlpUpdateStatus::NeverChecked`], а не ошибка.
+// - `check_ytdlp_update() -> Result<YtDlpUpdateSnapshot, YtDlpUpdateCommandError>`
+//   — «Проверить сейчас» (С-12). Запускает тот же конвейер, что плановая
+//   проверка, и возвращается сразу: ждать в промисе тут нечего, конвейер
+//   идёт минуты, а исход приезжает событием (Н-3 — ничего не блокирует).
+//   Возвращает снимок с уже переключённым [`YtDlpUpdateStatus::Checking`],
+//   чтобы кнопка гасла, не дожидаясь первого события.
+// - `roll_back_ytdlp() -> Result<YtDlpUpdateSnapshot, YtDlpUpdateCommandError>`
+//   — «Вернуться к известно-хорошей» (Р-3). **Без параметра-версии**: цель
+//   ровно одна по построению (Ф-8 держит на диске не более двух
+//   установок), и принимать её от фронтенда значило бы принимать выбор,
+//   которого он не делает, — а заодно заводить проверку «а ту ли версию
+//   прислали» на пути, где выбирать не из чего.
+//
+// # Одно значение и на снимок, и на событие
+//
+// Событие `ytdlp://update` (константа `UPDATE_EVENT` в
+// `crate::ytdlp::update`) несёт ровно [`YtDlpUpdateSnapshot`] — тот же
+// тип, что возвращают все три команды. Это не экономия на объявлениях, а
+// защита от расхождения, и причин две.
+//
+// 1. **Блок рисуется одной таблицей из 14 строк** (дизайн E6, «Все
+//    состояния»), и строка обязана получаться одинаково независимо от
+//    того, приехало состояние снимком при открытии экрана или событием
+//    по ходу конвейера. Разные формы для снимка и для события — это две
+//    проекции на одну таблицу, то есть две копии правила, которые
+//    разойдутся на первой же новой строке.
+// 2. **Цель отката меняется местами сама.** После переключения на Y
+//    известно-хорошей становится X, после возврата на X — снова Y (дизайн
+//    E6, «Ручной откат»). Событие без [`YtDlpUpdateSnapshot::rollback_target`]
+//    оставило бы на кнопке версию, от которой уже ушли; дочитывать её
+//    снимком после каждого терминального события — polling под другим
+//    именем, запрещённый Ф-11.
+//
+// Частоту эмита ограничивает оркестрация (TL-58) — по образцу E3, где
+// событие прогресса троттлится, кроме перехода в терминальную фазу.
+
+/// Доля скачанного архива обновления в процентах, 0..=100.
+///
+/// Отдельный тип, а не голый `u8`, ради того же инварианта, что у
+/// [`DownloadPercent`]: на провод не уходит число больше ста. Обрезание в
+/// конструкторе делает «103 %» невыразимым, а не оставляет полосе
+/// выезжать за край.
+///
+/// Почему **не** переиспользован [`DownloadPercent`], хотя величина
+/// арифметически та же. За тем типом стоит поведенческий договор, к
+/// обновлению отношения не имеющий: знаменатель там собирается из оценки
+/// размера, которую дал разбор E2, и вытесняется фактическим размером
+/// потока уже по ходу приёма. Здесь знаменатель известен заранее и точно
+/// — это объявленный размер ассета (`UpdateAsset::size_bytes` в
+/// `crate::ytdlp::update`), обязательное поле: ассет без размера контур
+/// не устанавливает вовсе. Тот же довод, по которому E3 завёл
+/// собственный `DownloadErrorDetails` вместо переиспользования
+/// `ProbeErrorDetails`: одинаковая форма не делает вещи одной вещью.
+///
+/// На проводе — просто число (`#[serde(transparent)]`), как и у соседа.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "update.ts", optional_fields))]
+#[serde(transparent)]
+pub struct YtDlpUpdatePercent(u8);
+
+impl YtDlpUpdatePercent {
+    /// Единственный конструктор: всё, что больше ста, становится сотней.
+    #[allow(dead_code)]
+    pub fn new(percent: u8) -> Self {
+        Self(percent.min(100))
+    }
+
+    /// Значение для форматирования на стороне вызывающего.
+    #[allow(dead_code)]
+    pub fn value(self) -> u8 {
+        self.0
+    }
+}
+
+/// Пять классов отказа контура (Ф-9) вместе с тем, что о каждом известно.
+///
+/// Ровно та типизация, которой Ф-9 требует: «нет сети», «источник
+/// недоступен», «архив повреждён», «не хватает места», «новая версия не
+/// прошла проверку». Ни один из них не влияет на работоспособность
+/// активной установки и ни один не показывается как ошибка скачивания
+/// ролика — тексты для пользователя задаёт UI по классу (дизайн E6,
+/// строки 8–12 таблицы состояний).
+///
+/// **Почему объединение, а не `kind` + `version: Option<String>`.**
+/// Версия известна не всем классам и нужна не всем текстам: проверка
+/// метаданных падает раньше, чем становится известно, о какой версии
+/// речь, и строки 8–9 её не называют, а строки 10–12 без неё не
+/// собираются вовсе («Обновление {Y} скачалось повреждённым»). Плоская
+/// структура с опциональной версией сделала бы выразимыми оба
+/// бессмысленных состояния сразу — «нет сети у версии 2026.08.21» и
+/// «повреждён архив неизвестно чего»; здесь они не компилируются.
+///
+/// Обрыв сети посреди скачивания архива — это `networkUnavailable`, и
+/// версия в этот момент уже известна. Она сюда не кладётся сознательно:
+/// строка 8 её не показывает, а поле, которое никто не читает, —
+/// приглашение однажды показать не то (К-5 проверяет ровно этот сценарий
+/// и ждёт «работаем на {X}», а не «не скачалось {Y}»).
+///
+/// `message` — формулировка ядра для лога и свёрнутых деталей, **не**
+/// основной текст на экране: stderr в него не попадает никогда (Ф-9,
+/// правило Н-4 E2). Поле повторено в каждом варианте, а не вынесено
+/// рядом с тегом: так у каждого шага конвейера (TL-55, TL-56, TL-57)
+/// значение остаётся самодостаточным — вернуть класс без диагностики
+/// нельзя.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "update.ts", optional_fields))]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum YtDlpUpdateFailure {
+    /// Нет соединения с интернетом (С-3). Возникает и на проверке
+    /// метаданных, и на скачивании архива (К-5).
+    NetworkUnavailable { message: String },
+    /// Сеть есть, а апстрим не отвечает: GitHub недоступен, ограничение
+    /// частоты запросов, неожиданный ответ вместо метаданных релиза
+    /// (С-3).
+    SourceUnavailable { message: String },
+    /// Скачанное отброшено до того, как что-либо тронуло активную
+    /// установку (С-4). Один класс на четыре причины — сумма sha256 не
+    /// сошлась, архив не читается, превышен потолок распакованного
+    /// размера (TL-18), в корне не ровно один исполняемый файл: лекарство
+    /// у всех одно (отбросить, попробовать позже), и дизайн сводит их в
+    /// один текст сознательно.
+    ArchiveCorrupted { version: String, message: String },
+    /// На томе с каталогом данных не хватает места под архив или под
+    /// распакованное дерево (С-11, проверка из TL-18). Отдельно от
+    /// [`Self::ArchiveCorrupted`], потому что действие пользователя
+    /// другое и оно есть: освободить место.
+    NotEnoughSpace { version: String, message: String },
+    /// Установка распакована и прогрета, но не прошла smoke-проверку
+    /// (С-5, Ф-6): `--version` не отвечает, отвечает не тем или падает.
+    /// Активная установка не менялась.
+    SmokeCheckFailed { version: String, message: String },
+}
+
+impl YtDlpUpdateFailure {
+    /// Диагностика для лога — одно место на всех вместо `match` по месту
+    /// вызова.
+    #[allow(dead_code)]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NetworkUnavailable { message }
+            | Self::SourceUnavailable { message }
+            | Self::ArchiveCorrupted { message, .. }
+            | Self::NotEnoughSpace { message, .. }
+            | Self::SmokeCheckFailed { message, .. } => message,
+        }
+    }
+
+    /// Версия, о которой шла речь, — у классов, которые её знают и
+    /// называют.
+    #[allow(dead_code)]
+    pub fn version(&self) -> Option<&str> {
+        match self {
+            Self::NetworkUnavailable { .. } | Self::SourceUnavailable { .. } => None,
+            Self::ArchiveCorrupted { version, .. }
+            | Self::NotEnoughSpace { version, .. }
+            | Self::SmokeCheckFailed { version, .. } => Some(version),
+        }
+    }
+}
+
+/// Состояние контура обновления — размеченное объединение, из которого
+/// однозначно получается строка блока «Обновление yt-dlp».
+///
+/// Десять вариантов покрывают все 14 строк таблицы «Все состояния»
+/// дизайна E6: девять — по строке каждый, десятый (`failed`) — пять
+/// строк, по одной на класс [`YtDlpUpdateFailure`]. Соответствие
+/// проверяется поимённо (`the_ten_variants_cover_the_fourteen_design_rows`
+/// ниже), и новый вариант или новый класс отказа ломает компиляцию того
+/// теста, пока ему не назначена строка.
+///
+/// **Что сделано невыразимым и зачем.** Процент есть только у
+/// `downloading`: ни у распаковки с прогревом (`preparing`), ни у
+/// ожидания границы задач числа не бывает — дизайн отвергает полосу на
+/// прогреве прямо, тем же доводом, что и на remux в E3 (операция ОС, не
+/// дающая надёжной оценки дешевле, чем сама операция). Штамп времени
+/// есть только у терминальных состояний: у `neverChecked` его не бывает
+/// по смыслу, а у идущего конвейера показывать нечего. Версия есть
+/// только там, где текст строки её называет. Плоская структура с
+/// полями-опциями выражала бы «проверяем 47 %» и «ещё не проверяли в
+/// 12:30» — здесь они не компилируются.
+///
+/// **Куда смотрит `version`.** У `downloading`, `preparing` и
+/// `readyWaiting` это версия-кандидат — та, которую ставят. У
+/// `rollbackWaiting` направление обратное: там названа версия, **к
+/// которой возвращаются** и которая станет активной на границе задач. У
+/// `updated` — уже активная, у `rolledBack` версии две и обе названы
+/// полями (`active`, `abandoned`). Сказано здесь, а не только у
+/// вариантов, потому что doc вариантов в TS-зеркало не попадает вовсе
+/// (ts-rs их отбрасывает), и по ту сторону границы это единственный
+/// текст, который читатель увидит.
+///
+/// **Почему `at` называется не `checkedAt`.** Дизайн подставляет `{когда}`
+/// в три разных смысла: время проверки (строки 3, 8, 9), время
+/// переключения (строка 7), время возврата (строка 13). Одно имя на все —
+/// «когда это состояние стало текущим»; `checkedAt` у `updated` врал бы
+/// про то, чей это штамп. Формат — RFC 3339 UTC, как у
+/// [`SidecarCheckResult::checked_at`] (`crate::clock::now_iso8601`);
+/// «3 часа назад» считает UI, потому что это его формат, а не факт.
+///
+/// **Про `rename_all_fields`.** Сегодня он не меняет ни одного имени:
+/// все поля вариантов односложные, и змеиный регистр совпадает с
+/// верблюжьим. Атрибут стоит не по инерции и проверить его сейчас нечем —
+/// первое же составное имя поля уехало бы на провод как `some_field`
+/// посреди camelCase-объекта, потому что `rename_all` у enum
+/// переименовывает **варианты**, а не поля внутри них. Ровно это ловили в
+/// E3 у [`DownloadingState::WaitingRetry`] сравнением значения целиком,
+/// и ловили не глазами.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "update.ts", optional_fields))]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum YtDlpUpdateStatus {
+    /// Строка 1: обновления не проверялись ни разу.
+    ///
+    /// Значение бывает только начальным: событием не приезжает никогда —
+    /// первое, что эмитит контур, это уже `checking`.
+    NeverChecked,
+    /// Строка 2: идёт проверка — плановая, ручная (С-12) или внеплановая
+    /// по сломанному извлечению (С-13). Какая именно, блок не различает:
+    /// текст один, и заводить различие ради него значило бы обещать
+    /// разницу, которой на экране нет.
+    Checking,
+    /// Строка 3: проверили, новее нет (С-2). Активную версию строка
+    /// показывает, но берёт её из `check_sidecar`, а не отсюда — дизайн
+    /// прямо запрещает спрашивать её вторично.
+    UpToDate { at: String },
+    /// Строка 4: идёт скачивание архива версии `version`.
+    ///
+    /// Процент обязателен, а не опционален: знаменатель известен раньше
+    /// первого принятого байта. Держится это на `UpdateAsset::size_bytes`
+    /// — объявленном размере ассета, который эпик требует проверить
+    /// против потолка **до** начала запроса (задача TL-56), а потому и
+    /// делает обязательным полем: ассет без объявленного размера контур
+    /// не устанавливает.
+    ///
+    /// Оговорка, важная для TL-56, чтобы не искать эту проверку не там.
+    /// Потолок TL-18 — **другая** граница и на другом рубеже: он живёт
+    /// внутри `crate::ytdlp::unpack`, складывается из заголовков уже
+    /// скачанного архива и метаданных релиза не видит вовсе. Тот модуль
+    /// прямо и говорит, что размер скачиваемого надо ограничивать
+    /// снаружи, до вызова распаковки, — изнутри расход памяти на разбор
+    /// центрального каталога уже не управляем. Скачивания с неизвестным
+    /// размером в этом контуре не бывает именно поэтому, а не потому,
+    /// что TL-18 умеет спросить апстрим.
+    Downloading {
+        version: String,
+        percent: YtDlpUpdatePercent,
+    },
+    /// Строка 5: распаковка и прогрев версии `version` (Ф-4, Ф-6).
+    /// Прогрев ждёт паузы между задачами скачивания (Н-3), и ожидание —
+    /// часть этого же состояния: пользователю показывают одно и то же
+    /// «Готовим обновление…», а различать внутри нечего.
+    Preparing { version: String },
+    /// Строка 6: версия готова и ждёт границы задач (Р-2, С-6).
+    ReadyWaiting { version: String },
+    /// Строка 14: возврат принят и ждёт границы задач — тем же
+    /// механизмом переключения, что обычное обновление (Ф-7).
+    ///
+    /// **`version` — та, К КОТОРОЙ возвращаемся**: известно-хорошая
+    /// установка, которая станет активной, когда закончится текущая
+    /// задача. Не та, от которой уходим. Направление названо прямо,
+    /// потому что у соседей оно противоположное — там версия всегда
+    /// кандидат на установку, — а сам дизайн в этом месте нестрог: его
+    /// легенда объявляет `X` активной, но строка 14 пишет «Возврат к
+    /// {X}», где `X` активной ещё не стала.
+    ///
+    /// [`YtDlpUpdateSnapshot::rollback_target`] в этом состоянии равен
+    /// этому же значению: местами версии меняются в момент применения
+    /// (строка 13), а не принятия. Кнопка всё равно неактивна, пока
+    /// возврат ждёт, — [`Self::busy`] здесь истинно.
+    ///
+    /// Отдельный вариант, а не [`Self::ReadyWaiting`] с флагом: тексты
+    /// строк 6 и 14 говорят о разном («обновление применится» против
+    /// «возврат применится»), а флаг рядом с версией позволил бы
+    /// собрать состояние, которого нет.
+    RollbackWaiting { version: String },
+    /// Строка 7: переключение произошло, активна `version` (С-1).
+    Updated { at: String, version: String },
+    /// Строка 13: возврат выполнен (С-8, Р-3).
+    ///
+    /// Обе версии названы, потому что обе стоят в тексте: `active` — та,
+    /// на которую вернулись и которая работает сейчас, `abandoned` — та,
+    /// от которой отказались и которая не будет предложена автоматически
+    /// до следующего релиза апстрима.
+    ///
+    /// `abandoned` и [`YtDlpUpdateSnapshot::rollback_target`] в этом
+    /// состоянии совпадают — цель отката теперь ведёт обратно. Это не
+    /// дублирование одного поля: первое — часть текста строки 13 и
+    /// остаётся верным, даже если возвращаться станет некуда, второе —
+    /// подпись кнопки и исчезает вместе с ней.
+    RolledBack {
+        at: String,
+        active: String,
+        abandoned: String,
+    },
+    /// Строки 8–12: конвейер отказал. Какая именно строка — решает класс
+    /// (Ф-9); активная установка при любом из них цела и работает (Н-2).
+    Failed {
+        at: String,
+        failure: YtDlpUpdateFailure,
+    },
+}
+
+impl YtDlpUpdateStatus {
+    /// Занят ли контур: конвейер идёт либо подготовленное ждёт границы
+    /// задач.
+    ///
+    /// Ровно те пять состояний, при которых дизайн гасит обе кнопки блока
+    /// («не плодим параллельные пробы поверх уже идущей»). Правило живёт
+    /// здесь одно на всех: по нему ядро отклоняет команды
+    /// ([`YtDlpUpdateCommandErrorKind::Busy`]), и его же проекция уезжает
+    /// на провод полем [`YtDlpUpdateSnapshot::busy`] — фронтенд не держит
+    /// собственной копии списка. `match` без ветки-заглушки: новый
+    /// вариант обязан получить решение здесь, а не унаследовать чужое.
+    #[allow(dead_code)]
+    pub fn busy(&self) -> bool {
+        match self {
+            Self::Checking
+            | Self::Downloading { .. }
+            | Self::Preparing { .. }
+            | Self::ReadyWaiting { .. }
+            | Self::RollbackWaiting { .. } => true,
+            Self::NeverChecked
+            | Self::UpToDate { .. }
+            | Self::Updated { .. }
+            | Self::RolledBack { .. }
+            | Self::Failed { .. } => false,
+        }
+    }
+}
+
+/// Снимок состояния блока «Обновление yt-dlp»: ответ всех трёх команд
+/// контура и полезная нагрузка события `ytdlp://update`.
+///
+/// Почему одно значение на снимок и на событие — см. шапку секции.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "update.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct YtDlpUpdateSnapshot {
+    /// Разворачивается в те же поля объекта, что и сам вариант: `status`
+    /// лежит рядом с `rollbackTarget`, а не вложенным объектом.
+    #[serde(flatten)]
+    pub status: YtDlpUpdateStatus,
+    /// Версия известно-хорошей установки, если она отличается от
+    /// активной, — подпись кнопки «Вернуться к …».
+    ///
+    /// Отсутствует, когда возвращаться некуда: до первого переключения
+    /// установка на диске одна. Именно отсутствует, а не приезжает
+    /// пустой строкой — кнопки в этом состоянии нет вовсе (дизайн E6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_target: Option<String>,
+    /// Проекция [`YtDlpUpdateStatus::busy`]: обе кнопки блока неактивны.
+    ///
+    /// Не второй источник правды, а именно проекция — по тому же
+    /// образцу, что `retryable` у [`DownloadError`]. Единственный
+    /// благословлённый конструктор — [`YtDlpUpdateSnapshot::new`], где
+    /// значение берётся из статуса, а не из мнения на месте вызова.
+    pub busy: bool,
+}
+
+impl YtDlpUpdateSnapshot {
+    /// Собрать снимок, выведя `busy` из статуса.
+    #[allow(dead_code)]
+    pub fn new(status: YtDlpUpdateStatus, rollback_target: Option<String>) -> Self {
+        Self {
+            busy: status.busy(),
+            status,
+            rollback_target,
+        }
+    }
+}
+
+/// Почему команда контура обновления отклонена.
+///
+/// Это **не** классы отказа обновления ([`YtDlpUpdateFailure`]): те
+/// описывают судьбу конвейера и рисуются строкой блока, а эти — отказ
+/// выполнить вызов, то есть состояние, до которого исправный фронтенд не
+/// доводит (кнопки, которых нельзя нажать, он не показывает). Тем не
+/// менее они типизированы, а не строки: защита на стороне ядра обязана
+/// быть настоящей, а её срабатывание — различимым в логе (тот же довод,
+/// что у [`DownloadCommandErrorKind`]).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "update.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub enum YtDlpUpdateCommandErrorKind {
+    /// Контур занят: идёт проверка или подготовка, либо подготовленное
+    /// ждёт границы задач ([`YtDlpUpdateStatus::busy`]). Обе команды
+    /// отклоняются одинаково.
+    Busy,
+    /// Возврат запрошен, когда возвращаться некуда: известно-хорошей
+    /// установки, отличной от активной, на диске нет
+    /// ([`YtDlpUpdateSnapshot::rollback_target`] отсутствует).
+    NothingToRollBackTo,
+}
+
+/// Отказ команды контура обновления в сериализуемом виде.
+///
+/// `message` — диагностика для лога, как и у [`DownloadCommandError`]:
+/// решение принимается по `kind`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "update.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct YtDlpUpdateCommandError {
+    pub kind: YtDlpUpdateCommandErrorKind,
+    pub message: String,
+}
+
 /// Фиксированные stub-данные: реальный запуск и разбор бинарников теперь
 /// реализованы (`crate::commands::sidecar::check_sidecar`, TL-5), эта
 /// функция больше не используется как продакшен-заглушка — оставлена ради
@@ -2471,5 +2916,330 @@ mod tests {
         }
         .is_empty());
         assert!(!download_details().is_empty());
+    }
+
+    // ───────────── самообновление yt-dlp (TL-53, эпик E6) ─────────────
+
+    /// Номер строки таблицы «Все состояния» дизайна E6, которой это
+    /// состояние видно пользователю.
+    ///
+    /// `match` без ветки-заглушки, и это главное свойство функции: новый
+    /// вариант статуса или новый класс отказа Ф-9 **ломает компиляцию**
+    /// теста, пока ему не назначена строка таблицы. Приёмка задачи
+    /// требует «покрыты без пробелов» — пробел здесь не проходит мимо
+    /// молча, а не компилируется.
+    fn design_row(status: &YtDlpUpdateStatus) -> u8 {
+        match status {
+            YtDlpUpdateStatus::NeverChecked => 1,
+            YtDlpUpdateStatus::Checking => 2,
+            YtDlpUpdateStatus::UpToDate { .. } => 3,
+            YtDlpUpdateStatus::Downloading { .. } => 4,
+            YtDlpUpdateStatus::Preparing { .. } => 5,
+            YtDlpUpdateStatus::ReadyWaiting { .. } => 6,
+            YtDlpUpdateStatus::Updated { .. } => 7,
+            YtDlpUpdateStatus::Failed { failure, .. } => match failure {
+                YtDlpUpdateFailure::NetworkUnavailable { .. } => 8,
+                YtDlpUpdateFailure::SourceUnavailable { .. } => 9,
+                YtDlpUpdateFailure::ArchiveCorrupted { .. } => 10,
+                YtDlpUpdateFailure::NotEnoughSpace { .. } => 11,
+                YtDlpUpdateFailure::SmokeCheckFailed { .. } => 12,
+            },
+            YtDlpUpdateStatus::RolledBack { .. } => 13,
+            YtDlpUpdateStatus::RollbackWaiting { .. } => 14,
+        }
+    }
+
+    /// Активная версия X и найденная Y — как в таблице дизайна.
+    const ACTIVE: &str = "2026.07.11";
+    const CANDIDATE: &str = "2026.08.21";
+    const AT: &str = "2026-08-27T09:15:30.123Z";
+
+    /// По одному значению на каждую строку таблицы состояний.
+    fn a_status_for_every_design_row() -> Vec<YtDlpUpdateStatus> {
+        let failed = |failure| YtDlpUpdateStatus::Failed {
+            at: AT.to_string(),
+            failure,
+        };
+        vec![
+            YtDlpUpdateStatus::NeverChecked,
+            YtDlpUpdateStatus::Checking,
+            YtDlpUpdateStatus::UpToDate { at: AT.to_string() },
+            YtDlpUpdateStatus::Downloading {
+                version: CANDIDATE.to_string(),
+                percent: YtDlpUpdatePercent::new(47),
+            },
+            YtDlpUpdateStatus::Preparing {
+                version: CANDIDATE.to_string(),
+            },
+            YtDlpUpdateStatus::ReadyWaiting {
+                version: CANDIDATE.to_string(),
+            },
+            YtDlpUpdateStatus::Updated {
+                at: AT.to_string(),
+                version: CANDIDATE.to_string(),
+            },
+            failed(YtDlpUpdateFailure::NetworkUnavailable {
+                message: "соединение не установлено".to_string(),
+            }),
+            failed(YtDlpUpdateFailure::SourceUnavailable {
+                message: "GitHub ответил 503".to_string(),
+            }),
+            failed(YtDlpUpdateFailure::ArchiveCorrupted {
+                version: CANDIDATE.to_string(),
+                message: "sha256 не сошлась".to_string(),
+            }),
+            failed(YtDlpUpdateFailure::NotEnoughSpace {
+                version: CANDIDATE.to_string(),
+                message: "нужно 124 МиБ, свободно 12 МиБ".to_string(),
+            }),
+            failed(YtDlpUpdateFailure::SmokeCheckFailed {
+                version: CANDIDATE.to_string(),
+                message: "--version не ответил за отведённое время".to_string(),
+            }),
+            YtDlpUpdateStatus::RolledBack {
+                at: AT.to_string(),
+                active: ACTIVE.to_string(),
+                abandoned: CANDIDATE.to_string(),
+            },
+            YtDlpUpdateStatus::RollbackWaiting {
+                version: ACTIVE.to_string(),
+            },
+        ]
+    }
+
+    /// Десять вариантов и пять классов отказа дают ровно 14 строк дизайна
+    /// — ни пробела, ни двух состояний на одну строку.
+    #[test]
+    fn the_contract_covers_the_fourteen_design_rows_without_gaps() {
+        let mut rows: Vec<u8> = a_status_for_every_design_row()
+            .iter()
+            .map(design_row)
+            .collect();
+        rows.sort_unstable();
+
+        assert_eq!(
+            rows,
+            (1..=14).collect::<Vec<u8>>(),
+            "состояния контракта и строки таблицы дизайна разошлись: каждая \
+             строка обязана получаться ровно из одного состояния"
+        );
+    }
+
+    /// Ни одна строка не спутается с другой уже на проводе.
+    ///
+    /// Совпади две — фронтенду пришлось бы различать их по чему-то, чего
+    /// в значении нет, то есть догадкой.
+    #[test]
+    fn every_design_row_has_its_own_shape_on_the_wire() {
+        let wire: Vec<serde_json::Value> = a_status_for_every_design_row()
+            .iter()
+            .map(|status| serde_json::to_value(status).expect("serialization must not fail"))
+            .collect();
+
+        for (i, left) in wire.iter().enumerate() {
+            for (j, right) in wire.iter().enumerate().skip(i + 1) {
+                assert_ne!(
+                    left,
+                    right,
+                    "строки {} и {} таблицы неразличимы на проводе: {left}",
+                    i + 1,
+                    j + 1
+                );
+            }
+        }
+    }
+
+    /// `busy` — ровно те пять строк, в которых дизайн гасит обе кнопки.
+    #[test]
+    fn busy_is_exactly_the_five_rows_where_the_design_disables_both_buttons() {
+        let busy: Vec<u8> = a_status_for_every_design_row()
+            .iter()
+            .filter(|status| status.busy())
+            .map(design_row)
+            .collect();
+
+        assert_eq!(
+            busy,
+            vec![2, 4, 5, 6, 14],
+            "набор занятых состояний разошёлся с таблицей дизайна («оба \
+             неактивны» стоит у строк 2, 4, 5, 6 и 14)"
+        );
+    }
+
+    /// Снимок выводит `busy` из статуса, а не принимает мнение вызывающего.
+    #[test]
+    fn the_snapshot_derives_busy_from_its_status() {
+        for status in a_status_for_every_design_row() {
+            let expected = status.busy();
+            let snapshot = YtDlpUpdateSnapshot::new(status, None);
+            assert_eq!(snapshot.busy, expected);
+        }
+    }
+
+    /// Идущий конвейер: тег статуса лежит рядом с полями снимка, процент —
+    /// внутри того же объекта, штампа времени нет.
+    #[test]
+    fn serializes_a_running_download_next_to_the_rollback_target() {
+        let snapshot = YtDlpUpdateSnapshot::new(
+            YtDlpUpdateStatus::Downloading {
+                version: CANDIDATE.to_string(),
+                percent: YtDlpUpdatePercent::new(47),
+            },
+            Some(ACTIVE.to_string()),
+        );
+
+        assert_eq!(
+            serde_json::to_value(&snapshot).expect("serialization must not fail"),
+            json!({
+                "status": "downloading",
+                "version": CANDIDATE,
+                "percent": 47,
+                "rollbackTarget": ACTIVE,
+                "busy": true,
+            })
+        );
+    }
+
+    /// Первый запуск: возвращаться некуда — ключа `rollbackTarget` нет
+    /// вовсе, а не `null`.
+    #[test]
+    fn serializes_the_first_run_without_a_rollback_target_key() {
+        assert_eq!(
+            serde_json::to_value(YtDlpUpdateSnapshot::new(
+                YtDlpUpdateStatus::NeverChecked,
+                None
+            ))
+            .expect("serialization must not fail"),
+            json!({ "status": "neverChecked", "busy": false })
+        );
+    }
+
+    /// Отказ приезжает вложенным объектом со своим тегом: строку 10
+    /// от строки 8 отличает `failure.kind`, а не наличие поля.
+    #[test]
+    fn serializes_a_failed_pipeline_with_its_typed_class() {
+        assert_eq!(
+            serde_json::to_value(YtDlpUpdateSnapshot::new(
+                YtDlpUpdateStatus::Failed {
+                    at: AT.to_string(),
+                    failure: YtDlpUpdateFailure::ArchiveCorrupted {
+                        version: CANDIDATE.to_string(),
+                        message: "sha256 не сошлась".to_string(),
+                    },
+                },
+                Some(ACTIVE.to_string()),
+            ))
+            .expect("serialization must not fail"),
+            json!({
+                "status": "failed",
+                "at": AT,
+                "failure": {
+                    "kind": "archiveCorrupted",
+                    "version": CANDIDATE,
+                    "message": "sha256 не сошлась",
+                },
+                "rollbackTarget": ACTIVE,
+                "busy": false,
+            })
+        );
+    }
+
+    /// Возврат: обе версии в состоянии, цель кнопки — отдельно, и после
+    /// возврата она ведёт обратно.
+    #[test]
+    fn serializes_a_rollback_naming_both_versions() {
+        assert_eq!(
+            serde_json::to_value(YtDlpUpdateSnapshot::new(
+                YtDlpUpdateStatus::RolledBack {
+                    at: AT.to_string(),
+                    active: ACTIVE.to_string(),
+                    abandoned: CANDIDATE.to_string(),
+                },
+                Some(CANDIDATE.to_string()),
+            ))
+            .expect("serialization must not fail"),
+            json!({
+                "status": "rolledBack",
+                "at": AT,
+                "active": ACTIVE,
+                "abandoned": CANDIDATE,
+                "rollbackTarget": CANDIDATE,
+                "busy": false,
+            })
+        );
+    }
+
+    /// Отказ команды — по образцу E3: решение по `kind`, `message` для лога.
+    #[test]
+    fn serializes_a_rejected_update_command() {
+        assert_eq!(
+            serde_json::to_value(YtDlpUpdateCommandError {
+                kind: YtDlpUpdateCommandErrorKind::NothingToRollBackTo,
+                message: "известно-хорошей установки, отличной от активной, нет".to_string(),
+            })
+            .expect("serialization must not fail"),
+            json!({
+                "kind": "nothingToRollBackTo",
+                "message": "известно-хорошей установки, отличной от активной, нет",
+            })
+        );
+    }
+
+    /// Процент больше ста невыразим: заниженный знаменатель не выводит
+    /// полосу за край.
+    #[test]
+    fn an_update_percent_never_exceeds_a_hundred() {
+        assert_eq!(YtDlpUpdatePercent::new(47).value(), 47);
+        assert_eq!(YtDlpUpdatePercent::new(100).value(), 100);
+        assert_eq!(YtDlpUpdatePercent::new(103).value(), 100);
+        assert_eq!(YtDlpUpdatePercent::new(u8::MAX).value(), 100);
+        assert_eq!(
+            serde_json::to_value(YtDlpUpdatePercent::new(200))
+                .expect("serialization must not fail"),
+            json!(100),
+            "на проводе процент — голое число, а не объект"
+        );
+    }
+
+    /// Версию называют ровно те три класса Ф-9, чьи строки её показывают.
+    #[test]
+    fn only_the_classes_whose_row_names_a_version_carry_one() {
+        let message = || "неважно".to_string();
+        let cases = [
+            (
+                YtDlpUpdateFailure::NetworkUnavailable { message: message() },
+                None,
+            ),
+            (
+                YtDlpUpdateFailure::SourceUnavailable { message: message() },
+                None,
+            ),
+            (
+                YtDlpUpdateFailure::ArchiveCorrupted {
+                    version: CANDIDATE.to_string(),
+                    message: message(),
+                },
+                Some(CANDIDATE),
+            ),
+            (
+                YtDlpUpdateFailure::NotEnoughSpace {
+                    version: CANDIDATE.to_string(),
+                    message: message(),
+                },
+                Some(CANDIDATE),
+            ),
+            (
+                YtDlpUpdateFailure::SmokeCheckFailed {
+                    version: CANDIDATE.to_string(),
+                    message: message(),
+                },
+                Some(CANDIDATE),
+            ),
+        ];
+
+        for (failure, version) in cases {
+            assert_eq!(failure.version(), version, "{failure:?}");
+            assert_eq!(failure.message(), "неважно", "{failure:?}");
+        }
     }
 }

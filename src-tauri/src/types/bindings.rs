@@ -65,6 +65,19 @@
 //! `bigint`) не оставлен на доверии к атрибуту: у каждого свой assert
 //! ниже.
 //!
+//! # Чего сверка не покрывает: doc-комментарии вариантов
+//!
+//! В зеркало едут doc-комментарии **типов и полей структур**, но не
+//! вариантов перечислений — ts-rs их отбрасывает (проверено мутацией на
+//! TL-53: правка текста у варианта не будит сверку, правка текста у типа
+//! будит с указанием строки). Практическое следствие для того, кто пишет
+//! фронтенд: у размеченного объединения TS покажет форму
+//! (`{ status: "rollbackWaiting", version: string }`) и ни слова о
+//! смысле полей — смысл читается в `types.rs`, и сторожа, который следил
+//! бы за его переносом, здесь нет. Автору контракта из этого следует
+//! обратное: то, без чего вариант можно прочесть неверно, должно стоять
+//! в doc **типа**, а не только варианта.
+//!
 //! # Цена и её границы
 //!
 //! `ts-rs` — dev-зависимость, `#[derive(TS)]` навешивается через
@@ -178,6 +191,13 @@ macro_rules! with_contract_types {
             DownloadStarted,
             DownloadCommandErrorKind,
             DownloadCommandError,
+            // update.ts
+            YtDlpUpdatePercent,
+            YtDlpUpdateFailure,
+            YtDlpUpdateStatus,
+            YtDlpUpdateSnapshot,
+            YtDlpUpdateCommandErrorKind,
+            YtDlpUpdateCommandError,
         ]
     };
 }
@@ -226,8 +246,12 @@ const HEADER: &str = "\
 ";
 
 /// Столько файлов зеркала производит генератор сейчас: по одному на
-/// модуль контракта — `sidecar`, `ytdlp`, `probe`, `download`.
-const MIRROR_FILES: usize = 4;
+/// модуль контракта — `sidecar`, `ytdlp`, `probe`, `download`, `update`.
+///
+/// Контур самообновления (E6) получил собственный файл, а не дописался в
+/// `ytdlp.ts`: тот про подготовку первого запуска, у которой с фоновым
+/// обновлением намеренно разные каналы событий и разные экраны.
+const MIRROR_FILES: usize = 5;
 
 /// Эталон: что зеркало обязано содержать прямо сейчас.
 ///
@@ -423,16 +447,15 @@ fn every_optional_field_of_the_contract_is_omitted_when_absent() {
     /// граница и заводилась. Меняется вместе с контрактом, одной строкой,
     /// и это осознанная просьба к автору нового поля посмотреть на
     /// сторожа.
-    const OPTIONAL_FIELDS: usize = 31;
+    const OPTIONAL_FIELDS: usize = 32;
 
     let mut checked = 0usize;
     let contract: Vec<&str> = contract_source().lines().collect();
 
     for (i, line) in contract.iter().enumerate() {
-        let field = line.trim();
-        if !field.contains(": Option<") || field.contains("fn ") {
+        let Some(field) = option_field(line) else {
             continue;
-        }
+        };
 
         assert!(
             attributes_above(&contract[..i])
@@ -451,6 +474,50 @@ fn every_optional_field_of_the_contract_is_omitted_when_absent() {
         "сторож нашёл в контракте {checked} Option-полей вместо {OPTIONAL_FIELDS}. \
          Если поле добавили или убрали осознанно — поправьте константу; если нет — \
          сломался разбор `types.rs`, и сторож проверяет не то, что думает."
+    );
+}
+
+/// Объявление `Option`-поля, если строка им является.
+///
+/// Отдельная функция с собственным тестом, а не условие внутри цикла,
+/// потому что у неё есть **обе** стороны отказа. Пропустить настоящее
+/// поле — дыра, ради которой сторож писался. Принять за поле упоминание
+/// в прозе — ложное срабатывание: doc-комментарии этого контракта
+/// объясняют, почему то или иное поле сделано **не** опциональным, и
+/// пишут `: Option<…>` по делу. Первая же такая строка (секция E6)
+/// уронила сторожа с обвинением автора в том, чего он не делал, — тот же
+/// класс дефекта, что уже чинился в `attributes_above`, и та же цена:
+/// сторож, которому не верят, бесполезен.
+fn option_field(line: &str) -> Option<&str> {
+    let line = line.trim();
+    // Проза не объявляет полей: ни doc-комментарий, ни обычный.
+    if line.starts_with("//") {
+        return None;
+    }
+    // `-> Option<T>` у метода — возвращаемое значение, а не поле на
+    // проводе; `: Option<` в сигнатуре — аргумент.
+    if !line.contains(": Option<") || line.contains("fn ") {
+        return None;
+    }
+    Some(line)
+}
+
+/// Разбор строки контракта различает поле и рассказ о поле.
+#[test]
+fn a_mention_of_option_in_prose_is_not_a_field_declaration() {
+    assert_eq!(
+        option_field("    pub reason: Option<LaunchFailedReason>,"),
+        Some("pub reason: Option<LaunchFailedReason>,")
+    );
+    assert_eq!(
+        option_field("/// Почему объединение, а не `kind` + `version: Option<String>`."),
+        None,
+        "doc-комментарий, объясняющий отказ от опционального поля, полем не является"
+    );
+    assert_eq!(
+        option_field("    pub fn version(&self) -> Option<&str> {"),
+        None,
+        "возвращаемое значение метода на провод не уходит"
     );
 }
 
@@ -542,6 +609,69 @@ fn the_serde_shapes_the_contract_stands_on_survive_generation() {
         running.contains(r#"{ "state": "running""#)
             && running.contains("percent?: DownloadPercent"),
         "внутренний тег или опциональность поля состояния поехали:\n{running}"
+    );
+}
+
+/// Формы, на которых стоит контракт E6, проверенные поимённо.
+///
+/// Тот же довод, что у соседнего теста про E2/E3: сверка с диском ловит
+/// «поменяли Rust и не перегенерировали», а этот — «перегенерировали,
+/// закоммитили, и форма молча поехала». Каждое утверждение здесь — про
+/// свойство, ради которого форма и выбиралась.
+#[test]
+fn the_serde_shapes_the_update_contract_stands_on_survive_generation() {
+    let temp = tempfile::tempdir().expect("не удалось создать временный каталог");
+    let cfg = config(temp.path());
+
+    let percent = YtDlpUpdatePercent::export_to_string(&cfg).expect("объявление процента");
+    assert!(
+        strip_jsdoc(&percent).contains("export type YtDlpUpdatePercent = number;"),
+        "transparent-newtype перестал быть голым числом:\n{percent}"
+    );
+
+    let status = YtDlpUpdateStatus::export_to_string(&cfg).expect("объявление состояния");
+    let status = strip_jsdoc(&status);
+    assert!(
+        status.contains(
+            r#"{ "status": "downloading", version: string, percent: YtDlpUpdatePercent, }"#
+        ),
+        "процент перестал быть обязательным полем ровно одного варианта — \
+         вся форма выбиралась ради этого:\n{status}"
+    );
+    assert!(
+        !status.contains(r#""status": "preparing", version: string, percent"#)
+            && !status.contains(r#""status": "checking", "#),
+        "у состояния без процента появились чужие поля:\n{status}"
+    );
+
+    let failure = YtDlpUpdateFailure::export_to_string(&cfg).expect("объявление отказа");
+    let failure = strip_jsdoc(&failure);
+    for (kind, version_is_named) in [
+        ("networkUnavailable", false),
+        ("sourceUnavailable", false),
+        ("archiveCorrupted", true),
+        ("notEnoughSpace", true),
+        ("smokeCheckFailed", true),
+    ] {
+        let expected = if version_is_named {
+            format!(r#"{{ "kind": "{kind}", version: string, message: string, }}"#)
+        } else {
+            format!(r#"{{ "kind": "{kind}", message: string, }}"#)
+        };
+        assert!(
+            failure.contains(&expected),
+            "класс отказа Ф-9 `{kind}` потерял форму `{expected}`:\n{failure}"
+        );
+    }
+
+    let snapshot = YtDlpUpdateSnapshot::export_to_string(&cfg).expect("объявление снимка");
+    let snapshot = strip_jsdoc(&snapshot);
+    assert!(
+        snapshot.contains("rollbackTarget?: string")
+            && snapshot.contains("busy: boolean")
+            && snapshot.contains(r#"} & ({ "status": "neverChecked" }"#),
+        "flatten перестал класть статус рядом с целью отката, либо \
+         обязательность полей снимка поехала:\n{snapshot}"
     );
 }
 
