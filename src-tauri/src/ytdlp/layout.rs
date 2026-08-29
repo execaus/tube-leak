@@ -72,8 +72,35 @@ const INSTALL_ROOT_DIR: &str = "yt-dlp";
 /// Префикс каталога, в который идёт распаковка до атомарного переименования.
 const STAGING_PREFIX: &str = ".staging-";
 
+/// Префикс файла, в который принимается скачиваемый архив обновления
+/// (TL-56), до того как он проверен суммой и распакован.
+///
+/// Отдельный префикс, а не [`STAGING_PREFIX`], и не косметика: уборка
+/// остатков различает их по типу объекта — `.staging-*` это каталог,
+/// `.download-*` файл, — и складывать их под одно имя значило бы удалять
+/// одно кодом для другого. Общее у них ровно одно свойство, ради которого
+/// префикс вообще есть: имя начинается с точки, то есть остаток
+/// прерванной работы никогда не выглядит установкой (та адресуется
+/// `<версия>-<sha12>`).
+const DOWNLOAD_PREFIX: &str = ".download-";
+
 /// Суффикс файла со счётчиком безуспешных переустановок.
 const REPAIR_SUFFIX: &str = ".repair.json";
+
+/// Суффикс файла со счётчиком безуспешных попыток **установить
+/// обновление** этого build id (TL-56).
+///
+/// Форма записи та же ([`RepairLog`]), а файл — другой, и это не
+/// дублирование. [`REPAIR_SUFFIX`] принадлежит подготовке первого запуска:
+/// по нему `super::prepare` решает, стоит ли ещё раз переустанавливать
+/// вложенный в бандл архив, и после [`super::prepare`]`::MAX_REPAIR_ATTEMPTS`
+/// отказывает сразу. У С-10 build id обновления и build id пина совпадают
+/// (тот же архив, тот же путь установки) — пиши контур свои неудачи в тот
+/// же файл, неудача скачивания обновления считалась бы неудачей починки
+/// и однажды запретила бы подготовку рабочей установки на старте. Разные
+/// файлы делают это невыразимым.
+#[allow(dead_code)] // Читает и пишет журнал `fetch`, зовёт его TL-58.
+const UPDATE_ATTEMPT_SUFFIX: &str = ".update.json";
 
 /// Сколько имён каталога распаковки пробовать, прежде чем сдаться.
 const STAGING_NAME_ATTEMPTS: u8 = 4;
@@ -104,7 +131,15 @@ pub fn bundled_build_id() -> String {
     build_id(BUNDLED_VERSION, BUNDLED_SHA256)
 }
 
-fn build_id(version: &str, sha256: &str) -> String {
+/// Идентификатор сборки yt-dlp: версия апстрима плюс начало суммы её
+/// архива.
+///
+/// Публичный, а не внутренний, с TL-56: обновление знает версию и сумму
+/// кандидата из метаданных релиза до того, как хоть байт скачан, и
+/// адресует ими и каталог установки, и журнал попыток. Считать этот
+/// идентификатор вторым способом рядом значило бы завести второе место,
+/// где раскладка каталога данных описана.
+pub fn build_id(version: &str, sha256: &str) -> String {
     let short = sha256.get(..12).unwrap_or(sha256);
     format!("{version}-{short}")
 }
@@ -146,6 +181,77 @@ impl Layout {
     /// в этом весь его смысл.
     pub fn repair_path(&self, build_id: &str) -> PathBuf {
         self.root.join(format!("{build_id}{REPAIR_SUFFIX}"))
+    }
+
+    /// Файл со счётчиком безуспешных попыток установить обновление до
+    /// этого build id (TL-56).
+    ///
+    /// Живёт там же и по той же причине, что [`Self::repair_path`], но
+    /// отдельным файлом — см. [`UPDATE_ATTEMPT_SUFFIX`].
+    #[allow(dead_code)] // Потребитель — `super::fetch`, его — TL-58.
+    pub fn update_attempt_path(&self, build_id: &str) -> PathBuf {
+        self.root.join(format!("{build_id}{UPDATE_ATTEMPT_SUFFIX}"))
+    }
+
+    /// Создаёт файл, в который пойдёт приём скачиваемого архива, под
+    /// именем, которое нельзя предугадать, и отдаёт его вместе с путём.
+    ///
+    /// `create_new` (то есть `O_EXCL`), а не «открыть или создать», ровно
+    /// по тому же доводу, что `create_dir` в [`Self::create_staging_dir`]:
+    /// занятый путь — не «уже готово», а чужой объект под именем, которое
+    /// мы считали своим, и лить в него шестьдесят мегабайт из сети нельзя.
+    /// Вместе со случайным суффиксом это и есть гарантия «файл приёма
+    /// создали мы».
+    #[allow(dead_code)] // Потребитель — `super::fetch`, его — TL-58.
+    pub fn create_download_file(
+        &self,
+        build_id: &str,
+    ) -> Result<(PathBuf, fs::File), PrepareError> {
+        let mut last_error = None;
+
+        for _ in 0..STAGING_NAME_ATTEMPTS {
+            let candidate = self.root.join(format!(
+                "{DOWNLOAD_PREFIX}{build_id}-{suffix:016x}",
+                suffix = random_suffix()
+            ));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => return Ok((candidate, file)),
+                Err(err) => last_error = Some((candidate, err)),
+            }
+        }
+
+        let (path, err) = last_error.expect("цикл выполняется хотя бы раз");
+        Err(PrepareError::UnpackFailed {
+            reason: format!("файл приёма архива {}: {err}", path.display()),
+        })
+    }
+
+    /// Собирает пути `.download-*` — недокачанные архивы от прерванных
+    /// обновлений (С-7).
+    ///
+    /// Сканирование живёт здесь, а не рядом с уборкой `.staging-*` в
+    /// [`super::unpack`], потому что здесь объявлен префикс: единственный
+    /// способ не разойтись с именем, которым файл создаётся, — не
+    /// повторять литерал в другом модуле.
+    pub fn stale_downloads(&self) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(DOWNLOAD_PREFIX))
+            })
+            .map(|entry| entry.path())
+            .collect()
     }
 
     /// Создаёт каталог, в который пойдёт распаковка, под именем, которое
@@ -438,8 +544,47 @@ impl std::fmt::Display for InvalidInstall {
     }
 }
 
+/// Чем архив себя называет: версия yt-dlp и sha256 самого архива.
+///
+/// До TL-56 обеих величин было ровно по одной на приложение — пин бандла,
+/// — и [`manifest_for`] брал их из констант. С обновлением их стало две
+/// пары (пин и кандидат из релиза апстрима), и константа в манифесте
+/// означала бы, что установка версии Y записывает в свой манифест версию
+/// X: `validate` этого не заметила бы (она сверяет только схему, число
+/// файлов и объём), а служебный экран и уборка читают версию именно
+/// оттуда.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveIdentity<'a> {
+    /// Версия yt-dlp в апстримном формате `YYYY.MM.DD`.
+    pub version: &'a str,
+    /// sha256 архива, шестнадцатеричная.
+    pub sha256: &'a str,
+}
+
+impl ArchiveIdentity<'static> {
+    /// То, что вложено в бандл этого приложения.
+    pub fn bundled() -> Self {
+        Self {
+            version: BUNDLED_VERSION,
+            sha256: BUNDLED_SHA256,
+        }
+    }
+}
+
+impl ArchiveIdentity<'_> {
+    /// Идентификатор сборки, которым адресуются каталог установки, её
+    /// манифест и журналы рядом.
+    pub fn build_id(&self) -> String {
+        build_id(self.version, self.sha256)
+    }
+}
+
 /// Собирает манифест по фактически распакованному дереву.
-pub fn manifest_for(dir: &Path, executable: &str) -> Result<Manifest, PrepareError> {
+pub fn manifest_for(
+    dir: &Path,
+    executable: &str,
+    identity: ArchiveIdentity<'_>,
+) -> Result<Manifest, PrepareError> {
     let (file_count, total_bytes) =
         measure_tree(dir).map_err(|err| PrepareError::UnpackFailed {
             reason: format!("обход {}: {err}", dir.display()),
@@ -447,8 +592,8 @@ pub fn manifest_for(dir: &Path, executable: &str) -> Result<Manifest, PrepareErr
 
     Ok(Manifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
-        yt_dlp_version: BUNDLED_VERSION.to_string(),
-        archive_sha256: BUNDLED_SHA256.to_string(),
+        yt_dlp_version: identity.version.to_string(),
+        archive_sha256: identity.sha256.to_string(),
         executable: executable.to_string(),
         file_count,
         total_bytes,
@@ -538,7 +683,8 @@ mod tests {
         write_file(&dir.join("yt-dlp-test"), b"#!/bin/sh\n", true);
         write_file(&dir.join("_internal/lib.so"), b"0123456789", false);
 
-        let manifest = manifest_for(&dir, "yt-dlp-test").expect("manifest must be collectable");
+        let manifest = manifest_for(&dir, "yt-dlp-test", ArchiveIdentity::bundled())
+            .expect("manifest must be collectable");
         manifest
             .write_atomic(&layout.manifest_path(&build_id))
             .expect("manifest must be writable");

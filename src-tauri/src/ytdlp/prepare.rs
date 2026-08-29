@@ -304,6 +304,22 @@ async fn prepare_inner(
         unpack::remove_dir_if_exists(&stale)?;
     }
 
+    // То же самое для недокачанного архива обновления (С-7): прерванное
+    // скачивание оставляет `.download-*` до шестидесяти мегабайт, и
+    // убирать его надо там же, где убирается `.staging-*`, — на старте,
+    // единственном моменте, когда заведомо никто не пишет в каталог
+    // данных. Отказ уборки здесь не роняет подготовку: остаток мешает
+    // месту на диске, а не работе.
+    for stale in layout.stale_downloads() {
+        eprintln!(
+            "yt-dlp: убираю недокачанный архив обновления {}",
+            stale.display()
+        );
+        if let Err(err) = std::fs::remove_file(&stale) {
+            eprintln!("yt-dlp: не удалось убрать {}: {err}", stale.display());
+        }
+    }
+
     let repair_path = layout.repair_path(&build_id);
 
     match layout::validate(&layout, &build_id) {
@@ -362,16 +378,8 @@ async fn prepare_inner(
         }
         Err(invalid) => {
             eprintln!("yt-dlp: установка непригодна ({invalid}), распаковываю заново");
-            let prepared = install_and_warm(
-                archive_path,
-                &layout,
-                &build_id,
-                registry,
-                sink,
-                started,
-                timeouts,
-            )
-            .await?;
+            let prepared =
+                install_and_warm(archive_path, &layout, registry, sink, started, timeouts).await?;
             RepairLog::clear(&repair_path);
             Ok(prepared)
         }
@@ -435,16 +443,7 @@ async fn repair(
         eprintln!("yt-dlp: не удалось записать историю починки: {err}");
     }
 
-    let outcome = install_and_warm(
-        archive_path,
-        layout,
-        build_id,
-        registry,
-        sink,
-        started,
-        timeouts,
-    )
-    .await;
+    let outcome = install_and_warm(archive_path, layout, registry, sink, started, timeouts).await;
 
     match &outcome {
         Ok(_) => RepairLog::clear(&repair_path),
@@ -479,13 +478,18 @@ fn repair_exhausted(history: &RepairLog, now_unix: u64) -> bool {
 async fn install_and_warm(
     archive_path: &Path,
     layout: &Layout,
-    build_id: &str,
     registry: &ChildRegistry,
     sink: &dyn ProgressSink,
     started: Instant,
     timeouts: Timeouts,
 ) -> Result<YtDlpPrepared, PrepareError> {
-    let installed = install(archive_path, layout, build_id, sink)?;
+    let unpack_started = Instant::now();
+    let installed = install(
+        archive_path,
+        layout,
+        layout::ArchiveIdentity::bundled(),
+        &mut |done, total| sink.emit(unpacking_event(done, total, unpack_started)),
+    )?;
     let file_count = count_tree_files(&installed);
     let version = warm_up(
         &installed,
@@ -506,12 +510,32 @@ async fn install_and_warm(
 }
 
 /// Распаковка в `.staging-*`, атомарный перенос, запись манифеста.
-fn install(
+///
+/// Единственная реализация установки на весь проект: обновление yt-dlp
+/// (TL-56) вызывает **эту** функцию, а не свою копию (Ф-4). Отсюда два
+/// её свойства, которых у неё не было до E6.
+///
+/// Первое — `identity` вместо констант пина: build id, каталог и манифест
+/// адресуются тем, чем архив себя называет, а вложен он в бандл или
+/// скачан из сети, установке безразлично.
+///
+/// Второе — `on_progress` вместо [`ProgressSink`]. Здесь сменился не
+/// стиль, а адресат: подготовка первого запуска эмитит ход в
+/// `ytdlp://prepare`, а фоновое обновление обязано **не** эмитить туда
+/// ничего — на этом канале поднимается полноэкранный блокирующий
+/// `YtDlpPrepareScreen`, и его появление посреди фоновой работы было бы
+/// прямой регрессией Р-1 («никаких прерывающих уведомлений»). Пока сюда
+/// передавался `&dyn ProgressSink`, единственным способом это соблюсти
+/// была дисциплина вызывающего; с замыканием канал выбирает тот, кто
+/// установку затеял, и выбрать чужой не может.
+pub(super) fn install(
     archive_path: &Path,
     layout: &Layout,
-    build_id: &str,
-    sink: &dyn ProgressSink,
+    identity: layout::ArchiveIdentity<'_>,
+    on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Installed, PrepareError> {
+    let build_id = identity.build_id();
+    let build_id = build_id.as_str();
     let install_dir = layout.install_dir(build_id);
     let manifest_path = layout.manifest_path(build_id);
 
@@ -526,11 +550,7 @@ fn install(
     unpack::remove_dir_if_exists(&install_dir)?;
     let _ = std::fs::remove_file(&manifest_path);
 
-    let unpack_started = Instant::now();
-    let unpacked = unpack::unpack(archive_path, &staging, &mut |done, total| {
-        sink.emit(unpacking_event(done, total, unpack_started));
-    })
-    .inspect_err(|_| {
+    let unpacked = unpack::unpack(archive_path, &staging, on_progress).inspect_err(|_| {
         // Полураспакованное дерево не должно пережить неудачу — иначе
         // следующий запуск найдёт мусор на 124 МиБ и будет чистить его
         // «за прошлый раз».
@@ -539,7 +559,7 @@ fn install(
 
     unpack::promote(&staging, &install_dir)?;
 
-    let manifest = layout::manifest_for(&install_dir, &unpacked.executable)?;
+    let manifest = layout::manifest_for(&install_dir, &unpacked.executable, identity)?;
     manifest.write_atomic(&manifest_path)?;
 
     Ok(Installed {
@@ -1251,6 +1271,44 @@ mod tests {
         assert!(
             !stale.exists(),
             "мусор прерванной подготовки обязан исчезнуть"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_half_downloaded_update_archive_is_removed_too() {
+        // С-7: обрыв во время скачивания обновления оставляет
+        // `.download-*` — до шестидесяти мегабайт, — и убирать его надо
+        // там же, где `.staging-*`: на старте, единственном моменте,
+        // когда в каталог данных заведомо никто не пишет. До TL-56
+        // уборка знала только про каталоги распаковки, и остаток
+        // скачивания пережил бы сколько угодно запусков.
+        let fixture = fixture(PRINTS_VERSION);
+        let layout = fixture.layout();
+        layout.create_root().expect("создать корень");
+        let (partial, file) = layout
+            .create_download_file("2000.01.01-deadbeefdead")
+            .expect("создать файл приёма");
+        drop(file);
+        fs::write(&partial, vec![0_u8; 4096]).expect("записать недокачанное");
+
+        assert_eq!(
+            layout.stale_downloads(),
+            vec![partial.clone()],
+            "остаток обязан быть виден уборке до подготовки"
+        );
+
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("подготовка обязана пройти");
+
+        assert!(
+            !partial.exists(),
+            "недокачанный архив обновления обязан исчезнуть"
+        );
+        assert!(
+            fixture.install_dir().exists(),
+            "уборка чужого остатка не должна мешать самой подготовке"
         );
     }
 
