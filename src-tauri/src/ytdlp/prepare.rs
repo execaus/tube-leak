@@ -92,6 +92,7 @@ use tauri::{AppHandle, Emitter};
 
 use super::error::PrepareError;
 use super::layout::{self, Installed, Layout, RepairLog};
+use super::state::{self, InstallEntry, InstallState};
 use super::unpack;
 use crate::sidecar::{self, ChildRegistry, SidecarError};
 use crate::types::{YtDlpPrepareEvent, YtDlpPrepareStage, YtDlpPrepared};
@@ -290,7 +291,10 @@ async fn prepare_inner(
 ) -> Result<YtDlpPrepared, PrepareError> {
     let layout = Layout::new(data_dir);
     layout.create_root()?;
-    let build_id = layout::bundled_build_id()?;
+    // Пин сразу в форме записи Ф-5: из неё же берётся его build id, то
+    // есть проверка идентификатора остаётся одна на оба применения.
+    let pinned = InstallEntry::for_identity(layout::ArchiveIdentity::bundled())?;
+    let build_id = pinned.build_id().clone();
 
     // Мусор от подготовок, прерванных на середине: полураспакованное
     // дерево под именем `.staging-*`. Оно никогда не считается установкой
@@ -320,9 +324,138 @@ async fn prepare_inner(
         }
     }
 
-    let repair_path = layout.repair_path(&build_id);
+    // Кого готовить, решает запись Ф-5, а не константа пина: контур
+    // обновления (E6) мог переключить активную установку на скачанную из
+    // сети, и готовить вместо неё пин значило бы греть дерево, которого
+    // никто потом не запустит, — а при исчерпанной уборке (Ф-8 держит на
+    // диске две установки, и пина среди них может уже не быть) ещё и
+    // распаковывать его заново на каждом старте.
+    let mut state = InstallState::load(&layout);
+    if let Some(prepared) = prepare_active(
+        &layout, &state, &build_id, registry, sink, started, timeouts,
+    )
+    .await
+    {
+        return Ok(prepared);
+    }
 
-    match layout::validate(&layout, &build_id) {
+    let prepared = prepare_pinned(
+        archive_path,
+        &layout,
+        &build_id,
+        registry,
+        sink,
+        started,
+        timeouts,
+    )
+    .await?;
+
+    // Пин работает — значит он и есть активная установка. Сюда приходят
+    // два случая: первый запуск вообще (записи ещё нет) и отказ активной
+    // установки, после которого вложенный архив сработал резервом (Ф-5).
+    // Отказ записи не отменяет подготовку: приложение работоспособно и
+    // без неё — резолв найдёт пин третьей попыткой, — а следующий запуск
+    // попробует записать снова.
+    match state.activate(&layout, pinned) {
+        Ok(true) => eprintln!("yt-dlp: активной установкой записан {build_id}"),
+        Ok(false) => {}
+        Err(err) => eprintln!("yt-dlp: не удалось записать активную установку: {err}"),
+    }
+
+    Ok(prepared)
+}
+
+/// Готовит установку, которую называет активной запись Ф-5, — но только
+/// если это не пин: пином занимается [`prepare_pinned`], у которого есть
+/// чем переустановить дерево.
+///
+/// `None` означает «этой дорогой не вышло, работай вложенным архивом».
+/// Причин ровно три, и все три — про негодность активной установки:
+/// записи нет, дерево не прошло [`layout::validate`], дерево не
+/// запускается. Переустановить активную установку здесь нечем: в бандле
+/// лежит архив пина, а не её, и распаковка его под чужим идентификатором
+/// собрала бы установку, врущую о своём содержимом. Поэтому исход один —
+/// вложенный архив как резерв (Ф-5), и это **не** откат (Р-3): запись не
+/// меняется, а сменит её [`prepare_pinned`] только после того, как пин
+/// действительно заработает.
+async fn prepare_active(
+    layout: &Layout,
+    state: &InstallState,
+    pinned: &layout::BuildId,
+    registry: &ChildRegistry,
+    sink: &dyn ProgressSink,
+    started: Instant,
+    timeouts: Timeouts,
+) -> Option<YtDlpPrepared> {
+    let active = state.active()?;
+    if active.build_id() == pinned {
+        return None;
+    }
+    let build_id = active.build_id();
+
+    let installed = match layout::validate(layout, build_id) {
+        Ok(installed) => installed,
+        Err(invalid) => {
+            eprintln!(
+                "yt-dlp: активная установка {build_id} непригодна ({invalid}), \
+                 беру вложенный в бандл архив как резерв"
+            );
+            return None;
+        }
+    };
+
+    match probe(&installed, registry, timeouts.probe).await {
+        Probe::Warm(version) => Some(YtDlpPrepared {
+            version,
+            path: installed.executable.display().to_string(),
+            prepared: false,
+            duration_ms: elapsed_ms(started),
+        }),
+        Probe::Cold => {
+            // Дерево цело, но ОС забыла результат проверки подписей.
+            let file_count = count_tree_files(&installed);
+            match warm_up(&installed, registry, sink, file_count, 0, timeouts.warmup).await {
+                Ok(version) => Some(YtDlpPrepared {
+                    version,
+                    path: installed.executable.display().to_string(),
+                    prepared: true,
+                    duration_ms: elapsed_ms(started),
+                }),
+                Err(err) => {
+                    eprintln!(
+                        "yt-dlp: активная установка {build_id} не прогрелась ({err}), \
+                         беру вложенный в бандл архив как резерв"
+                    );
+                    None
+                }
+            }
+        }
+        Probe::Broken(reason) => {
+            eprintln!(
+                "yt-dlp: активная установка {build_id} не запускается ({reason}), \
+                 беру вложенный в бандл архив как резерв"
+            );
+            None
+        }
+    }
+}
+
+/// Подготовка вложенной в бандл установки — тот же путь, что был до E6:
+/// проверка дерева, проба, прогрев, а при негодном дереве —
+/// переустановка со счётчиком починок.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_pinned(
+    archive_path: &Path,
+    layout: &Layout,
+    build_id: &layout::BuildId,
+    registry: &ChildRegistry,
+    sink: &dyn ProgressSink,
+    started: Instant,
+    timeouts: Timeouts,
+) -> Result<YtDlpPrepared, PrepareError> {
+    let repair_path = layout.repair_path(build_id);
+
+    match layout::validate(layout, build_id) {
         Ok(installed) => {
             match probe(&installed, registry, timeouts.probe).await {
                 Probe::Warm(version) => {
@@ -365,8 +498,8 @@ async fn prepare_inner(
                     repair(
                         &reason,
                         archive_path,
-                        &layout,
-                        &build_id,
+                        layout,
+                        build_id,
                         registry,
                         sink,
                         started,
@@ -379,7 +512,7 @@ async fn prepare_inner(
         Err(invalid) => {
             eprintln!("yt-dlp: установка непригодна ({invalid}), распаковываю заново");
             let prepared =
-                install_and_warm(archive_path, &layout, registry, sink, started, timeouts).await?;
+                install_and_warm(archive_path, layout, registry, sink, started, timeouts).await?;
             RepairLog::clear(&repair_path);
             Ok(prepared)
         }
@@ -722,17 +855,37 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Путь к исполняемому файлу готовой установки yt-dlp.
+/// Путь к исполняемому файлу готовой установки yt-dlp — единственный
+/// резолв на всех потребителей (служебный экран, разбор ссылки,
+/// скачивание).
+///
+/// Идёт через явную запись Ф-5, а не через константу пина: после первого
+/// же обновления yt-dlp пин перестаёт быть тем, чем работает приложение,
+/// а после второго его каталога может уже не быть на диске (Ф-8 держит
+/// две установки). Что именно ответило — активная запись, известно-хорошая
+/// или вложенный в бандл пин, — решает [`state::resolve`].
 ///
 /// `Err` означает «подготовка не выполнена или дерево непригодно» — это
 /// не сбой, а нормальное состояние до первого вызова `prepare_ytdlp`.
 pub fn installed_executable(data_dir: &Path) -> Result<PathBuf, PrepareError> {
     let layout = Layout::new(data_dir);
-    layout::validate(&layout, &layout::bundled_build_id()?)
-        .map(|installed| installed.executable)
-        .map_err(|invalid| PrepareError::LayoutUnexpected {
-            reason: invalid.to_string(),
-        })
+    let state = InstallState::load(&layout);
+    let resolved = state::resolve(&layout, &state)?;
+
+    // Резерв работает молча для пользователя, но не для лога: по этой
+    // строке владелец отличает «работаем на том, что записано» от
+    // «активная установка испортилась, и мы работаем на запасной».
+    // Молчание про `Bundled` без записи — не пропуск: до первого
+    // переключения пин и есть активная установка (С-10), и сообщать там
+    // не о чем.
+    if resolved.slot != state::Slot::Active && state.active().is_some() {
+        eprintln!(
+            "yt-dlp: активная установка недоступна, работаю на резерве ({})",
+            resolved.build_id
+        );
+    }
+
+    Ok(resolved.installed.executable)
 }
 
 #[cfg(test)]
@@ -752,6 +905,24 @@ mod tests {
     fn other_build_id() -> layout::BuildId {
         layout::BuildId::new("2000.01.01", &"de".repeat(32))
             .expect("образец обязан проходить проверку")
+    }
+
+    /// Установка, которой в бандле нет и быть не может: так выглядит
+    /// yt-dlp, скачанный контуром обновления (E6) уже после выпуска этой
+    /// сборки приложения. Версия заведомо новее пина — не потому, что
+    /// код где-то их сравнивает (он не сравнивает нигде), а чтобы
+    /// читатель теста не гадал, кто из двух кому предшественник.
+    fn updated_identity() -> layout::ArchiveIdentity<'static> {
+        layout::ArchiveIdentity {
+            version: "2030.01.01",
+            sha256: UPDATED_SHA,
+        }
+    }
+
+    const UPDATED_SHA: &str = "beef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab";
+
+    fn updated_entry() -> InstallEntry {
+        InstallEntry::for_identity(updated_identity()).expect("образец обязан проходить проверку")
     }
     use std::fs::{self, File};
     use std::io::Write;
@@ -887,6 +1058,44 @@ mod tests {
 
         fn manifest_path(&self) -> PathBuf {
             self.layout().manifest_path(&pinned_build_id())
+        }
+
+        /// Раскладывает готовую установку, которой нет в бандле, и делает
+        /// её активной по записи — так выглядит машина, на которой контур
+        /// обновления уже отработал.
+        ///
+        /// Дерево пишется руками, а не распаковкой: архива этой версии у
+        /// приложения нет и взяться ему неоткуда — в этом весь смысл
+        /// сценария.
+        fn install_and_activate(&self, identity: layout::ArchiveIdentity<'_>, body: &str) {
+            let layout = self.layout();
+            layout.create_root().expect("создать корень");
+            let entry = InstallEntry::for_identity(identity).expect("проверенный идентификатор");
+            let dir = layout.install_dir(entry.build_id());
+
+            fs::create_dir_all(dir.join("_internal")).expect("создать дерево");
+            fs::write(dir.join(EXECUTABLE_NAME), body).expect("записать исполняемый файл");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(dir.join(EXECUTABLE_NAME), fs::Permissions::from_mode(0o755))
+                    .expect("бит выполнения");
+            }
+            fs::write(dir.join("_internal/lib.so"), b"pretend-shared-library")
+                .expect("записать библиотеку");
+
+            layout::manifest_for(&dir, EXECUTABLE_NAME, identity)
+                .expect("манифест обязан собираться")
+                .write_atomic(&layout.manifest_path(entry.build_id()))
+                .expect("манифест обязан записываться");
+
+            InstallState::default()
+                .activate(&layout, entry)
+                .expect("запись обязана сохраняться");
+        }
+
+        fn state(&self) -> InstallState {
+            InstallState::load(&self.layout())
         }
     }
 
@@ -1402,6 +1611,131 @@ mod tests {
 
         let path = installed_executable(&fixture.data_dir).expect("после подготовки путь есть");
         assert!(path.ends_with(EXECUTABLE_NAME));
+    }
+
+    #[tokio::test]
+    async fn the_first_run_records_the_pin_as_the_active_installation() {
+        // Ф-5: активная установка — явная запись, и завести её обязана
+        // подготовка первого запуска. Без этого запись появлялась бы
+        // только после первого обновления, а до него резолв работал бы
+        // догадкой.
+        let fixture = fixture(PRINTS_VERSION);
+        assert_eq!(
+            fixture.state(),
+            InstallState::default(),
+            "до подготовки записи нет"
+        );
+
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("подготовка обязана пройти");
+
+        let state = fixture.state();
+        assert_eq!(
+            state.active().map(InstallEntry::build_id),
+            Some(&pinned_build_id())
+        );
+        assert_eq!(
+            state.known_good(),
+            None,
+            "первому запуску не от чего откатываться"
+        );
+
+        // Второй запуск ничего не переписывает: активная и так та же.
+        let before = fs::metadata(fixture.layout().state_path())
+            .and_then(|meta| meta.modified())
+            .expect("время изменения записи");
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("второй запуск обязан пройти");
+        assert_eq!(
+            fs::metadata(fixture.layout().state_path())
+                .and_then(|meta| meta.modified())
+                .expect("время изменения записи"),
+            before,
+            "повторная активация той же установки не должна переписывать файл"
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_and_resolution_follow_the_record_not_the_pin() {
+        // Машина, на которой контур обновления уже отработал: активна
+        // версия, которой в бандле нет. Подготовка обязана греть её, а не
+        // распаковывать пин, — иначе после уборки (Ф-8 держит на диске
+        // две установки) каждый старт заново разворачивал бы 124 МиБ
+        // дерева, которое потом никто не запустит.
+        let fixture = fixture(PRINTS_VERSION);
+        fixture.install_and_activate(updated_identity(), "#!/bin/sh\necho 2030.01.01\n");
+
+        let prepared = fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("подготовка обязана пройти");
+
+        assert_eq!(prepared.version, "2030.01.01");
+        assert!(
+            !prepared.prepared,
+            "готовая установка не требует ни распаковки, ни прогрева"
+        );
+        assert!(
+            !fixture.install_dir().exists(),
+            "вложенный в бандл архив не должен распаковываться, пока активная \
+             установка работает"
+        );
+        assert_eq!(
+            fixture.state().active().map(InstallEntry::build_id),
+            Some(updated_entry().build_id()),
+            "подготовка не должна переписывать запись, которую не она завела"
+        );
+
+        // И то же самое для всех потребителей пути (служебный экран,
+        // разбор ссылки, скачивание): они ходят через тот же резолв.
+        let resolved = installed_executable(&fixture.data_dir).expect("путь обязан находиться");
+        assert_eq!(
+            resolved,
+            fixture
+                .layout()
+                .install_dir(updated_entry().build_id())
+                .join(EXECUTABLE_NAME)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broken_active_installation_falls_back_to_the_bundled_archive() {
+        // Ф-5, «вшитый архив — резерв»: активная установка не запускается,
+        // а починить её нечем — архива этой версии в бандле нет. Приложение
+        // обязано остаться работоспособным на пине, и запись обязана
+        // сказать об этом честно.
+        let fixture = fixture(PRINTS_VERSION);
+        fixture.install_and_activate(updated_identity(), EXITS_NONZERO);
+
+        let prepared = fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("резерв обязан вытащить подготовку");
+
+        assert_eq!(prepared.version, "2026.08.19");
+        assert!(
+            prepared
+                .path
+                .starts_with(&fixture.install_dir().display().to_string()),
+            "работать обязан пин: {}",
+            prepared.path
+        );
+
+        let state = fixture.state();
+        assert_eq!(
+            state.active().map(InstallEntry::build_id),
+            Some(&pinned_build_id())
+        );
+        assert_eq!(
+            state.known_good().map(InstallEntry::build_id),
+            Some(updated_entry().build_id()),
+            "смещённая установка становится известно-хорошей — годна ли она к \
+             запуску, решает тот, кто будет откатываться (TL-58)"
+        );
     }
 
     #[test]

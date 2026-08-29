@@ -69,6 +69,22 @@ pub const BUNDLED_ARCHIVE_RESOURCE: &str = "resources/yt-dlp.zip";
 /// Подкаталог каталога данных приложения, в котором живут установки yt-dlp.
 const INSTALL_ROOT_DIR: &str = "yt-dlp";
 
+/// Имя файла с записью «какая установка активна, какая — известно-хорошая»
+/// (TL-54, Ф-5).
+///
+/// Лежит в корне установок, а не рядом с ним, ровно ради С-7: снос
+/// каталога `yt-dlp` целиком (руками пользователя или скриптом уборки
+/// диска) обязан возвращать контур в исходное состояние, а не в
+/// полусостояние «записи есть, установок нет». Одним каталогом это
+/// получается само.
+///
+/// С манифестом столкнуться не может, и это свойство раскладки, а не
+/// удача: манифест называется `<версия>-<12 hex>.json`, то есть до
+/// расширения всегда кончается дефисом и двенадцатью
+/// шестнадцатеричными символами. Версии `installs` для этого мало —
+/// её манифест звался бы `installs-<12 hex>.json`.
+const STATE_FILE: &str = "installs.json";
+
 /// Префикс каталога, в который идёт распаковка до атомарного переименования.
 const STAGING_PREFIX: &str = ".staging-";
 
@@ -83,6 +99,15 @@ const STAGING_PREFIX: &str = ".staging-";
 /// прерванной работы никогда не выглядит установкой (та адресуется
 /// `<версия>-<sha12>`).
 const DOWNLOAD_PREFIX: &str = ".download-";
+
+/// Суффикс файла манифеста установки.
+///
+/// Литералом он был ровно до тех пор, пока имена в корне установок читал
+/// один только тот код, который их и создаёт. Уборка (TL-54) читает их
+/// вторым местом, и повторить литерал там значило бы завести вторую
+/// правду о том, как называется манифест: разойдясь с этой, она удалила
+/// бы манифест живой установки как мусор.
+const MANIFEST_SUFFIX: &str = ".json";
 
 /// Суффикс файла со счётчиком безуспешных переустановок.
 const REPAIR_SUFFIX: &str = ".repair.json";
@@ -99,7 +124,6 @@ const REPAIR_SUFFIX: &str = ".repair.json";
 /// же файл, неудача скачивания обновления считалась бы неудачей починки
 /// и однажды запретила бы подготовку рабочей установки на старте. Разные
 /// файлы делают это невыразимым.
-#[allow(dead_code)] // Читает и пишет журнал `fetch`, зовёт его TL-58.
 const UPDATE_ATTEMPT_SUFFIX: &str = ".update.json";
 
 /// Сколько имён каталога распаковки пробовать, прежде чем сдаться.
@@ -381,7 +405,7 @@ impl Layout {
 
     /// Файл манифеста конкретной установки.
     pub fn manifest_path(&self, build_id: &BuildId) -> PathBuf {
-        self.root.join(format!("{build_id}.json"))
+        self.root.join(format!("{build_id}{MANIFEST_SUFFIX}"))
     }
 
     /// Файл со счётчиком безуспешных переустановок этой установки.
@@ -493,6 +517,52 @@ impl Layout {
         Err(PrepareError::UnpackFailed {
             reason: format!("каталог распаковки {}: {err}", path.display()),
         })
+    }
+
+    /// Файл с записью об активной и известно-хорошей установках (TL-54).
+    pub fn state_path(&self) -> PathBuf {
+        self.root.join(STATE_FILE)
+    }
+
+    /// Принадлежит ли `name` — имя записи прямо в корне установок —
+    /// установке `build_id`.
+    ///
+    /// Отвечает на вопрос уборки «это чьё?» и живёт здесь по той же
+    /// причине, что [`Self::stale_downloads`]: здесь объявлены все
+    /// префиксы и суффиксы, из которых имена и составляются. Повтори
+    /// уборка эти литералы у себя — и разойтись с ними ей было бы нечем
+    /// помешать, а цена расхождения несимметрична: лишнее «не наше»
+    /// стоит 124 МиБ на диске, ошибочное «наше» стоит удалённой
+    /// установки.
+    ///
+    /// Перечислено то, что уборке **сохранять**, а не то, что удалять:
+    /// сама уборка удаляет всё, чего в этом списке нет (белый список —
+    /// урок E3). Поэтому временные файлы записи (`…json.tmp` из
+    /// [`write_json_atomic`]) сюда не попадают намеренно: пережить
+    /// `rename` они не должны, а переживший — мусор.
+    #[allow(dead_code)] // Зовёт уборка `super::state`, а её — TL-58.
+    pub fn belongs_to(name: &str, build_id: &BuildId) -> bool {
+        let id = build_id.as_str();
+
+        // Остатки работы (`.staging-<id>-<суффикс>`, `.download-<id>-<суффикс>`):
+        // дефис после идентификатора обязателен, иначе установка
+        // `2026.08.19-aaaaaaaaaaaa` присвоила бы себе остатки версии
+        // `2026.08.19-aaaaaaaaaaaab…`, которой она не родня.
+        for prefix in [STAGING_PREFIX, DOWNLOAD_PREFIX] {
+            if let Some(rest) = name.strip_prefix(prefix) {
+                return rest
+                    .strip_prefix(id)
+                    .is_some_and(|tail| tail.starts_with('-'));
+            }
+        }
+
+        let Some(rest) = name.strip_prefix(id) else {
+            return false;
+        };
+        matches!(
+            rest,
+            "" | MANIFEST_SUFFIX | REPAIR_SUFFIX | UPDATE_ATTEMPT_SUFFIX
+        )
     }
 
     /// Создаёт корневой каталог установок.
@@ -621,7 +691,11 @@ impl RepairLog {
 /// Половина JSON под рабочим именем — это либо «установка готова» при
 /// неполном дереве (манифест), либо нечитаемый счётчик (история починки);
 /// первое опаснее, но чинится одинаково.
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T, what: &str) -> Result<(), PrepareError> {
+pub(super) fn write_json_atomic<T: Serialize>(
+    path: &Path,
+    value: &T,
+    what: &str,
+) -> Result<(), PrepareError> {
     let json = serde_json::to_vec_pretty(value).map_err(|err| PrepareError::UnpackFailed {
         reason: format!("сериализация {what}: {err}"),
     })?;
@@ -641,7 +715,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T, what: &str) -> Result
 }
 
 /// Читает JSON. `None` — файла нет либо он не разбирается.
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+pub(super) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     let raw = fs::read(path).ok()?;
     serde_json::from_slice(&raw).ok()
 }
