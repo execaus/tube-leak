@@ -23,7 +23,7 @@ vi.mock('@tauri-apps/api/event', () => ({
 }))
 
 // Импортируется после мока модулей, чтобы composable получил замоканные `invoke`/`listen`.
-const { checkYtDlpUpdate, fetchYtDlpUpdateState, useYtDlpUpdate } = await import('./useYtDlpUpdate')
+const { checkYtDlpUpdate, fetchYtDlpUpdateState, rollBackYtDlp, useYtDlpUpdate } = await import('./useYtDlpUpdate')
 
 const neverCheckedSnapshot: YtDlpUpdateSnapshot = { busy: false, status: 'neverChecked' }
 const checkingSnapshot: YtDlpUpdateSnapshot = { busy: true, status: 'checking' }
@@ -31,6 +31,24 @@ const upToDateSnapshot: YtDlpUpdateSnapshot = {
   busy: false,
   status: 'upToDate',
   at: '2026-08-25T12:00:00Z',
+}
+
+/** Строка 14 таблицы — откат принят, ждёт паузы между задачами (Ф-7, Р-3). */
+const rollbackWaitingSnapshot: YtDlpUpdateSnapshot = {
+  busy: true,
+  status: 'rollbackWaiting',
+  version: '2026.07.11',
+  rollbackTarget: '2026.08.20',
+}
+
+/** Строка 13 — откат уже применён немедленно (нет активной загрузки, Ф-8/Р-3). */
+const rolledBackSnapshot: YtDlpUpdateSnapshot = {
+  busy: false,
+  status: 'rolledBack',
+  at: '2026-08-25T12:00:05Z',
+  active: '2026.07.11',
+  abandoned: '2026.08.20',
+  rollbackTarget: '2026.08.20',
 }
 
 /**
@@ -83,6 +101,16 @@ describe('checkYtDlpUpdate', () => {
     await checkYtDlpUpdate()
 
     expect(invokeMock).toHaveBeenCalledExactlyOnceWith('check_ytdlp_update')
+  })
+})
+
+describe('rollBackYtDlp', () => {
+  it('calls the roll_back_ytdlp Tauri command with no arguments (TL-60, Р-3: цель ровно одна, не параметр)', async () => {
+    invokeMock.mockResolvedValueOnce(rollbackWaitingSnapshot)
+
+    await rollBackYtDlp()
+
+    expect(invokeMock).toHaveBeenCalledExactlyOnceWith('roll_back_ytdlp')
   })
 })
 
@@ -231,6 +259,101 @@ describe('useYtDlpUpdate', () => {
     await expect(result.checkNow()).resolves.toBeUndefined()
     // Снимок не портится отказом — остаётся тем, что было до вызова.
     expect(result.snapshot.value).toStrictEqual(neverCheckedSnapshot)
+  })
+
+  /*
+   * TL-60 (Р-3): `rollback()` — тот же контракт, что `checkNow()`, только
+   * за `roll_back_ytdlp`, и он им и является технически (`callCommandAndApply`
+   * общий, doc composable выше). Проверяется отдельно, а не по аналогии —
+   * дублирующий код неизбежно расходится с оригиналом на следующей правке,
+   * и тест обязан ловить это здесь, а не полагаться на симметрию с checkNow.
+   */
+  it('rollback() calls roll_back_ytdlp and updates the snapshot from its response', async () => {
+    invokeMock.mockResolvedValueOnce(upToDateSnapshot)
+
+    const { result } = withSetup(() => useYtDlpUpdate())
+    await flushPromises()
+
+    invokeMock.mockResolvedValueOnce(rollbackWaitingSnapshot)
+    await result.rollback()
+
+    expect(invokeMock).toHaveBeenLastCalledWith('roll_back_ytdlp')
+    expect(result.snapshot.value).toStrictEqual(rollbackWaitingSnapshot)
+  })
+
+  /*
+   * Критерий приёмки TL-60: «во время активной загрузки клик «Вернуться»
+   * переводит блок в состояние 14 (ожидание границы), не в 13 (уже
+   * применено) немедленно». `rollback()` не решает это сам — он лишь
+   * применяет то, что вернула команда (doc `rollback` в composable);
+   * здесь доказывается, что при ответе `rollbackWaiting` composable
+   * действительно оседает на строке 14, а не на что-то другое.
+   * Симметричный случай (нет активной загрузки, ответ — `rolledBack`,
+   * строка 13, применяется немедленно) проверяется тестом выше по
+   * тому же коду — если бы composable решал это сам, для двух исходов
+   * потребовались бы разные пути, а не один и тот же вызов.
+   */
+  it('rollback() reflects rollbackWaiting (row 14), not an assumed immediate rolledBack (row 13), when the command says so', async () => {
+    invokeMock.mockResolvedValueOnce(upToDateSnapshot)
+
+    const { result } = withSetup(() => useYtDlpUpdate())
+    await flushPromises()
+
+    invokeMock.mockResolvedValueOnce(rollbackWaitingSnapshot)
+    await result.rollback()
+
+    expect(result.snapshot.value?.status).toBe('rollbackWaiting')
+    expect(result.snapshot.value?.status).not.toBe('rolledBack')
+  })
+
+  it('rollback() reflects an immediate rolledBack (row 13) when the command applies it right away', async () => {
+    invokeMock.mockResolvedValueOnce(upToDateSnapshot)
+
+    const { result } = withSetup(() => useYtDlpUpdate())
+    await flushPromises()
+
+    invokeMock.mockResolvedValueOnce(rolledBackSnapshot)
+    await result.rollback()
+
+    expect(result.snapshot.value).toStrictEqual(rolledBackSnapshot)
+  })
+
+  it('does not let a stale roll_back_ytdlp response overwrite a terminal event that arrived first (Н-1, окно Б, зеркало для отката)', async () => {
+    invokeMock.mockResolvedValueOnce(upToDateSnapshot)
+
+    const { result } = withSetup(() => useYtDlpUpdate())
+    await flushPromises()
+
+    let resolveRollback: (value: YtDlpUpdateSnapshot) => void = () => {}
+    invokeMock.mockReturnValueOnce(
+      new Promise<YtDlpUpdateSnapshot>((resolve) => {
+        resolveRollback = resolve
+      }),
+    )
+    const pending = result.rollback()
+    await Promise.resolve()
+
+    // Событие приходит раньше ответа команды.
+    capturedHandler?.({ payload: rolledBackSnapshot })
+    expect(result.snapshot.value).toStrictEqual(rolledBackSnapshot)
+
+    // Ответ команды приходит позже, всё ещё несёт устаревший `rollbackWaiting`.
+    resolveRollback(rollbackWaitingSnapshot)
+    await pending
+
+    expect(result.snapshot.value).toStrictEqual(rolledBackSnapshot)
+  })
+
+  it('swallows a rejection from rollback() instead of throwing (unreachable command error, e.g. nothingToRollBackTo)', async () => {
+    invokeMock.mockResolvedValueOnce(upToDateSnapshot)
+
+    const { result } = withSetup(() => useYtDlpUpdate())
+    await flushPromises()
+
+    invokeMock.mockRejectedValueOnce({ kind: 'nothingToRollBackTo', message: 'no known-good install' })
+
+    await expect(result.rollback()).resolves.toBeUndefined()
+    expect(result.snapshot.value).toStrictEqual(upToDateSnapshot)
   })
 
   it('swallows a rejection from the initial snapshot fetch instead of leaving the composable in a broken state', async () => {

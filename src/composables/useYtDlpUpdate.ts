@@ -6,6 +6,7 @@ import type { YtDlpUpdateSnapshot } from '@/types/generated/update'
 
 const UPDATE_STATE_COMMAND = 'ytdlp_update_state'
 const CHECK_UPDATE_COMMAND = 'check_ytdlp_update'
+const ROLL_BACK_COMMAND = 'roll_back_ytdlp'
 
 /**
  * Имя события хода контура обновления (контракт TL-53). Отдельный канал от
@@ -35,6 +36,19 @@ export async function checkYtDlpUpdate(): Promise<YtDlpUpdateSnapshot> {
   return invoke<YtDlpUpdateSnapshot>(CHECK_UPDATE_COMMAND)
 }
 
+/**
+ * «Вернуться» (Р-3, TL-60) — вызывает `roll_back_ytdlp` контракта TL-53.
+ * **Без параметра-версии**: цель ровно одна по построению (Ф-8 держит на
+ * диске не более двух установок), контракт `types.rs` объявляет команду
+ * так же, без аргументов — принимать версию от фронтенда значило бы
+ * принимать выбор, которого он не делает. Терминальный исход (сразу или
+ * после паузы между задачами — Ф-7) тот же снимок, что и у остальных
+ * команд контура (см. doc функции ниже, «Окно Б»).
+ */
+export async function rollBackYtDlp(): Promise<YtDlpUpdateSnapshot> {
+  return invoke<YtDlpUpdateSnapshot>(ROLL_BACK_COMMAND)
+}
+
 export interface UseYtDlpUpdateReturn {
   /** Последний известный снимок контура — `undefined` до первого ответа `ytdlp_update_state`. */
   snapshot: Ref<YtDlpUpdateSnapshot | undefined>
@@ -44,14 +58,23 @@ export interface UseYtDlpUpdateReturn {
    * `YtDlpUpdateSnapshot.busy` — doc в `src/types/generated/update.ts`).
    */
   checkNow: () => Promise<void>
+  /**
+   * «Вернуться» (Р-3, TL-60) — тот же контракт неактивности кнопки, что и
+   * `checkNow`: вызывающая сторона не даёт нажать её, пока
+   * `snapshot.value?.busy` истинно. Инлайн-подтверждение и решение
+   * пользователя «Вернуться»/«Отмена» — в `YtDlpUpdateBlock`; здесь только
+   * сам вызов команды и применение её ответа.
+   */
+  rollback: () => Promise<void>
 }
 
 /**
- * Composable блока «Обновление yt-dlp» (TL-59, дизайн E6): разовый снимок
- * при маунте + подписка на `ytdlp://update` — тот же приём, что у
+ * Composable блока «Обновление yt-dlp» (TL-59/TL-60, дизайн E6): разовый
+ * снимок при маунте + подписка на `ytdlp://update` — тот же приём, что у
  * `useSidecarCheck` (снимок) и `useYtDlpPrepare` (событие). Ядро — источник
  * истины состояния контура (CLAUDE.md), этот composable — проекция, не
- * второй источник: пишет только то, что получил снимком или событием.
+ * второй источник: пишет только то, что получил снимком, событием или
+ * ответом одной из двух команд (`checkNow`/`rollback`).
  *
  * # Порядок «подписка раньше снимка» — что он закрывает, а что нет
  *
@@ -74,13 +97,14 @@ export interface UseYtDlpUpdateReturn {
  *   открытия экрана и как раз в этот момент прислал событие) — если бы
  *   `snapshot.value` присваивался ответу команды безусловно, только что
  *   пришедшее свежее событие откатилось бы назад.
- * - **Окно Б (клик «Проверить сейчас»).** Ответ `check_ytdlp_update`
- *   обычно несёт промежуточный `checking`, но конвейер может успеть дойти
+ * - **Окно Б (клик «Проверить сейчас» или «Вернуться»).** Ответ
+ *   `check_ytdlp_update`/`roll_back_ytdlp` обычно несёт промежуточный
+ *   статус (`checking`/`rollbackWaiting`), но конвейер может успеть дойти
  *   до терминального исхода и прислать событие раньше, чем разрешится сам
  *   вызов команды — тогда безусловное присваивание затёрло бы честный
  *   терминальный текст (и `busy: true` из ответа команды) обратно в
  *   вечный спиннер до следующего события по расписанию (прямая
- *   регрессия С-12).
+ *   регрессия С-12, и её же зеркало для отката — Р-3).
  *
  * Лечится счётчиком поколений `eventGeneration`: каждое событие его
  * увеличивает, и ответ команды применяется, только если поколение не
@@ -117,9 +141,10 @@ export function useYtDlpUpdate(): UseYtDlpUpdateReturn {
         })
         .catch((err: unknown) => {
           // Сбрасываем memoization, чтобы следующая попытка (следующий
-          // маунт в тестах, либо — раз composable общий для TL-59/TL-60 —
-          // повторный вызов checkNow()) не унаследовала уже отклонённый
-          // промис навсегда (тот же приём, что `useYtDlpPrepare`).
+          // маунт в тестах, либо — раз composable общий для блока TL-59 и
+          // отката TL-60 — повторный вызов checkNow()/rollback()) не
+          // унаследовала уже отклонённый промис навсегда (тот же приём,
+          // что `useYtDlpPrepare`).
           listening = undefined
           throw err
         })
@@ -147,21 +172,45 @@ export function useYtDlpUpdate(): UseYtDlpUpdateReturn {
     }
   }
 
-  async function checkNow(): Promise<void> {
-    const generationBeforeCheck = eventGeneration
+  /**
+   * Общий хвост «Окна Б» для обеих команд, ждущих терминального исхода
+   * событием (`checkNow`/`rollback`): вызывает команду и применяет её
+   * ответ, только если за время ожидания не пришло более свежее событие
+   * (doc функции выше). Один код на обе команды — не удобство изложения:
+   * разные копии одной и той же гонки расходятся так же надёжно, как
+   * разные копии одного правила (тот же довод, что у `YtDlpUpdateSnapshot`
+   * — «одно значение и на снимок, и на событие» в контракте).
+   */
+  async function callCommandAndApply(command: () => Promise<YtDlpUpdateSnapshot>): Promise<void> {
+    const generationBeforeCall = eventGeneration
     try {
-      const result = await checkYtDlpUpdate()
-      // Окно Б (doc функции выше): терминальный исход, пришедший событием
-      // раньше ответа команды, не переписывается назад в «Проверяем…».
-      if (eventGeneration === generationBeforeCheck) {
+      const result = await command()
+      if (eventGeneration === generationBeforeCall) {
         snapshot.value = result
       }
     } catch {
       // `YtDlpUpdateCommandError` ("busy"/"nothingToRollBackTo") — отказ, до
-      // которого исправный UI не доводит: кнопка неактивна, пока
-      // `snapshot.value.busy` истинно (doc типа в контракте). Проглатывается
+      // которого исправный UI не доводит: обе кнопки неактивны, пока
+      // `snapshot.value.busy` истинно, а «Вернуться» вдобавок не рисуется
+      // вовсе без `rollbackTarget` (doc типов в контракте). Проглатывается
       // по той же причине, что и в `loadInitialSnapshot`.
     }
+  }
+
+  async function checkNow(): Promise<void> {
+    await callCommandAndApply(checkYtDlpUpdate)
+  }
+
+  /**
+   * «Вернуться» (Р-3, TL-60) — вызывается только по подтверждению из
+   * инлайн-диалога `YtDlpUpdateBlock` («Вернуться»/«Отмена»); сам выбор
+   * версии не передаётся (см. doc `rollBackYtDlp` выше). Composable не
+   * предсказывает исход локально: применится ли откат сразу (строка 13)
+   * или встанет в ожидание границы задачи (строка 14, Ф-7) — решает
+   * ответ команды, а не клик сам по себе.
+   */
+  async function rollback(): Promise<void> {
+    await callCommandAndApply(rollBackYtDlp)
   }
 
   onMounted(() => {
@@ -179,5 +228,5 @@ export function useYtDlpUpdate(): UseYtDlpUpdateReturn {
     }
   })
 
-  return { snapshot, checkNow }
+  return { snapshot, checkNow, rollback }
 }

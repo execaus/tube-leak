@@ -36,18 +36,36 @@
  * issue #61) и делает пять классов отказа пиксель-в-пиксель равными
  * обычным состояниям.
  *
- * # Откат — не отсюда (TL-60)
+ * # Инлайн-подтверждение отката (TL-60, Р-3)
  *
- * Кнопка «Вернуться к …» здесь — только видимость и надпись по правилам
- * таблицы; инлайн-подтверждение и вызов команды отката (Р-3) — отдельная
- * задача TL-60, которая достраивает обработчик `rollback` этого же
- * компонента, не переписывая его.
+ * Клик по «Вернуться к {версия}» не откатывает ничего сам — он раскрывает
+ * на месте блока инлайн-подтверждение (текст с обеими версиями + кнопки
+ * «Вернуться»/«Отмена»), тот же приём необязательного раскрытия, что
+ * «Подробнее» у `SidecarStatusRow`: обычный текст с кнопками в
+ * естественном порядке табуляции, `role="dialog"` не используется — на
+ * экране это не модалка (design, «Ручной откат — полный путь»).
+ * `ExitConfirmDialog` (TL-46) сюда не переиспользуется: он зарезервирован
+ * за риском потери прогресса активной загрузки, откат версии инструмента
+ * не тот случай.
+ *
+ * «Отмена» просто закрывает подтверждение — ни `emit`, ни изменения
+ * статус-строки. «Вернуться» внутри подтверждения закрывает его и
+ * эмитит `rollback` — сам вызов команды и применение её ответа делает
+ * `rollback()` из `useYtDlpUpdate` в родителе (тот же контракт, что
+ * `check`/`checkNow`): этот компонент не решает, применится ли откат
+ * немедленно (строка 13) или встанет в ожидание границы задачи (строка
+ * 14, Ф-7) — он только просит родителя выполнить действие и рисует то,
+ * что вернул новый снимок.
  */
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import type { YtDlpUpdateSnapshot } from '@/types/generated/update'
 import { formatRelativeTime } from '@/utils/formatRelativeTime'
-import { getYtDlpUpdateStatusText, isYtDlpUpdateStatusFailure } from '@/utils/ytDlpUpdateStatusText'
+import {
+  getYtDlpUpdateStatusText,
+  isYtDlpUpdateStatusFailure,
+  versionOrPlaceholder,
+} from '@/utils/ytDlpUpdateStatusText'
 
 const props = defineProps<{
   /**
@@ -102,11 +120,72 @@ const busy = computed(() => isBootstrapping.value || (props.snapshot?.busy ?? tr
  */
 const rollbackTarget = computed(() => props.snapshot?.rollbackTarget)
 
+/**
+ * Раскрыто ли инлайн-подтверждение отката (см. doc компонента, «Инлайн-
+ * подтверждение отката») — свёрнуто по умолчанию, тот же приём, что
+ * `detailsOpen` у `SidecarStatusRow`.
+ */
+const confirmingRollback = ref(false)
+
+/**
+ * Панель подтверждения рисуется только пока есть куда возвращаться —
+ * `rollbackTarget` может пропасть из-под открытой панели, если снимок
+ * сменился независимо от локального клика (например, следующим
+ * `ytdlp://update`, пока пользователь ещё не решил); без этого условия
+ * панель осталась бы висеть с версией, которой уже нет в снимке.
+ */
+const showRollbackConfirm = computed(() => confirmingRollback.value && rollbackTarget.value !== undefined)
+
+// Тот же случай, что в doc `showRollbackConfirm` выше, но для локального
+// флага: если цель отката исчезла, флаг сбрасывается, а не остаётся
+// «раскрыт» на панели, которая больше не рисуется (иначе следующее
+// появление `rollbackTarget`, скажем для другой пары версий, раскрыло бы
+// подтверждение без клика пользователя).
+watch(rollbackTarget, (target) => {
+  if (target === undefined) {
+    confirmingRollback.value = false
+  }
+})
+
+const rollbackConfirmTitle = computed(() => {
+  const target = rollbackTarget.value
+  return target === undefined ? '' : `Вернуться на версию ${target}?`
+})
+
+const rollbackConfirmText = computed(() => {
+  const target = rollbackTarget.value
+  if (target === undefined) return ''
+  const activeText = versionOrPlaceholder(props.activeVersion)
+  return (
+    `Сейчас активна ${activeText}. После возврата скачивание будет идти на ${target} — ` +
+    `до тех пор, пока апстрим не выпустит более новый релиз, версия ${activeText} не будет ` +
+    `предложена автоматически снова.`
+  )
+})
+
 function onCheckClick(): void {
   emit('check')
 }
 
-function onRollbackClick(): void {
+/** Клик по «Вернуться к {версия}» в основной строке кнопок — только раскрывает подтверждение, ничего не эмитит. */
+function onRollbackToggleClick(): void {
+  confirmingRollback.value = !confirmingRollback.value
+}
+
+/** «Отмена» внутри подтверждения — просто закрывает панель, без `emit` (doc компонента выше). */
+function onCancelRollbackClick(): void {
+  confirmingRollback.value = false
+}
+
+/**
+ * «Вернуться» внутри подтверждения — закрывает панель (пользователь уже
+ * решил) и передаёт решение родителю. Закрытие панели — локальный UI-факт
+ * («вопрос больше не задан»), а не предположение об исходе отката: строка
+ * 13 или 14 появится из нового снимка, который принесёт `rollback()`
+ * родителя, не отсюда.
+ */
+function onConfirmRollbackClick(): void {
+  confirmingRollback.value = false
   emit('rollback')
 }
 </script>
@@ -139,10 +218,40 @@ function onRollbackClick(): void {
         type="button"
         class="tap-target"
         :disabled="busy"
-        @click="onRollbackClick"
+        :aria-expanded="confirmingRollback"
+        @click="onRollbackToggleClick"
       >
         Вернуться к {{ rollbackTarget }}
       </button>
+    </div>
+
+    <div
+      v-if="showRollbackConfirm"
+      class="ytdlp-update-block__rollback-confirm"
+    >
+      <p class="ytdlp-update-block__rollback-confirm-title">
+        {{ rollbackConfirmTitle }}
+      </p>
+      <p class="ytdlp-update-block__rollback-confirm-text">
+        {{ rollbackConfirmText }}
+      </p>
+      <div class="ytdlp-update-block__actions">
+        <button
+          type="button"
+          class="tap-target"
+          :disabled="busy"
+          @click="onConfirmRollbackClick"
+        >
+          Вернуться
+        </button>
+        <button
+          type="button"
+          class="tap-target"
+          @click="onCancelRollbackClick"
+        >
+          Отмена
+        </button>
+      </div>
     </div>
   </section>
 </template>
@@ -184,6 +293,27 @@ function onRollbackClick(): void {
   display: flex;
   gap: 0.5rem;
   margin-top: 0.5rem;
+}
+
+/*
+ * Инлайн-подтверждение отката (TL-60) — та же секция, не модалка
+ * (doc компонента, «Инлайн-подтверждение отката»): без своего фона/тени,
+ * только небольшой отступ сверху, чтобы визуально отделить вопрос от
+ * строки статуса выше.
+ */
+.ytdlp-update-block__rollback-confirm {
+  margin-top: 0.5rem;
+}
+
+.ytdlp-update-block__rollback-confirm-title {
+  margin: 0 0 0.25rem;
+  font-weight: 600;
+}
+
+.ytdlp-update-block__rollback-confirm-text {
+  margin: 0;
+  max-width: 40rem;
+  line-height: 1.4;
 }
 
 .tap-target {

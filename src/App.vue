@@ -71,7 +71,11 @@ const { report, isLoading, check } = useSidecarCheck()
  * проверки sidecar (`report.ytDlp.version`), второй раз не запрашивается
  * (дизайн, «Данные для UI»).
  */
-const { snapshot: ytDlpUpdateSnapshot, checkNow: checkYtDlpUpdateNow } = useYtDlpUpdate()
+const {
+  snapshot: ytDlpUpdateSnapshot,
+  checkNow: checkYtDlpUpdateNow,
+  rollback: rollBackYtDlpUpdate,
+} = useYtDlpUpdate()
 
 /**
  * `stage` (composable) уже не бывает терминальным (`ready`/`failed`
@@ -238,15 +242,18 @@ function onDownloadRequested(payload: {
       </footer>
 
       <!--
-        Блок «Обновление yt-dlp» (Ф-10, TL-59, дизайн E6) — между строками
-        SidecarStatusRow и разделителем перед полем ссылки (дизайн, «Где
-        живёт блок»). Кнопка «Вернуться к …» рисуется самим блоком по
-        снимку контура; обработчик отката добавляется задачей TL-60.
+        Блок «Обновление yt-dlp» (Ф-10, TL-59/TL-60, дизайн E6) — между
+        строками SidecarStatusRow и разделителем перед полем ссылки
+        (дизайн, «Где живёт блок»). Кнопка «Вернуться к …» и инлайн-
+        подтверждение рисуются самим блоком по снимку контура; вызов
+        самой команды отката (Р-3) — здесь, тем же приёмом, что «Проверить
+        сейчас»/`checkYtDlpUpdateNow`.
       -->
       <YtDlpUpdateBlock
         :snapshot="ytDlpUpdateSnapshot"
         :active-version="report?.ytDlp.version"
         @check="checkYtDlpUpdateNow"
+        @rollback="rollBackYtDlpUpdate"
       />
 
       <!--

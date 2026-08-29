@@ -33,7 +33,14 @@ import { assertNever } from '@/utils/assertNever'
 
 const NO_ACTIVE_VERSION_PLACEHOLDER = '—'
 
-function versionOrPlaceholder(version: string | undefined): string {
+/**
+ * Экспортирован (TL-60): инлайн-подтверждение отката `YtDlpUpdateBlock`
+ * называет активную версию в собственном тексте («Сейчас активна X…»),
+ * вне статус-строки, но по тому же правилу — плейсхолдер, а не пустая
+ * строка, когда `check_sidecar` ещё не вернул `ok` (doc пропса
+ * `activeVersion` компонента).
+ */
+export function versionOrPlaceholder(version: string | undefined): string {
   return version ?? NO_ACTIVE_VERSION_PLACEHOLDER
 }
 
