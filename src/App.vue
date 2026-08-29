@@ -37,9 +37,11 @@ import ProbeSection from '@/components/ProbeSection.vue'
 import SidecarStatusRow from '@/components/SidecarStatusRow.vue'
 import YtDlpPrepareError from '@/components/YtDlpPrepareError.vue'
 import YtDlpPrepareScreen from '@/components/YtDlpPrepareScreen.vue'
+import YtDlpUpdateBlock from '@/components/YtDlpUpdateBlock.vue'
 import { useExitConfirmation } from '@/composables/useExitConfirmation'
 import { useSidecarCheck } from '@/composables/useSidecarCheck'
 import { useYtDlpPrepare } from '@/composables/useYtDlpPrepare'
+import { useYtDlpUpdate } from '@/composables/useYtDlpUpdate'
 import { useDownloadTaskStore } from '@/stores/downloadTask'
 import type { QualitySize, QualityStreams } from '@/types/generated/probe'
 
@@ -58,6 +60,18 @@ const {
 } = useYtDlpPrepare()
 
 const { report, isLoading, check } = useSidecarCheck()
+
+/**
+ * Блок «Обновление yt-dlp» (Ф-10, TL-59, дизайн E6) — независимый
+ * композабл, монтируется наравне с проверкой sidecar, а не внутри неё:
+ * контур обновления живёт своей жизнью в ядре и не ждёт исхода
+ * `check_sidecar` (дизайн, «Насколько тихо — конкретно» — событие
+ * `ytdlp://update` эмитится независимо от того, открыт ли служебный
+ * экран). Активная версия для текста блока берётся из уже выполненной
+ * проверки sidecar (`report.ytDlp.version`), второй раз не запрашивается
+ * (дизайн, «Данные для UI»).
+ */
+const { snapshot: ytDlpUpdateSnapshot, checkNow: checkYtDlpUpdateNow } = useYtDlpUpdate()
 
 /**
  * `stage` (composable) уже не бывает терминальным (`ready`/`failed`
@@ -222,6 +236,18 @@ function onDownloadRequested(payload: {
           {{ isLoading ? 'Проверяем…' : 'Повторить проверку' }}
         </button>
       </footer>
+
+      <!--
+        Блок «Обновление yt-dlp» (Ф-10, TL-59, дизайн E6) — между строками
+        SidecarStatusRow и разделителем перед полем ссылки (дизайн, «Где
+        живёт блок»). Кнопка «Вернуться к …» рисуется самим блоком по
+        снимку контура; обработчик отката добавляется задачей TL-60.
+      -->
+      <YtDlpUpdateBlock
+        :snapshot="ytDlpUpdateSnapshot"
+        :active-version="report?.ytDlp.version"
+        @check="checkYtDlpUpdateNow"
+      />
 
       <!--
         Разделитель — единственное, что явно отделяет «служебную» часть

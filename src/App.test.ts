@@ -9,17 +9,36 @@ const invokeMock = vi.fn()
 const unlistenMock = vi.fn()
 type EventHandler = (event: { payload: YtDlpPrepareEvent }) => void
 let capturedHandler: EventHandler | undefined
-const listenMock = vi.fn((_event: string, handler: EventHandler) => {
-  capturedHandler = handler
+
+/**
+ * `App.vue` подписывается на два независимых канала событий: `ytdlp://prepare`
+ * (TL-17, этот файл) и `ytdlp://update` (TL-59, блок «Обновление yt-dlp» —
+ * не тема этого файла, см. `useYtDlpUpdate.test.ts`/`YtDlpUpdateBlock.test.ts`).
+ * Роутинг по имени события обязателен: `useYtDlpUpdate`'s `onMounted`
+ * регистрируется раньше, чем `App.vue` вызывает `prepare()` из своего
+ * собственного `onMounted` (порядок регистрации hooks в setup), поэтому
+ * первый вызов `listen()` при монтаже — за каналом обновления, не за
+ * `ytdlp://prepare`; общий безусловный `capturedHandler = handler` без
+ * различения событий подставил бы сюда не тот обработчик.
+ */
+function defaultListenImpl(
+  event: string,
+  handler: (event: unknown) => void,
+): Promise<typeof unlistenMock> {
+  if (event === 'ytdlp://prepare') {
+    capturedHandler = handler as EventHandler
+  }
   return Promise.resolve(unlistenMock)
-})
+}
+
+const listenMock = vi.fn(defaultListenImpl)
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
 }))
 
 vi.mock('@tauri-apps/api/event', () => ({
-  listen: (...args: [string, EventHandler]) => listenMock(...args),
+  listen: (...args: [string, (event: unknown) => void]) => listenMock(...args),
 }))
 
 // `useExitConfirmation` (TL-46) вызывается на верхнем уровне `App.vue` и
@@ -88,10 +107,23 @@ const warmupFailedError: YtDlpPrepareError = {
   message: 'yt-dlp не ответил за отведённое время прогрева',
 }
 
-/** Роутер `invoke` по имени команды — так же ведёт себя настоящий Tauri IPC. */
+/**
+ * Роутер `invoke` по имени команды — так же ведёт себя настоящий Tauri IPC.
+ *
+ * `ytdlp_update_state` (TL-59) замешана сюда дефолтом, который никогда не
+ * разрешается: блок «Обновление yt-dlp» — не тема этого файла (см. doc
+ * `listenMock` выше), а вечно висящий промис держит его в нейтральном
+ * состоянии «Загружаем статус обновления…», не мешая ни одному из
+ * существующих здесь ассертов. Явно переданный в `handlers` обработчик
+ * той же команды имеет приоритет — по тому же принципу, что и остальные.
+ */
 function routeInvoke(handlers: Record<string, () => Promise<unknown>>) {
+  const withDefaults: Record<string, () => Promise<unknown>> = {
+    ytdlp_update_state: () => new Promise<unknown>(() => {}),
+    ...handlers,
+  }
   invokeMock.mockImplementation((command: string) => {
-    const handler = handlers[command]
+    const handler = withDefaults[command]
     if (!handler) throw new Error(`unexpected invoke: ${command}`)
     return handler()
   })
@@ -99,7 +131,8 @@ function routeInvoke(handlers: Record<string, () => Promise<unknown>>) {
 
 beforeEach(() => {
   invokeMock.mockReset()
-  listenMock.mockClear()
+  listenMock.mockReset()
+  listenMock.mockImplementation(defaultListenImpl)
   unlistenMock.mockClear()
   capturedHandler = undefined
   // App.vue использует `useDownloadTaskStore` (эпик E3, TL-45) — стору
@@ -139,9 +172,17 @@ describe('App — order of calls (TL-17, #18)', () => {
     // `listen()` синхронно, фиксировала лишь порядок синхронных вызовов —
     // гонку между «подписка подтверждена» и «команда вызвана» она не
     // сторожила. Здесь подписка отложена по-настоящему.
+    // Только канал `ytdlp://prepare` отложен здесь: `ytdlp://update`
+    // (TL-59, не тема этого теста) продолжает разрешаться сразу же через
+    // `defaultListenImpl`, иначе `mockImplementationOnce` перехватил бы
+    // первый вызов `listen()` при монтаже — а это вызов за каналом
+    // обновления (см. doc `defaultListenImpl` выше), не за prepare.
     let resolveListen: (fn: typeof unlistenMock) => void = () => {}
-    listenMock.mockImplementationOnce((_event, handler) => {
-      capturedHandler = handler
+    listenMock.mockImplementation((event: string, handler: (event: unknown) => void) => {
+      if (event !== 'ytdlp://prepare') {
+        return defaultListenImpl(event, handler)
+      }
+      capturedHandler = handler as EventHandler
       return new Promise<typeof unlistenMock>((resolve) => {
         resolveListen = resolve
       })
@@ -154,7 +195,7 @@ describe('App — order of calls (TL-17, #18)', () => {
     mount(App)
     await flushPromises()
 
-    expect(listenMock).toHaveBeenCalledTimes(1)
+    expect(listenMock.mock.calls.filter(([event]) => event === 'ytdlp://prepare')).toHaveLength(1)
     expect(invokeMock).not.toHaveBeenCalledWith('prepare_ytdlp')
     expect(invokeMock).not.toHaveBeenCalledWith('check_sidecar')
 
@@ -376,7 +417,12 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     expect(wrapper.text()).toContain('yt-dlp')
     expect(wrapper.text()).toContain('ffmpeg')
     expect(wrapper.text().match(/Проверяем…/g)).toHaveLength(2)
-    expect(wrapper.find('button').exists()).toBe(false)
+    // Не «нет ни одной кнопки вовсе» — блок «Обновление yt-dlp» (TL-59)
+    // всегда рисует «Проверить сейчас» (неактивной, пока свой снимок не
+    // пришёл, см. doc `routeInvoke` выше); здесь важна только кнопка
+    // повторной проверки sidecar, которой до ответа `check_sidecar` не
+    // должно быть.
+    expect(wrapper.findAll('button').some((b) => b.text().includes('Повторить проверку'))).toBe(false)
 
     resolveCheck(okReport)
     await flushPromises()
@@ -388,7 +434,10 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
 
     expect(wrapper.text()).toContain('2026.08.20')
     expect(wrapper.text()).toContain('7.1')
-    expect(wrapper.find('button').exists()).toBe(false)
+    // См. doc-комментарий у предыдущего теста — «Проверить сейчас» блока
+    // обновления не в счёт, здесь проверяется только отсутствие кнопки
+    // повторной проверки sidecar.
+    expect(wrapper.findAll('button').some((b) => b.text().includes('Повторить проверку'))).toBe(false)
   })
 
   it('shows the retry button when at least one row is not Ok, for a mixed ok/timeout report', async () => {
@@ -438,9 +487,11 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     await retryButton?.trigger('click')
     await flushPromises()
 
-    expect(invokeMock).toHaveBeenCalledTimes(3) // prepare_ytdlp, check_sidecar, check_sidecar
+    // prepare_ytdlp, ytdlp_update_state (TL-59, блок обновления — висит
+    // вечно, см. doc `routeInvoke`), check_sidecar × 2.
+    expect(invokeMock).toHaveBeenCalledTimes(4)
     expect(invokeMock.mock.calls.filter(([cmd]) => cmd === 'prepare_ytdlp')).toHaveLength(1)
-    expect(wrapper.find('button').exists()).toBe(false)
+    expect(wrapper.findAll('button').some((b) => b.text().includes('Повторить проверку'))).toBe(false)
   })
 })
 
