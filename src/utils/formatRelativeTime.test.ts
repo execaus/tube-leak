@@ -40,4 +40,12 @@ describe('formatRelativeTime', () => {
     const justNow = new Date().toISOString()
     expect(formatRelativeTime(justNow)).toBe('только что')
   })
+
+  it('falls back to a neutral placeholder instead of "NaN дней назад" for an unparsable timestamp (Н-5)', () => {
+    // Контракт обещает RFC 3339 (недостижимо сегодня настоящим `at` из
+    // ядра), но `new Date('мусор').getTime()` -> `NaN` не должно молча
+    // доходить до ветки суток и печатать `NaN` пользователю.
+    expect(formatRelativeTime('мусор', NOW)).toBe('некоторое время назад')
+    expect(formatRelativeTime('', NOW)).toBe('некоторое время назад')
+  })
 })

@@ -33,6 +33,18 @@ const upToDateSnapshot: YtDlpUpdateSnapshot = {
   at: '2026-08-25T12:00:00Z',
 }
 
+/**
+ * Терминальный исход, эмитированный конвейером по С-12 быстрее, чем
+ * успевает разрешиться сам вызов `check_ytdlp_update` (ревью TL-59,
+ * «Н-1», окно Б).
+ */
+const failedSnapshot: YtDlpUpdateSnapshot = {
+  busy: false,
+  status: 'failed',
+  at: '2026-08-25T12:00:05Z',
+  failure: { kind: 'networkUnavailable', message: 'connect ETIMEDOUT' },
+}
+
 /** Аналог test-utils `withSetup` — composable использует `onMounted`/`onUnmounted`, ему нужен активный инстанс. */
 function withSetup<T>(composable: () => T): { result: T; unmount: () => void } {
   let result!: T
@@ -114,6 +126,40 @@ describe('useYtDlpUpdate', () => {
     expect(result.snapshot.value).toStrictEqual(neverCheckedSnapshot)
   })
 
+  it('does not let a stale ytdlp_update_state response overwrite an event that arrived first (Н-1, окно А)', async () => {
+    // Ревью TL-59 «Н-1»: конвейер мог прислать `ytdlp://update` раньше,
+    // чем разрешился начальный снимок (например, шёл уже до открытия
+    // экрана) — без счётчика поколений более старый ответ
+    // `ytdlp_update_state` откатил бы уже показанное свежее событие назад.
+    let resolveFetch: (value: YtDlpUpdateSnapshot) => void = () => {}
+    invokeMock.mockReturnValueOnce(
+      new Promise<YtDlpUpdateSnapshot>((resolve) => {
+        resolveFetch = resolve
+      }),
+    )
+
+    const { result } = withSetup(() => useYtDlpUpdate())
+    // Подписка (в этом файле резолвится сразу) должна успеть подтвердиться
+    // и запустить вызов `ytdlp_update_state`, прежде чем событие придёт.
+    // `flushPromises()`, а не фиксированное число `Promise.resolve()`:
+    // безопасно здесь, потому что сам ответ `ytdlp_update_state`
+    // управляется вручную (`resolveFetch`) и остаётся висеть, пока его не
+    // вызвали, — флаш дренирует только уже готовые к разрешению микрозадачи.
+    await flushPromises()
+    expect(invokeMock).toHaveBeenCalledExactlyOnceWith('ytdlp_update_state')
+    expect(capturedHandler).toBeDefined()
+
+    // Событие приходит, пока начальный снимок ещё не разрешился.
+    capturedHandler?.({ payload: failedSnapshot })
+    expect(result.snapshot.value).toStrictEqual(failedSnapshot)
+
+    // Ответ команды приходит позже, всё ещё несёт устаревшее значение.
+    resolveFetch(neverCheckedSnapshot)
+    await flushPromises()
+
+    expect(result.snapshot.value).toStrictEqual(failedSnapshot)
+  })
+
   it('updates the snapshot as ytdlp://update events arrive', async () => {
     invokeMock.mockResolvedValueOnce(neverCheckedSnapshot)
 
@@ -140,6 +186,38 @@ describe('useYtDlpUpdate', () => {
 
     expect(invokeMock).toHaveBeenLastCalledWith('check_ytdlp_update')
     expect(result.snapshot.value).toStrictEqual(checkingSnapshot)
+  })
+
+  it('does not let a stale check_ytdlp_update response overwrite a terminal event that arrived first (Н-1, окно Б)', async () => {
+    // Ревью TL-59 «Н-1»: конвейер может дойти до терминального исхода и
+    // прислать `ytdlp://update` раньше, чем разрешится сам вызов
+    // `check_ytdlp_update` — обычно несущий лишь промежуточный `checking`.
+    // Без счётчика поколений более старый ответ команды переписал бы
+    // честный терминальный текст назад в вечный спиннер (прямая
+    // регрессия С-12).
+    invokeMock.mockResolvedValueOnce(neverCheckedSnapshot)
+
+    const { result } = withSetup(() => useYtDlpUpdate())
+    await flushPromises()
+
+    let resolveCheck: (value: YtDlpUpdateSnapshot) => void = () => {}
+    invokeMock.mockReturnValueOnce(
+      new Promise<YtDlpUpdateSnapshot>((resolve) => {
+        resolveCheck = resolve
+      }),
+    )
+    const pending = result.checkNow()
+    await Promise.resolve()
+
+    // Событие приходит раньше ответа команды.
+    capturedHandler?.({ payload: failedSnapshot })
+    expect(result.snapshot.value).toStrictEqual(failedSnapshot)
+
+    // Ответ команды приходит позже, всё ещё несёт устаревший «checking».
+    resolveCheck(checkingSnapshot)
+    await pending
+
+    expect(result.snapshot.value).toStrictEqual(failedSnapshot)
   })
 
   it('swallows a rejection from checkNow() instead of throwing (unreachable command error, e.g. busy)', async () => {

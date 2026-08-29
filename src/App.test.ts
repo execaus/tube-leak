@@ -129,6 +129,19 @@ function routeInvoke(handlers: Record<string, () => Promise<unknown>>) {
   })
 }
 
+/**
+ * Точный набор подписей кнопок на экране (ревью TL-59 «Н-2»): замена
+ * трёх `find('button').exists() === false` на отсутствие конкретно
+ * «Повторить проверку» была вынужденной (блок «Обновление yt-dlp», TL-59,
+ * всегда рисует «Проверить сейчас») — но `some(...) === false` ловит
+ * только эту одну подпись и молчит про любую другую постороннюю кнопку.
+ * `toStrictEqual` на полном списке возвращает исходную силу: посторонняя
+ * кнопка меняет список и ассерт падает.
+ */
+function buttonLabels(wrapper: ReturnType<typeof mount>): string[] {
+  return wrapper.findAll('button').map((b) => b.text())
+}
+
 beforeEach(() => {
   invokeMock.mockReset()
   listenMock.mockReset()
@@ -419,10 +432,9 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     expect(wrapper.text().match(/Проверяем…/g)).toHaveLength(2)
     // Не «нет ни одной кнопки вовсе» — блок «Обновление yt-dlp» (TL-59)
     // всегда рисует «Проверить сейчас» (неактивной, пока свой снимок не
-    // пришёл, см. doc `routeInvoke` выше); здесь важна только кнопка
-    // повторной проверки sidecar, которой до ответа `check_sidecar` не
-    // должно быть.
-    expect(wrapper.findAll('button').some((b) => b.text().includes('Повторить проверку'))).toBe(false)
+    // пришёл, см. doc `routeInvoke` выше); точный список подписей — не
+    // «отсутствует конкретно „Повторить проверку“» (doc `buttonLabels`).
+    expect(buttonLabels(wrapper)).toStrictEqual(['Проверить сейчас'])
 
     resolveCheck(okReport)
     await flushPromises()
@@ -434,10 +446,9 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
 
     expect(wrapper.text()).toContain('2026.08.20')
     expect(wrapper.text()).toContain('7.1')
-    // См. doc-комментарий у предыдущего теста — «Проверить сейчас» блока
-    // обновления не в счёт, здесь проверяется только отсутствие кнопки
-    // повторной проверки sidecar.
-    expect(wrapper.findAll('button').some((b) => b.text().includes('Повторить проверку'))).toBe(false)
+    // См. doc-комментарий у предыдущего теста и `buttonLabels` — точный
+    // список, не отсутствие одной конкретной подписи.
+    expect(buttonLabels(wrapper)).toStrictEqual(['Проверить сейчас'])
   })
 
   it('shows the retry button when at least one row is not Ok, for a mixed ok/timeout report', async () => {
@@ -491,7 +502,7 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     // вечно, см. doc `routeInvoke`), check_sidecar × 2.
     expect(invokeMock).toHaveBeenCalledTimes(4)
     expect(invokeMock.mock.calls.filter(([cmd]) => cmd === 'prepare_ytdlp')).toHaveLength(1)
-    expect(wrapper.findAll('button').some((b) => b.text().includes('Повторить проверку'))).toBe(false)
+    expect(buttonLabels(wrapper)).toStrictEqual(['Проверить сейчас'])
   })
 })
 

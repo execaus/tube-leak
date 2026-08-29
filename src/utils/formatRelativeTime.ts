@@ -29,6 +29,16 @@ function pluralizeRu(n: number, one: string, few: string, many: string): string 
 
 export function formatRelativeTime(iso: string, now: Date = new Date()): string {
   const thenMs = new Date(iso).getTime()
+  if (Number.isNaN(thenMs)) {
+    // Контракт обещает RFC 3339 (doc функции выше) — этот путь сегодня
+    // недостижим настоящим `at` из ядра. Ревью TL-59 «Н-5»: недостижимость
+    // по контракту — не повод не проверять вход, тот же урок, на котором
+    // этот эпик уже спотыкался несколько раз («доверие документу вместо
+    // проверки», CLAUDE.md). Без guard'а `new Date('мусор').getTime()`
+    // даёт `NaN`, все сравнения ниже ложны, и управление молча доходит до
+    // ветки суток — на экране была бы строка «NaN дней назад».
+    return 'некоторое время назад'
+  }
   const diffMs = Math.max(0, now.getTime() - thenMs)
 
   if (diffMs < MINUTE_MS) {
