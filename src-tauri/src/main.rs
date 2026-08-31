@@ -85,6 +85,7 @@ mod clock;
 mod commands;
 mod download;
 mod probe;
+mod queue;
 mod sidecar;
 mod types;
 mod ytdlp;
@@ -92,9 +93,10 @@ mod ytdlp;
 use std::sync::Arc;
 
 use commands::{
-    cancel_download, cancel_probe, check_sidecar, check_ytdlp_update, prepare_ytdlp, probe_url,
-    retry_download, roll_back_ytdlp, start_download, start_ytdlp_preparation,
-    start_ytdlp_update_schedule, ytdlp_update_state, PreparationLock,
+    cancel_download, cancel_probe, check_sidecar, check_ytdlp_update, dismiss_queue_task,
+    prepare_ytdlp, probe_url, queue_state, resume_queue, retry_download, roll_back_ytdlp,
+    start_download, start_ytdlp_preparation, start_ytdlp_update_schedule, ytdlp_update_state,
+    PreparationLock,
 };
 use download::DownloadSession;
 use probe::ProbeSession;
@@ -108,8 +110,11 @@ fn main() {
             cancel_probe,
             check_sidecar,
             check_ytdlp_update,
+            dismiss_queue_task,
             prepare_ytdlp,
             probe_url,
+            queue_state,
+            resume_queue,
             retry_download,
             roll_back_ytdlp,
             start_download,

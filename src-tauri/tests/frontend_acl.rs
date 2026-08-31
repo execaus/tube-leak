@@ -1747,7 +1747,12 @@ fn the_frontend_listens_only_on_declared_event_channels() {
 #[test]
 fn the_channel_scan_still_finds_the_channels_that_exist() {
     let emitted = core_event_channels();
-    for channel in ["ytdlp://prepare", "download://progress", "ytdlp://update"] {
+    for channel in [
+        "ytdlp://prepare",
+        "download://progress",
+        "ytdlp://update",
+        "queue://changed",
+    ] {
         assert!(
             emitted.contains(channel),
             "скан ядра не нашёл {channel} — разбор литералов сломан, и обе \

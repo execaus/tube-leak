@@ -198,6 +198,12 @@ macro_rules! with_contract_types {
             YtDlpUpdateSnapshot,
             YtDlpUpdateCommandErrorKind,
             YtDlpUpdateCommandError,
+            // queue.ts
+            SelectedQuality,
+            QueueTaskRef,
+            QueueTask,
+            QueuePauseReason,
+            QueueSnapshot,
         ]
     };
 }
@@ -246,12 +252,16 @@ const HEADER: &str = "\
 ";
 
 /// Столько файлов зеркала производит генератор сейчас: по одному на
-/// модуль контракта — `sidecar`, `ytdlp`, `probe`, `download`, `update`.
+/// модуль контракта — `sidecar`, `ytdlp`, `probe`, `download`, `update`,
+/// `queue`.
 ///
 /// Контур самообновления (E6) получил собственный файл, а не дописался в
 /// `ytdlp.ts`: тот про подготовку первого запуска, у которой с фоновым
-/// обновлением намеренно разные каналы событий и разные экраны.
-const MIRROR_FILES: usize = 5;
+/// обновлением намеренно разные каналы событий и разные экраны. Очередь
+/// (E4) — по тому же правилу: её типы описывают список задач и его
+/// команды, а не ход одной загрузки, который остался в `download.ts`
+/// нетронутым (обещание дизайна E3, повторённое дизайном E4).
+const MIRROR_FILES: usize = 6;
 
 /// Эталон: что зеркало обязано содержать прямо сейчас.
 ///
@@ -447,7 +457,7 @@ fn every_optional_field_of_the_contract_is_omitted_when_absent() {
     /// граница и заводилась. Меняется вместе с контрактом, одной строкой,
     /// и это осознанная просьба к автору нового поля посмотреть на
     /// сторожа.
-    const OPTIONAL_FIELDS: usize = 32;
+    const OPTIONAL_FIELDS: usize = 34;
 
     let mut checked = 0usize;
     let contract: Vec<&str> = contract_source().lines().collect();

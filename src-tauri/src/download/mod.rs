@@ -69,9 +69,11 @@
 //!
 //! - **Старт возвращается быстро** — id задачи и план, не результат
 //!   загрузки: ждать в промисе часовую работу нечего, всё идёт событиями.
-//!   Проверка занятого слота — в ядре, а не только в неактивной кнопке
-//!   (`alreadyActive`), и она мгновенная: слот занят, пока текущая задача
-//!   не терминальна.
+//!   Отказа «слот занят» у команды больше нет: Ф-2 эпика E4 убрала этот
+//!   класс из контракта, потому что постановка при активной задаче —
+//!   штатный путь (задача встаёт в хвост очереди), а не ошибка. Очередь
+//!   ставит TL-73; до неё слот остаётся один, и новая постановка
+//!   вытесняет предыдущую задачу (см. `orchestrate::start_download`).
 //! - **Недоступная папка назначения — отказ задачи, а не команды.**
 //!   Даже если ядро обнаружит её проверкой до запуска процесса (дизайн
 //!   оставил момент обнаружения реализации), команда всё равно отдаёт id,
@@ -156,8 +158,8 @@ pub mod retry;
 pub use error::{DownloadCommandRejection, DownloadFailure};
 pub use merge::SidecarFfmpeg;
 pub use orchestrate::{
-    cancel_download, retry_download, run_task, start_download, AppSink, DownloadSession,
-    DownloadTask, SidecarDownloader, WorkerSpawn,
+    cancel_download, dismiss_queue_task, queue_snapshot, retry_download, run_task, start_download,
+    AppSink, DownloadSession, DownloadTask, SidecarDownloader, WorkerSpawn,
 };
 
 /// Имя Tauri-события с ходом одной задачи скачивания (Ф-2).
