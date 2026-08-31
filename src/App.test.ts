@@ -116,10 +116,17 @@ const warmupFailedError: YtDlpPrepareError = {
  * состоянии «Загружаем статус обновления…», не мешая ни одному из
  * существующих здесь ассертов. Явно переданный в `handlers` обработчик
  * той же команды имеет приоритет — по тому же принципу, что и остальные.
+ *
+ * `queue_state` (эпик E4, TL-75) — тем же приёмом: `App.vue` вызывает
+ * `downloadTaskStore.initialize()` в собственном `onMounted` независимо
+ * от экрана подготовки/sidecar (см. doc `App.vue`), и без дефолта здесь
+ * каждый тест этого файла (не про очередь) был бы обязан его мокать —
+ * вечно висящий промис держит очередь в нейтральном «списка ещё нет».
  */
 function routeInvoke(handlers: Record<string, () => Promise<unknown>>) {
   const withDefaults: Record<string, () => Promise<unknown>> = {
     ytdlp_update_state: () => new Promise<unknown>(() => {}),
+    queue_state: () => new Promise<unknown>(() => {}),
     ...handlers,
   }
   invokeMock.mockImplementation((command: string) => {
@@ -499,8 +506,9 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     await flushPromises()
 
     // prepare_ytdlp, ytdlp_update_state (TL-59, блок обновления — висит
-    // вечно, см. doc `routeInvoke`), check_sidecar × 2.
-    expect(invokeMock).toHaveBeenCalledTimes(4)
+    // вечно, см. doc `routeInvoke`), queue_state (эпик E4, TL-75 — тоже
+    // висит вечно), check_sidecar × 2.
+    expect(invokeMock).toHaveBeenCalledTimes(5)
     expect(invokeMock.mock.calls.filter(([cmd]) => cmd === 'prepare_ytdlp')).toHaveLength(1)
     expect(buttonLabels(wrapper)).toStrictEqual(['Проверить сейчас'])
   })

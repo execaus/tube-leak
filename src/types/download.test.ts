@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type {
-  DownloadCommandErrorKind,
+  DownloadCommandError,
   DownloadErrorKind,
   DownloadPhase,
   DownloadPlan,
@@ -69,14 +69,21 @@ const ALL_PARTIAL_DATA = {
   kept: true,
 } satisfies Record<PartialData, true>
 
+// `DownloadCommandErrorKind` (эпик E4, TL-70) стал размеченным
+// объединением объектов (несёт `existing` у `duplicateTask`), поэтому
+// полнота набора здесь проверяется по `DownloadCommandError['kind']` —
+// извлечённому индексированным доступом строковому union тегов, а не по
+// имени типа целиком (правило CLAUDE.md о `satisfies` при разметке
+// объединений).
 const ALL_DOWNLOAD_COMMAND_ERROR_KINDS = {
-  alreadyActive: true,
   unknownTask: true,
   notFailed: true,
   notRetryable: true,
   noStreamsSelected: true,
   invalidUrl: true,
-} satisfies Record<DownloadCommandErrorKind, true>
+  duplicateTask: true,
+  taskNotFinished: true,
+} satisfies Record<DownloadCommandError['kind'], true>
 
 describe('DownloadPhase — ровно семь значений контракта (Ф-3)', () => {
   it('has exactly 7 phases', () => {
@@ -110,8 +117,8 @@ describe('прочие enum-ы контракта — полнота набор�
     expect(Object.keys(ALL_PARTIAL_DATA)).toHaveLength(3)
   })
 
-  it('DownloadCommandErrorKind has exactly 6 values', () => {
-    expect(Object.keys(ALL_DOWNLOAD_COMMAND_ERROR_KINDS)).toHaveLength(6)
+  it('DownloadCommandErrorKind has exactly 7 values (TL-70/TL-75: alreadyActive убран, duplicateTask/taskNotFinished добавлены)', () => {
+    expect(Object.keys(ALL_DOWNLOAD_COMMAND_ERROR_KINDS)).toHaveLength(7)
   })
 })
 

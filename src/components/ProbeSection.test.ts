@@ -217,7 +217,7 @@ describe('ProbeSection — ретрансляция запроса скачив�
           title: 'Ролик A',
           streams: { audioFormatId: 'a' },
           size: { kind: 'unknown' },
-          qualityLabel: 'Только аудио',
+          quality: { kind: 'audioOnly', heightPx: undefined },
         },
       ],
     ])
@@ -243,8 +243,8 @@ describe('ProbeSection — ретрансляция запроса скачив�
     expect(emitted?.[0]?.[0]).toMatchObject({ url: 'https://youtu.be/a' })
   })
 
-  it('forwards downloadBlocked to VideoCard so its download button carries the С-13 hint', async () => {
-    const wrapper = mount(ProbeSection, { props: { ytDlpState: 'ready', downloadBlocked: true } })
+  it('leaves the download button enabled once a quality is picked — no downloadBlocked prop left to forward (TL-74/TL-75, Ф-2 E4)', async () => {
+    const wrapper = mount(ProbeSection, { props: { ytDlpState: 'ready' } })
     invokeMock.mockResolvedValueOnce(resultA)
 
     await wrapper.find('input').setValue('https://youtu.be/a')
@@ -252,7 +252,10 @@ describe('ProbeSection — ретрансляция запроса скачив�
     await vi.waitFor(() => {
       expect(wrapper.text()).toContain('Ролик A')
     })
+    await wrapper.find('input[type="radio"]').setValue(true)
 
-    expect(wrapper.text()).toContain('Уже идёт другая загрузка')
+    const downloadButton = wrapper.findAll('button').find((b) => b.text() === 'Скачать')
+    expect(downloadButton?.attributes('disabled')).toBeUndefined()
+    expect(wrapper.text()).not.toContain('Уже идёт другая загрузка')
   })
 })

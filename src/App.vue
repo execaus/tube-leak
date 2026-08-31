@@ -30,10 +30,9 @@
 import { storeToRefs } from 'pinia'
 import { computed, onMounted } from 'vue'
 
-import DownloadCommandErrorBlock from '@/components/DownloadCommandErrorBlock.vue'
-import DownloadPanel from '@/components/DownloadPanel.vue'
 import ExitConfirmDialog from '@/components/ExitConfirmDialog.vue'
 import ProbeSection from '@/components/ProbeSection.vue'
+import QueueSection from '@/components/QueueSection.vue'
 import SidecarStatusRow from '@/components/SidecarStatusRow.vue'
 import YtDlpPrepareError from '@/components/YtDlpPrepareError.vue'
 import YtDlpPrepareScreen from '@/components/YtDlpPrepareScreen.vue'
@@ -44,6 +43,7 @@ import { useYtDlpPrepare } from '@/composables/useYtDlpPrepare'
 import { useYtDlpUpdate } from '@/composables/useYtDlpUpdate'
 import { useDownloadTaskStore } from '@/stores/downloadTask'
 import type { QualitySize, QualityStreams } from '@/types/generated/probe'
+import type { SelectedQuality } from '@/types/generated/queue'
 
 // Версия приложения известна локально и не зависит от sidecar (дизайн E1,
 // «Компоновка»). Держим в синхроне с `package.json` вручную — единственное
@@ -123,11 +123,23 @@ onMounted(() => {
 })
 
 /**
- * Секция «Текущая загрузка» (эпик E3, TL-45). Стор — единственный хозяин
- * состояния задачи; `App.vue` лишь связывает клик «Скачать» на карточке со
- * стартом задачи и прокидывает пропсы панели, ничего не решая сам.
+ * Секция «Очередь загрузок» (эпик E4, TL-75, сменила «Текущую загрузку»
+ * эпика E3/TL-45). Стор — единственный хозяин состояния очереди; `App.vue`
+ * лишь связывает клик «Скачать» на карточке с постановкой задачи и
+ * прокидывает пропсы секции, ничего не решая сам.
+ *
+ * `initialize()` — разовый снимок `queue_state` плюс подписка на
+ * `queue://changed` (С-9), тем же приёмом, что `runPrepareAndCheckSidecar`
+ * выше и `check_sidecar` эпика E1: вызывается явно из `onMounted`, а не
+ * автоматически при первом обращении к стору — иначе `queue_state`
+ * потребовался бы каждому потребителю стора (например,
+ * `useExitConfirmation.ts`), а не только этому экрану.
  */
 const downloadTaskStore = useDownloadTaskStore()
+
+onMounted(() => {
+  void downloadTaskStore.initialize()
+})
 
 /**
  * Диалог подтверждения выхода (Р-2, эпик E3, TL-46) — подписывается на
@@ -138,6 +150,11 @@ const downloadTaskStore = useDownloadTaskStore()
  * `core:window:allow-destroy`) — реализация целиком в
  * `src/composables/windowExitPort.ts`, здесь используется только через
  * интерфейс `WindowExitPort`.
+ *
+ * Читает `task`/`progress`/`isActive` стора — до сих пор проекцию
+ * **активной** задачи очереди (обратная совместимость, doc
+ * `useDownloadTaskStore` в `src/stores/downloadTask.ts`); срез всей
+ * очереди для диалога — TL-76 (issue #83), не эта задача.
  */
 const {
   visible: showExitConfirm,
@@ -146,33 +163,23 @@ const {
   stay: onExitStay,
   exitAnyway: onExitAnyway,
 } = useExitConfirmation()
-const {
-  task: downloadTask,
-  progress: downloadProgress,
-  softStallSeconds,
-  commandError: downloadCommandError,
-  isActive: isDownloadActive,
-} = storeToRefs(downloadTaskStore)
+const { tasks: queueTasks, awaitingContinue, pauseReason, softStallSeconds, commandError: downloadCommandError } =
+  storeToRefs(downloadTaskStore)
 
-/**
- * Заголовок панели — снимок «название + качество», собранный **здесь**, в
- * момент клика, а не прочитанный из карточки позже (требование С-13/TL-45
- * п.6): карточка может смениться или уже смениться содержимым к моменту,
- * когда панель решит перерисоваться, а `displayTitle` в сторе уже не
- * зависит от неё.
- */
 function onDownloadRequested(payload: {
   url: string
   title: string
   streams: QualityStreams
   size: QualitySize
-  qualityLabel: string
+  quality: SelectedQuality
 }): void {
-  const displayTitle = `«${payload.title}» — ${payload.qualityLabel}`
-  void downloadTaskStore.start(
-    { url: payload.url, title: payload.title, streams: payload.streams, size: payload.size },
-    displayTitle,
-  )
+  void downloadTaskStore.start({
+    url: payload.url,
+    title: payload.title,
+    streams: payload.streams,
+    size: payload.size,
+    quality: payload.quality,
+  })
 }
 </script>
 
@@ -266,52 +273,42 @@ function onDownloadRequested(payload: {
 
       <ProbeSection
         :yt-dlp-state="ytDlpState"
-        :download-blocked="isDownloadActive"
         @download="onDownloadRequested"
       />
 
       <!--
-        Секция «Текущая загрузка» (дизайн E3) — рендерится тогда и только
-        тогда, когда задача существует (с момента клика «Скачать» до
-        «Скрыть»/новой загрузки) **или** есть отказ команды управления
-        загрузкой, который ещё не скрыт (ревью TL-45, «Достижимый путь
-        к молчаливому отказу»): отказ `start_download` возможен и без
-        существующей задачи (слот и не должен был занять что-то), поэтому
-        секция не привязана только к наличию `downloadTask`. Пока ни того,
-        ни другого нет, макет не резервирует под секцию пустое место
-        (дизайн, «Где живёт задача экрана»).
+        Секция «Очередь загрузок» (дизайн E4) — рендерится тогда и только
+        тогда, когда есть хоть одна задача **или** есть отказ команды
+        управления загрузкой/очередью, который ещё не скрыт (ревью TL-45,
+        «Достижимый путь к молчаливому отказу», унаследовано TL-75): отказ
+        `start_download`/`dismiss_queue_task` и т.п. возможен и без
+        существующей задачи в списке. Пока ни того, ни другого нет, макет
+        не резервирует под секцию пустое место (дизайн E3, «Где живёт
+        задача экрана», унаследовано дизайном E4). Условие продублировано
+        здесь (а не только внутри `QueueSection`) ради разделителя —
+        `<hr>` не должен появляться перед пустой секцией.
+
+        Без собственного aria-live на разделителе секции (ревью TL-45,
+        «Заметки»): `DownloadCommandErrorBlock` несёт role="alert",
+        `DownloadPanel` — свою единственную живую зону для нетерминальных
+        фаз и role="status" для терминальных, `QueueWaitingRow` — свою.
       -->
-      <template v-if="(downloadTask && downloadProgress) || downloadCommandError">
+      <template v-if="queueTasks.length > 0 || downloadCommandError">
         <hr class="screen__divider">
 
-        <!--
-          Без собственного aria-live здесь (ревью TL-45, «Заметки»):
-          `DownloadCommandErrorBlock` несёт role="alert", `DownloadPanel` —
-          свою единственную живую зону для нетерминальных фаз и role="status"
-          для терминальных. Обёртка секции с ещё одним aria-live поверх них
-          дала бы вложенные регионы и задвоенные объявления одного и того
-          же текста.
-        -->
-        <section class="download-section">
-          <h2 class="download-section__title">
-            Текущая загрузка
-          </h2>
-          <DownloadCommandErrorBlock
-            v-if="downloadCommandError"
-            :error="downloadCommandError"
-            @hide="downloadTaskStore.dismissCommandError"
-          />
-          <DownloadPanel
-            v-if="downloadTask && downloadProgress"
-            :display-title="downloadTask.displayTitle"
-            :plan="downloadTask.plan"
-            :progress="downloadProgress"
-            :soft-stall-seconds="softStallSeconds"
-            @cancel="downloadTaskStore.cancel"
-            @retry="downloadTaskStore.retry"
-            @hide="downloadTaskStore.hide"
-          />
-        </section>
+        <QueueSection
+          :tasks="queueTasks"
+          :awaiting-continue="awaitingContinue"
+          :pause-reason="pauseReason"
+          :command-error="downloadCommandError"
+          :soft-stall-seconds="softStallSeconds"
+          @cancel="downloadTaskStore.cancel"
+          @retry="downloadTaskStore.retry"
+          @hide="downloadTaskStore.hide"
+          @hide-all-terminal="downloadTaskStore.hideAllTerminal"
+          @resume="downloadTaskStore.resume"
+          @dismiss-command-error="downloadTaskStore.dismissCommandError"
+        />
       </template>
     </template>
   </main>
@@ -346,12 +343,6 @@ function onDownloadRequested(payload: {
 
 .screen__footer {
   margin-top: 1rem;
-}
-
-.download-section__title {
-  margin: 0 0 0.5rem;
-  font-size: 1rem;
-  font-weight: 600;
 }
 
 .tap-target {

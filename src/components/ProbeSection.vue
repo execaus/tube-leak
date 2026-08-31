@@ -19,6 +19,7 @@
 import { computed, useId } from 'vue'
 
 import type { QualitySize, QualityStreams } from '@/types/generated/probe'
+import type { SelectedQuality } from '@/types/generated/queue'
 import { useLinkProbe } from '@/composables/useProbe'
 
 import ProbeErrorBlock from './ProbeErrorBlock.vue'
@@ -32,17 +33,22 @@ const props = defineProps<{
    * - `ready` — yt-dlp `ok`, поле активно.
    */
   ytDlpState: 'checking' | 'blocked' | 'ready'
-  /** Уже идёт другая задача скачивания — передаётся в `VideoCard` как есть (С-13). */
-  downloadBlocked?: boolean
 }>()
 
 const emit = defineEmits<{
-  download: [payload: { url: string; title: string; streams: QualityStreams; size: QualitySize; qualityLabel: string }]
+  download: [
+    payload: { url: string; title: string; streams: QualityStreams; size: QualitySize; quality: SelectedQuality },
+  ]
 }>()
 
 const { url, state, retry } = useLinkProbe()
 
-function onDownload(payload: { title: string; streams: QualityStreams; size: QualitySize; qualityLabel: string }): void {
+function onDownload(payload: {
+  title: string
+  streams: QualityStreams
+  size: QualitySize
+  quality: SelectedQuality
+}): void {
   // `url.value` — то, что буквально лежит в поле (для отображения); разбор
   // (`useLinkProbe`) уже давно решает по обрезанной строке (`evaluate`
   // делает `value.trim()` перед проверками). Ссылка, вставленная с
@@ -138,7 +144,6 @@ const inlineNotAUrlText = computed(() =>
       <VideoCard
         v-else-if="state.kind === 'success'"
         :result="state.result"
-        :download-blocked="downloadBlocked"
         @download="onDownload"
       />
 

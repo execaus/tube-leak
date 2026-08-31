@@ -8,44 +8,51 @@
  * Превью — `alt=""` (декоративное): название уже показано текстом рядом,
  * иначе скринридер зачитал бы его дважды подряд.
  *
- * # Кнопка «Скачать» (эпик E3, дизайн «Кнопка Скачать»)
+ * # Кнопка «Скачать» (эпик E3, дизайн «Кнопка Скачать»; правка TL-74/TL-75, Ф-2 E4)
  *
  * Живёт здесь же, под лестницей качеств — несколько строк, физически
  * часть той же карточки, не отдельная ui-задача (декомпозиция E3, «Что
- * сознательно не резалось мельче»). Неактивна в двух независимых
- * случаях с разным текстом-подсказкой: ничего не выбрано (подсказки нет —
- * самообъясняющееся состояние лестницы) и уже идёт другая задача
- * (`downloadBlocked`, С-13 — независимо от того, к этому же ролику она
- * относится или к другому).
+ * сознательно не резалось мельче»). Неактивна ровно в одном случае —
+ * ничего не выбрано в лестнице качеств (самообъясняющееся состояние,
+ * подсказки не требует). Блокировка на случай «уже идёт другая задача»
+ * (`downloadBlocked`) и её текст-подсказка — из дизайна E3 — сняты TL-74
+ * как прямое следствие Ф-2 E4: постановка при занятом слоте больше не
+ * отказ, а нормальный путь (очередь, эпик E4), и превентивно объяснять на
+ * карточке нечего. Единственный оставшийся повод отказа — дубль (Ф-8
+ * E4) — виден после клика через `DownloadCommandErrorBlock` (TL-75), не
+ * здесь.
  *
  * Сама карточка не хранит и не запускает задачу скачивания — она лишь
  * эмитит снимок «что скачивать» в момент клика (заголовок, потоки,
  * подпись качества); что происходит с этим снимком дальше (стор
  * `useDownloadTaskStore`, независимая от карточки панель) её не касается —
  * это и есть требование С-13 «панель переживает замену карточки».
+ *
+ * `quality` в эмитируемом payload (TL-75, эпик E4) — тот же
+ * {@link import('@/types/generated/queue').SelectedQuality}, что уносит
+ * `StartDownloadRequest.quality`: два поля выбранного пункта лестницы
+ * (`kind`/`heightPx`), без которых заголовок задачи не собрать заново
+ * после перезапуска приложения (карточки и лестницы к этому моменту уже
+ * нет, см. doc `StartDownloadRequest.quality` в
+ * `src/types/generated/download.ts`).
  */
-import { computed, ref, useId } from 'vue'
+import { computed, ref } from 'vue'
 
 import type { ProbeResult, QualityItem, QualitySize, QualityStreams } from '@/types/generated/probe'
+import type { SelectedQuality } from '@/types/generated/queue'
 import { formatDuration } from '@/utils/formatDuration'
-import { qualityLabel } from '@/utils/qualityLabel'
 
 import QualityLadder from './QualityLadder.vue'
 import VideoThumbnail from './VideoThumbnail.vue'
 
-const props = withDefaults(
-  defineProps<{
-    result: ProbeResult
-    /** Уже идёт другая задача скачивания (нетерминальная фаза) — С-13. */
-    downloadBlocked?: boolean
-  }>(),
-  {
-    downloadBlocked: false,
-  },
-)
+const props = defineProps<{
+  result: ProbeResult
+}>()
 
 const emit = defineEmits<{
-  download: [payload: { title: string; streams: QualityStreams; size: QualitySize; qualityLabel: string }]
+  download: [
+    payload: { title: string; streams: QualityStreams; size: QualitySize; quality: SelectedQuality },
+  ]
 }>()
 
 const selected = ref<QualityItem>()
@@ -54,28 +61,8 @@ function onSelect(item: QualityItem | undefined): void {
   selected.value = item
 }
 
-const downloadDisabled = computed(() => selected.value === undefined || props.downloadBlocked)
-
-/**
- * Подсказка под кнопкой — только для случая «занято другой задачей»
- * (дизайн: «ничего не выбрано» — без подсказки, самообъясняющееся
- * состояние лестницы).
- */
-const downloadHint = computed(() =>
-  props.downloadBlocked
-    ? 'Уже идёт другая загрузка. Дождитесь её завершения или отмените её ниже, чтобы начать новую.'
-    : undefined,
-)
-
-/**
- * Связывает подсказку с кнопкой для скринридера (`aria-describedby`) —
- * ревью TL-45, «Заметки»: заблокированная кнопка не получает фокус (это
- * обычное и ожидаемое поведение `disabled`), но клавиатурный пользователь,
- * дошедший до неё виртуальным курсором чтения, должен слышать не только
- * «Скачать, недоступно», а и причину — без явной связи подсказка была
- * соседним, никак не привязанным к кнопке абзацем.
- */
-const downloadHintId = useId()
+/** Единственный оставшийся повод недоступности — ничего не выбрано в лестнице (TL-74, Ф-2 E4). */
+const downloadDisabled = computed(() => selected.value === undefined)
 
 function onDownloadClick(): void {
   const item = selected.value
@@ -87,9 +74,10 @@ function onDownloadClick(): void {
     // прогресса в ядре (TL-41); берётся отсюда же, где и `streams`, не
     // собирается отдельно (правило контракта `StartDownloadRequest.size`).
     size: item.size,
-    qualityLabel: qualityLabel(item),
+    quality: { kind: item.kind, heightPx: item.heightPx },
   })
 }
+
 </script>
 
 <template>
@@ -125,18 +113,10 @@ function onDownloadClick(): void {
       type="button"
       class="tap-target video-card__download"
       :disabled="downloadDisabled"
-      :aria-describedby="downloadHint ? downloadHintId : undefined"
       @click="onDownloadClick"
     >
       Скачать
     </button>
-    <p
-      v-if="downloadHint"
-      :id="downloadHintId"
-      class="video-card__download-hint"
-    >
-      {{ downloadHint }}
-    </p>
   </article>
 </template>
 
@@ -179,12 +159,6 @@ function onDownloadClick(): void {
 
 .video-card__download {
   margin-top: 0.75rem;
-}
-
-.video-card__download-hint {
-  margin: 0.35rem 0 0;
-  font-size: 0.85rem;
-  color: #777;
 }
 
 .tap-target {
