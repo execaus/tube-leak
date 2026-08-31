@@ -86,6 +86,7 @@ mod commands;
 mod download;
 mod probe;
 mod sidecar;
+mod single_instance;
 mod types;
 mod ytdlp;
 
@@ -160,11 +161,49 @@ fn main() {
             start_ytdlp_update_schedule(app.handle());
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(single_instance::context())
         .unwrap_or_else(|err| {
             eprintln!("error while building tauri application: {err}");
             std::process::exit(1);
         });
+
+    // Один экземпляр приложения (TL-20, решение Р-6 эпика E4). Замок
+    // берётся здесь, а не в `setup` ниже, и точка выбрана по порядку в
+    // самом Tauri: `build` уже вернул `App`, но окон ещё нет и наш `setup`
+    // ещё не выполнялся — они оба ждут `RuntimeRunEvent::Ready` внутри
+    // `run`. То есть лишний экземпляр уходит, не мигнув окном и не тронув
+    // дерево установок yt-dlp. Подробности и цена решения — в doc-блоке
+    // `single_instance`.
+    match single_instance::claim_for(app.handle()) {
+        // Замок кладётся в состояние приложения, а не в локальную
+        // переменную, намеренно: `let _ = …` отпустил бы его немедленно, и
+        // единственность пропала бы молча — ровно тот класс правки, что не
+        // ловится ни сборкой, ни тестами.
+        single_instance::Claim::Sole(lock) => {
+            app.manage(lock);
+        }
+        single_instance::Claim::AlreadyRunning(path) => {
+            eprintln!(
+                "tube-leak уже запущен: замок {} держит другой процесс. Этот \
+                 запуск завершается; окно работающего экземпляра он не \
+                 поднимает — это отдельная задача.",
+                path.display()
+            );
+            std::process::exit(0);
+        }
+        // Fail-open: замок не дали по причине, не связанной с соседом
+        // (нет блокировок на сетевом томе, права на каталог). Отказать
+        // себе в старте здесь значило бы сделать приложение
+        // незапускаемым из-за файловой системы, поэтому запускаемся — но
+        // громко.
+        single_instance::Claim::Undecided(err) => {
+            eprintln!(
+                "не удалось проверить, запущен ли уже tube-leak ({err}). Запуск \
+                 продолжается; если экземпляр уже работает, они будут мешать \
+                 друг другу."
+            );
+        }
+    }
 
     // Tauri/tao завершают процесс приложения через `std::process::exit`
     // сразу после того, как этот колбэк вернёт управление на `RunEvent::Exit`
