@@ -32,8 +32,6 @@ const props = defineProps<{
    * - `ready` — yt-dlp `ok`, поле активно.
    */
   ytDlpState: 'checking' | 'blocked' | 'ready'
-  /** Уже идёт другая задача скачивания — передаётся в `VideoCard` как есть (С-13). */
-  downloadBlocked?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -138,7 +136,6 @@ const inlineNotAUrlText = computed(() =>
       <VideoCard
         v-else-if="state.kind === 'success'"
         :result="state.result"
-        :download-blocked="downloadBlocked"
         @download="onDownload"
       />
 

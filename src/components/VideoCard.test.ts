@@ -54,32 +54,16 @@ describe('VideoCard — кнопка «Скачать» (эпик E3, дизай
     expect(wrapper.find('.video-card__download-hint').exists()).toBe(false)
   })
 
-  it('becomes enabled once a quality row is selected', async () => {
+  it('becomes enabled once a quality row is selected, with no hint about any other active download (TL-74, Ф-2 E4 — постановка при занятом слоте больше не отказ)', async () => {
     const wrapper = mount(VideoCard, { props: { result: full } })
     await wrapper.find('input[type="radio"]').setValue(true)
+
     expect(downloadButton(wrapper)?.attributes('disabled')).toBeUndefined()
+    expect(wrapper.find('.video-card__download-hint').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('Уже идёт другая загрузка')
   })
 
-  it('is disabled with an explanatory hint when another download is already active (С-13), even after selecting a quality', async () => {
-    const wrapper = mount(VideoCard, { props: { result: full, downloadBlocked: true } })
-    await wrapper.find('input[type="radio"]').setValue(true)
-
-    expect(downloadButton(wrapper)?.attributes('disabled')).toBeDefined()
-    expect(wrapper.text()).toContain('Уже идёт другая загрузка')
-  })
-
-  it('associates the blocked hint with the button via aria-describedby, for keyboard/screen-reader users (ревью TL-45)', async () => {
-    const wrapper = mount(VideoCard, { props: { result: full, downloadBlocked: true } })
-    const button = downloadButton(wrapper)
-    const hint = wrapper.find('.video-card__download-hint')
-
-    expect(hint.exists()).toBe(true)
-    const describedBy = button?.attributes('aria-describedby')
-    expect(describedBy).toBeTruthy()
-    expect(hint.attributes('id')).toBe(describedBy)
-  })
-
-  it('has no aria-describedby when there is no hint to point to', () => {
+  it('has no aria-describedby — there is no hint left to point to (TL-74)', () => {
     const wrapper = mount(VideoCard, { props: { result: full } })
     expect(downloadButton(wrapper)?.attributes('aria-describedby')).toBeUndefined()
   })
