@@ -151,15 +151,15 @@ onMounted(() => {
  * `src/composables/windowExitPort.ts`, здесь используется только через
  * интерфейс `WindowExitPort`.
  *
- * Читает `task`/`progress`/`isActive` стора — до сих пор проекцию
- * **активной** задачи очереди (обратная совместимость, doc
- * `useDownloadTaskStore` в `src/stores/downloadTask.ts`); срез всей
- * очереди для диалога — TL-76 (issue #83), не эта задача.
+ * Читает срез всей очереди (эпик E4, TL-76): `activeTask`/`pauseReason`/
+ * `waitingCount` — не одну задачу, как было до TL-76 (doc
+ * `useExitConfirmation.ts`, «Полный срез очереди»).
  */
 const {
   visible: showExitConfirm,
-  task: exitConfirmTask,
-  progress: exitConfirmProgress,
+  activeTask: exitConfirmActiveTask,
+  pauseReason: exitConfirmPauseReason,
+  waitingCount: exitConfirmWaitingCount,
   stay: onExitStay,
   exitAnyway: onExitAnyway,
 } = useExitConfirmation()
@@ -185,9 +185,10 @@ function onDownloadRequested(payload: {
 
 <template>
   <ExitConfirmDialog
-    v-if="showExitConfirm && exitConfirmTask && exitConfirmProgress"
-    :display-title="exitConfirmTask.displayTitle"
-    :progress="exitConfirmProgress"
+    v-if="showExitConfirm"
+    :active-task="exitConfirmActiveTask"
+    :pause-reason="exitConfirmPauseReason"
+    :waiting-count="exitConfirmWaitingCount"
     @stay="onExitStay"
     @exit-anyway="onExitAnyway"
   />

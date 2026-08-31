@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
- * Диалог подтверждения выхода при активной загрузке (Р-2, эпик E3, TL-46,
- * `role="alertdialog"`).
+ * Диалог подтверждения выхода при непустой очереди (Р-2, эпик E3, TL-46;
+ * срез всей очереди вместо одной задачи — эпик E4, TL-76, `role="alertdialog"`).
  *
  * Чисто презентационный компонент — видимость и различение «выйти»/
  * «отменить» решает `useExitConfirmation`, сюда приходят уже готовые пропсы
@@ -19,12 +19,20 @@
  */
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 
-import type { DownloadProgress } from '@/types/generated/download'
-import { getExitDialogText } from '@/utils/exitDialogTexts'
+import type { QueuePauseReason } from '@/types/generated/queue'
+import { getExitDialogText, type ExitDialogActiveTask } from '@/utils/exitDialogTexts'
 
 const props = defineProps<{
-  displayTitle: string
-  progress: DownloadProgress
+  /**
+   * Задача, реально выполняющаяся прямо сейчас — отсутствует ровно тогда,
+   * когда `pauseReason` присутствует (Р-7: во время паузы между задачами
+   * активной задачи физически нет). Срез всей очереди, не одна задача
+   * (дизайн E4, «Диалог выхода», TL-76) — второе число (`waitingCount`)
+   * несёт остальное.
+   */
+  activeTask?: ExitDialogActiveTask
+  pauseReason?: QueuePauseReason
+  waitingCount: number
 }>()
 
 const emit = defineEmits<{
@@ -32,7 +40,9 @@ const emit = defineEmits<{
   exitAnyway: []
 }>()
 
-const text = computed(() => getExitDialogText(props.displayTitle, props.progress))
+const text = computed(() =>
+  getExitDialogText({ activeTask: props.activeTask, pauseReason: props.pauseReason, waitingCount: props.waitingCount }),
+)
 
 const stayButton = ref<HTMLButtonElement>()
 const exitButton = ref<HTMLButtonElement>()

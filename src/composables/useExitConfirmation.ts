@@ -1,18 +1,51 @@
 import { storeToRefs } from 'pinia'
-import { onMounted, onScopeDispose, ref, type Ref } from 'vue'
+import { computed, onMounted, onScopeDispose, ref, type Ref } from 'vue'
 
-import { useDownloadTaskStore, type DownloadTask } from '@/stores/downloadTask'
-import type { DownloadProgress } from '@/types/generated/download'
+import { useDownloadTaskStore } from '@/stores/downloadTask'
+import type { QueuePauseReason } from '@/types/generated/queue'
+import type { ExitDialogActiveTask } from '@/utils/exitDialogTexts'
+import { isTerminalQueuePhase } from '@/utils/queueTaskPhase'
+import { toDownloadProgress } from '@/utils/queueTaskProgress'
+import { formatTaskDisplayTitle } from '@/utils/queueTaskTitle'
 import { windowExitPort as defaultWindowExitPort, type WindowExitPort } from './windowExitPort'
 
 /**
- * Диалог подтверждения выхода при активной загрузке (Р-2, эпик E3, TL-46).
+ * Диалог подтверждения выхода при непустой очереди (Р-2, эпик E3, TL-46;
+ * срез всей очереди вместо одной задачи — эпик E4, TL-76, С-6, Р-8).
  *
  * Разграничение «выйти» / «отменить» — ключевое требование Р-2: при любом
  * ответе уже скачанное остаётся на диске (правила подчистки живут в ядре,
  * этот композабл их не трогает), выбор влияет только на факт закрытия окна.
  * Поэтому «Всё равно выйти» здесь **не** зовёт `downloadTaskStore.cancel()`
  * — только {@link WindowExitPort.finishWindow}.
+ *
+ * # Полный срез очереди, а не одна задача (TL-76)
+ *
+ * До TL-76 композабл читал `store.task`/`store.progress`/`store.isActive`
+ * — временную проекцию первой задачи списка, которую TL-75 оставил
+ * намеренно (doc `useDownloadTaskStore` в `src/stores/downloadTask.ts`,
+ * «Обратная совместимость»). Теперь вход — сам список `tasks` плюс
+ * `awaitingContinue`/`pauseReason` уровня очереди, из которых считаются:
+ * - `activeTask` — задача, реально выполняющаяся прямо сейчас (голова
+ *   нетерминального подсписка, Р-4: активная задача всегда первая среди
+ *   нетерминальных); отсутствует во время паузы между задачами на
+ *   обновление yt-dlp (Р-7) — в этот момент предыдущая задача уже
+ *   терминальна, а следующая ещё не стартовала, назвать эту задачу
+ *   активной значило бы соврать про фазу, которой у неё ещё нет;
+ * - `waitingCount` — число нетерминальных задач сверх названной
+ *   `activeTask` (во время паузы, когда `activeTask` не назван никто, —
+ *   это все нетерминальные задачи целиком).
+ *
+ * # Условие показа — С-6, уточнённое Р-8
+ *
+ * Буквально С-6 требует диалог при хоть одной нетерминальной задаче. Р-8
+ * сужает это условие: диалог **не** показывается, если очередь
+ * восстановлена после перезапуска и пользователь ещё ни разу не нажал
+ * «Продолжить» (`awaitingContinue: true`) — в этом состоянии закрытие
+ * ничего не теряет: снимок уже лежит на диске, сетевой активности нет,
+ * частичные файлы целы. Диалог, предупреждающий о том, чего не
+ * происходит, приучает закрывать его не читая (обоснование — дизайн E4,
+ * раздел «Р-8»).
  *
  * # Оконное событие — за портом, не напрямую
  *
@@ -25,26 +58,49 @@ import { windowExitPort as defaultWindowExitPort, type WindowExitPort } from './
  */
 export function useExitConfirmation(port: WindowExitPort = defaultWindowExitPort): {
   visible: Ref<boolean>
-  task: Ref<DownloadTask | undefined>
-  progress: Ref<DownloadProgress | undefined>
+  activeTask: Ref<ExitDialogActiveTask | undefined>
+  pauseReason: Ref<QueuePauseReason | undefined>
+  waitingCount: Ref<number>
   stay: () => void
   exitAnyway: () => void
 } {
   const store = useDownloadTaskStore()
-  // `storeToRefs`, не `store.task` напрямую: последнее вернуло бы
+  // `storeToRefs`, не `store.tasks` напрямую: последнее вернуло бы
   // разово развёрнутое значение, а не живую ссылку — тот же приём,
   // что уже применён в `App.vue` для панели (ревью TL-45).
-  const { task, progress } = storeToRefs(store)
+  const { tasks, awaitingContinue, pauseReason } = storeToRefs(store)
   const visible = ref(false)
 
+  const nonTerminalTasks = computed(() => tasks.value.filter((t) => !isTerminalQueuePhase(t.phase)))
+
+  /** Планировщик держит паузу между задачами на обновление yt-dlp (Р-7) — единственный случай, когда `activeTask` не назван никто. */
+  const isPaused = computed(() => pauseReason.value === 'ytDlpUpdate')
+
+  const activeTask = computed<ExitDialogActiveTask | undefined>(() => {
+    if (isPaused.value) return undefined
+    const head = nonTerminalTasks.value[0]
+    if (!head) return undefined
+    return {
+      displayTitle: formatTaskDisplayTitle(head.title, head.quality),
+      progress: toDownloadProgress(head),
+    }
+  })
+
+  const waitingCount = computed(() => {
+    const total = nonTerminalTasks.value.length
+    return isPaused.value ? total : Math.max(total - 1, 0)
+  })
+
   /**
-   * Показывается тогда и только тогда, когда задача существует и её фаза
-   * нетерминальна — буквально `store.isActive`. Для отсутствующей или уже
-   * терминальной (даже не скрытой) задачи выход не перехватывается: диалог
-   * был бы лишним трением, данные уже не в опасности.
+   * Показывается тогда и только тогда, когда есть хоть одна нетерминальная
+   * задача (С-6) и очередь не лежит приостановленной после перезапуска,
+   * ещё не продолженной пользователем (Р-8, см. doc функции выше). Для
+   * пустой очереди или для приостановленной, ещё не продолженной, выход
+   * не перехватывается: диалог был бы лишним трением, данные уже не в
+   * опасности.
    */
   function handleCloseAttempt(): void {
-    if (store.isActive) {
+    if (nonTerminalTasks.value.length > 0 && !awaitingContinue.value) {
       visible.value = true
     } else {
       void port.finishWindow()
@@ -76,8 +132,9 @@ export function useExitConfirmation(port: WindowExitPort = defaultWindowExitPort
 
   return {
     visible,
-    task,
-    progress,
+    activeTask,
+    pauseReason,
+    waitingCount,
     stay,
     exitAnyway,
   }
