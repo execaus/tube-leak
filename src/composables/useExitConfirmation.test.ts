@@ -4,21 +4,29 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent } from 'vue'
 
 import type { DownloadProgressEvent, DownloadStarted, StartDownloadRequest } from '@/types/generated/download'
+import type { QueueSnapshot } from '@/types/generated/queue'
+
 /**
- * Композабл диалога подтверждения выхода (Р-2, эпик E3, TL-46). Оконное
- * событие подставляется фейковым портом — реальная реализация ждёт
- * разрешение `core:window:allow-destroy` (задача ядра #49, см.
- * `windowExitPort.ts`); здесь проверяется только бизнес-логика: когда
- * показывать диалог и что делает каждый ответ, независимо от того, как
- * приходит попытка закрытия.
+ * Композабл диалога подтверждения выхода (Р-2, эпик E3, TL-46; срез всей
+ * очереди — эпик E4, TL-76, С-6, Р-8). Оконное событие подставляется
+ * фейковым портом — реальная реализация ждёт разрешение
+ * `core:window:allow-destroy` (задача ядра #49, см. `windowExitPort.ts`);
+ * здесь проверяется только бизнес-логика: когда показывать диалог и что
+ * именно он говорит про очередь, независимо от того, как приходит
+ * попытка закрытия.
+ *
+ * Пять состояний очереди (культура проверки CLAUDE.md: «каждое состояние
+ * закрывается отдельным тестом»): нет задач; активная; только ожидающие
+ * (в т.ч. пауза на обновление yt-dlp, Р-7 — там тоже нет активной задачи);
+ * приостановленная после перезапуска (Р-8); только терминальные.
  */
 
+type Handler = (event: { payload: unknown }) => void
 const invokeMock = vi.fn()
 const unlistenMock = vi.fn()
-type EventHandler = (event: { payload: DownloadProgressEvent }) => void
-let capturedHandler: EventHandler | undefined
-const listenMock = vi.fn((_event: string, handler: EventHandler) => {
-  capturedHandler = handler
+const handlers = new Map<string, Handler>()
+const listenMock = vi.fn((eventName: string, handler: Handler) => {
+  handlers.set(eventName, handler)
   return Promise.resolve(unlistenMock)
 })
 
@@ -27,14 +35,33 @@ vi.mock('@tauri-apps/api/core', () => ({
 }))
 
 vi.mock('@tauri-apps/api/event', () => ({
-  listen: (...args: [string, EventHandler]) => listenMock(...args),
+  listen: (...args: [string, Handler]) => listenMock(...args),
 }))
 
 const { useDownloadTaskStore } = await import('@/stores/downloadTask')
 const { useExitConfirmation } = await import('./useExitConfirmation')
 
-function emit(payload: DownloadProgressEvent): void {
-  capturedHandler?.({ payload })
+function emitProgress(payload: DownloadProgressEvent): void {
+  handlers.get('download://progress')?.({ payload })
+}
+
+function emitQueueChanged(snapshot: QueueSnapshot): void {
+  handlers.get('queue://changed')?.({ payload: snapshot })
+}
+
+const EMPTY_SNAPSHOT: QueueSnapshot = { tasks: [], awaitingContinue: false }
+
+/** Роутинг `invoke` по имени команды — `queue_state` по умолчанию пуст, остальное задаётся тестом. */
+function routeInvoke(byCommand: Record<string, () => Promise<unknown>>): void {
+  const withDefaults: Record<string, () => Promise<unknown>> = {
+    queue_state: () => Promise.resolve(EMPTY_SNAPSHOT),
+    ...byCommand,
+  }
+  invokeMock.mockImplementation((command: string) => {
+    const handler = withDefaults[command]
+    if (!handler) throw new Error(`unexpected invoke: ${command}`)
+    return handler()
+  })
 }
 
 const request: StartDownloadRequest = {
@@ -42,9 +69,6 @@ const request: StartDownloadRequest = {
   title: 'Как приручить дракона',
   streams: { videoFormatId: 'v1080', audioFormatId: 'a' },
   size: { kind: 'known', bytes: 303_038_464 },
-  // TL-70/TL-75 (эпик E4): поле обязательно с контракта TL-70 — здесь
-  // добавлено чисто механически, чтобы файл компилировался; поведение
-  // диалога выхода по срезу очереди — TL-76 (issue #83), не эта задача.
   quality: { kind: 'standard', heightPx: 1080 },
 }
 
@@ -85,12 +109,13 @@ beforeEach(() => {
   invokeMock.mockReset()
   listenMock.mockClear()
   unlistenMock.mockClear()
-  capturedHandler = undefined
+  handlers.clear()
+  routeInvoke({})
   setActivePinia(createPinia())
 })
 
-describe('useExitConfirmation — когда показывается диалог (Р-2)', () => {
-  it('без задачи вовсе: попытка закрытия сразу завершает окно, диалог не показывается', () => {
+describe('useExitConfirmation — состояние «нет задач вообще» (С-6)', () => {
+  it('попытка закрытия сразу завершает окно, диалог не показывается', () => {
     const port = createFakePort()
     const { result } = withSetup(() => useExitConfirmation(port))
 
@@ -99,13 +124,19 @@ describe('useExitConfirmation — когда показывается диало
     expect(result.visible.value).toBe(false)
     expect(port.finishCalls).toBe(1)
   })
+})
 
+describe('useExitConfirmation — состояние «только терминальные задачи» (С-6)', () => {
   it('для терминальной задачи (Done), даже не скрытой: диалог не показывается', async () => {
     const port = createFakePort()
-    invokeMock.mockResolvedValueOnce(started)
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'queue_state') return Promise.resolve(EMPTY_SNAPSHOT)
+      if (command === 'start_download') return Promise.resolve(started)
+      throw new Error(`unexpected invoke: ${command}`)
+    })
     const store = useDownloadTaskStore()
     await store.start(request)
-    emit({ taskId: 'task-1', phase: 'done', fileName: 'x.mp4' })
+    emitProgress({ taskId: 'task-1', phase: 'done', fileName: 'x.mp4' })
 
     const { result } = withSetup(() => useExitConfirmation(port))
     port.attempt()
@@ -116,10 +147,14 @@ describe('useExitConfirmation — когда показывается диало
 
   it('для терминальной задачи (Cancelled), даже не скрытой: диалог не показывается', async () => {
     const port = createFakePort()
-    invokeMock.mockResolvedValueOnce(started)
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'queue_state') return Promise.resolve(EMPTY_SNAPSHOT)
+      if (command === 'start_download') return Promise.resolve(started)
+      throw new Error(`unexpected invoke: ${command}`)
+    })
     const store = useDownloadTaskStore()
     await store.start(request)
-    emit({ taskId: 'task-1', phase: 'cancelled', partialData: 'removed' })
+    emitProgress({ taskId: 'task-1', phase: 'cancelled', partialData: 'removed' })
 
     const { result } = withSetup(() => useExitConfirmation(port))
     port.attempt()
@@ -128,14 +163,137 @@ describe('useExitConfirmation — когда показывается диало
     expect(port.finishCalls).toBe(1)
   })
 
-  it('для активной нетерминальной задачи (Downloading): диалог показывается, окно пока не завершается', async () => {
+  it('несколько терминальных задач сразу (Done + Failed), нетерминальных нет: диалог не показывается', async () => {
     const port = createFakePort()
-    invokeMock.mockResolvedValueOnce(started)
     const store = useDownloadTaskStore()
-    await store.start(request)
-    emit({ taskId: 'task-1', phase: 'downloading', state: 'running', percent: 40 })
+    await store.initialize()
+    emitQueueChanged({
+      awaitingContinue: false,
+      tasks: [
+        { taskId: 'a', title: 'Ролик A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp4' },
+        {
+          taskId: 'b',
+          title: 'Ролик B',
+          quality: { kind: 'audioOnly' },
+          plan: 'singleStream',
+          phase: 'failed',
+          error: { kind: 'connectionLost', message: 'diag', retryable: true, partialData: 'kept' },
+        },
+      ],
+    })
 
     const { result } = withSetup(() => useExitConfirmation(port))
+    port.attempt()
+
+    expect(result.visible.value).toBe(false)
+    expect(port.finishCalls).toBe(1)
+  })
+})
+
+describe('useExitConfirmation — состояние «активная задача» (С-6)', () => {
+  it('для активной нетерминальной задачи (Downloading): диалог показывается, окно пока не завершается, названа задача', async () => {
+    const port = createFakePort()
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'queue_state') return Promise.resolve(EMPTY_SNAPSHOT)
+      if (command === 'start_download') return Promise.resolve(started)
+      throw new Error(`unexpected invoke: ${command}`)
+    })
+    const store = useDownloadTaskStore()
+    await store.start(request)
+    emitProgress({ taskId: 'task-1', phase: 'downloading', state: 'running', percent: 40 })
+
+    const { result } = withSetup(() => useExitConfirmation(port))
+    port.attempt()
+
+    expect(result.visible.value).toBe(true)
+    expect(port.finishCalls).toBe(0)
+    expect(result.activeTask.value).toStrictEqual({
+      displayTitle: '«Как приручить дракона» — 1080p',
+      progress: { phase: 'downloading', state: 'running', percent: 40 },
+    })
+    expect(result.waitingCount.value).toBe(0)
+  })
+
+  it('активная задача + 2 ожидающих: диалог называет обе величины (критерий приёмки issue #83)', async () => {
+    const port = createFakePort()
+    const store = useDownloadTaskStore()
+    await store.initialize()
+    emitQueueChanged({
+      awaitingContinue: false,
+      tasks: [
+        { taskId: 'a', title: 'Ролик A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'downloading', state: 'running', percent: 40 },
+        { taskId: 'b', title: 'Ролик B', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' },
+        { taskId: 'c', title: 'Ролик C', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' },
+      ],
+    })
+
+    const { result } = withSetup(() => useExitConfirmation(port))
+    port.attempt()
+
+    expect(result.visible.value).toBe(true)
+    expect(result.activeTask.value?.displayTitle).toBe('«Ролик A» — Только аудио')
+    expect(result.waitingCount.value).toBe(2)
+  })
+})
+
+describe('useExitConfirmation — состояние «только ожидающие задачи»', () => {
+  it('очередь работает (не приостановлена после перезапуска), но активная фаза отсутствует из-за паузы на обновление yt-dlp (Р-7): диалог показывается без названной задачи', async () => {
+    const port = createFakePort()
+    const store = useDownloadTaskStore()
+    await store.initialize()
+    emitQueueChanged({
+      awaitingContinue: false,
+      pauseReason: 'ytDlpUpdate',
+      tasks: [{ taskId: 'w', title: 'Ожидающий ролик', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' }],
+    })
+
+    const { result } = withSetup(() => useExitConfirmation(port))
+    port.attempt()
+
+    expect(result.visible.value).toBe(true)
+    expect(port.finishCalls).toBe(0)
+    expect(result.activeTask.value).toBeUndefined()
+    expect(result.pauseReason.value).toBe('ytDlpUpdate')
+    expect(result.waitingCount.value).toBe(1)
+  })
+})
+
+describe('useExitConfirmation — состояние «приостановлена после перезапуска, ещё не продолжена» (Р-8)', () => {
+  it('awaitingContinue: true и есть нетерминальные задачи — диалог НЕ показывается, окно завершается сразу', async () => {
+    const port = createFakePort()
+    const store = useDownloadTaskStore()
+    await store.initialize()
+    emitQueueChanged({
+      awaitingContinue: true,
+      tasks: [
+        { taskId: 'r1', title: 'Восстановленный ролик 1', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' },
+        { taskId: 'r2', title: 'Восстановленный ролик 2', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' },
+      ],
+    })
+
+    const { result } = withSetup(() => useExitConfirmation(port))
+    port.attempt()
+
+    expect(result.visible.value).toBe(false)
+    expect(port.finishCalls).toBe(1)
+  })
+
+  it('после «Продолжить очередь» (awaitingContinue становится false) диалог снова работает как обычно', async () => {
+    const port = createFakePort()
+    const store = useDownloadTaskStore()
+    await store.initialize()
+    emitQueueChanged({
+      awaitingContinue: true,
+      tasks: [{ taskId: 'r1', title: 'Восстановленный ролик', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' }],
+    })
+
+    const { result } = withSetup(() => useExitConfirmation(port))
+
+    // Снимок после `resume_queue`: `awaitingContinue: false`, задача теперь реально идёт.
+    emitQueueChanged({
+      awaitingContinue: false,
+      tasks: [{ taskId: 'r1', title: 'Восстановленный ролик', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'downloading', state: 'running', percent: 5 }],
+    })
     port.attempt()
 
     expect(result.visible.value).toBe(true)
@@ -145,10 +303,14 @@ describe('useExitConfirmation — когда показывается диало
 
 describe('useExitConfirmation — «Остаться» против «Всё равно выйти»', () => {
   async function setupActiveTask(port: ReturnType<typeof createFakePort>) {
-    invokeMock.mockResolvedValueOnce(started)
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'queue_state') return Promise.resolve(EMPTY_SNAPSHOT)
+      if (command === 'start_download') return Promise.resolve(started)
+      throw new Error(`unexpected invoke: ${command}`)
+    })
     const store = useDownloadTaskStore()
     await store.start(request)
-    emit({ taskId: 'task-1', phase: 'downloading', state: 'running', percent: 40 })
+    emitProgress({ taskId: 'task-1', phase: 'downloading', state: 'running', percent: 40 })
     const setup = withSetup(() => useExitConfirmation(port))
     port.attempt()
     return { store, ...setup }
@@ -176,7 +338,7 @@ describe('useExitConfirmation — «Остаться» против «Всё р�
     expect(port.finishCalls).toBe(1)
     expect(invokeMock).not.toHaveBeenCalledWith('cancel_download', expect.anything())
     // Задача в сторе остаётся как есть — «Всё равно выйти» не трогает её состояние.
-    expect(result.progress.value?.phase).toBe('downloading')
+    expect(result.activeTask.value?.progress.phase).toBe('downloading')
   })
 })
 

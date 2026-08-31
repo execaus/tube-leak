@@ -484,7 +484,7 @@ describe('App — диалог подтверждения выхода, наст
     await attemptWindowClose()
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.text()).toContain('Загрузка ещё не завершена')
+    expect(wrapper.text()).toContain('Очередь ещё не завершена')
     expect(wrapper.text()).toContain('скачивается (62 %)')
     expect(destroyMock).not.toHaveBeenCalled()
   })
@@ -500,12 +500,12 @@ describe('App — диалог подтверждения выхода, наст
 
     await attemptWindowClose()
     await wrapper.vm.$nextTick()
-    expect(wrapper.text()).toContain('Загрузка ещё не завершена')
+    expect(wrapper.text()).toContain('Очередь ещё не завершена')
 
     await wrapper.findAll('button').find((b) => b.text() === 'Остаться')?.trigger('click')
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.text()).not.toContain('Загрузка ещё не завершена')
+    expect(wrapper.text()).not.toContain('Очередь ещё не завершена')
     expect(destroyMock).not.toHaveBeenCalled()
     // Задача не тронута: панель по-прежнему показывает идущую загрузку.
     expect(wrapper.text()).toContain('10 %')
@@ -528,7 +528,7 @@ describe('App — диалог подтверждения выхода, наст
 
     expect(destroyMock).toHaveBeenCalledTimes(1)
     expect(invokeMock).not.toHaveBeenCalledWith('cancel_download', expect.anything())
-    expect(wrapper.text()).not.toContain('Загрузка ещё не завершена')
+    expect(wrapper.text()).not.toContain('Очередь ещё не завершена')
   })
 
   it('terminal task (Cancelled), even not hidden yet: a close attempt destroys the window immediately, no dialog', async () => {
@@ -547,6 +547,62 @@ describe('App — диалог подтверждения выхода, наст
     await flushPromises()
 
     expect(destroyMock).toHaveBeenCalledTimes(1)
-    expect(wrapper.text()).not.toContain('Загрузка ещё не завершена')
+    expect(wrapper.text()).not.toContain('Очередь ещё не завершена')
+  })
+
+  it('active task + 2 waiting: the dialog names both quantities and never claims "вставьте ссылку заново" (critерий приёмки issue #83)', async () => {
+    const wrapper = await mountReady()
+    await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
+    invokeMock.mockImplementationOnce(() => Promise.resolve({ taskId: 'task-1', phase: 'downloading', plan: 'singleStream' }))
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+    emitProgress({ taskId: 'task-1', phase: 'downloading', state: 'running', percent: 62 })
+    await wrapper.vm.$nextTick()
+
+    await probeAndSelect(wrapper, 'https://youtu.be/b', resultB)
+    invokeMock.mockImplementationOnce(() => Promise.resolve({ taskId: 'task-2', phase: 'queued', plan: 'singleStream' }))
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+
+    const resultC: ProbeResult = {
+      title: 'Ролик C',
+      durationSecs: 40,
+      qualities: [{ kind: 'audioOnly', size: { kind: 'unknown' }, streams: { audioFormatId: 'c' } }],
+    }
+    await probeAndSelect(wrapper, 'https://youtu.be/c', resultC)
+    invokeMock.mockImplementationOnce(() => Promise.resolve({ taskId: 'task-3', phase: 'queued', plan: 'singleStream' }))
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+
+    await attemptWindowClose()
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.text()).toContain('Очередь ещё не завершена')
+    expect(wrapper.text()).toContain('скачивается (62 %)')
+    expect(wrapper.text()).toContain('Ещё в очереди: 2 задачи')
+    expect(wrapper.text()).not.toMatch(/вставьте/i)
+    expect(destroyMock).not.toHaveBeenCalled()
+  })
+
+  it('restored queue after a restart, not yet resumed (Р-8): a close attempt destroys the window immediately, no dialog', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () =>
+        Promise.resolve({
+          awaitingContinue: true,
+          tasks: [
+            { taskId: 'r1', title: 'Восстановленный ролик', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' },
+          ],
+        } satisfies QueueSnapshot),
+    })
+    const wrapper = await mountReady()
+    expect(wrapper.text()).toContain('Очередь приостановлена после перезапуска')
+
+    await attemptWindowClose()
+    await flushPromises()
+
+    expect(destroyMock).toHaveBeenCalledTimes(1)
+    expect(wrapper.text()).not.toContain('Очередь ещё не завершена')
   })
 })

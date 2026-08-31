@@ -1,12 +1,42 @@
 import type { DownloadProgress } from '@/types/generated/download'
+import type { QueuePauseReason } from '@/types/generated/queue'
+import { pluralizeRu } from './pluralizeRu'
 
-/** Заголовок и текст диалога подтверждения выхода (дизайн E3, TL-46). */
+/** Заголовок и текст диалога подтверждения выхода (дизайн E4, TL-76). */
 export interface ExitDialogText {
   heading: string
   body: string
 }
 
-const HEADING = 'Загрузка ещё не завершена'
+/**
+ * С TL-76 (эпик E4) диалог говорит про очередь целиком, а не про одну
+ * задачу (дизайн «Диалог выхода», С-6) — заголовок точнее отражает это:
+ * речь не обязательно про одну скачивающуюся задачу.
+ */
+const HEADING = 'Очередь ещё не завершена'
+
+/** Активная задача диалога — та же пара, что уже держит `DownloadTask` (`displayTitle`) плюс её прогресс. */
+export interface ExitDialogActiveTask {
+  displayTitle: string
+  progress: DownloadProgress
+}
+
+/**
+ * Вход текста диалога (дизайн E4, «Диалог выхода»):
+ * - `activeTask` — задача, которая реально выполняется прямо сейчас
+ *   (Fetching/Downloading/Merging, включая паузу перед повтором);
+ *   отсутствует ровно тогда, когда `pauseReason` присутствует — в паузе
+ *   между задачами (Р-7) активной задачи физически нет;
+ * - `pauseReason` — планировщик держит паузу на обновление yt-dlp (Р-7);
+ * - `waitingCount` — число нетерминальных задач сверх той, что названа
+ *   первым предложением (при паузе — все нетерминальные задачи, ни одна
+ *   из них не активна).
+ */
+export interface ExitDialogInput {
+  activeTask?: ExitDialogActiveTask
+  pauseReason?: QueuePauseReason
+  waitingCount: number
+}
 
 /**
  * Фрагмент «что сейчас происходит с задачей», подставляемый сразу после
@@ -42,9 +72,9 @@ function stateFragment(progress: DownloadProgress): string {
         : `скачивается (${Math.round(progress.percent)} %)`
     case 'merging':
       return 'идёт склейка видео и звука'
-    // Терминальные фазы сюда не доходят — диалог не показывается для
-    // terminal-задачи (`useDownloadTaskStore.isActive`, requirement TL-46).
-    // Ветка — оборона, а не ожидаемый путь.
+    // Терминальные фазы сюда не доходят — диалог не показывается, когда
+    // нетерминальных задач нет (`useExitConfirmation`, TL-76). Ветка —
+    // оборона, а не ожидаемый путь.
     case 'done':
     case 'failed':
     case 'cancelled':
@@ -52,18 +82,55 @@ function stateFragment(progress: DownloadProgress): string {
   }
 }
 
+/** Именительный падеж «N задача/задачи/задач» — счётчик ожидающих (дизайн, «строка ожидания»). */
+function tasksNominative(n: number): string {
+  return pluralizeRu(n, 'задача', 'задачи', 'задач')
+}
+
 /**
- * Текст диалога (Р-2, дизайн «Диалог подтверждения выхода»). `displayTitle`
- * — тот же снимок «название + качество», что уже держит панель
- * (`DownloadTask.displayTitle`), а не второй источник заголовка.
+ * Первое предложение — про то, что выполняется прямо сейчас. Во время
+ * паузы между задачами (Р-7) конкретной выполняющейся задачи физически
+ * нет (предыдущая уже терминальна, следующая ещё не стартовала) — вместо
+ * названия задачи и выдуманного процента честная фраза о самой паузе
+ * (тот же приём, что и в строке паузы `QueueSection.vue`, но собственный
+ * текст диалога, не импорт чужой константы — они описывают разные вещи:
+ * там это состояние всей секции, здесь одно предложение диалога выхода).
  */
-export function getExitDialogText(displayTitle: string, progress: DownloadProgress): ExitDialogText {
-  const fragment = stateFragment(progress)
+function activeSentence(activeTask: ExitDialogActiveTask | undefined, pauseReason: QueuePauseReason | undefined): string {
+  if (pauseReason === 'ytDlpUpdate') {
+    return 'Между загрузками устанавливается обновлённый yt-dlp.'
+  }
+  if (!activeTask) {
+    // Недостижимо по контракту вызова (composable не показывает диалог
+    // для пустой очереди), но не выдумывать данные, которых нет.
+    return 'Очередь ещё не завершена.'
+  }
+  return `${activeTask.displayTitle} ${stateFragment(activeTask.progress)}.`
+}
+
+/**
+ * Второе предложение — счётчик ожидающих сверх названной в первом
+ * предложении (дизайн: «добавляется, только если таких задач больше
+ * нуля»).
+ */
+function waitingSentence(waitingCount: number): string {
+  if (waitingCount <= 0) return ''
+  return ` Ещё в очереди: ${waitingCount} ${tasksNominative(waitingCount)}.`
+}
+
+/**
+ * Текст диалога (дизайн E4, «Диалог выхода», С-6). Фраза «вставьте ту же
+ * ссылку ещё раз» из E3 сюда не вернулась: она стала ложью с появлением
+ * снимка очереди (Ф-9) — нетерминальные задачи переживают перезапуск и
+ * восстанавливаются приостановленными (Р-3), их не нужно ставить заново,
+ * достаточно «Продолжить очередь».
+ */
+export function getExitDialogText(input: ExitDialogInput): ExitDialogText {
   return {
     heading: HEADING,
     body:
-      `${displayTitle} ${fragment}. Если выйти сейчас, загрузка остановится. ` +
-      'Уже скачанное останется на диске в папке «Загрузки» — чтобы продолжить, ' +
-      'после следующего запуска вставьте ту же ссылку ещё раз.',
+      `${activeSentence(input.activeTask, input.pauseReason)}${waitingSentence(input.waitingCount)} ` +
+      'Если выйти сейчас, всё остановится. Уже скачанное останется на диске, а очередь — тоже: ' +
+      'при следующем запуске она будет ждать вас, нажмите «Продолжить очередь», чтобы возобновить.',
   }
 }
