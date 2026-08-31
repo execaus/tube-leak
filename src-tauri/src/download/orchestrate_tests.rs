@@ -22,6 +22,7 @@ use crate::download::fixtures;
 use crate::download::merge::MERGE_TIMEOUT_SECS;
 use crate::download::progress::parse_line;
 use crate::download::retry::{MAX_ATTEMPTS, NO_PROGRESS_TIMEOUT, SOCKET_TIMEOUT_SECS};
+use crate::queue::video_id::canonical_video_id;
 use crate::sidecar::RunOutput;
 use crate::types::{QualityKind, QualitySize, SelectedQuality, YtDlpFailureReason};
 
@@ -2218,4 +2219,42 @@ fn a_video_id_is_taken_from_the_link_without_parsing_youtube() {
     // где от названия ничего не осталось, и оно всё равно проходит через
     // белый список санитизации.
     assert_eq!(video_id_of("https://example.com/"), "example.com");
+}
+
+#[test]
+fn the_fallback_stem_id_agrees_with_the_canonical_id_wherever_that_one_exists() {
+    // На ссылку в ядре смотрят два места, и это осознанно: здесь — ради
+    // запасного имени файла (Ф-6 E3), в `queue::video_id` — ради
+    // тождества ролика при сравнении дублей (Ф-8/Р-5 E4, TL-72). Задачи
+    // разные: тамошний разбор строгий (белый список форм, «не понял» —
+    // отказ), здешний нарочно нестрогий (на чужом адресе он отдаёт хоть
+    // что-нибудь, лишь бы имя файла было не пустым).
+    //
+    // Сторож ровно об одном: там, где строгий разбор говорит «это ролик
+    // N», нестрогий обязан давать ту же строку. Разъедутся — значит одно
+    // из двух мест втихую разошлось с формой ссылки, и увидеть это
+    // должен тест, а не пользователь по чужому имени файла.
+    for url in [
+        "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+        "http://youtube.com/watch?v=aqz-KE-bpKQ",
+        "https://m.youtube.com/watch?v=aqz-KE-bpKQ",
+        "HTTPS://WWW.YOUTUBE.COM/watch?v=aqz-KE-bpKQ",
+        "https://www.youtube.com/watch?v=aqz-KE-bpKQ&list=PL1&index=2",
+        "https://www.youtube.com/watch?app=desktop&v=aqz-KE-bpKQ",
+        "https://www.youtube.com/watch?v=aqz-KE-bpKQ#t=10",
+        "https://youtu.be/aqz-KE-bpKQ",
+        "https://youtu.be/aqz-KE-bpKQ/",
+        "https://youtu.be/aqz-KE-bpKQ?si=Kx1yQ7wSomething",
+        "https://www.youtube.com/shorts/aqz-KE-bpKQ",
+        "  https://m.youtube.com/shorts/aqz-KE-bpKQ?feature=share  ",
+    ] {
+        let canonical = canonical_video_id(url)
+            .unwrap_or_else(|| panic!("«{url}» — разбираемая форма (TL-72)"));
+
+        assert_eq!(
+            video_id_of(url),
+            canonical.as_str(),
+            "запасное имя и канонический id разошлись на форме «{url}»"
+        );
+    }
 }
