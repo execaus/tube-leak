@@ -190,11 +190,24 @@ describe('App — секция «Текущая загрузка» (эпик E3,
     expect(wrapper.text()).toContain('Ролик B')
     expect(wrapper.text()).toContain('«Ролик A» — Только аудио')
 
-    // Кнопка «Скачать» под новой карточкой заблокирована с объясняющей
-    // подсказкой — слот занят первой задачей (С-13).
+    // TL-74, Ф-2 E4: занятый слот больше не повод превентивно блокировать
+    // кнопку «Скачать» под новой карточкой — постановка в очередь теперь
+    // нормальный путь (реальная постановка — TL-73). Единственный
+    // оставшийся повод недоступности — не выбранное качество, а оно уже
+    // выбрано `probeAndSelect`.
     const downloadButton = wrapper.findAll('button').find((b) => b.text() === 'Скачать')
-    expect(downloadButton?.attributes('disabled')).toBeDefined()
-    expect(wrapper.text()).toContain('Уже идёт другая загрузка')
+    expect(downloadButton?.attributes('disabled')).toBeUndefined()
+    expect(wrapper.text()).not.toContain('Уже идёт другая загрузка. Дождитесь')
+
+    // И клик по ней не блокируется на уровне UI: вызов реально уходит
+    // в ядро, а не отклоняется молча фронтендом.
+    invokeMock.mockImplementationOnce((command: string) => {
+      expect(command).toBe('start_download')
+      return Promise.reject({ kind: 'alreadyActive', message: 'diag' })
+    })
+    await downloadButton?.trigger('click')
+    await flushPromises()
+    expect(invokeMock).toHaveBeenCalledWith('start_download', expect.objectContaining({}))
   })
 
   it('cancel → hide fully clears the panel and re-enables the download button', async () => {

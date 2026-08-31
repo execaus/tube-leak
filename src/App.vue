@@ -151,7 +151,6 @@ const {
   progress: downloadProgress,
   softStallSeconds,
   commandError: downloadCommandError,
-  isActive: isDownloadActive,
 } = storeToRefs(downloadTaskStore)
 
 /**
@@ -266,7 +265,6 @@ function onDownloadRequested(payload: {
 
       <ProbeSection
         :yt-dlp-state="ytDlpState"
-        :download-blocked="isDownloadActive"
         @download="onDownloadRequested"
       />
 
