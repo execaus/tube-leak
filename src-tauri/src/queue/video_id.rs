@@ -221,13 +221,8 @@ const SHORT_HOST: &str = "youtu.be";
 /// границу окна не уходит и `Serialize` не имеет намеренно — сравнение
 /// живёт целиком в ядре.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-// Единственный потребитель — планировщик очереди (TL-73), и до него
-// продакшен-вызовов у типа нет. Глушитель снимается вместе с ним;
-// прецедент — `super::CHANGED_EVENT`.
-#[allow(dead_code)]
 pub struct VideoId(String);
 
-#[allow(dead_code)]
 impl VideoId {
     /// Идентификатор строкой — для лога и для ключа в структурах
     /// планировщика.
@@ -249,7 +244,6 @@ impl fmt::Display for VideoId {
 /// Функция тотальна: любая строка, включая пустую, обрезанную посреди
 /// UTF-8-последовательности пользователем или собранную из мусора,
 /// получает ответ, а не панику.
-#[allow(dead_code)]
 pub fn canonical_video_id(url: &str) -> Option<VideoId> {
     let url = url.trim();
 

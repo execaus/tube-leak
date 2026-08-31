@@ -76,7 +76,7 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -88,15 +88,14 @@ use super::merge::{merge_streams, FfmpegLauncher, MergeRequest, MergeVerdict};
 use super::progress::{StdoutLine, PROGRESS_TEMPLATE};
 use super::retry::{RetryDecision, RetryPolicy};
 use super::PROGRESS_EVENT;
-use crate::clock::{monotonic_now, now_unix_nanos};
+use crate::clock::monotonic_now;
 use crate::sidecar::{
     run_streaming, stderr_tail, ChildRegistry, RunHandle, SidecarError, StreamedRun,
 };
 use crate::types::{
-    DownloadErrorDetails, DownloadErrorKind, DownloadPercent, DownloadPhase, DownloadPlan,
-    DownloadProgress, DownloadProgressEvent, DownloadStarted, DownloadStream, DownloadingState,
-    PartialData, QualityStreams, QueueSnapshot, QueueTask, StartDownloadRequest,
-    YtDlpFailureReason,
+    DownloadErrorDetails, DownloadErrorKind, DownloadPercent, DownloadPlan, DownloadProgress,
+    DownloadProgressEvent, DownloadStream, DownloadingState, PartialData, QualityStreams,
+    StartDownloadRequest, YtDlpFailureReason,
 };
 
 // ───────────────────────────── Числа ─────────────────────────────
@@ -484,10 +483,10 @@ impl ProgressSink for AppSink {
 /// Троттлинг и запись последнего состояния задачи в одном месте.
 ///
 /// Через него проходит **каждое** изменение фазы: он и отправляет
-/// событие, и обновляет снимок, по которому команды решают, занят ли слот
-/// и что случилось с задачей. Двух путей к этим двум действиям нет
-/// намеренно — разойдясь, они дали бы слот, занятый завершившейся
-/// задачей.
+/// событие, и обновляет снимок, по которому очередь решает, что случилось
+/// с задачей и можно ли её повторить. Двух путей к этим двум действиям
+/// нет намеренно — разойдясь, они дали бы задачу, о состоянии которой
+/// экран и ядро думают разное.
 struct Emitter<'a> {
     task: &'a Arc<DownloadTask>,
     sink: &'a dyn ProgressSink,
@@ -598,8 +597,8 @@ pub struct SidecarDownloader<'a> {
     /// Отсутствие пути выражено здесь, а не отдельной веткой у
     /// вызывающего, ради единственности терминального пути: задача,
     /// которой не на чем работать, обязана кончиться тем же событием
-    /// `failed`, той же подчисткой и тем же освобождением слота, что и
-    /// любая другая. Подменять недостающий путь относительным именем
+    /// `failed` и той же подчисткой, что и любая другая, — и так же
+    /// вернуть управление очереди. Подменять недостающий путь относительным именем
     /// (`"yt-dlp"`) нельзя: относительное имя ОС ищет в `PATH`, то есть
     /// приложение запустило бы **чужой** yt-dlp с машины пользователя.
     executable: Option<PathBuf>,
@@ -747,7 +746,37 @@ impl DownloadTask {
         self.lock().progress.clone()
     }
 
-    fn set_progress(&self, progress: DownloadProgress) {
+    /// Данные постановки — то, с чем задача создана.
+    ///
+    /// Планировщику они нужны целиком: заголовок и пункт качества едут в
+    /// снимок очереди (Ф-1), ссылка и `streams` — в сравнение дублей
+    /// (Ф-8), а весь запрос как есть — в файл-снимок на диске (Ф-9).
+    /// Отдаётся ссылкой, а не копией: запрос неизменяем с момента
+    /// создания задачи.
+    pub fn request(&self) -> &StartDownloadRequest {
+        &self.request
+    }
+
+    /// Класс последнего отказа — по нему решается, есть ли смысл в
+    /// повторе (Ф-5).
+    ///
+    /// Отдельно от [`Self::snapshot`], потому что доставать его из
+    /// варианта пришлось бы в двух местах; здесь то же поле, что читал
+    /// `retry_download` E3 до переезда в очередь.
+    pub fn failure(&self) -> Option<DownloadErrorKind> {
+        self.lock().failure
+    }
+
+    /// Ставит состояние задачи, минуя события.
+    ///
+    /// Зовут двое: [`Emitter`] (и он же шлёт событие) и планировщик
+    /// очереди — на переходах, у которых события прогресса нет по
+    /// построению. Их ровно два, и оба про ожидающую задачу: повтор
+    /// возвращает её в `Queued` (Ф-5), отмена ожидающей — в `Cancelled`
+    /// без единого побочного действия (Ф-4, С-2). Ожидающие задачи
+    /// молчат в `download://progress` (Ф-6), а изменение состава очереди
+    /// уезжает `queue://changed`.
+    pub fn set_progress(&self, progress: DownloadProgress) {
         let mut state = self.lock();
         if let DownloadProgress::Failed { error } = &progress {
             state.failure = Some(error.kind);
@@ -765,7 +794,7 @@ impl DownloadTask {
     /// Возврат означает, что убийство уже отправлено, — то есть новую
     /// загрузку можно начинать, не рискуя оставить два живых процесса
     /// (то же обещание, что у [`RunHandle::cancel`]).
-    async fn cancel(&self) {
+    pub async fn cancel(&self) {
         self.cancel.cancel();
         let child = self.lock().child.clone();
         if let Some(child) = child {
@@ -774,131 +803,22 @@ impl DownloadTask {
     }
 }
 
-/// Слот активной загрузки на всё приложение: живёт Tauri-состоянием
-/// (`app.manage`), ровно один экземпляр на процесс.
+// ─────────────────────── Создание задачи ───────────────────────
+
+/// Проверяет запрос и собирает задачу — всё, что делается **до** того,
+/// как её возьмёт планировщик очереди (`crate::queue::scheduler`).
 ///
-/// Активная задача в E3 ровно одна (С-13), и её единственность держится
-/// здесь, а не на неактивной кнопке во фронтенде: «Старт задачи тоже
-/// проверяется на стороне Rust» — прямое требование дизайна.
-pub struct DownloadSession {
-    inner: StdMutex<SessionState>,
-    /// Очередь исполнителей: воркер держит её всю свою жизнь.
-    ///
-    /// Слот освобождается **в момент терминального перехода** (дизайн:
-    /// «Готовность к новой загрузке — сразу»), а воркер в этот момент ещё
-    /// доделывает подчистку. Без очереди новый запуск успел бы породить
-    /// свой yt-dlp, пока предыдущий доубивает свой, — и К-8 («`pgrep`
-    /// показывает **один** процесс yt-dlp») перестал бы выполняться от
-    /// расторопности пользователя.
-    gate: tokio::sync::Mutex<()>,
-    /// Счётчик выданных идентификаторов задач.
-    counter: AtomicU64,
-    /// Будильник «задач больше нет» — граница задач для контура
-    /// обновления yt-dlp (Ф-7 и Р-2 эпика E6, задача TL-58).
-    ///
-    /// Уведомление, а не опрос: ждущий регистрируется до проверки
-    /// [`Self::is_active`], поэтому переход в терминальное состояние не
-    /// может проскочить между проверкой и ожиданием. Опрос по таймеру
-    /// дал бы то же самое ценой либо задержки, либо холостых просыпаний
-    /// на всё время жизни приложения.
-    idle: tokio::sync::Notify,
-}
-
-#[derive(Default)]
-struct SessionState {
-    current: Option<Arc<DownloadTask>>,
-}
-
-impl Default for DownloadSession {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DownloadSession {
-    pub fn new() -> Self {
-        Self {
-            inner: StdMutex::new(SessionState::default()),
-            gate: tokio::sync::Mutex::new(()),
-            counter: AtomicU64::new(0),
-            idle: tokio::sync::Notify::new(),
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, SessionState> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    pub fn current(&self) -> Option<Arc<DownloadTask>> {
-        self.lock().current.clone()
-    }
-
-    /// Идентификатор задачи, непрозрачный для фронтенда.
-    ///
-    /// Счётчик плюс момент запуска: счётчик разводит задачи одного
-    /// запуска приложения, момент — задачи разных запусков. Второе нужно
-    /// не сегодня (до E4/E5 задачи не переживают выход), а тому, кто
-    /// однажды увидит два идентификатора рядом в логе.
-    fn next_id(&self) -> String {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("dl-{}-{n}", now_unix_nanos())
-    }
-
-    /// Идёт ли сейчас задача скачивания.
-    ///
-    /// «Идёт» здесь означает ровно то же, что и для занятого слота:
-    /// текущая задача есть и она не терминальна. Второго определения
-    /// «занятости» в приложении заводить нельзя — контур обновления
-    /// ждёт ровно ту границу, на которой освобождается слот, и разойдись
-    /// эти два правила, он ждал бы момента, которого не бывает.
-    pub fn is_active(&self) -> bool {
-        self.current()
-            .is_some_and(|task| !task.snapshot().is_terminal())
-    }
-
-    /// Ждёт паузы между задачами — момента, когда [`Self::is_active`]
-    /// ложно.
-    ///
-    /// Порядок внутри цикла обязателен: подписка на уведомление
-    /// оформляется **до** проверки состояния. Сделай наоборот — и
-    /// терминальный переход, случившийся между проверкой и ожиданием,
-    /// пропал бы, а ждущий уснул бы до следующей задачи, которой может
-    /// не быть никогда.
-    ///
-    /// Возврат не является обещанием, что задача не начнётся в
-    /// следующий миг: единственность активной задачи держит слот, а не
-    /// это ожидание. Вызывающему (контуру обновления) этого достаточно —
-    /// Ф-7 требует не менять версию **посреди** задачи, а начатая после
-    /// переключения задача возьмёт уже новый путь резолвом (Ф-5).
-    pub async fn wait_for_task_boundary(&self) {
-        loop {
-            let notified = self.idle.notified();
-            if !self.is_active() {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    /// Будит всех, кто ждёт паузы между задачами.
-    ///
-    /// Зовётся ровно там, где задача становится терминальной, — иначе
-    /// «граница задач» была бы утверждением о коде, а не его свойством.
-    fn notify_task_boundary(&self) {
-        self.idle.notify_waiters();
-    }
-}
-
-// ─────────────────────── Команда «начать» ───────────────────────
-
-/// Проверяет запрос, занимает слот и запускает воркер (Ф-1).
+/// Слота здесь больше нет, и это главное отличие от E3: где задача
+/// встанет, когда стартует и что случится с её предшественницей, решает
+/// очередь (Ф-2, Ф-3 эпика E4), а этот модуль ведёт **одну** задачу от
+/// `Queued` до терминальной фазы и ничего не знает о соседях. Раньше обе
+/// обязанности жили в одной функции `start_download`, и цена этого была
+/// названа прямо: второй старт вытеснял идущую загрузку.
 ///
-/// Возвращается быстро и не ждёт ни одного байта: работа идёт событиями.
-/// Возврат — `DownloadStarted` без необязательности в позиции успеха:
-/// пустой результат панель не переживает (ревью TL-33 проверило это
-/// запуском в E2), а отказ команды — отдельный типизированный класс.
+/// Идентификатор выдаёт вызывающий, а не эта функция: он же ведёт
+/// очередь, он же восстанавливает её с диска — а восстановленная задача
+/// обязана получить **тот же** id, что был в снимке (Ф-5, Ф-9), и новый
+/// счётчик здесь этого не дал бы.
 ///
 /// # Что здесь проверяется и почему заново
 ///
@@ -908,21 +828,20 @@ impl DownloadSession {
 /// не то, что показывали. Идентификаторы потоков — [`usable_format_id`].
 ///
 /// Отказ непригодного идентификатора носит класс `noStreamsSelected`, и
-/// это решение, а не совпадение. Своего класса у него нет: девятка
-/// отказов команд зафиксирована контрактом (TL-38), а десятый стоил бы
-/// правки в трёх областях ради состояния, до которого исправный фронтенд
-/// не доводит — идентификаторы он берёт из нашей же выдачи разбора.
-/// Из шести существующих подходит ровно этот: строка, которую ядро
+/// это решение, а не совпадение. Своего класса у него нет: список отказов
+/// команд зафиксирован контрактом (TL-38, правка TL-70), а лишний класс
+/// стоил бы правки в трёх областях ради состояния, до которого исправный
+/// фронтенд не доводит — идентификаторы он берёт из нашей же выдачи
+/// разбора. Из существующих подходит ровно этот: строка, которую ядро
 /// отказывается передать процессу, идентификатором потока не является,
 /// то есть пригодных потоков в запросе нет. Молча выбросить негодный и
 /// скачать оставшийся — путь, отвергнутый прямо: пользователь получил бы
 /// не то качество, которое выбрал. Настоящая причина при этом уезжает в
 /// лог, где на неё есть место.
-pub async fn start_download(
-    session: &Arc<DownloadSession>,
+pub fn build_task(
+    id: String,
     request: StartDownloadRequest,
-    worker: impl WorkerSpawn,
-) -> Result<DownloadStarted, DownloadCommandRejection> {
+) -> Result<Arc<DownloadTask>, DownloadCommandRejection> {
     crate::probe::validate_url(&request.url).map_err(|_| {
         eprintln!("download: ссылка не является http(s)-адресом — yt-dlp не запускался");
         DownloadCommandRejection::InvalidUrl
@@ -945,76 +864,33 @@ pub async fn start_download(
         .ok_or(DownloadCommandRejection::NoStreamsSelected)?;
     let plan = aggregator.plan();
 
-    // Занятие слота и создание задачи — под одним замком: между чтением
-    // слота и его занятием не должно быть ни одной точки, где успеет
-    // пройти второй вызов.
-    //
-    // Сторожа «слот занят — отказать» здесь больше нет: Ф-2 эпика E4
-    // убрала из контракта класс `alreadyActive`, потому что постановка
-    // при занятом слоте — теперь штатный путь, а не отказ. До
-    // планировщика (TL-73) очереди как структуры данных ещё нет, и слот
-    // по-прежнему один: второй старт вытесняет предыдущую задачу тем же
-    // механизмом, которым это делает разбор ссылки в E2, — `previous`
-    // уезжает воркеру, а тот добивает предшественника до терминальной
-    // фазы прежде, чем взять шлюз (см. `run_task`). Это промежуточное
-    // состояние, а не целевое: FIFO без вытеснения ставит TL-73.
-    let previous;
-    let task;
-    {
-        let mut state = session.lock();
-
-        let stem = sanitized_stem(&request.title, &video_id_of(&request.url));
-        let download_stem = download_stem(&stem);
-        let jobs = jobs_of(&request.streams);
-
-        task = Arc::new(DownloadTask {
-            id: session.next_id(),
-            plan,
-            request: request.clone(),
-            state: StdMutex::new(TaskState {
-                progress: DownloadProgress::Queued,
-                failure: None,
-                child: None,
-            }),
-            cancel: CancelToken::default(),
-            work: tokio::sync::Mutex::new(TaskWork {
-                aggregator,
-                jobs,
-                stem,
-                download_stem,
-                last_interrupt: None,
-            }),
-        });
-        previous = state.current.replace(Arc::clone(&task));
-    }
+    let stem = sanitized_stem(&request.title, &video_id_of(&request.url));
+    let download_stem = download_stem(&stem);
+    let jobs = jobs_of(&request.streams);
 
     eprintln!(
-        "download: задача {} создана, потоков {}, план {plan:?}",
-        task.id,
+        "download: задача {id} создана, потоков {}, план {plan:?}",
         format_ids(&request.streams).count()
     );
 
-    worker.spawn(Arc::clone(session), Arc::clone(&task), previous);
-
-    Ok(DownloadStarted {
-        task_id: task.id.clone(),
-        phase: DownloadPhase::Queued,
+    Ok(Arc::new(DownloadTask {
+        id,
         plan,
-    })
-}
-
-/// Кто и как запускает воркера задачи.
-///
-/// Шов существует потому, что боевой воркер — это `tauri::async_runtime::spawn`
-/// с `AppHandle` внутри, а тесты автомата поднимать приложение не могут и
-/// не должны.
-pub trait WorkerSpawn {
-    fn spawn(
-        self,
-        session: Arc<DownloadSession>,
-        task: Arc<DownloadTask>,
-        previous: Option<Arc<DownloadTask>>,
-    );
+        request,
+        state: StdMutex::new(TaskState {
+            progress: DownloadProgress::Queued,
+            failure: None,
+            child: None,
+        }),
+        cancel: CancelToken::default(),
+        work: tokio::sync::Mutex::new(TaskWork {
+            aggregator,
+            jobs,
+            stem,
+            download_stem,
+            last_interrupt: None,
+        }),
+    }))
 }
 
 /// Идентификаторы потоков запроса — в том порядке, в каком они
@@ -1074,153 +950,6 @@ fn video_id_of(url: &str) -> String {
         .to_string()
 }
 
-// ─────────────────── Команды «отменить» и «повторить» ───────────────────
-
-/// Отменяет задачу в любой нетерминальной фазе (Ф-4).
-///
-/// Отмена уже терминальной задачи — **не ошибка, а ничего**: пользователь
-/// способен нажать «Отменить» ровно в тот момент, когда приехало `done`,
-/// и показывать ему ошибку за безобидную гонку не за что.
-pub async fn cancel_download(
-    session: &DownloadSession,
-    task_id: &str,
-) -> Result<(), DownloadCommandRejection> {
-    let task = known_task(session, task_id)?;
-
-    if task.snapshot().is_terminal() {
-        eprintln!("download: отмена задачи {task_id}, уже завершившейся, — ничего не делаем");
-        return Ok(());
-    }
-
-    eprintln!("download: отмена задачи {task_id}");
-    task.cancel().await;
-    Ok(())
-}
-
-/// Продолжает ту же задачу после отказа (тот же `taskId`).
-///
-/// Не новая задача с нуля: агрегатор и файлы на диске остаются, поэтому
-/// повтор после неудачной склейки пересобирает только склейку, а повтор
-/// после потери связи докачивает с места. Чем именно окажется повтор,
-/// решает состояние задачи, а не флаг от фронтенда.
-pub async fn retry_download(
-    session: &Arc<DownloadSession>,
-    task_id: &str,
-    worker: impl WorkerSpawn,
-) -> Result<(), DownloadCommandRejection> {
-    let task = known_task(session, task_id)?;
-
-    let (progress, failure) = {
-        let state = task.lock();
-        (state.progress.clone(), state.failure)
-    };
-
-    if progress.phase() != DownloadPhase::Failed {
-        return Err(DownloadCommandRejection::NotFailed);
-    }
-    let Some(failure) = failure else {
-        return Err(DownloadCommandRejection::NotFailed);
-    };
-    if !failure.is_retryable() {
-        return Err(DownloadCommandRejection::NotRetryable);
-    }
-
-    eprintln!("download: повтор задачи {task_id} после отказа {failure:?}");
-    task.set_progress(DownloadProgress::Queued);
-    worker.spawn(Arc::clone(session), task, None);
-    Ok(())
-}
-
-/// Задача по идентификатору либо типизированный отказ.
-///
-/// Идентификатор, которого нет в слоте, — это `unknownTask`, и другого
-/// исхода у него нет. До эпика E4 их было два: команда по старому
-/// идентификатору при занятом слоте отвечала «место занято другой»
-/// (`alreadyActive`), потому что задача, вытесненная новой, ядру
-/// действительно переставала быть известна. Ф-2 убрала этот класс из
-/// контракта, и различать стало нечем — да и незачем: с точки зрения
-/// вызывающего оба случая означают ровно одно, задачи с таким
-/// идентификатором у ядра нет. В целевом состоянии (TL-73) она найдётся
-/// в очереди, если она там есть, и не найдётся, если её скрыли.
-fn known_task(
-    session: &DownloadSession,
-    task_id: &str,
-) -> Result<Arc<DownloadTask>, DownloadCommandRejection> {
-    match session.current() {
-        Some(task) if task.id == task_id => Ok(task),
-        _ => Err(DownloadCommandRejection::UnknownTask {
-            task_id: task_id.to_string(),
-        }),
-    }
-}
-
-// ─────────────────── Команды очереди (контракт TL-70) ───────────────────
-//
-// Очередь как структура данных — задача TL-73. До неё «очередь» ядра это
-// один слот E3, и обе функции ниже — его честная проекция на контракт
-// E4, а не заглушки: снимок, отдающий пустой список при живой задаче,
-// был бы неправдой на проводе, а неправду на проводе чинит не тот, кто
-// её написал.
-
-/// Снимок очереди: ответ команды `queue_state`, а с TL-73 — и полезная
-/// нагрузка события `queue://changed`.
-///
-/// Ноль задач или одна, потому что слот один. Порядок списка значим и
-/// сегодня тривиален.
-pub fn queue_snapshot(session: &DownloadSession) -> QueueSnapshot {
-    let tasks = session
-        .current()
-        .map(|task| QueueTask {
-            task_id: task.id.clone(),
-            title: task.request.title.clone(),
-            quality: task.request.quality,
-            plan: task.plan,
-            progress: task.snapshot(),
-        })
-        .into_iter()
-        .collect();
-
-    QueueSnapshot {
-        tasks,
-        // Восстановления очереди с диска ещё нет (TL-71), поэтому
-        // приостановленной после перезапуска она не бывает; паузу между
-        // задачами держит планировщик, которого тоже ещё нет (Р-7).
-        awaiting_continue: false,
-        pause_reason: None,
-    }
-}
-
-/// Скрывает завершённую задачу — «Скрыть» на её панели.
-///
-/// Команда ядра, а не локальное состояние стора: С-9 требует, чтобы
-/// перезагрузка webview восстанавливала список по снимку ядра, и
-/// скрытие, живущее только во фронтенде, воскрешало бы скрытые задачи.
-///
-/// Нетерминальная задача отклоняется типизированно
-/// ([`DownloadCommandRejection::TaskNotFinished`]) — «скрыть» не означает
-/// «отменить», и подменять одно другим команда не станет.
-pub fn dismiss_queue_task(
-    session: &DownloadSession,
-    task_id: &str,
-) -> Result<(), DownloadCommandRejection> {
-    let task = known_task(session, task_id)?;
-    if !task.snapshot().is_terminal() {
-        return Err(DownloadCommandRejection::TaskNotFinished);
-    }
-
-    let mut state = session.lock();
-    if state
-        .current
-        .as_ref()
-        .is_some_and(|current| current.id == task_id)
-    {
-        // Слот и так свободен — задача терминальна; уходит из него
-        // именно запись о задаче, чтобы следующий снимок её не показал.
-        state.current = None;
-    }
-    Ok(())
-}
-
 // ──────────────────────────── Воркер ────────────────────────────
 
 /// Чем кончилась задача.
@@ -1232,26 +961,21 @@ enum TaskEnd {
 
 /// Ведёт задачу от `Queued` до одной из трёх терминальных фаз.
 ///
-/// Порядок первых двух шагов — часть требования, а не стиль: сначала
-/// добить предыдущего исполнителя, потом встать в очередь. Слот
-/// освобождается раньше, чем предыдущий воркер закончил подчистку, и без
-/// обоих шагов два yt-dlp пересеклись бы во времени.
+/// Функция ведёт **одну** задачу и о существовании соседей не знает:
+/// единственность активной держит очередь (`crate::queue::scheduler`),
+/// которая зовёт воркера следующей только после возврата отсюда. В E3
+/// здесь стояли два шага, которых больше нет, — «добить предшественника»
+/// и «встать в шлюз»: они были платой за вытеснение, а вытеснения в
+/// очереди не бывает (Ф-3, строгий FIFO). Двух yt-dlp во времени это
+/// по-прежнему не допускает, но держится это теперь на планировщике, а
+/// не на шлюзе внутри воркера.
 pub async fn run_task(
-    session: &DownloadSession,
     task: &Arc<DownloadTask>,
     launcher: &dyn DownloadLauncher,
     ffmpeg: &dyn FfmpegLauncher,
     sink: &dyn ProgressSink,
     destination: &Path,
-    previous: Option<Arc<DownloadTask>>,
 ) {
-    if let Some(previous) = previous {
-        if !Arc::ptr_eq(&previous, task) {
-            previous.cancel().await;
-        }
-    }
-    let _queued = session.gate.lock().await;
-
     let mut emitter = Emitter::new(task, sink);
     let started = monotonic_now();
     let end = execute(task, launcher, ffmpeg, &mut emitter, destination).await;
@@ -1299,19 +1023,19 @@ pub async fn run_task(
             }
         }
     };
-    // Снимаем ссылку на процесс до терминального события: после него слот
-    // свободен, и убивать по чужому дескриптору уже нечего.
+    // Снимаем ссылку на процесс до терминального события: после него
+    // задача кончилась, и убивать по чужому дескриптору уже нечего.
     task.set_child(None);
     work.last_interrupt = None;
     drop(work);
 
     emitter.emit(progress);
 
-    // Задача терминальна — это и есть граница задач, которой ждёт контур
-    // обновления yt-dlp (Ф-7, Р-2 эпика E6). Будильник стоит после
-    // терминального события, а не до него: ждущий обязан увидеть уже
-    // изменившееся состояние, а не догонять его.
-    session.notify_task_boundary();
+    // Границу задач (Ф-7, Р-2 эпика E6) объявляет не воркер, а очередь —
+    // после возврата отсюда. Причина в определении самой границы: «задач
+    // нет» — свойство очереди, а не одной задачи, и объявить его тому,
+    // кто видит одну, было бы неправдой ровно тогда, когда за этой
+    // задачей стоит следующая.
 }
 
 /// Автомат фаз: подготовка → скачивание (с повторами) → склейка →

@@ -24,7 +24,7 @@ use crate::download::progress::parse_line;
 use crate::download::retry::{MAX_ATTEMPTS, NO_PROGRESS_TIMEOUT, SOCKET_TIMEOUT_SECS};
 use crate::queue::video_id::canonical_video_id;
 use crate::sidecar::RunOutput;
-use crate::types::{QualityKind, QualitySize, SelectedQuality, YtDlpFailureReason};
+use crate::types::{DownloadPhase, QualityKind, QualitySize, SelectedQuality, YtDlpFailureReason};
 
 // ─────────────────────────── Оснастка ───────────────────────────
 
@@ -118,12 +118,6 @@ struct ScriptedLauncher {
     dir: PathBuf,
     scripts: StdMutex<VecDeque<Script>>,
     calls: StdMutex<Vec<Call>>,
-    /// Как этот запускатель зовётся в общей ленте.
-    tag: &'static str,
-    /// Общая на несколько запускателей лента: кто и в каком порядке
-    /// начал работу. Нужна там, где предмет проверки — порядок, а не
-    /// результат.
-    timeline: Option<Arc<StdMutex<Vec<String>>>>,
 }
 
 impl ScriptedLauncher {
@@ -132,21 +126,6 @@ impl ScriptedLauncher {
             dir: dir.to_path_buf(),
             scripts: StdMutex::new(scripts.into()),
             calls: StdMutex::new(Vec::new()),
-            tag: "yt-dlp",
-            timeline: None,
-        }
-    }
-
-    fn tagged(
-        dir: &Path,
-        scripts: Vec<Script>,
-        tag: &'static str,
-        timeline: &Arc<StdMutex<Vec<String>>>,
-    ) -> Self {
-        Self {
-            tag,
-            timeline: Some(Arc::clone(timeline)),
-            ..Self::new(dir, scripts)
         }
     }
 
@@ -164,12 +143,6 @@ impl DownloadLauncher for ScriptedLauncher {
         on_line: &'a mut (dyn FnMut(&str) -> Option<Instant> + Send),
     ) -> Pin<Box<dyn Future<Output = Result<StreamedRun, SidecarError>> + Send + 'a>> {
         Box::pin(async move {
-            if let Some(timeline) = &self.timeline {
-                timeline
-                    .lock()
-                    .unwrap()
-                    .push(format!("запуск {}", self.tag));
-            }
             let script = self
                 .scripts
                 .lock()
@@ -338,20 +311,6 @@ impl ProgressSink for RecordingSink {
     }
 }
 
-/// Воркер, который ничего не запускает: тесты ведут задачу сами, вызывая
-/// [`run_task`] напрямую.
-struct NoopWorker;
-
-impl WorkerSpawn for NoopWorker {
-    fn spawn(
-        self,
-        _session: Arc<DownloadSession>,
-        _task: Arc<DownloadTask>,
-        _previous: Option<Arc<DownloadTask>>,
-    ) {
-    }
-}
-
 const URL: &str = "https://www.youtube.com/watch?v=aqz-KE-bpKQ";
 const TITLE: &str = "Big Buck Bunny";
 
@@ -392,15 +351,16 @@ fn destination_line(dir: &Path, name: &str) -> String {
     format!("[download] Destination: {}", dir.join(name).display())
 }
 
-/// Задача, созданная штатным путём (через проверки команды старта).
-async fn new_task(
-    session: &Arc<DownloadSession>,
-    request: StartDownloadRequest,
-) -> Arc<DownloadTask> {
-    start_download(session, request, NoopWorker)
-        .await
-        .expect("запрос обязан быть принят");
-    session.current().expect("задача обязана занять слот")
+/// Задача, созданная штатным путём — через те же проверки, что делает
+/// постановка в очередь.
+///
+/// Идентификатор выдаёт счётчик тестов, а не планировщик: очередь этим
+/// файлом не проверяется вовсе (её тесты — в `crate::queue::scheduler`),
+/// а два соседних вызова обязаны давать разные задачи.
+fn new_task(request: StartDownloadRequest) -> Arc<DownloadTask> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let id = format!("dl-тест-{}", NEXT.fetch_add(1, Ordering::SeqCst));
+    build_task(id, request).expect("запрос обязан быть принят")
 }
 
 /// Имена файлов в папке, отсортированные.
@@ -421,11 +381,10 @@ async fn run_two_streams(
     scripts: Vec<Script>,
     ffmpeg: &ScriptedFfmpeg,
 ) -> Arc<DownloadTask> {
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(Some("133"), Some("139")))).await;
+    let task = new_task(request(streams(Some("133"), Some("139"))));
     let launcher = ScriptedLauncher::new(dir.path(), scripts);
 
-    run_task(&session, &task, &launcher, ffmpeg, sink, dir.path(), None).await;
+    run_task(&task, &launcher, ffmpeg, sink, dir.path()).await;
     task
 }
 
@@ -489,17 +448,14 @@ async fn every_launch_carries_the_arguments_the_parser_and_the_watchdog_stand_on
     .await;
 
     let launcher_calls = {
-        let session = Arc::new(DownloadSession::new());
-        let task = new_task(&session, request(streams(Some("133"), Some("139")))).await;
+        let task = new_task(request(streams(Some("133"), Some("139"))));
         let launcher = ScriptedLauncher::new(dir.path(), two_stream_scripts(dir.path()));
         run_task(
-            &session,
             &task,
             &launcher,
             &ScriptedFfmpeg::merging(),
             &RecordingSink::new(),
             dir.path(),
-            None,
         )
         .await;
         launcher.calls()
@@ -527,18 +483,15 @@ async fn each_launch_asks_for_exactly_one_format() {
     // Объединённый запрос (`133+139`) yt-dlp склеил бы сам — своим
     // ffmpeg, найденным в PATH, — и Ф-9 перестал бы выполняться.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(Some("133"), Some("139")))).await;
+    let task = new_task(request(streams(Some("133"), Some("139"))));
     let launcher = ScriptedLauncher::new(dir.path(), two_stream_scripts(dir.path()));
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &RecordingSink::new(),
         dir.path(),
-        None,
     )
     .await;
 
@@ -559,8 +512,7 @@ async fn each_launch_asks_for_exactly_one_format() {
 #[tokio::test]
 async fn the_url_is_the_last_argument_and_stands_after_the_separator() {
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
+    let task = new_task(request(streams(None, Some("140"))));
     let launcher = ScriptedLauncher::new(
         dir.path(),
         vec![Script::ok()
@@ -569,13 +521,11 @@ async fn the_url_is_the_last_argument_and_stands_after_the_separator() {
     );
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &RecordingSink::new(),
         dir.path(),
-        None,
     )
     .await;
 
@@ -663,10 +613,9 @@ async fn a_title_with_a_percent_and_a_dollar_reaches_a_file_inside_the_destinati
     std::fs::create_dir(&dir).unwrap();
 
     const TITLE: &str = "Скидка 100%(ext)s и $HOME внутри";
-    let session = Arc::new(DownloadSession::new());
     let mut req = request(streams(None, Some("140")));
     req.title = TITLE.to_string();
-    let task = new_task(&session, req).await;
+    let task = new_task(req);
     let sink = RecordingSink::new();
 
     // Сценарий кладёт файл ровно туда, куда его положил бы yt-dlp по
@@ -682,16 +631,7 @@ async fn a_title_with_a_percent_and_a_dollar_reaches_a_file_inside_the_destinati
             .creates(&partial)],
     );
 
-    run_task(
-        &session,
-        &task,
-        &launcher,
-        &ScriptedFfmpeg::merging(),
-        &sink,
-        &dir,
-        None,
-    )
-    .await;
+    run_task(&task, &launcher, &ScriptedFfmpeg::merging(), &sink, &dir).await;
 
     // Финальное имя сохраняет название целиком — и процент, и доллар:
     // его строит финализация уже после того, как yt-dlp сделал своё дело.
@@ -724,10 +664,9 @@ async fn a_hostile_title_is_still_cleaned_up_after_a_cancel() {
     // подчистка потом ищет.
     let dir = tempfile::tempdir().unwrap();
     const TITLE: &str = "$HOME-leading 100%(ext)s";
-    let session = Arc::new(DownloadSession::new());
     let mut req = request(streams(None, Some("140")));
     req.title = TITLE.to_string();
-    let task = new_task(&session, req).await;
+    let task = new_task(req);
     let sink = RecordingSink::new();
 
     let partial = format!(
@@ -743,13 +682,11 @@ async fn a_hostile_title_is_still_cleaned_up_after_a_cancel() {
     });
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
 
@@ -781,48 +718,39 @@ fn a_format_id_that_is_not_one_is_refused_whole() {
     }
 }
 
-#[tokio::test]
-async fn an_unusable_format_id_never_reaches_a_process() {
-    let session = Arc::new(DownloadSession::new());
-
-    let rejection = start_download(
-        &session,
+#[test]
+fn an_unusable_format_id_never_reaches_a_process() {
+    let Err(rejection) = build_task(
+        "dl-негодный".to_string(),
         request(streams(Some("137+140"), Some("140"))),
-        NoopWorker,
-    )
-    .await
-    .expect_err("такой запрос обязан быть отклонён");
+    ) else {
+        panic!("такой запрос обязан быть отклонён");
+    };
 
     assert!(matches!(
         rejection,
         DownloadCommandRejection::NoStreamsSelected
     ));
-    assert!(
-        session.current().is_none(),
-        "отклонённый запрос не занимает слот"
-    );
 }
 
-#[tokio::test]
-async fn a_link_that_is_not_a_link_never_reaches_a_process() {
-    let session = Arc::new(DownloadSession::new());
+#[test]
+fn a_link_that_is_not_a_link_never_reaches_a_process() {
     let mut broken = request(streams(Some("137"), None));
     broken.url = "-o--".to_string();
 
-    let rejection = start_download(&session, broken, NoopWorker)
-        .await
-        .expect_err("не-ссылка обязана быть отклонена");
+    let Err(rejection) = build_task("dl-не-ссылка".to_string(), broken) else {
+        panic!("не-ссылка обязана быть отклонена");
+    };
 
     assert!(matches!(rejection, DownloadCommandRejection::InvalidUrl));
 }
 
-#[tokio::test]
-async fn an_empty_selection_is_refused() {
-    let session = Arc::new(DownloadSession::new());
-
-    let rejection = start_download(&session, request(streams(None, None)), NoopWorker)
-        .await
-        .expect_err("пункт без потоков скачивать нечем");
+#[test]
+fn an_empty_selection_is_refused() {
+    let Err(rejection) = build_task("dl-пусто".to_string(), request(streams(None, None)))
+    else {
+        panic!("пункт без потоков скачивать нечем");
+    };
 
     assert!(matches!(
         rejection,
@@ -903,8 +831,7 @@ async fn the_percent_reaches_a_hundred_and_never_goes_backwards() {
 async fn a_progressive_format_never_enters_merging() {
     // С-3: у пункта заполнен только видеопоток, звук уже внутри него.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(Some("18"), None))).await;
+    let task = new_task(request(streams(Some("18"), None)));
     let sink = RecordingSink::new();
     let ffmpeg = ScriptedFfmpeg::merging();
     let launcher = ScriptedLauncher::new(
@@ -914,7 +841,7 @@ async fn a_progressive_format_never_enters_merging() {
             .creates("Big Buck Bunny.f18.mp4")],
     );
 
-    run_task(&session, &task, &launcher, &ffmpeg, &sink, dir.path(), None).await;
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
 
     assert_eq!(task.plan, DownloadPlan::SingleStream);
     assert!(
@@ -935,8 +862,7 @@ async fn a_progressive_format_never_enters_merging() {
 async fn audio_only_keeps_the_extension_the_stream_actually_has() {
     // С-2: расширение — по фактическому контейнеру, а не «всегда .mp4».
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
+    let task = new_task(request(streams(None, Some("140"))));
     let sink = RecordingSink::new();
     let ffmpeg = ScriptedFfmpeg::merging();
     let launcher = ScriptedLauncher::new(
@@ -947,7 +873,7 @@ async fn audio_only_keeps_the_extension_the_stream_actually_has() {
             .creates("Big Buck Bunny.f140.m4a")],
     );
 
-    run_task(&session, &task, &launcher, &ffmpeg, &sink, dir.path(), None).await;
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
 
     assert_eq!(ffmpeg.calls(), 0);
     assert_eq!(
@@ -1009,20 +935,17 @@ async fn cancelling_in_queued_says_nothing_was_created() {
     // Первая строка таблицы «Отмена по фазам»: убивать нечего, файлов
     // не появлялось — и текст панели не должен утверждать обратного.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(Some("133"), Some("139")))).await;
+    let task = new_task(request(streams(Some("133"), Some("139"))));
     let sink = RecordingSink::new();
     let launcher = ScriptedLauncher::new(dir.path(), Vec::new());
 
     task.cancel().await;
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
 
@@ -1038,8 +961,7 @@ async fn cancelling_in_queued_says_nothing_was_created() {
 #[tokio::test]
 async fn cancelling_in_fetching_kills_the_process_and_leaves_no_files() {
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(Some("133"), Some("139")))).await;
+    let task = new_task(request(streams(Some("133"), Some("139"))));
     let sink = RecordingSink::new();
     // Процесс, который висит до убийства: строк прогресса ещё не было.
     let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().hangs()]);
@@ -1051,13 +973,11 @@ async fn cancelling_in_fetching_kills_the_process_and_leaves_no_files() {
     });
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
 
@@ -1073,8 +993,7 @@ async fn cancelling_in_fetching_kills_the_process_and_leaves_no_files() {
 #[tokio::test]
 async fn cancelling_in_downloading_removes_every_partial_file() {
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(Some("133"), Some("139")))).await;
+    let task = new_task(request(streams(Some("133"), Some("139"))));
     let sink = RecordingSink::new();
     // Первый поток скачан целиком, второй качается и оставляет `.part`,
     // а рядом — служебный хвост фрагментного протокола.
@@ -1100,13 +1019,11 @@ async fn cancelling_in_downloading_removes_every_partial_file() {
     });
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
 
@@ -1130,8 +1047,7 @@ async fn cancelling_during_the_pause_before_a_retry_answers_at_once() {
     // отложенный таймер, а накопленное всё равно удаляется — раз
     // пользователь отменил, докачивать в будущем нечего.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
+    let task = new_task(request(streams(None, Some("140"))));
     let sink = RecordingSink::new();
     let launcher = ScriptedLauncher::new(
         dir.path(),
@@ -1150,13 +1066,11 @@ async fn cancelling_during_the_pause_before_a_retry_answers_at_once() {
 
     let started = Instant::now();
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
     let elapsed = started.elapsed();
@@ -1185,8 +1099,7 @@ async fn cancelling_during_the_pause_before_a_retry_answers_at_once() {
 #[tokio::test]
 async fn cancelling_in_merging_removes_both_streams_and_the_half_merged_file() {
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(Some("133"), Some("139")))).await;
+    let task = new_task(request(streams(Some("133"), Some("139"))));
     let sink = RecordingSink::new();
     let ffmpeg = ScriptedFfmpeg::hanging();
     let launcher = ScriptedLauncher::new(dir.path(), two_stream_scripts(dir.path()));
@@ -1197,7 +1110,7 @@ async fn cancelling_in_merging_removes_both_streams_and_the_half_merged_file() {
         canceller.cancel().await;
     });
 
-    run_task(&session, &task, &launcher, &ffmpeg, &sink, dir.path(), None).await;
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
 
     assert_eq!(ffmpeg.calls(), 1, "склейка успела начаться");
     assert_eq!(
@@ -1225,8 +1138,7 @@ async fn an_interrupted_attempt_is_retried_and_the_percent_does_not_fall_to_zero
     // К-6 буквально: обрыв на 995 883 байтах, следующая попытка
     // продолжает с 996 907 — обе серии сняты живьём.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(Some("134"), None))).await;
+    let task = new_task(request(streams(Some("134"), None)));
     let sink = RecordingSink::new();
     let launcher = ScriptedLauncher::new(
         dir.path(),
@@ -1244,13 +1156,11 @@ async fn an_interrupted_attempt_is_retried_and_the_percent_does_not_fall_to_zero
     );
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
 
@@ -1290,8 +1200,7 @@ async fn any_advance_resets_the_attempt_counter() {
     // суммированием редких обрывов. Обрывов здесь больше, чем попыток в
     // лимите, но каждый со скачанными байтами между ними.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
+    let task = new_task(request(streams(None, Some("140"))));
     let sink = RecordingSink::new();
 
     let samples = fixture_progress("audio-only.json", "140");
@@ -1314,13 +1223,11 @@ async fn any_advance_resets_the_attempt_counter() {
     let launcher = ScriptedLauncher::new(dir.path(), scripts);
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
 
@@ -1351,8 +1258,7 @@ async fn any_advance_resets_the_attempt_counter() {
 async fn attempts_without_a_single_byte_run_out_and_become_connection_lost() {
     // С-7: попытки закончились, а сеть не восстановилась.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
+    let task = new_task(request(streams(None, Some("140"))));
     let sink = RecordingSink::new();
     let scripts: Vec<Script> = (0..MAX_ATTEMPTS)
         .map(|_| {
@@ -1367,13 +1273,11 @@ async fn attempts_without_a_single_byte_run_out_and_become_connection_lost() {
     // не станет: время в этом рантайме управляемое.
     tokio::time::pause();
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
     tokio::time::resume();
@@ -1415,8 +1319,7 @@ async fn a_stream_already_on_disk_is_not_downloaded_again() {
     // включая `finished`. Без отметки о его готовности задача навсегда
     // упиралась бы в неполный процент.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(Some("133"), Some("139")))).await;
+    let task = new_task(request(streams(Some("133"), Some("139"))));
     let sink = RecordingSink::new();
     let already = |name: &str| {
         format!(
@@ -1437,13 +1340,11 @@ async fn a_stream_already_on_disk_is_not_downloaded_again() {
     );
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
 
@@ -1460,8 +1361,7 @@ async fn the_stall_watchdog_is_armed_from_the_last_advance_not_from_the_last_lin
     // принимая. Срок обязан двигаться от **принятых байт**, а не от
     // факта вывода строки.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
+    let task = new_task(request(streams(None, Some("140"))));
     let samples = fixture_progress("audio-only.json", "140");
     let repeated = samples[1].clone();
     let launcher = ScriptedLauncher::new(
@@ -1478,13 +1378,11 @@ async fn the_stall_watchdog_is_armed_from_the_last_advance_not_from_the_last_lin
     );
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &RecordingSink::new(),
         dir.path(),
-        None,
     )
     .await;
 
@@ -1512,8 +1410,7 @@ async fn a_stalled_stream_is_retried_like_a_lost_connection() {
     // С-8: пользователь не видит отдельного «поток завис» — он видит
     // ожидание повтора.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
+    let task = new_task(request(streams(None, Some("140"))));
     let sink = RecordingSink::new();
     let launcher = ScriptedLauncher::new(
         dir.path(),
@@ -1535,13 +1432,11 @@ async fn a_stalled_stream_is_retried_like_a_lost_connection() {
 
     tokio::time::pause();
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
     tokio::time::resume();
@@ -1563,19 +1458,16 @@ async fn silence_during_preparation_is_a_yt_dlp_failure_not_a_lost_connection() 
     // сработавший **до первой строки прогресса**, означает зависший
     // процесс, а не сеть, — и класс у него свой.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
+    let task = new_task(request(streams(None, Some("140"))));
     let sink = RecordingSink::new();
     let launcher = ScriptedLauncher::new(dir.path(), vec![Script::stalled()]);
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
 
@@ -1594,8 +1486,7 @@ async fn silence_during_preparation_is_a_yt_dlp_failure_not_a_lost_connection() 
 #[tokio::test]
 async fn the_first_deadline_of_every_launch_is_the_preparation_one() {
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
+    let task = new_task(request(streams(None, Some("140"))));
     let before = monotonic_now();
     let launcher = ScriptedLauncher::new(
         dir.path(),
@@ -1605,13 +1496,11 @@ async fn the_first_deadline_of_every_launch_is_the_preparation_one() {
     );
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &RecordingSink::new(),
         dir.path(),
-        None,
     )
     .await;
 
@@ -1627,8 +1516,7 @@ async fn a_stale_format_removes_what_it_downloaded() {
     // С-10: докачка того же формата невозможна по построению, и хранить
     // огрызок незачем.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
+    let task = new_task(request(streams(None, Some("140"))));
     let sink = RecordingSink::new();
     let launcher = ScriptedLauncher::new(
         dir.path(),
@@ -1639,13 +1527,11 @@ async fn a_stale_format_removes_what_it_downloaded() {
     );
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
 
@@ -1668,8 +1554,7 @@ async fn a_class_that_surfaced_before_the_first_byte_says_nothing_was_created() 
     // `nothingCreated` — удалять было нечего, и говорить «данные удалены»
     // было бы неправдой.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
+    let task = new_task(request(streams(None, Some("140"))));
     let sink = RecordingSink::new();
     let launcher = ScriptedLauncher::new(
         dir.path(),
@@ -1680,13 +1565,11 @@ async fn a_class_that_surfaced_before_the_first_byte_says_nothing_was_created() 
     );
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
 
@@ -1722,32 +1605,22 @@ async fn a_failed_merge_keeps_both_streams_and_no_half_merged_file() {
 #[tokio::test]
 async fn a_retry_after_a_failed_merge_only_merges_again() {
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(Some("133"), Some("139")))).await;
+    let task = new_task(request(streams(Some("133"), Some("139"))));
     let sink = RecordingSink::new();
 
     let failing = ScriptedFfmpeg::failing();
     let launcher = ScriptedLauncher::new(dir.path(), two_stream_scripts(dir.path()));
-    run_task(
-        &session,
-        &task,
-        &launcher,
-        &failing,
-        &sink,
-        dir.path(),
-        None,
-    )
-    .await;
+    run_task(&task, &launcher, &failing, &sink, dir.path()).await;
     assert_eq!(launcher.calls().len(), 2);
 
     // Повтор — продолжение той же задачи: тот же id, ни одного нового
-    // запуска yt-dlp, только склейка.
-    retry_download(&session, &task.id.clone(), NoopWorker)
-        .await
-        .expect("класс mergeFailed повторяем");
+    // запуска yt-dlp, только склейка. Решение «повторять ли» принимает
+    // очередь (`crate::queue::scheduler`), здесь проверяется то, что
+    // делает сам воркер, когда та вернула задачу в `Queued`.
+    task.set_progress(DownloadProgress::Queued);
     let working = ScriptedFfmpeg::merging();
     let empty = ScriptedLauncher::new(dir.path(), Vec::new());
-    run_task(&session, &task, &empty, &working, &sink, dir.path(), None).await;
+    run_task(&task, &empty, &working, &sink, dir.path()).await;
 
     assert!(
         empty.calls().is_empty(),
@@ -1770,19 +1643,16 @@ async fn a_missing_destination_folder_fails_the_task_and_not_the_command() {
     // ошибки рисовался бы то панелью, то отказом команды.
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("нет такой папки");
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
+    let task = new_task(request(streams(None, Some("140"))));
     let sink = RecordingSink::new();
     let launcher = ScriptedLauncher::new(&missing, Vec::new());
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         &missing,
-        None,
     )
     .await;
 
@@ -1794,268 +1664,6 @@ async fn a_missing_destination_folder_fails_the_task_and_not_the_command() {
     assert_eq!(error.partial_data, PartialData::NothingCreated);
 }
 
-// ─────────────────────── Слот и команды ───────────────────────
-
-/// Исполнитель, который только запоминает, что ему передали.
-struct CapturingWorker(Arc<StdMutex<Option<Option<Arc<DownloadTask>>>>>);
-
-impl WorkerSpawn for CapturingWorker {
-    fn spawn(
-        self,
-        _session: Arc<DownloadSession>,
-        _task: Arc<DownloadTask>,
-        previous: Option<Arc<DownloadTask>>,
-    ) {
-        *self.0.lock().unwrap() = Some(previous);
-    }
-}
-
-#[tokio::test]
-async fn a_new_task_is_handed_the_one_it_replaces() {
-    // Без этого воркеру нечего добивать: предыдущая задача известна
-    // только слоту, и передать её — обязанность старта.
-    let session = Arc::new(DownloadSession::new());
-    let first = new_task(&session, request(streams(None, Some("140")))).await;
-    first.set_progress(DownloadProgress::Done {
-        file_name: "x.m4a".to_string(),
-    });
-
-    let captured = Arc::new(StdMutex::new(None));
-    start_download(
-        &session,
-        request(streams(None, Some("139"))),
-        CapturingWorker(Arc::clone(&captured)),
-    )
-    .await
-    .expect("слот свободен");
-
-    let previous = captured
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("исполнитель обязан быть позван");
-    assert_eq!(
-        previous.map(|task| task.id.clone()),
-        Some(first.id.clone()),
-        "новая задача обязана получить ту, которую она заменила"
-    );
-}
-
-#[tokio::test]
-async fn a_new_worker_finishes_off_the_previous_one_before_starting_its_own() {
-    // Механизм, ради которого заведена очередь. Слот освобождается в
-    // момент терминального перехода, а предыдущий воркер в этот момент
-    // ещё доубивает свой процесс и подчищает. Не дождись его новый — на
-    // машине оказались бы два yt-dlp сразу, и К-8 («виден один процесс»)
-    // выполнялся бы через раз, в зависимости от расторопности
-    // пользователя.
-    let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let first = new_task(&session, request(streams(None, Some("140")))).await;
-    // Вторую задачу слот принимает только после терминального перехода
-    // первой — ровно то состояние, в котором предыдущий воркер ещё жив.
-    let timeline = Arc::new(StdMutex::new(Vec::new()));
-
-    let hanging =
-        ScriptedLauncher::tagged(dir.path(), vec![Script::ok().hangs()], "первый", &timeline);
-    let second_launcher = ScriptedLauncher::tagged(
-        dir.path(),
-        vec![Script::ok()
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f139.m4a"))
-            .creates("Big Buck Bunny.f139.m4a")],
-        "второй",
-        &timeline,
-    );
-    let ffmpeg = ScriptedFfmpeg::merging();
-    let sink = RecordingSink::new();
-
-    let leader = run_task(&session, &first, &hanging, &ffmpeg, &sink, dir.path(), None);
-
-    let follower = async {
-        // Дожидаемся, пока первый действительно занял очередь.
-        while timeline.lock().unwrap().is_empty() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        first.set_progress(DownloadProgress::Cancelled {
-            partial_data: PartialData::NothingCreated,
-        });
-        let second = new_task(&session, request(streams(None, Some("139")))).await;
-
-        run_task(
-            &session,
-            &second,
-            &second_launcher,
-            &ffmpeg,
-            &RecordingSink::new(),
-            dir.path(),
-            Some(Arc::clone(&first)),
-        )
-        .await;
-        timeline.lock().unwrap().push("второй закончил".to_string());
-    };
-
-    let leader = async {
-        leader.await;
-        timeline.lock().unwrap().push("первый вернулся".to_string());
-    };
-
-    tokio::join!(leader, follower);
-
-    let timeline = timeline.lock().unwrap().clone();
-    assert_eq!(
-        timeline,
-        [
-            "запуск первый",
-            "первый вернулся",
-            "запуск второй",
-            "второй закончил"
-        ],
-        "второй запускатель обязан быть позван только после того, как \
-         первый воркер вернул управление: {timeline:?}"
-    );
-    assert!(
-        sink.last().is_terminal(),
-        "добитый предшественник обязан дойти до терминальной фазы, а не \
-         зависнуть навсегда: {:?}",
-        sink.last()
-    );
-}
-
-#[tokio::test]
-async fn a_second_start_is_no_longer_refused_while_the_slot_is_busy() {
-    // Ф-2 эпика E4: класс отказа «слот занят» ушёл из контракта, и
-    // постановка при активной задаче перестала быть ошибкой. Целевое
-    // поведение — хвост очереди (TL-73); проверяется здесь только то,
-    // что относится к контракту: команда **не отказывает** и отдаёт
-    // новую задачу.
-    //
-    // Промежуточное состояние до планировщика названо прямо, а не
-    // подразумевается: слот один, поэтому новая задача его занимает, а
-    // предшественник уезжает воркеру как `previous` и добивается им до
-    // терминальной фазы (`a_new_worker_finishes_off_the_previous_one_before_starting_its_own`
-    // проверяет именно это). Ни один сценарий эпика E4 такого не хочет —
-    // и ни один не наступит, пока TL-73 не поставит очередь.
-    let session = Arc::new(DownloadSession::new());
-    let first = new_task(&session, request(streams(Some("133"), Some("139")))).await;
-
-    let started = start_download(&session, request(streams(None, Some("140"))), NoopWorker)
-        .await
-        .expect("постановка при занятом слоте — не отказ (Ф-2)");
-
-    assert_ne!(started.task_id, first.id, "новая задача — новый id");
-    assert_eq!(
-        session.current().expect("слот").id,
-        started.task_id,
-        "принятая постановка обязана быть видна ядру"
-    );
-}
-
-#[tokio::test]
-async fn the_slot_frees_at_the_terminal_transition() {
-    let dir = tempfile::tempdir().unwrap();
-    let sink = RecordingSink::new();
-    run_two_streams(
-        &dir,
-        &sink,
-        two_stream_scripts(dir.path()),
-        &ScriptedFfmpeg::merging(),
-    )
-    .await;
-
-    let session = Arc::new(DownloadSession::new());
-    // Новая сессия: проверяем ровно правило, а не остатки предыдущей.
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
-    task.set_progress(DownloadProgress::Done {
-        file_name: "x.m4a".to_string(),
-    });
-
-    let started = start_download(&session, request(streams(None, Some("140"))), NoopWorker)
-        .await
-        .expect("после терминального перехода слот свободен");
-    assert_ne!(started.task_id, task.id, "новая задача — новый id");
-    assert_eq!(started.phase, DownloadPhase::Queued);
-    assert_eq!(started.plan, DownloadPlan::SingleStream);
-}
-
-#[tokio::test]
-async fn cancelling_a_finished_task_is_not_an_error() {
-    // Пользователь способен нажать «Отменить» ровно в тот момент, когда
-    // приехало `done`.
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
-    task.set_progress(DownloadProgress::Done {
-        file_name: "x.m4a".to_string(),
-    });
-
-    cancel_download(&session, &task.id)
-        .await
-        .expect("отмена терминальной задачи — не ошибка, а ничего");
-}
-
-#[tokio::test]
-async fn an_unknown_task_id_is_refused_the_same_way_whatever_the_slot_holds() {
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
-
-    // До E4 у чужого идентификатора было два исхода: при занятом слоте
-    // ядро отвечало «место занято другой» (`alreadyActive`), при
-    // свободном — «задачи не знаю». Ф-2 убрала первый класс из
-    // контракта, и различие исчезло вместе с ним: вызывающему оба
-    // случая говорят одно и то же — задачи с таким идентификатором у
-    // ядра нет.
-    let busy = cancel_download(&session, "dl-чужой")
-        .await
-        .expect_err("чужой id");
-    assert!(matches!(busy, DownloadCommandRejection::UnknownTask { .. }));
-
-    task.set_progress(DownloadProgress::Cancelled {
-        partial_data: PartialData::NothingCreated,
-    });
-    let unknown = retry_download(&session, "dl-чужой", NoopWorker)
-        .await
-        .expect_err("чужой id при свободном слоте");
-    assert!(matches!(
-        unknown,
-        DownloadCommandRejection::UnknownTask { .. }
-    ));
-}
-
-#[tokio::test]
-async fn retry_is_refused_for_a_task_that_did_not_fail_and_for_a_hopeless_class() {
-    let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
-
-    let not_failed = retry_download(&session, &task.id.clone(), NoopWorker)
-        .await
-        .expect_err("задача не падала");
-    assert!(matches!(not_failed, DownloadCommandRejection::NotFailed));
-
-    let sink = RecordingSink::new();
-    let launcher = ScriptedLauncher::new(
-        dir.path(),
-        vec![Script::failing(
-            1,
-            &fixtures::outcome("sign-in-required.json").stderr,
-        )],
-    );
-    run_task(
-        &session,
-        &task,
-        &launcher,
-        &ScriptedFfmpeg::merging(),
-        &sink,
-        dir.path(),
-        None,
-    )
-    .await;
-
-    let hopeless = retry_download(&session, &task.id.clone(), NoopWorker)
-        .await
-        .expect_err("вход в аккаунт повтором не чинится");
-    assert!(matches!(hopeless, DownloadCommandRejection::NotRetryable));
-}
-
 // ─────────────────────── Троттлинг событий ───────────────────────
 
 #[tokio::test]
@@ -2064,8 +1672,7 @@ async fn a_burst_of_progress_lines_does_not_become_a_burst_of_events() {
     // Фикстура фрагментного потока — та самая, что печатает 15,7 строк в
     // секунду (замер TL-41).
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(Some("602"), None))).await;
+    let task = new_task(request(streams(Some("602"), None)));
     let sink = RecordingSink::new();
     let samples = fixture_progress("hls-fragmented.json", "602");
     assert!(
@@ -2081,13 +1688,11 @@ async fn a_burst_of_progress_lines_does_not_become_a_burst_of_events() {
     );
 
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
 
@@ -2118,8 +1723,7 @@ async fn the_shape_of_the_state_always_gets_through() {
     // проезжать мимо троттлинга: иначе панель показывала бы «качается»
     // всю паузу перед повтором.
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(DownloadSession::new());
-    let task = new_task(&session, request(streams(None, Some("140")))).await;
+    let task = new_task(request(streams(None, Some("140"))));
     let sink = RecordingSink::new();
     let samples = fixture_progress("audio-only.json", "140");
     let launcher = ScriptedLauncher::new(
@@ -2138,13 +1742,11 @@ async fn the_shape_of_the_state_always_gets_through() {
 
     tokio::time::pause();
     run_task(
-        &session,
         &task,
         &launcher,
         &ScriptedFfmpeg::merging(),
         &sink,
         dir.path(),
-        None,
     )
     .await;
     tokio::time::resume();
