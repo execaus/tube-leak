@@ -21,7 +21,7 @@
 //!
 //! Здесь и только здесь. Домен `ytdlp` о задачах скачивания не знает
 //! ничего: границу задач он видит трейтом [`ytdlp::TaskBoundary`], а
-//! боевая реализация ([`SessionBoundary`]) — в этом файле, где слот
+//! боевая реализация ([`QueueBoundary`]) — в этом файле, где очередь
 //! загрузки и так под рукой. Тем же способом сюда вынесен и приёмник
 //! событий: канал `ytdlp://update` — контракт с фронтендом, и знать о
 //! нём должен слой границы.
@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, Manager, State};
 
-use crate::download::DownloadSession;
+use crate::queue::scheduler::QueueScheduler;
 use crate::sidecar::ChildRegistry;
 use crate::types::{YtDlpUpdateCommandError, YtDlpUpdateSnapshot};
 use crate::ytdlp::{
@@ -180,7 +180,7 @@ fn spawn(app: AppHandle, action: Action) {
 ///
 /// Всё, что нужно конвейеру, берётся из состояния приложения — того же,
 /// которым живут остальные команды: реестр процессов (TL-10), отметки
-/// занятости установок (Ф-7), слот активной загрузки (E3) и один на
+/// занятости установок (Ф-7), очередь загрузок (E4) и один на
 /// процесс HTTP-клиент (переиспользование соединений и пула TLS).
 async fn run(app: AppHandle, action: Action) {
     let Ok(data_dir) = app.path().app_data_dir() else {
@@ -194,10 +194,10 @@ async fn run(app: AppHandle, action: Action) {
     let transport = app.state::<GithubTransport>();
     let registry = app.state::<ChildRegistry>();
     let in_use = app.state::<InUse>();
-    let session = app.state::<Arc<DownloadSession>>().inner().clone();
+    let scheduler = app.state::<Arc<QueueScheduler>>().inner().clone();
 
     let sink = AppUpdateSink(app.clone());
-    let boundary = SessionBoundary(session);
+    let boundary = QueueBoundary(scheduler);
 
     let job = UpdateJob::new(
         &data_dir,
@@ -254,13 +254,19 @@ impl UpdateSink for AppUpdateSink {
     }
 }
 
-/// Граница задач для контура — слот активной загрузки E3.
+/// Граница задач для контура — очередь загрузок (E4).
+///
+/// До E4 здесь стоял слот E3, и разница не в имени: «задач нет» —
+/// свойство очереди, а не одной задачи. Пока за завершившейся задачей
+/// стоит следующая, граница не наступает сама собой — её наступление
+/// объявляет планировщик, и он же ждёт на ней контур (Р-7 E4), чтобы
+/// прогрев не соревновался с новой загрузкой (Н-3).
 ///
 /// Держит `Arc`, а не ссылку: конвейер живёт отдельной задачей рантайма
 /// и переживает возврат из команды, которая его затеяла.
-struct SessionBoundary(Arc<DownloadSession>);
+struct QueueBoundary(Arc<QueueScheduler>);
 
-impl TaskBoundary for SessionBoundary {
+impl TaskBoundary for QueueBoundary {
     fn is_busy(&self) -> bool {
         self.0.is_active()
     }
