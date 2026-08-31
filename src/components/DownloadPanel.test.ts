@@ -7,6 +7,19 @@ import DownloadPanel from './DownloadPanel.vue'
 
 const TITLE = '«Как приручить дракона» — 1080p'
 
+/**
+ * Предел попыток в фикстурах намеренно НЕ равен действующему (он 8, см.
+ * сгенерированный `@/types/generated/download`). Панель — проекция: она
+ * обязана печатать пришедшее число, а не своё. Фикстура, совпавшая с
+ * настоящим пределом, перестала бы отличать «рисую пришедшее» от «рисую
+ * захардкоженное», то есть тест замолчал бы ровно о том дефекте, ради
+ * которого написан.
+ *
+ * Поэтому это число не синхронизируется с контрактом — TL-49 (#51) закрыт
+ * с этим обоснованием, а не правкой шестёрок на восьмёрки.
+ */
+const FIXTURE_ATTEMPT_LIMIT = 6
+
 describe('DownloadPanel — степпер фаз (нетерминальные состояния)', () => {
   it('renders all four steps for a two-stream plan, marking the current one', () => {
     const wrapper = mount(DownloadPanel, {
@@ -227,7 +240,7 @@ describe('DownloadPanel — Скачивание (running)', () => {
           phase: 'downloading',
           state: 'running',
           percent: 10,
-          attempt: { number: 1, total: 6 },
+          attempt: { number: 1, total: FIXTURE_ATTEMPT_LIMIT },
         },
       },
     })
@@ -241,11 +254,11 @@ describe('DownloadPanel — Скачивание (running)', () => {
           phase: 'downloading',
           state: 'running',
           percent: 10,
-          attempt: { number: 2, total: 6 },
+          attempt: { number: 2, total: FIXTURE_ATTEMPT_LIMIT },
         },
       },
     })
-    expect(second.text()).toContain('попытка 2 из 6')
+    expect(second.text()).toContain(`попытка 2 из ${FIXTURE_ATTEMPT_LIMIT}`)
   })
 
   it('emits cancel when the Cancel button is clicked', async () => {
@@ -296,7 +309,7 @@ describe('DownloadPanel — пауза перед повтором (waitingRetry
           phase: 'downloading',
           state: 'waitingRetry',
           percent: 62,
-          attempt: { number: 2, total: 6 },
+          attempt: { number: 2, total: FIXTURE_ATTEMPT_LIMIT },
           delaySecs: 10,
           remainingSecs: 8,
         },
@@ -304,7 +317,7 @@ describe('DownloadPanel — пауза перед повтором (waitingRetry
     })
 
     expect(wrapper.find('.download-panel__percent').text()).toBe('62 % (сохранено)')
-    expect(wrapper.text()).toContain('попытки (2 из 6)')
+    expect(wrapper.text()).toContain(`попытки (2 из ${FIXTURE_ATTEMPT_LIMIT})`)
     expect(wrapper.text()).toContain('через 8 с')
     expect(wrapper.text()).not.toMatch(/МБ\/с|осталось/)
 
@@ -321,7 +334,7 @@ describe('DownloadPanel — пауза перед повтором (waitingRetry
         progress: {
           phase: 'downloading',
           state: 'waitingRetry',
-          attempt: { number: 2, total: 6 },
+          attempt: { number: 2, total: FIXTURE_ATTEMPT_LIMIT },
           delaySecs: 10,
           remainingSecs: 8,
         },
