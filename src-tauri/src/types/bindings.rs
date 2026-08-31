@@ -566,7 +566,11 @@ fn the_list_covers_every_contract_type() {
 ///    предупреждение при сборке тестов («failed to parse serde attribute
 ///    | transparent»). Игнорирование безвредно ровно потому, что
 ///    newtype-структуру ts-rs и без того печатает как её внутренний тип, —
-///    но это совпадение, а не гарантия, и держит его этот assert.
+///    но это совпадение, а не гарантия. Здесь оно держится со стороны
+///    зеркала: `= number;` и ничего кроме. Со стороны провода — в
+///    [`transparent_types_travel_in_the_shape_the_ts_mirror_declares`]
+///    (TL-68): этот assert знает два имени наперечёт и о третьем
+///    transparent-типе не узнает, тот сторож читает их из `types.rs`.
 ///    Глушить предупреждение фичей `no-serde-warnings` было бы хуже: она
 ///    скрывает такие же сообщения обо ВСЕХ будущих атрибутах, то есть
 ///    заводит ровно тот молчаливый отказ, из-за которого задача и
@@ -675,6 +679,259 @@ fn the_serde_shapes_the_update_contract_stands_on_survive_generation() {
     );
 }
 
+/// Единственный список типов границы, у которых стоит
+/// `#[serde(transparent)]`, вместе с образцом значения каждого.
+///
+/// Образец здесь не для красоты: оба сторожа ниже сравнивают **форму
+/// фактического JSON** с формой TS-объявления, а фактический JSON без
+/// значения не получить. Полнота списка держится
+/// [`every_transparent_type_of_the_contract_is_checked_for_shape`], который
+/// читает исходник контракта, а не этот список.
+macro_rules! with_transparent_types {
+    ($macro_name:ident $(, $arg:expr)?) => {
+        $macro_name![
+            $($arg,)?
+            (DownloadPercent, DownloadPercent::new(42)),
+            (YtDlpUpdatePercent, YtDlpUpdatePercent::new(42)),
+        ]
+    };
+}
+
+macro_rules! transparent_names {
+    ($(($ty:ty, $sample:expr)),+ $(,)?) => {
+        vec![$(stringify!($ty)),+]
+    };
+}
+
+macro_rules! transparent_cases {
+    ($cfg:expr, $(($ty:ty, $sample:expr)),+ $(,)?) => {
+        vec![$((
+            stringify!($ty),
+            serde_json::to_value($sample).unwrap_or_else(|e| {
+                panic!("не удалось сериализовать образец {}: {e}", stringify!($ty))
+            }),
+            <$ty as TS>::export_to_string($cfg)
+                .unwrap_or_else(|e| panic!("не удалось объявить {}: {e}", stringify!($ty))),
+        )),+]
+    };
+}
+
+/// Форма значения на проводе, огрублённая ровно до того, что различает
+/// TypeScript структурно.
+///
+/// Мельче не нужно: класс отказа, ради которого писан сторож, — «на
+/// проводе голое число, а в зеркале объект с полем». Крупнее нельзя:
+/// объект и массив в TS взаимно неприсваиваемы.
+#[derive(Debug, PartialEq, Eq)]
+enum WireShape {
+    Object,
+    Array,
+    Number,
+    String,
+    Boolean,
+    Null,
+}
+
+/// Форма фактически сериализованного значения.
+fn json_shape(value: &serde_json::Value) -> WireShape {
+    match value {
+        serde_json::Value::Object(_) => WireShape::Object,
+        serde_json::Value::Array(_) => WireShape::Array,
+        serde_json::Value::Number(_) => WireShape::Number,
+        serde_json::Value::String(_) => WireShape::String,
+        serde_json::Value::Bool(_) => WireShape::Boolean,
+        serde_json::Value::Null => WireShape::Null,
+    }
+}
+
+/// Форма, объявленная сгенерированным TS, — по правой части
+/// `export type <name> = …;`.
+///
+/// Непонятную правую часть функция **не пропускает молча**, а роняет
+/// прогон с просьбой её разобрать. Тихий пропуск здесь был бы худшим из
+/// возможных исходов: сторож, который на незнакомой форме зеленеет,
+/// охраняет только знакомые случаи — а расхождение приезжает как раз с
+/// незнакомым. Этот класс дефекта в проекте уже ловили (разбор имён
+/// каналов, тихо пропускавший непонятное).
+fn ts_shape(name: &str, declaration: &str) -> WireShape {
+    let code = strip_jsdoc(declaration);
+    let head = format!("export type {name} = ");
+    let rhs = code
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&head))
+        .unwrap_or_else(|| panic!("в объявлении `{name}` не нашлось строки `{head}…`:\n{code}"))
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+
+    if rhs.starts_with('{') {
+        return WireShape::Object;
+    }
+    if rhs.ends_with("[]") || rhs.starts_with("Array<") {
+        return WireShape::Array;
+    }
+    match rhs {
+        "number" => WireShape::Number,
+        "string" => WireShape::String,
+        "boolean" => WireShape::Boolean,
+        "null" => WireShape::Null,
+        other => panic!(
+            "сторож форм не умеет читать правую часть объявления `{name}`: \
+             `{other}`. Разберите её здесь явно — молча пропустить нельзя, \
+             иначе сторож зеленеет ровно на том, ради чего писался."
+        ),
+    }
+}
+
+/// Разбор правой части объявления различает объект и голый скаляр.
+///
+/// Свой тест у разбора, потому что вся ценность сторожа ниже держится на
+/// нём: разбор, который на объекте вернул бы `Number`, сделал бы сторожа
+/// вечнозелёным.
+#[test]
+fn the_shape_reader_tells_an_object_from_a_bare_value() {
+    assert_eq!(ts_shape("P", "export type P = number;"), WireShape::Number);
+    assert_eq!(
+        ts_shape("P", "export type P = { value: number, };"),
+        WireShape::Object
+    );
+    assert_eq!(
+        ts_shape("P", "export type P = Array<number>;"),
+        WireShape::Array
+    );
+    assert_eq!(
+        ts_shape("P", "/** number */\nexport type P = string;"),
+        WireShape::String,
+        "слово из doc-комментария не должно подменять форму"
+    );
+}
+
+/// **Ответ на TL-68: расхождения нет, и вот чем оно удержано.**
+///
+/// `ts-rs` не разбирает `#[serde(transparent)]` и печатает об этом
+/// предупреждение на каждой тестовой сборке («failed to parse serde
+/// attribute | transparent», ровно по одному на каждый такой тип).
+/// Атрибут он игнорирует — то есть гарантия TL-51 «зеркало не может
+/// разойтись с источником» для него не работает: генератор и `serde`
+/// приходят к одной форме **порознь**, по двум разным правилам.
+///
+/// Правила эти сейчас совпадают: у newtype-структуры (ровно одно
+/// безымянное поле) `serde` и без `transparent` кладёт на провод
+/// внутреннее значение, а `ts-rs` печатает такой тип как внутренний.
+/// Замер: `DownloadPercent::new(42)` даёт `42`, зеркало объявляет
+/// `export type DownloadPercent = number;`.
+///
+/// Совпадение это ломается ровно там, где кончается newtype:
+/// `#[serde(transparent)]` законен и на структуре с именованными полями,
+/// если все прочие помечены `skip`. Тогда `serde` по-прежнему отдаёт
+/// голое значение, а `ts-rs`, атрибут не увидевший, объявит объект с
+/// полем — и **сверка зеркала с генератором этого не заметит**, потому
+/// что генератор ошибается одинаково по обе стороны сравнения: эталон во
+/// временном каталоге получится ровно таким же, каким лежит
+/// закоммиченный. Отсюда сторож, который сравнивает не зеркало с
+/// генератором, а форму провода с формой зеркала.
+#[test]
+fn transparent_types_travel_in_the_shape_the_ts_mirror_declares() {
+    let temp = tempfile::tempdir().expect("не удалось создать временный каталог");
+    let cfg = config(temp.path());
+    let cases: Vec<(&str, serde_json::Value, String)> =
+        with_transparent_types!(transparent_cases, &cfg);
+
+    for (name, value, declaration) in cases {
+        let wire = json_shape(&value);
+        let mirror = ts_shape(name, &declaration);
+        assert_eq!(
+            wire,
+            mirror,
+            "`{name}`: на проводе {wire:?}, а TS-зеркало обещает {mirror:?}.\n\
+             Фактический JSON: {value}\n\
+             Объявление:\n{}\n\
+             `#[serde(transparent)]` генератор не разбирает и игнорирует; \
+             форму зеркала он вывел сам, и сейчас она разошлась с проводом. \
+             Чинить — в Rust: либо тип возвращается к newtype-структуре, \
+             форму которой генератор печатает верно, либо `transparent` \
+             снимается и на провод едет объект.",
+            strip_jsdoc(&declaration)
+        );
+    }
+}
+
+/// Полнота списка [`with_transparent_types`]: в контракте не осталось
+/// `#[serde(transparent)]`, который сторож формы не осматривает.
+///
+/// Проверяется по исходнику `types.rs`, а не по списку самому по себе, —
+/// иначе тест сверял бы список с собой. Незарегистрированный тип и есть
+/// самый тихий отказ этой задачи: расхождения формы не будет видно не
+/// потому, что его нет, а потому, что смотреть было некому.
+#[test]
+fn every_transparent_type_of_the_contract_is_checked_for_shape() {
+    let checked: Vec<&str> = with_transparent_types!(transparent_names);
+
+    let contract: Vec<&str> = contract_source().lines().collect();
+    let declared: Vec<&str> = contract
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let name = declaration_name(line)?;
+            attributes_above(&contract[..i])
+                .iter()
+                .any(|attr| is_serde_transparent(attr))
+                .then_some(name)
+        })
+        .collect();
+
+    for name in &declared {
+        assert!(
+            checked.contains(name),
+            "на типе границы `{name}` стоит `#[serde(transparent)]`, но он не \
+             зарегистрирован в `with_transparent_types!`. Этот атрибут ts-rs не \
+             разбирает и игнорирует: форму зеркала он выводит сам, и совпадает \
+             она с проводом только у newtype-структур. Добавьте тип с образцом \
+             значения — иначе расхождение формы проверять некому."
+        );
+    }
+    assert_eq!(
+        declared.len(),
+        checked.len(),
+        "список transparent-типов разошёлся с контрактом числом:\n\
+         в types.rs: {declared:?}\nв списке сторожа: {checked:?}\n\
+         Пустой список слева означает, что сломался разбор `types.rs`, и \
+         сторож проверяет не то, что думает."
+    );
+}
+
+/// Атрибут — это `#[serde(transparent)]`, а не что-то похожее.
+///
+/// Проверяется принадлежность к `serde`, а не одно вхождение слова:
+/// `#[ts(rename = "transparent")]` или наш собственный будущий атрибут со
+/// словом внутри дали бы ложное срабатывание, а сторож, которому не
+/// верят, бесполезен (тот же довод, что у `attributes_above`).
+fn is_serde_transparent(attribute: &str) -> bool {
+    let Some(rest) = attribute.strip_prefix("#[serde(") else {
+        return false;
+    };
+    rest.trim_end_matches(']')
+        .trim_end_matches(')')
+        .split(',')
+        .any(|item| item.trim() == "transparent")
+}
+
+/// Разбор атрибута не путает `transparent` с похожим на него.
+#[test]
+fn only_a_serde_attribute_declares_transparency() {
+    assert!(is_serde_transparent("#[serde(transparent)]"));
+    assert!(
+        is_serde_transparent("#[serde(transparent, deny_unknown_fields)]"),
+        "атрибут с соседями остаётся тем же атрибутом"
+    );
+    assert!(
+        !is_serde_transparent(r#"#[ts(rename = "transparent")]"#),
+        "слово в чужом атрибуте прозрачности не объявляет"
+    );
+    assert!(!is_serde_transparent(
+        r#"#[serde(rename_all = "camelCase")]"#
+    ));
+}
 /// Исходник `types.rs` до объявления этого модуля — то есть ровно
 /// объявления контракта, без тестов.
 ///
