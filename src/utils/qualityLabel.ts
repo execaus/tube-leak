@@ -21,7 +21,16 @@ import type { QualityItem } from '@/types/generated/probe'
  * видно, поэтому у обоих есть честный текстовый фолбэк на случай
  * расхождения контракта.
  */
-export function qualityLabel(item: QualityItem): string {
+/**
+ * Принимает только `kind`/`heightPx` (`Pick`), не весь {@link QualityItem}
+ * (TL-75, эпик E4): подпись нужна и лестнице (полный `QualityItem` с
+ * `streams`/`size`), и очереди — там же контракт хранит только эти два
+ * поля ({@link import('@/types/generated/queue').SelectedQuality}), а
+ * `streams`/`size` после перезапуска не нужны и не пересылаются
+ * (`QueueTask.quality`, `QueueTaskRef.quality`). Одна и та же функция
+ * форматирования на оба случая — второй копии той же подписи не заводим.
+ */
+export function qualityLabel(item: Pick<QualityItem, 'kind' | 'heightPx'>): string {
   switch (item.kind) {
     case 'standard':
       return item.heightPx !== undefined ? `${item.heightPx}p` : 'Видео'

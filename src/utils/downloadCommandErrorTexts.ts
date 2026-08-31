@@ -1,37 +1,49 @@
 import type { DownloadCommandErrorKind } from '@/types/generated/download'
+import type { QueueTaskRef } from '@/types/generated/queue'
+import { formatTaskDisplayTitle } from './queueTaskTitle'
 
 /**
- * Тексты для шести классов отказа команд управления загрузкой
- * (`start_download`/`cancel_download`/`retry_download`,
- * {@link DownloadCommandErrorKind}) — не путать с девятью классами отказа
- * самой задачи ({@link import('@/types/generated/download').DownloadErrorKind}),
- * для которых есть `downloadErrorTexts.ts`.
+ * Тексты для семи классов отказа команд управления загрузкой и очередью
+ * (`start_download`/`cancel_download`/`retry_download`/`resume_queue`/
+ * `dismiss_queue_task`, {@link DownloadCommandErrorKind}) — не путать с
+ * девятью классами отказа самой задачи
+ * ({@link import('@/types/generated/download').DownloadErrorKind}), для
+ * которых есть `downloadErrorTexts.ts`.
  *
  * Дизайн E3 это состояние не описывает — оно считалось недостижимым
  * (кнопка «Скачать» на исправном фронтенде не должна быть достижима для
- * `alreadyActive` и т.п.). Ревью TL-45 нашло достижимый путь (несовпадение
+ * шести классов). Ревью TL-45 нашло достижимый путь (несовпадение
  * обрезки пробелов между разбором и стартом) и потребовало не глушить
  * отказ в консоль молча — тот же класс дефекта, что «не отвечает» в E1.
  *
+ * С эпика E4 (TL-70) список пополнился и изменился дважды:
+ * - класс `alreadyActive` («слот занят другой задачей») **убран** —
+ *   прямое следствие Ф-2 E4: постановка при занятом слоте больше не
+ *   мгновенный отказ, а нормальный путь (задача встаёт в хвост очереди);
+ * - класс `duplicateTask` **добавлен** (Ф-8/Р-5 E4) — точный дубль
+ *   (тот же ролик, тот же пункт качества) среди нетерминальных задач;
+ * - класс `taskNotFinished` **добавлен** — «Скрыть» доступно только
+ *   терминальной задаче (`dismiss_queue_task`, дизайн «Данные для API»,
+ *   п.5).
+ *
  * Показ решён так же, как и остальные ошибки: заголовок и пояснение по
- * классу, без кнопки «Повторить» — для всех шести классов повтор того же
- * вызова не имеет смысла (см. doc {@link DownloadCommandErrorKind}
+ * классу, без кнопки «Повторить» — ни для одного из семи классов повтор
+ * того же вызова не имеет смысла (см. doc {@link DownloadCommandErrorKind}
  * в `src/types/generated/download.ts`): либо гонка уже разрешилась сама
- * (`alreadyActive`/`unknownTask`), либо нужен другой ввод, а не тот же
- * вызов ещё раз (`noStreamsSelected`/`invalidUrl`/`notFailed`/`notRetryable`).
+ * (`unknownTask`), либо нужен другой ввод или другое действие, а не тот же
+ * вызов ещё раз.
  *
  * Как и {@link import('./downloadErrorTexts').getDownloadErrorText} —
- * сигнатура не принимает диагностическое `message`, подмена не
- * скомпилируется.
+ * сигнатура не принимает диагностическое `message`. Исключение —
+ * `duplicateTask`: он обязан назвать существующую задачу (Р-5 E4), но
+ * не через свободную строку, а через структурные поля
+ * {@link QueueTaskRef} (`existing`), уже безопасно показанные на экране
+ * собственной строкой/панелью этой же задачи (дизайн E4, «Отказ по
+ * дублю», «Явное расхождение с уже задокументированным правилом»).
  */
 export interface DownloadCommandErrorText {
   title: string
   explanation: string
-}
-
-const ALREADY_ACTIVE_TEXT: DownloadCommandErrorText = {
-  title: 'Уже идёт другая загрузка',
-  explanation: 'Слот занят предыдущей задачей — дождитесь её завершения или отмените её, затем попробуйте снова.',
 }
 
 const UNKNOWN_TASK_TEXT: DownloadCommandErrorText = {
@@ -61,11 +73,40 @@ const INVALID_URL_TEXT: DownloadCommandErrorText = {
     'Проверьте, что в поле — обычная ссылка на ролик YouTube, без лишних символов, и попробуйте ещё раз.',
 }
 
+/**
+ * `taskNotFinished` — «Скрыть» доступно только терминальной задаче
+ * (Done/Failed/Cancelled): текст по образцу остальных пяти классов, без
+ * `message`, но этот случай не должен быть достижим с исправного
+ * фронтенда (кнопка «Скрыть» рисуется только для терминальной ветки
+ * `DownloadPanel`) — оборона на случай гонки, тот же класс дефекта, что и
+ * у остальных шести.
+ */
+const TASK_NOT_FINISHED_TEXT: DownloadCommandErrorText = {
+  title: 'Скрыть нельзя',
+  explanation:
+    'Скрыть можно только завершённую задачу — дождитесь её исхода (Готово, Отменена или Ошибка) и попробуйте снова.',
+}
+
+/**
+ * `duplicateTask` — единственный класс, чей текст зависит от данных
+ * (Р-5: «отказ называет существующую задачу»). `existing` несёт ровно те
+ * же два поля, что уже безопасно показаны в списке очереди собственной
+ * строкой/панелью этой задачи ({@link QueueTaskRef}), поэтому это не
+ * утечка диагностики, а цитирование уже видимого экрана.
+ */
+function getDuplicateTaskText(existing: QueueTaskRef): DownloadCommandErrorText {
+  const displayTitle = formatTaskDisplayTitle(existing.title, existing.quality)
+  return {
+    title: 'Такая задача уже в очереди',
+    explanation:
+      `${displayTitle} уже стоит в очереди с этим же качеством. Дождитесь её исхода или отмените ` +
+      'её в списке ниже, если хотите начать заново.',
+  }
+}
+
 /** Текст по классу отказа команды. Сигнатура не принимает `message` — см. doc выше. */
 export function getDownloadCommandErrorText(kind: DownloadCommandErrorKind): DownloadCommandErrorText {
-  switch (kind) {
-    case 'alreadyActive':
-      return ALREADY_ACTIVE_TEXT
+  switch (kind.kind) {
     case 'unknownTask':
       return UNKNOWN_TASK_TEXT
     case 'notFailed':
@@ -76,6 +117,10 @@ export function getDownloadCommandErrorText(kind: DownloadCommandErrorKind): Dow
       return NO_STREAMS_SELECTED_TEXT
     case 'invalidUrl':
       return INVALID_URL_TEXT
+    case 'duplicateTask':
+      return getDuplicateTaskText(kind.existing)
+    case 'taskNotFinished':
+      return TASK_NOT_FINISHED_TEXT
   }
 }
 

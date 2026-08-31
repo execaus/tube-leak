@@ -95,7 +95,8 @@ use crate::sidecar::{
 use crate::types::{
     DownloadErrorDetails, DownloadErrorKind, DownloadPercent, DownloadPhase, DownloadPlan,
     DownloadProgress, DownloadProgressEvent, DownloadStarted, DownloadStream, DownloadingState,
-    PartialData, QualityStreams, StartDownloadRequest, YtDlpFailureReason,
+    PartialData, QualityStreams, QueueSnapshot, QueueTask, StartDownloadRequest,
+    YtDlpFailureReason,
 };
 
 // ───────────────────────────── Числа ─────────────────────────────
@@ -830,7 +831,7 @@ impl DownloadSession {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn current(&self) -> Option<Arc<DownloadTask>> {
+    pub fn current(&self) -> Option<Arc<DownloadTask>> {
         self.lock().current.clone()
     }
 
@@ -944,18 +945,23 @@ pub async fn start_download(
         .ok_or(DownloadCommandRejection::NoStreamsSelected)?;
     let plan = aggregator.plan();
 
-    // Слот и создание задачи — под одним замком: между проверкой «свободен
-    // ли» и занятием не должно быть ни одной точки, где успеет пройти
-    // второй вызов.
+    // Занятие слота и создание задачи — под одним замком: между чтением
+    // слота и его занятием не должно быть ни одной точки, где успеет
+    // пройти второй вызов.
+    //
+    // Сторожа «слот занят — отказать» здесь больше нет: Ф-2 эпика E4
+    // убрала из контракта класс `alreadyActive`, потому что постановка
+    // при занятом слоте — теперь штатный путь, а не отказ. До
+    // планировщика (TL-73) очереди как структуры данных ещё нет, и слот
+    // по-прежнему один: второй старт вытесняет предыдущую задачу тем же
+    // механизмом, которым это делает разбор ссылки в E2, — `previous`
+    // уезжает воркеру, а тот добивает предшественника до терминальной
+    // фазы прежде, чем взять шлюз (см. `run_task`). Это промежуточное
+    // состояние, а не целевое: FIFO без вытеснения ставит TL-73.
     let previous;
     let task;
     {
         let mut state = session.lock();
-        if let Some(current) = &state.current {
-            if !current.snapshot().is_terminal() {
-                return Err(DownloadCommandRejection::AlreadyActive);
-            }
-        }
 
         let stem = sanitized_stem(&request.title, &video_id_of(&request.url));
         let download_stem = download_stem(&stem);
@@ -1127,24 +1133,92 @@ pub async fn retry_download(
 
 /// Задача по идентификатору либо типизированный отказ.
 ///
-/// Занятый слот проверяется **раньше** незнакомого идентификатора: если
-/// пользователь успел запустить новую загрузку поверх завершившейся, то
-/// команда по старому идентификатору — не «задачи не существовало», а
-/// «место занято другой» (прямая оговорка doc
-/// [`crate::types::DownloadCommandErrorKind::AlreadyActive`]).
+/// Идентификатор, которого нет в слоте, — это `unknownTask`, и другого
+/// исхода у него нет. До эпика E4 их было два: команда по старому
+/// идентификатору при занятом слоте отвечала «место занято другой»
+/// (`alreadyActive`), потому что задача, вытесненная новой, ядру
+/// действительно переставала быть известна. Ф-2 убрала этот класс из
+/// контракта, и различать стало нечем — да и незачем: с точки зрения
+/// вызывающего оба случая означают ровно одно, задачи с таким
+/// идентификатором у ядра нет. В целевом состоянии (TL-73) она найдётся
+/// в очереди, если она там есть, и не найдётся, если её скрыли.
 fn known_task(
     session: &DownloadSession,
     task_id: &str,
 ) -> Result<Arc<DownloadTask>, DownloadCommandRejection> {
     match session.current() {
         Some(task) if task.id == task_id => Ok(task),
-        Some(task) if !task.snapshot().is_terminal() => {
-            Err(DownloadCommandRejection::AlreadyActive)
-        }
         _ => Err(DownloadCommandRejection::UnknownTask {
             task_id: task_id.to_string(),
         }),
     }
+}
+
+// ─────────────────── Команды очереди (контракт TL-70) ───────────────────
+//
+// Очередь как структура данных — задача TL-73. До неё «очередь» ядра это
+// один слот E3, и обе функции ниже — его честная проекция на контракт
+// E4, а не заглушки: снимок, отдающий пустой список при живой задаче,
+// был бы неправдой на проводе, а неправду на проводе чинит не тот, кто
+// её написал.
+
+/// Снимок очереди: ответ команды `queue_state`, а с TL-73 — и полезная
+/// нагрузка события `queue://changed`.
+///
+/// Ноль задач или одна, потому что слот один. Порядок списка значим и
+/// сегодня тривиален.
+pub fn queue_snapshot(session: &DownloadSession) -> QueueSnapshot {
+    let tasks = session
+        .current()
+        .map(|task| QueueTask {
+            task_id: task.id.clone(),
+            title: task.request.title.clone(),
+            quality: task.request.quality,
+            plan: task.plan,
+            progress: task.snapshot(),
+        })
+        .into_iter()
+        .collect();
+
+    QueueSnapshot {
+        tasks,
+        // Восстановления очереди с диска ещё нет (TL-71), поэтому
+        // приостановленной после перезапуска она не бывает; паузу между
+        // задачами держит планировщик, которого тоже ещё нет (Р-7).
+        awaiting_continue: false,
+        pause_reason: None,
+    }
+}
+
+/// Скрывает завершённую задачу — «Скрыть» на её панели.
+///
+/// Команда ядра, а не локальное состояние стора: С-9 требует, чтобы
+/// перезагрузка webview восстанавливала список по снимку ядра, и
+/// скрытие, живущее только во фронтенде, воскрешало бы скрытые задачи.
+///
+/// Нетерминальная задача отклоняется типизированно
+/// ([`DownloadCommandRejection::TaskNotFinished`]) — «скрыть» не означает
+/// «отменить», и подменять одно другим команда не станет.
+pub fn dismiss_queue_task(
+    session: &DownloadSession,
+    task_id: &str,
+) -> Result<(), DownloadCommandRejection> {
+    let task = known_task(session, task_id)?;
+    if !task.snapshot().is_terminal() {
+        return Err(DownloadCommandRejection::TaskNotFinished);
+    }
+
+    let mut state = session.lock();
+    if state
+        .current
+        .as_ref()
+        .is_some_and(|current| current.id == task_id)
+    {
+        // Слот и так свободен — задача терминальна; уходит из него
+        // именно запись о задаче, чтобы следующий снимок её не показал.
+        state.current = None;
+    }
+    Ok(())
 }
 
 // ──────────────────────────── Воркер ────────────────────────────

@@ -4,15 +4,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DownloadProgressEvent, DownloadStarted } from '@/types/generated/download'
 import type { ProbeResult } from '@/types/generated/probe'
+import type { QueueSnapshot } from '@/types/generated/queue'
 import type { SidecarCheckReport } from '@/types/generated/sidecar'
 import type { YtDlpPrepared } from '@/types/generated/ytdlp'
 
 /**
- * Интеграционные тесты App.vue ↔ секция «Текущая загрузка» (эпик E3,
- * TL-45): собственный файл, а не довесок к `App.test.ts` — там общий
- * `capturedHandler` типизирован под `ytdlp://prepare` и его нельзя
- * переиспользовать для `download://progress` без конфликта типов; здесь
- * `listen` замокан маршрутизацией по имени события.
+ * Интеграционные тесты App.vue ↔ секция «Очередь загрузок» (эпик E3 →
+ * E4, TL-45 → TL-75): собственный файл, а не довесок к `App.test.ts` —
+ * там общий `capturedHandler` типизирован под `ytdlp://prepare` и его
+ * нельзя переиспользовать для `download://progress`/`queue://changed`
+ * без конфликта типов; здесь `listen` замокан маршрутизацией по имени
+ * события.
  *
  * Здесь же — диалог подтверждения выхода (Р-2, TL-46) с настоящей оконной
  * привязкой (TL-47/#49): `@tauri-apps/api/window` замокан прямо в этом
@@ -91,13 +93,27 @@ const resultB: ProbeResult = {
 
 const started: DownloadStarted = { taskId: 'task-1', phase: 'queued', plan: 'singleStream' }
 
+const EMPTY_QUEUE_SNAPSHOT: QueueSnapshot = { tasks: [], awaitingContinue: false }
+
 function emitProgress(payload: DownloadProgressEvent): void {
   handlers.get('download://progress')?.({ payload })
 }
 
+function emitQueueChanged(snapshot: QueueSnapshot): void {
+  handlers.get('queue://changed')?.({ payload: snapshot })
+}
+
 function routeInvoke(handlersByCommand: Record<string, () => Promise<unknown>>) {
+  const withDefaults: Record<string, () => Promise<unknown>> = {
+    // Снимок очереди (эпик E4, TL-75): `App.vue` запрашивает его в
+    // собственном `onMounted`, независимо от готовности yt-dlp/ffmpeg —
+    // дефолт «пусто», явно переданный обработчик той же команды имеет
+    // приоритет (тот же приём, что `ytdlp_update_state` в `App.test.ts`).
+    queue_state: () => Promise.resolve(EMPTY_QUEUE_SNAPSHOT),
+    ...handlersByCommand,
+  }
   invokeMock.mockImplementation((command: string) => {
-    const handler = handlersByCommand[command]
+    const handler = withDefaults[command]
     if (!handler) throw new Error(`unexpected invoke: ${command}`)
     return handler()
   })
@@ -144,13 +160,13 @@ async function probeAndSelect(wrapper: Awaited<ReturnType<typeof mountReady>>, u
   await wrapper.find('input[type="radio"]').setValue(true)
 }
 
-describe('App — секция «Текущая загрузка» (эпик E3, TL-45)', () => {
-  it('renders no download section at all before any task exists', async () => {
+describe('App — секция «Очередь загрузок» (эпик E3 → E4, TL-45 → TL-75)', () => {
+  it('renders no queue section at all before any task exists', async () => {
     const wrapper = await mountReady()
-    expect(wrapper.text()).not.toContain('Текущая загрузка')
+    expect(wrapper.text()).not.toContain('Очередь загрузок')
   })
 
-  it('starts a task on "Скачать", showing the panel with a title snapshot built from the card + quality', async () => {
+  it('starts a task on "Скачать", showing the panel with a title built from title+quality, and passes quality in the request (TL-75, эпик E4)', async () => {
     const wrapper = await mountReady()
     await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
 
@@ -162,6 +178,7 @@ describe('App — секция «Текущая загрузка» (эпик E3,
           title: 'Ролик A',
           streams: { audioFormatId: 'a' },
           size: { kind: 'unknown' },
+          quality: { kind: 'audioOnly', heightPx: undefined },
         },
       })
       return Promise.resolve(started)
@@ -170,11 +187,11 @@ describe('App — секция «Текущая загрузка» (эпик E3,
     await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
     await flushPromises()
 
-    expect(wrapper.text()).toContain('Текущая загрузка')
+    expect(wrapper.text()).toContain('Очередь загрузок')
     expect(wrapper.text()).toContain('«Ролик A» — Только аудио')
   })
 
-  it('survives replacement of the video card — the panel keeps its own title snapshot (С-13, требование п.6)', async () => {
+  it('starting a second task while the first is active puts it in the queue as waiting, not as a rejected duplicate (Ф-2 E4 — занятый слот больше не отказ)', async () => {
     const wrapper = await mountReady()
     await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
 
@@ -183,34 +200,26 @@ describe('App — секция «Текущая загрузка» (эпик E3,
     await flushPromises()
     expect(wrapper.text()).toContain('«Ролик A» — Только аудио')
 
-    // Новая ссылка приходит поверх идущей загрузки — С-13: разбор работает
-    // как обычно, задача не трогается.
+    // Новая ссылка поверх идущей загрузки — С-13: разбор работает как
+    // обычно, первая задача не трогается. Кнопка «Скачать» больше не
+    // заблокирована (TL-74) — постановка второй задачи штатна (Ф-2 E4).
     await probeAndSelect(wrapper, 'https://youtu.be/b', resultB)
-
-    expect(wrapper.text()).toContain('Ролик B')
-    expect(wrapper.text()).toContain('«Ролик A» — Только аудио')
-
-    // TL-74, Ф-2 E4: занятый слот больше не повод превентивно блокировать
-    // кнопку «Скачать» под новой карточкой — постановка в очередь теперь
-    // нормальный путь (реальная постановка — TL-73). Единственный
-    // оставшийся повод недоступности — не выбранное качество, а оно уже
-    // выбрано `probeAndSelect`.
     const downloadButton = wrapper.findAll('button').find((b) => b.text() === 'Скачать')
     expect(downloadButton?.attributes('disabled')).toBeUndefined()
-    expect(wrapper.text()).not.toContain('Уже идёт другая загрузка. Дождитесь')
+    expect(wrapper.text()).not.toContain('Уже идёт другая загрузка')
 
-    // И клик по ней не блокируется на уровне UI: вызов реально уходит
-    // в ядро, а не отклоняется молча фронтендом.
-    invokeMock.mockImplementationOnce((command: string) => {
-      expect(command).toBe('start_download')
-      return Promise.reject({ kind: 'alreadyActive', message: 'diag' })
-    })
+    invokeMock.mockImplementationOnce(() => Promise.resolve({ taskId: 'task-2', phase: 'queued', plan: 'singleStream' }))
     await downloadButton?.trigger('click')
     await flushPromises()
-    expect(invokeMock).toHaveBeenCalledWith('start_download', expect.objectContaining({}))
+
+    // Обе задачи видны: первая — активной панелью, вторая — честно
+    // ожидающей строкой (дизайн E4, «Пять состояний»).
+    expect(wrapper.text()).toContain('«Ролик A» — Только аудио')
+    expect(wrapper.text()).toContain('«Ролик B» — Только аудио')
+    expect(wrapper.text()).toContain('В очереди — начнётся после текущей загрузки')
   })
 
-  it('cancel → hide fully clears the panel and re-enables the download button', async () => {
+  it('cancel → hide: after the core confirms via queue://changed, the section disappears', async () => {
     const wrapper = await mountReady()
     await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
 
@@ -230,15 +239,25 @@ describe('App — секция «Текущая загрузка» (эпик E3,
     await wrapper.vm.$nextTick()
     expect(wrapper.text()).toContain('удалены')
 
+    invokeMock.mockImplementationOnce((command: string, args) => {
+      expect(command).toBe('dismiss_queue_task')
+      expect(args).toStrictEqual({ taskId: 'task-1' })
+      return Promise.resolve(undefined)
+    })
     await wrapper.findAll('button').find((b) => b.text() === 'Скрыть')?.trigger('click')
+    await flushPromises()
+
+    // «Скрыть» — команда ядра (дизайн E4, «Данные для API», п.5): список
+    // ещё не меняется локально до подтверждения снимком.
+    expect(wrapper.text()).toContain('Очередь загрузок')
+
+    emitQueueChanged({ tasks: [], awaitingContinue: false })
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.text()).not.toContain('Текущая загрузка')
-    const downloadButton = wrapper.findAll('button').find((b) => b.text() === 'Скачать')
-    expect(downloadButton?.attributes('disabled')).toBeUndefined()
+    expect(wrapper.text()).not.toContain('Очередь загрузок')
   })
 
-  it('resumes progress events after a failed phase via retry — the stream is not filtered/unsubscribed (требование п.3)', async () => {
+  it('resumes progress events after a failed phase via retry — the stream is not filtered/unsubscribed (требование п.3, не изменилось в E4)', async () => {
     const wrapper = await mountReady()
     await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
 
@@ -269,20 +288,130 @@ describe('App — секция «Текущая загрузка» (эпик E3,
   })
 })
 
+describe('App — три задачи подряд, критерий приёмки issue #82 (К-1)', () => {
+  it('three links probed and started one after another are all visible: active shows progress, waiting show their place', async () => {
+    const wrapper = await mountReady()
+
+    await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
+    invokeMock.mockImplementationOnce(() => Promise.resolve({ taskId: 'task-1', phase: 'downloading', plan: 'singleStream' }))
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+    emitProgress({ taskId: 'task-1', phase: 'downloading', state: 'running', percent: 30 })
+    await wrapper.vm.$nextTick()
+
+    await probeAndSelect(wrapper, 'https://youtu.be/b', resultB)
+    invokeMock.mockImplementationOnce(() => Promise.resolve({ taskId: 'task-2', phase: 'queued', plan: 'singleStream' }))
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+
+    const resultC: ProbeResult = {
+      title: 'Ролик C',
+      durationSecs: 40,
+      qualities: [{ kind: 'audioOnly', size: { kind: 'unknown' }, streams: { audioFormatId: 'c' } }],
+    }
+    await probeAndSelect(wrapper, 'https://youtu.be/c', resultC)
+    invokeMock.mockImplementationOnce(() => Promise.resolve({ taskId: 'task-3', phase: 'queued', plan: 'singleStream' }))
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('«Ролик A» — Только аудио')
+    expect(wrapper.text()).toContain('30 %')
+    expect(wrapper.text()).toContain('«Ролик B» — Только аудио')
+    expect(wrapper.text()).toContain('В очереди — начнётся после текущей загрузки')
+    expect(wrapper.text()).toContain('«Ролик C» — Только аудио')
+    expect(wrapper.text()).toContain('и ещё 1 задачи')
+  })
+})
+
+describe('App — отказ по дублю (Ф-8/Р-5, К-9)', () => {
+  it('rejects a repeat submission of the same video+quality with a typed error naming the existing task, and does not add a second task', async () => {
+    const wrapper = await mountReady()
+    await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
+
+    invokeMock.mockImplementationOnce(() => Promise.resolve(started))
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+
+    // Тот же ролик, то же качество — повторный клик на всё ещё активной карточке.
+    invokeMock.mockRejectedValueOnce({
+      kind: 'duplicateTask',
+      message: 'CORE-DIAGNOSTIC-NOT-SCREEN-TEXT',
+      existing: { taskId: 'task-1', title: 'Ролик A', quality: { kind: 'audioOnly' } },
+    })
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Такая задача уже в очереди')
+    expect(wrapper.text()).toContain('«Ролик A» — Только аудио уже стоит в очереди')
+    expect(wrapper.text()).not.toContain('CORE-DIAGNOSTIC-NOT-SCREEN-TEXT')
+    // Вторая задача в списке не появилась.
+    expect(wrapper.findAll('.download-panel, .queue-waiting-row')).toHaveLength(1)
+  })
+})
+
+describe('App — продолжение очереди после перезапуска (Р-3)', () => {
+  it('awaitingContinue shows the banner and blocks network calls until "Продолжить очередь" is clicked (мок команды resume_queue)', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () =>
+        Promise.resolve({
+          awaitingContinue: true,
+          tasks: [
+            { taskId: 'r1', title: 'Восстановленный ролик', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' },
+          ],
+        } satisfies QueueSnapshot),
+    })
+    const wrapper = await mountReady()
+
+    expect(wrapper.text()).toContain('Очередь приостановлена после перезапуска')
+    expect(wrapper.text()).toContain('начнётся первой, как только вы продолжите')
+    expect(invokeMock).not.toHaveBeenCalledWith('start_download', expect.anything())
+
+    invokeMock.mockImplementationOnce((command: string) => {
+      expect(command).toBe('resume_queue')
+      return Promise.resolve(undefined)
+    })
+    await wrapper.findAll('button').find((b) => b.text() === 'Продолжить очередь')?.trigger('click')
+    await flushPromises()
+
+    expect(invokeMock).toHaveBeenCalledWith('resume_queue')
+  })
+})
+
+describe('App — пауза на обновление yt-dlp между задачами (Р-7)', () => {
+  it('shows the honest pause line when the queue snapshot reports pauseReason: ytDlpUpdate', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () =>
+        Promise.resolve({
+          awaitingContinue: false,
+          pauseReason: 'ytDlpUpdate',
+          tasks: [
+            { taskId: 'w', title: 'Ожидающий ролик', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' },
+          ],
+        } satisfies QueueSnapshot),
+    })
+    const wrapper = await mountReady()
+
+    expect(wrapper.text()).toContain('Между загрузками устанавливается обновлённый yt-dlp')
+  })
+})
+
 describe('App — отказ команды виден на экране, не только в консоли (ревью TL-45)', () => {
   it('shows the typed command-error block (with the title from the table, no Retry button, no diagnostic message) when start_download rejects, and never renders a task panel', async () => {
     const wrapper = await mountReady()
     await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
 
-    invokeMock.mockRejectedValueOnce({ kind: 'alreadyActive', message: 'CORE-DIAGNOSTIC-NOT-SCREEN-TEXT' })
+    invokeMock.mockRejectedValueOnce({ kind: 'invalidUrl', message: 'CORE-DIAGNOSTIC-NOT-SCREEN-TEXT' })
     await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
     await flushPromises()
 
-    expect(wrapper.text()).toContain('Текущая загрузка')
-    expect(wrapper.text()).toContain('Уже идёт другая загрузка')
+    expect(wrapper.text()).toContain('Очередь загрузок')
+    expect(wrapper.text()).toContain('Ссылка не распознана')
     expect(wrapper.text()).not.toContain('CORE-DIAGNOSTIC-NOT-SCREEN-TEXT')
     expect(wrapper.findAll('button').some((b) => b.text() === 'Повторить')).toBe(false)
-    // Слот не занят — задача не была создана.
     const downloadButton = wrapper.findAll('button').find((b) => b.text() === 'Скачать')
     expect(downloadButton?.attributes('disabled')).toBeUndefined()
   })
@@ -299,7 +428,7 @@ describe('App — отказ команды виден на экране, не �
     await wrapper.findAll('button').find((b) => b.text() === 'Скрыть')?.trigger('click')
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.text()).not.toContain('Текущая загрузка')
+    expect(wrapper.text()).not.toContain('Очередь загрузок')
     expect(wrapper.text()).not.toContain('Ссылка не распознана')
   })
 
@@ -322,7 +451,7 @@ describe('App — отказ команды виден на экране, не �
     await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
     await flushPromises()
 
-    expect(wrapper.text()).toContain('Текущая загрузка')
+    expect(wrapper.text()).toContain('Очередь загрузок')
     expect(wrapper.text()).not.toContain('Ссылка не распознана')
   })
 })
@@ -340,7 +469,7 @@ describe('App — диалог подтверждения выхода, наст
     await flushPromises()
 
     expect(destroyMock).toHaveBeenCalledTimes(1)
-    expect(wrapper.text()).not.toContain('Загрузка ещё не завершена')
+    expect(wrapper.text()).not.toContain('Очередь ещё не завершена')
   })
 
   it('active task (Downloading): a close attempt shows the dialog with the panel\'s percent and does not destroy the window yet', async () => {
@@ -412,7 +541,7 @@ describe('App — диалог подтверждения выхода, наст
     await wrapper.vm.$nextTick()
     // Панель ещё видна («Скрыть» не нажато) — терминальность решает диалог,
     // а не видимость панели.
-    expect(wrapper.text()).toContain('Текущая загрузка')
+    expect(wrapper.text()).toContain('Очередь загрузок')
 
     await attemptWindowClose()
     await flushPromises()

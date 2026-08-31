@@ -622,6 +622,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "url": "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
                 "title": "Big Buck Bunny",
+                "quality": { "kind": "standard", "heightPx": 240 },
                 "streams": { "videoFormatId": "133", "audioFormatId": "139" },
                 "size": size,
             }))

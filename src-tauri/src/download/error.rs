@@ -16,7 +16,7 @@
 
 use crate::types::{
     DownloadCommandError, DownloadCommandErrorKind, DownloadError, DownloadErrorDetails,
-    DownloadErrorKind, PartialData, YtDlpFailureReason,
+    DownloadErrorKind, PartialData, QueueTaskRef, YtDlpFailureReason,
 };
 
 /// Почему скачивание не дошло до готового файла.
@@ -486,10 +486,6 @@ mod tests {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DownloadCommandRejection {
-    /// Слот занят задачей в нетерминальной фазе (С-13).
-    #[error("уже идёт другая загрузка")]
-    AlreadyActive,
-
     /// Задачи с таким идентификатором ядро не знает.
     ///
     /// Идентификатор уезжает в `message`, то есть в лог: он выдан самим
@@ -519,6 +515,22 @@ pub enum DownloadCommandRejection {
     /// Ссылка не является http(s)-адресом (Ф-1).
     #[error("ссылка не является http(s)-адресом")]
     InvalidUrl,
+
+    /// Тот же ролик с тем же пунктом качества уже стоит в очереди
+    /// нетерминальной задачей (Ф-8, Р-5 эпика E4).
+    ///
+    /// Ссылка на существующую задачу едет на провод, а не в текст:
+    /// текст отказа собирает UI по структурным полям, а `message`
+    /// остаётся диагностикой для лога (дизайн E4, «Отказ по дублю»).
+    /// Идентификатор в текст всё же попадает — по нему в логе видно,
+    /// какую именно задачу ядро посчитало дублем.
+    #[error("задача {} уже стоит в очереди с тем же качеством", existing.task_id)]
+    DuplicateTask { existing: QueueTaskRef },
+
+    /// Скрыть просят задачу, которая ещё не дошла до терминальной фазы
+    /// (Ф-1 эпика E4, дизайн: «скрывать можно только завершённое»).
+    #[error("скрыть можно только завершённую задачу")]
+    TaskNotFinished,
 }
 
 #[allow(dead_code)]
@@ -526,12 +538,15 @@ impl DownloadCommandRejection {
     /// Класс отказа для фронтенда.
     pub fn kind(&self) -> DownloadCommandErrorKind {
         match self {
-            Self::AlreadyActive => DownloadCommandErrorKind::AlreadyActive,
             Self::UnknownTask { .. } => DownloadCommandErrorKind::UnknownTask,
             Self::NotFailed => DownloadCommandErrorKind::NotFailed,
             Self::NotRetryable => DownloadCommandErrorKind::NotRetryable,
             Self::NoStreamsSelected => DownloadCommandErrorKind::NoStreamsSelected,
             Self::InvalidUrl => DownloadCommandErrorKind::InvalidUrl,
+            Self::DuplicateTask { existing } => DownloadCommandErrorKind::DuplicateTask {
+                existing: existing.clone(),
+            },
+            Self::TaskNotFinished => DownloadCommandErrorKind::TaskNotFinished,
         }
     }
 
@@ -549,13 +564,21 @@ impl DownloadCommandRejection {
 mod command_tests {
     use super::*;
 
-    /// Все шесть классов отказа команд с представителем каждого.
+    /// Ссылка на существующую задачу — образец для отказа по дублю.
+    fn existing_task() -> QueueTaskRef {
+        QueueTaskRef {
+            task_id: "dl-1".to_string(),
+            title: "Летний влог".to_string(),
+            quality: crate::types::SelectedQuality {
+                kind: crate::types::QualityKind::Standard,
+                height_px: Some(720),
+            },
+        }
+    }
+
+    /// Все семь классов отказа команд с представителем каждого.
     fn all_rejections() -> Vec<(DownloadCommandRejection, DownloadCommandErrorKind)> {
         vec![
-            (
-                DownloadCommandRejection::AlreadyActive,
-                DownloadCommandErrorKind::AlreadyActive,
-            ),
             (
                 DownloadCommandRejection::UnknownTask {
                     task_id: "task-1".to_string(),
@@ -578,6 +601,18 @@ mod command_tests {
                 DownloadCommandRejection::InvalidUrl,
                 DownloadCommandErrorKind::InvalidUrl,
             ),
+            (
+                DownloadCommandRejection::DuplicateTask {
+                    existing: existing_task(),
+                },
+                DownloadCommandErrorKind::DuplicateTask {
+                    existing: existing_task(),
+                },
+            ),
+            (
+                DownloadCommandRejection::TaskNotFinished,
+                DownloadCommandErrorKind::TaskNotFinished,
+            ),
         ]
     }
 
@@ -585,7 +620,7 @@ mod command_tests {
     fn maps_every_rejection_to_its_own_contract_kind() {
         let rejections = all_rejections();
 
-        assert_eq!(rejections.len(), 6);
+        assert_eq!(rejections.len(), 7);
 
         for (rejection, expected_kind) in rejections {
             assert_eq!(rejection.kind(), expected_kind);
@@ -609,7 +644,9 @@ mod command_tests {
                 "DownloadCommandRejection",
                 "DownloadCommandErrorKind",
                 "DownloadErrorKind",
-                "AlreadyActive",
+                "DuplicateTask",
+                "TaskNotFinished",
+                "QueueTaskRef",
                 "UnknownTask",
                 "NotFailed",
                 "NotRetryable",

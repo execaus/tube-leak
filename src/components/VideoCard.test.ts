@@ -54,7 +54,7 @@ describe('VideoCard — кнопка «Скачать» (эпик E3, дизай
     expect(wrapper.find('.video-card__download-hint').exists()).toBe(false)
   })
 
-  it('becomes enabled once a quality row is selected, with no hint about any other active download (TL-74, Ф-2 E4 — постановка при занятом слоте больше не отказ)', async () => {
+  it('becomes enabled once a quality row is selected, with no hint about any other active download (TL-74/TL-75, Ф-2 E4 — постановка при занятом слоте больше не отказ)', async () => {
     const wrapper = mount(VideoCard, { props: { result: full } })
     await wrapper.find('input[type="radio"]').setValue(true)
 
@@ -68,7 +68,7 @@ describe('VideoCard — кнопка «Скачать» (эпик E3, дизай
     expect(downloadButton(wrapper)?.attributes('aria-describedby')).toBeUndefined()
   })
 
-  it('emits download with the title, the streams of the selected item, and its quality label', async () => {
+  it('emits download with the title, the streams of the selected item, and its structured quality (kind/heightPx, TL-75, эпик E4)', async () => {
     const wrapper = mount(VideoCard, { props: { result: full } })
     await wrapper.find('input[type="radio"]').setValue(true)
     await downloadButton(wrapper)?.trigger('click')
@@ -79,9 +79,23 @@ describe('VideoCard — кнопка «Скачать» (эпик E3, дизай
           title: full.title,
           streams: { audioFormatId: 'a' },
           size: { kind: 'known', bytes: 14 * 1024 ** 2 },
-          qualityLabel: 'Только аудио',
+          quality: { kind: 'audioOnly', heightPx: undefined },
         },
       ],
     ])
+  })
+
+  it('emits the exact heightPx of a standard step (TL-75) — needed to rebuild the queue title after a restart', async () => {
+    const withStandard: ProbeResult = {
+      ...full,
+      qualities: [{ kind: 'standard', heightPx: 1080, size: { kind: 'unknown' }, streams: { videoFormatId: 'v' } }],
+    }
+    const wrapper = mount(VideoCard, { props: { result: withStandard } })
+    await wrapper.find('input[type="radio"]').setValue(true)
+    await downloadButton(wrapper)?.trigger('click')
+
+    expect(wrapper.emitted('download')?.[0]?.[0]).toMatchObject({
+      quality: { kind: 'standard', heightPx: 1080 },
+    })
   })
 })

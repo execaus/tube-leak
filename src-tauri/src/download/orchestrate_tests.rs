@@ -23,7 +23,7 @@ use crate::download::merge::MERGE_TIMEOUT_SECS;
 use crate::download::progress::parse_line;
 use crate::download::retry::{MAX_ATTEMPTS, NO_PROGRESS_TIMEOUT, SOCKET_TIMEOUT_SECS};
 use crate::sidecar::RunOutput;
-use crate::types::{QualitySize, YtDlpFailureReason};
+use crate::types::{QualityKind, QualitySize, SelectedQuality, YtDlpFailureReason};
 
 // ─────────────────────────── Оснастка ───────────────────────────
 
@@ -365,6 +365,10 @@ fn request(streams: QualityStreams) -> StartDownloadRequest {
     StartDownloadRequest {
         url: URL.to_string(),
         title: TITLE.to_string(),
+        quality: SelectedQuality {
+            kind: QualityKind::Standard,
+            height_px: Some(720),
+        },
         streams,
         size: QualitySize::Known { bytes: 22_157_855 },
     }
@@ -1917,21 +1921,31 @@ async fn a_new_worker_finishes_off_the_previous_one_before_starting_its_own() {
 }
 
 #[tokio::test]
-async fn a_second_start_is_refused_while_the_slot_is_busy() {
-    // С-13: старт второй загрузки при активной первой недоступен, и
-    // проверка живёт в ядре, а не в неактивной кнопке.
+async fn a_second_start_is_no_longer_refused_while_the_slot_is_busy() {
+    // Ф-2 эпика E4: класс отказа «слот занят» ушёл из контракта, и
+    // постановка при активной задаче перестала быть ошибкой. Целевое
+    // поведение — хвост очереди (TL-73); проверяется здесь только то,
+    // что относится к контракту: команда **не отказывает** и отдаёт
+    // новую задачу.
+    //
+    // Промежуточное состояние до планировщика названо прямо, а не
+    // подразумевается: слот один, поэтому новая задача его занимает, а
+    // предшественник уезжает воркеру как `previous` и добивается им до
+    // терминальной фазы (`a_new_worker_finishes_off_the_previous_one_before_starting_its_own`
+    // проверяет именно это). Ни один сценарий эпика E4 такого не хочет —
+    // и ни один не наступит, пока TL-73 не поставит очередь.
     let session = Arc::new(DownloadSession::new());
     let first = new_task(&session, request(streams(Some("133"), Some("139")))).await;
 
-    let rejection = start_download(&session, request(streams(None, Some("140"))), NoopWorker)
+    let started = start_download(&session, request(streams(None, Some("140"))), NoopWorker)
         .await
-        .expect_err("слот занят");
+        .expect("постановка при занятом слоте — не отказ (Ф-2)");
 
-    assert!(matches!(rejection, DownloadCommandRejection::AlreadyActive));
+    assert_ne!(started.task_id, first.id, "новая задача — новый id");
     assert_eq!(
         session.current().expect("слот").id,
-        first.id,
-        "отклонённый вызов не подменяет задачу в слоте"
+        started.task_id,
+        "принятая постановка обязана быть видна ядру"
     );
 }
 
@@ -1978,15 +1992,20 @@ async fn cancelling_a_finished_task_is_not_an_error() {
 }
 
 #[tokio::test]
-async fn an_unknown_task_id_is_told_apart_from_a_busy_slot() {
+async fn an_unknown_task_id_is_refused_the_same_way_whatever_the_slot_holds() {
     let session = Arc::new(DownloadSession::new());
     let task = new_task(&session, request(streams(None, Some("140")))).await;
 
-    // Слот занят другой задачей: это не «задачи не существовало».
+    // До E4 у чужого идентификатора было два исхода: при занятом слоте
+    // ядро отвечало «место занято другой» (`alreadyActive`), при
+    // свободном — «задачи не знаю». Ф-2 убрала первый класс из
+    // контракта, и различие исчезло вместе с ним: вызывающему оба
+    // случая говорят одно и то же — задачи с таким идентификатором у
+    // ядра нет.
     let busy = cancel_download(&session, "dl-чужой")
         .await
         .expect_err("чужой id");
-    assert!(matches!(busy, DownloadCommandRejection::AlreadyActive));
+    assert!(matches!(busy, DownloadCommandRejection::UnknownTask { .. }));
 
     task.set_progress(DownloadProgress::Cancelled {
         partial_data: PartialData::NothingCreated,

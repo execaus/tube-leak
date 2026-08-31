@@ -8,8 +8,9 @@
  *
  * Чисто презентационный блок, тот же приём, что `ProbeErrorBlock` в E2:
  * заголовок и пояснение по классу (`downloadCommandErrorTexts.ts`), без
- * кнопки «Повторить» — ни один из шести классов не решается повтором
- * того же вызова (см. doc `DownloadCommandErrorKind` в
+ * кнопки «Повторить» — ни один из семи классов (эпик E4, TL-70/TL-75:
+ * `alreadyActive` убран, `duplicateTask`/`taskNotFinished` добавлены) не
+ * решается повтором того же вызова (см. doc `DownloadCommandErrorKind` в
  * `src/types/generated/download.ts`).
  */
 import { computed } from 'vue'
@@ -31,7 +32,7 @@ defineEmits<{
 const text = computed(() =>
   props.error.kind === undefined
     ? NON_CONTRACTUAL_COMMAND_ERROR_TEXT
-    : getDownloadCommandErrorText(props.error.kind),
+    : getDownloadCommandErrorText(props.error),
 )
 </script>
 

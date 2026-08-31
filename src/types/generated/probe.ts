@@ -118,6 +118,11 @@ heightPx?: number, size: QualitySize, streams: QualityStreams, };
  *
  * Лестница показывает **только доступные** строки: пункта, которого у
  * ролика нет, в списке нет вовсе — ни выключенного, ни с пометкой (Р-1).
+ *
+ * **Тип ходит в обе стороны границы** с эпика E4: он же — половина
+ * [`SelectedQuality`], которую фронтенд возвращает вместе с выбранным
+ * пунктом ([`StartDownloadRequest::quality`]), чтобы ядро могло назвать
+ * задачу очереди после перезапуска приложения. Отсюда `Deserialize`.
  */
 export type QualityKind = "standard" | "maxAvailable" | "audioOnly";
 

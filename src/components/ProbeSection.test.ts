@@ -217,7 +217,7 @@ describe('ProbeSection — ретрансляция запроса скачив�
           title: 'Ролик A',
           streams: { audioFormatId: 'a' },
           size: { kind: 'unknown' },
-          qualityLabel: 'Только аудио',
+          quality: { kind: 'audioOnly', heightPx: undefined },
         },
       ],
     ])
@@ -243,7 +243,7 @@ describe('ProbeSection — ретрансляция запроса скачив�
     expect(emitted?.[0]?.[0]).toMatchObject({ url: 'https://youtu.be/a' })
   })
 
-  it('leaves the download button enabled once a quality is picked — no downloadBlocked prop left to forward (TL-74, Ф-2 E4)', async () => {
+  it('leaves the download button enabled once a quality is picked — no downloadBlocked prop left to forward (TL-74/TL-75, Ф-2 E4)', async () => {
     const wrapper = mount(ProbeSection, { props: { ytDlpState: 'ready' } })
     invokeMock.mockResolvedValueOnce(resultA)
 

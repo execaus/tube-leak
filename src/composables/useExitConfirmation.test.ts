@@ -42,6 +42,10 @@ const request: StartDownloadRequest = {
   title: 'Как приручить дракона',
   streams: { videoFormatId: 'v1080', audioFormatId: 'a' },
   size: { kind: 'known', bytes: 303_038_464 },
+  // TL-70/TL-75 (эпик E4): поле обязательно с контракта TL-70 — здесь
+  // добавлено чисто механически, чтобы файл компилировался; поведение
+  // диалога выхода по срезу очереди — TL-76 (issue #83), не эта задача.
+  quality: { kind: 'standard', heightPx: 1080 },
 }
 
 const started: DownloadStarted = { taskId: 'task-1', phase: 'downloading', plan: 'videoAndAudio' }
@@ -100,7 +104,7 @@ describe('useExitConfirmation — когда показывается диало
     const port = createFakePort()
     invokeMock.mockResolvedValueOnce(started)
     const store = useDownloadTaskStore()
-    await store.start(request, '«Как приручить дракона» — 1080p')
+    await store.start(request)
     emit({ taskId: 'task-1', phase: 'done', fileName: 'x.mp4' })
 
     const { result } = withSetup(() => useExitConfirmation(port))
@@ -114,7 +118,7 @@ describe('useExitConfirmation — когда показывается диало
     const port = createFakePort()
     invokeMock.mockResolvedValueOnce(started)
     const store = useDownloadTaskStore()
-    await store.start(request, '«Как приручить дракона» — 1080p')
+    await store.start(request)
     emit({ taskId: 'task-1', phase: 'cancelled', partialData: 'removed' })
 
     const { result } = withSetup(() => useExitConfirmation(port))
@@ -128,7 +132,7 @@ describe('useExitConfirmation — когда показывается диало
     const port = createFakePort()
     invokeMock.mockResolvedValueOnce(started)
     const store = useDownloadTaskStore()
-    await store.start(request, '«Как приручить дракона» — 1080p')
+    await store.start(request)
     emit({ taskId: 'task-1', phase: 'downloading', state: 'running', percent: 40 })
 
     const { result } = withSetup(() => useExitConfirmation(port))
@@ -143,7 +147,7 @@ describe('useExitConfirmation — «Остаться» против «Всё р�
   async function setupActiveTask(port: ReturnType<typeof createFakePort>) {
     invokeMock.mockResolvedValueOnce(started)
     const store = useDownloadTaskStore()
-    await store.start(request, '«Как приручить дракона» — 1080p')
+    await store.start(request)
     emit({ taskId: 'task-1', phase: 'downloading', state: 'running', percent: 40 })
     const setup = withSetup(() => useExitConfirmation(port))
     port.attempt()

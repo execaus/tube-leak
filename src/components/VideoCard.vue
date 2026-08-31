@@ -8,7 +8,7 @@
  * Превью — `alt=""` (декоративное): название уже показано текстом рядом,
  * иначе скринридер зачитал бы его дважды подряд.
  *
- * # Кнопка «Скачать» (эпик E3, дизайн «Кнопка Скачать»; правка TL-74, Ф-2 E4)
+ * # Кнопка «Скачать» (эпик E3, дизайн «Кнопка Скачать»; правка TL-74/TL-75, Ф-2 E4)
  *
  * Живёт здесь же, под лестницей качеств — несколько строк, физически
  * часть той же карточки, не отдельная ui-задача (декомпозиция E3, «Что
@@ -17,22 +17,30 @@
  * подсказки не требует). Блокировка на случай «уже идёт другая задача»
  * (`downloadBlocked`) и её текст-подсказка — из дизайна E3 — сняты TL-74
  * как прямое следствие Ф-2 E4: постановка при занятом слоте больше не
- * отказ, а нормальный путь (очередь, TL-73), и превентивно объяснять на
+ * отказ, а нормальный путь (очередь, эпик E4), и превентивно объяснять на
  * карточке нечего. Единственный оставшийся повод отказа — дубль (Ф-8
- * E4) — виден после клика через `DownloadCommandErrorBlock`, не здесь
- * (TL-75).
+ * E4) — виден после клика через `DownloadCommandErrorBlock` (TL-75), не
+ * здесь.
  *
  * Сама карточка не хранит и не запускает задачу скачивания — она лишь
  * эмитит снимок «что скачивать» в момент клика (заголовок, потоки,
  * подпись качества); что происходит с этим снимком дальше (стор
  * `useDownloadTaskStore`, независимая от карточки панель) её не касается —
  * это и есть требование С-13 «панель переживает замену карточки».
+ *
+ * `quality` в эмитируемом payload (TL-75, эпик E4) — тот же
+ * {@link import('@/types/generated/queue').SelectedQuality}, что уносит
+ * `StartDownloadRequest.quality`: два поля выбранного пункта лестницы
+ * (`kind`/`heightPx`), без которых заголовок задачи не собрать заново
+ * после перезапуска приложения (карточки и лестницы к этому моменту уже
+ * нет, см. doc `StartDownloadRequest.quality` в
+ * `src/types/generated/download.ts`).
  */
 import { computed, ref } from 'vue'
 
 import type { ProbeResult, QualityItem, QualitySize, QualityStreams } from '@/types/generated/probe'
+import type { SelectedQuality } from '@/types/generated/queue'
 import { formatDuration } from '@/utils/formatDuration'
-import { qualityLabel } from '@/utils/qualityLabel'
 
 import QualityLadder from './QualityLadder.vue'
 import VideoThumbnail from './VideoThumbnail.vue'
@@ -42,7 +50,9 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  download: [payload: { title: string; streams: QualityStreams; size: QualitySize; qualityLabel: string }]
+  download: [
+    payload: { title: string; streams: QualityStreams; size: QualitySize; quality: SelectedQuality },
+  ]
 }>()
 
 const selected = ref<QualityItem>()
@@ -64,9 +74,10 @@ function onDownloadClick(): void {
     // прогресса в ядре (TL-41); берётся отсюда же, где и `streams`, не
     // собирается отдельно (правило контракта `StartDownloadRequest.size`).
     size: item.size,
-    qualityLabel: qualityLabel(item),
+    quality: { kind: item.kind, heightPx: item.heightPx },
   })
 }
+
 </script>
 
 <template>
