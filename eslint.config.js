@@ -28,6 +28,20 @@ export default tseslint.config(
     },
     rules: {
       'vue/multi-word-component-names': 'off',
+      'no-restricted-imports': [
+        'error',
+        {
+          paths: [
+            {
+              name: '@tauri-apps/api',
+              message:
+                'Импортируй из подпути пакета (например, "@tauri-apps/api/core" или "@tauri-apps/api/event"), а не из корня. ' +
+                'Корневой импорт хуже разбирается сторожем ACL (src-tauri/tests/frontend_acl.rs), который выводит список ' +
+                'использованных IPC-команд из импортов, — необходимость выдать разрешение от формы импорта не зависит.',
+            },
+          ],
+        },
+      ],
     },
   },
 )
