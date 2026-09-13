@@ -139,6 +139,12 @@ pub mod filename;
 mod fixtures;
 #[allow(dead_code)]
 pub mod merge;
+// Шаблон имени (TL-86, E5) готов раньше вызывающих: хранилище настроек
+// (TL-87) валидирует им шаблон, команды настроек (TL-91) строят
+// предпросмотр, оркестрация (TL-89) — основу имени. Глушитель снимает та
+// из них, что начнёт звать первой.
+#[allow(dead_code)]
+pub mod name_template;
 pub mod orchestrate;
 #[allow(dead_code)]
 pub mod progress;

@@ -650,14 +650,14 @@ fn fitted_extension(extension: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashSet;
 
     /// Названия, в которых нет ничего запрещённого. Санитизация обязана
     /// оставить их ровно такими, какие они есть: правило, портящее
     /// обычное имя, хуже отсутствия правила.
-    const ORDINARY_TITLES: [&str; 11] = [
+    pub(crate) const ORDINARY_TITLES: [&str; 11] = [
         "Как приручить дракона (2010)",
         "Rust 1.98 — что нового",
         "S01E02. Начало",
@@ -672,7 +672,7 @@ mod tests {
     ];
 
     /// Названия, каждое из которых ломает наивную склейку пути.
-    const HOSTILE_TITLES: [&str; 16] = [
+    pub(crate) const HOSTILE_TITLES: [&str; 16] = [
         "../../../etc/passwd",
         "..\\..\\Windows\\System32",
         "C:\\Users\\me\\file",

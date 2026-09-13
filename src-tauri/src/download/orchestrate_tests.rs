@@ -727,7 +727,7 @@ async fn the_url_is_the_last_argument_and_stands_after_the_separator() {
 /// Каждое снято прямым запуском вложенного бинарника (`--print filename`,
 /// macOS, пин 2026.08.19) — это не выдуманные строки, а измеренные
 /// раскрытия; таблица с результатами в doc `template_safe`.
-const HOSTILE_TITLES: [&str; 9] = [
+pub(crate) const HOSTILE_TITLES: [&str; 9] = [
     "Скидка 100%(ext)s навсегда",
     "A$HOME B",
     "$HOME-leading",
