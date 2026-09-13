@@ -21,7 +21,7 @@ use crate::os_reveal::{
     reveal_with, CommandArgs, LaunchCause, Launcher, LauncherFailure, LinuxTools, RevealCommand,
     TargetOs,
 };
-use crate::storage::history::{NewHistoryRecord, HISTORY_FILE_NAME};
+use crate::storage::history::{HistoryOpenError, NewHistoryRecord, ShownId, HISTORY_FILE_NAME};
 use crate::types::{
     HistoryFileStatus, HistoryNotice, HistoryWriteFailure, QualityKind, SelectedQuality,
 };
@@ -40,7 +40,7 @@ struct Scene {
 fn scene() -> Scene {
     let data = tempdir().expect("временный каталог данных");
     let downloads = tempdir().expect("временная папка назначения");
-    let state = Arc::new(HistoryState::open(Ok(data.path().to_path_buf())));
+    let state = Arc::new(HistoryState::open_isolated(Ok(data.path().to_path_buf())));
     Scene {
         data,
         downloads,
@@ -76,9 +76,15 @@ fn insert_with_file(state: &HistoryState, folder: &Path, n: u64) -> String {
 }
 
 async fn first_page(state: &Arc<HistoryState>) -> HistoryPage {
-    page_in(Arc::clone(state), None, None, HistoryStore::page)
-        .await
-        .expect("страница читается")
+    page_in(
+        Arc::clone(state),
+        None,
+        || None,
+        HistoryStore::page,
+        log_to_stderr,
+    )
+    .await
+    .expect("страница читается")
 }
 
 /// Обход ФС: относительный путь → содержимое файла (`None` у каталога).
@@ -111,7 +117,7 @@ async fn notices_wait_through_a_cursor_request_and_arrive_both_on_the_first_page
     let data = tempdir().expect("каталог данных");
     let downloads = tempdir().expect("папка назначения");
     fs::write(data.path().join(HISTORY_FILE_NAME), "не база ".repeat(40)).expect("мусор");
-    let state = Arc::new(HistoryState::open(Ok(data.path().to_path_buf())));
+    let state = Arc::new(HistoryState::open_isolated(Ok(data.path().to_path_buf())));
     let id = insert_with_file(&state, downloads.path(), 1);
     store(&state).record_write_failure(HistoryWriteFailure::DiskFull);
 
@@ -122,8 +128,9 @@ async fn notices_wait_through_a_cursor_request_and_arrive_both_on_the_first_page
     let with_cursor = page_in(
         Arc::clone(&state),
         Some(issued_cursor),
-        None,
+        || None,
         HistoryStore::page,
+        log_to_stderr,
     )
     .await
     .expect("страница с курсором");
@@ -153,39 +160,79 @@ async fn notices_wait_through_a_cursor_request_and_arrive_both_on_the_first_page
     );
 }
 
+/// Сток лога для `page_in`, запоминающий строки.
+#[derive(Clone, Default)]
+struct LogSink {
+    lines: Arc<Mutex<Vec<String>>>,
+}
+
+impl LogSink {
+    fn sink(&self) -> impl Fn(&str) + Clone + Send + 'static {
+        let lines = Arc::clone(&self.lines);
+        move |line: &str| lines.lock().expect("мьютекс").push(line.to_owned())
+    }
+
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.lines.lock().expect("мьютекс"))
+    }
+}
+
 /// Контракт `HistoryCursor`: курсор с нецелым `id` — пустая страница без
-/// `nextCursor`, не отказ, и пометки он не гасит. Строка лога называет класс.
+/// `nextCursor`, не отказ, и пометки он не гасит. Строка с классом уходит в
+/// лог на самом вызове `page_in`, а выданный ядром курсор лога не даёт.
 #[tokio::test]
 async fn a_foreign_cursor_gives_an_empty_page_and_is_logged_with_its_class() {
     let scene = scene();
     insert_with_file(&scene.state, scene.downloads.path(), 1);
     store(&scene.state).record_write_failure(HistoryWriteFailure::NoAccess);
+    let log = LogSink::default();
 
     for id in ["чужой", "1.5", "007", ""] {
         let cursor = HistoryCursor {
             finished_at_unix_secs: 5_000,
             id: id.to_owned(),
         };
-        let line = foreign_cursor_log(&cursor).expect("курсор чужой");
-        assert!(line.contains("foreignCursor"), "{line}");
-
         let page = page_in(
             Arc::clone(&scene.state),
             Some(cursor),
-            None,
+            || None,
             HistoryStore::page,
+            log.sink(),
         )
         .await
         .expect("пустая страница, а не отказ");
         assert_eq!(page.entries, Vec::new(), "{id:?}");
         assert_eq!(page.next_cursor, None, "{id:?}");
         assert_eq!(page.notices, Vec::new(), "{id:?}");
+
+        let lines = log.take();
+        assert_eq!(lines.len(), 1, "{id:?}: {lines:?}");
+        assert!(lines[0].contains("foreignCursor"), "{}", lines[0]);
+        assert!(
+            lines[0].contains(&format!("{id:?}")),
+            "id не назван: {}",
+            lines[0]
+        );
     }
 
     let issued = HistoryCursor {
         finished_at_unix_secs: 5_000,
         id: "12".to_owned(),
     };
+    page_in(
+        Arc::clone(&scene.state),
+        Some(issued.clone()),
+        || None,
+        HistoryStore::page,
+        log.sink(),
+    )
+    .await
+    .expect("страница по выданному курсору");
+    assert_eq!(
+        log.take(),
+        Vec::<String>::new(),
+        "выданный курсор залогирован"
+    );
     assert_eq!(foreign_cursor_log(&issued), None);
     let long = HistoryCursor {
         finished_at_unix_secs: 1,
@@ -235,11 +282,13 @@ async fn entries_carry_the_folder_display_by_the_resolved_downloads() {
     insert_with_file(&scene.state, scene.downloads.path(), 1);
     insert_with_file(&scene.state, other.path(), 2);
 
+    let system_downloads = scene.downloads.path().to_path_buf();
     let page = page_in(
         Arc::clone(&scene.state),
         None,
-        Some(scene.downloads.path().to_path_buf()),
+        move || Some(system_downloads),
         HistoryStore::page,
+        log_to_stderr,
     )
     .await
     .expect("страница");
@@ -264,9 +313,13 @@ async fn entries_carry_the_folder_display_by_the_resolved_downloads() {
 #[tokio::test]
 async fn a_panicking_read_is_a_typed_refusal() {
     let scene = scene();
-    let refused = page_in(Arc::clone(&scene.state), None, None, |_, _| {
-        panic!("чтение запаниковало (ожидаемо в тесте)")
-    })
+    let refused = page_in(
+        Arc::clone(&scene.state),
+        None,
+        || None,
+        |_, _| panic!("чтение запаниковало (ожидаемо в тесте)"),
+        log_to_stderr,
+    )
     .await
     .expect_err("паника — отказ");
     assert_eq!(refused.reason, HistoryUnavailableReason::NoAccess);
@@ -290,12 +343,18 @@ async fn a_newer_base_makes_every_command_answer_unavailable() {
             .expect("фикстура-версия");
     }
     let before = fs::read(&path).expect("байты фикстуры");
-    let state = Arc::new(HistoryState::open(Ok(data.path().to_path_buf())));
+    let state = Arc::new(HistoryState::open_isolated(Ok(data.path().to_path_buf())));
     let unavailable = HistoryUnavailableReason::NewerVersion;
 
-    let page = page_in(Arc::clone(&state), None, None, HistoryStore::page)
-        .await
-        .expect_err("история недоступна");
+    let page = page_in(
+        Arc::clone(&state),
+        None,
+        || None,
+        HistoryStore::page,
+        log_to_stderr,
+    )
+    .await
+    .expect_err("история недоступна");
     assert_eq!(page.reason, unavailable);
     assert!(!page.message.is_empty());
 
@@ -342,8 +401,10 @@ async fn a_newer_base_makes_every_command_answer_unavailable() {
 
 #[tokio::test]
 async fn an_unresolved_data_dir_is_no_access() {
-    let state = Arc::new(HistoryState::open(Err("нет домашнего каталога".to_owned())));
-    let page = page_in(state, None, None, HistoryStore::page)
+    let state = Arc::new(HistoryState::open_isolated(Err(
+        "нет домашнего каталога".to_owned()
+    )));
+    let page = page_in(state, None, || None, HistoryStore::page, log_to_stderr)
         .await
         .expect_err("история недоступна");
     assert_eq!(page.reason, HistoryUnavailableReason::NoAccess);
@@ -672,7 +733,7 @@ async fn reading_a_page_does_not_block_the_runtime() {
     let page = page_in(
         Arc::clone(&scene.state),
         None,
-        None,
+        || None,
         move |store, cursor| {
             assert!(
                 wait(),
@@ -680,11 +741,137 @@ async fn reading_a_page_does_not_block_the_runtime() {
             );
             store.page(cursor)
         },
+        log_to_stderr,
     )
     .await
     .expect("страница");
     assert_eq!(page.entries.len(), 1);
     neighbour.await.expect("сосед завершился");
+}
+
+/// С-1 ревью: резолв системной «Загрузки» — обращение к ОС, и он идёт вне
+/// потока рантайма вместе с чтением.
+#[tokio::test(flavor = "current_thread")]
+async fn resolving_the_downloads_folder_does_not_block_the_runtime() {
+    let scene = scene();
+    insert_with_file(&scene.state, scene.downloads.path(), 1);
+    let (neighbour, wait) = rendezvous();
+    let system_downloads = scene.downloads.path().to_path_buf();
+
+    let page = page_in(
+        Arc::clone(&scene.state),
+        None,
+        move || {
+            assert!(
+                wait(),
+                "резолв «Загрузок» выполнялся на потоке рантайма: соседняя задача не получила хода"
+            );
+            Some(system_downloads)
+        },
+        HistoryStore::page,
+        log_to_stderr,
+    )
+    .await
+    .expect("страница");
+    assert_eq!(
+        page.entries[0].folder_display,
+        FolderDisplay::SystemDownloads,
+        "резолвер не дошёл до folderDisplay"
+    );
+    neighbour.await.expect("сосед завершился");
+}
+
+/// Эксклюзивный замок SQLite вторым соединением; снимает его соседняя
+/// задача того же однопоточного рантайма. Если операция идёт на потоке
+/// рантайма, сосед хода не получит: операция прождёт таймаут занятости
+/// (5 с у rusqlite) и откажет `writeFailed`.
+fn exclusive_lock_released_by_a_neighbour(data: &Path) -> tokio::task::JoinHandle<()> {
+    let blocker = Connection::open(data.join(HISTORY_FILE_NAME)).expect("второе соединение");
+    blocker
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("эксклюзивный замок");
+    tokio::spawn(async move {
+        blocker.execute_batch("COMMIT").expect("снять замок");
+    })
+}
+
+/// С-2 ревью (шов ревьюера TL-90).
+#[tokio::test(flavor = "current_thread")]
+async fn deleting_does_not_block_the_runtime() {
+    let scene = scene();
+    let id = insert_with_file(&scene.state, scene.downloads.path(), 1);
+    let release = exclusive_lock_released_by_a_neighbour(scene.data.path());
+
+    delete_in(Arc::clone(&scene.state), id)
+        .await
+        .expect("удаление после снятия замка: работа шла вне потока рантайма");
+    release.await.expect("сосед завершился");
+    assert!(first_page(&scene.state).await.entries.is_empty());
+}
+
+/// С-2 ревью: то же для очистки.
+#[tokio::test(flavor = "current_thread")]
+async fn clearing_does_not_block_the_runtime() {
+    let scene = scene();
+    insert_with_file(&scene.state, scene.downloads.path(), 1);
+    insert_with_file(&scene.state, scene.downloads.path(), 2);
+    let release = exclusive_lock_released_by_a_neighbour(scene.data.path());
+
+    clear_in(Arc::clone(&scene.state))
+        .await
+        .expect("очистка после снятия замка: работа шла вне потока рантайма");
+    release.await.expect("сосед завершился");
+    assert!(first_page(&scene.state).await.entries.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Непроверенный id в логе и в message (М-1)
+// ---------------------------------------------------------------------------
+
+/// Перевод строки внутри `id` не начинает в тексте новую строку, а длинный
+/// `id` обрезан. Проверяются `ShownId` и `message` двух команд, которые
+/// печатают непроверенный `id`. Строки лога `delete_in`/`show_in` строятся
+/// тем же `ShownId`, но на вызове не перехватываются.
+#[tokio::test]
+async fn an_unverified_id_neither_forges_a_line_nor_bloats_the_text() {
+    assert_eq!(ShownId("12").to_string(), "\"12\"");
+    let exact = "7".repeat(ShownId::MAX_CHARS);
+    assert_eq!(ShownId(&exact).to_string(), format!("\"{exact}\""));
+
+    let forged = format!(
+        "1\nhistory_page: подделанная строка\r{}",
+        "9".repeat(10_000)
+    );
+    let shown = ShownId(&forged).to_string();
+    assert!(!shown.contains(['\n', '\r']), "{shown}");
+    assert!(shown.contains("\\n") && shown.contains("\\r"), "{shown}");
+    assert!(shown.ends_with('…'), "{shown}");
+    assert!(shown.chars().count() < 60, "{shown}");
+
+    let scene = scene();
+    let delete = delete_in(Arc::clone(&scene.state), forged.clone())
+        .await
+        .expect_err("записи нет");
+    assert_eq!(delete.kind, HistoryCommandErrorKind::UnknownRecord);
+    let recorder = Recorder::default();
+    let show = show_in(
+        Arc::clone(&scene.state),
+        forged,
+        recorder.reveal_on(TargetOs::MacOs),
+    )
+    .await
+    .expect_err("записи нет");
+    assert_eq!(show.kind, ShowInFolderErrorKind::UnknownRecord);
+
+    for message in [&delete.message, &show.message] {
+        assert!(!message.contains(['\n', '\r']), "{message}");
+        assert!(message.contains(&shown), "id не через ShownId: {message}");
+        assert!(
+            message.chars().count() < 120,
+            "{} знаков",
+            message.chars().count()
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -756,14 +943,74 @@ async fn no_command_opens_the_store_a_second_time() {
     assert!(!db.exists(), "clear_history открыла базу заново");
 }
 
-/// Сторож по исходникам: `HistoryStore::open(` в продакшен-коде зовётся
-/// ровно в одном месте — в `HistoryState::open`. Второе открытие в `main.rs`
-/// или в оркестрации поведенческий сторож не увидел бы.
+/// Б-1 ревью, главная защита: второе открытие за процесс не трогает диск.
 ///
-/// Границы: смотрятся все `.rs` под `src/`, кроме файлов `*_tests.rs`;
-/// строки-комментарии (`//`, `///`, `//!`) пропускаются. Вызов через
-/// переименованный импорт (`use … HistoryStore as Store`) сторож не видит —
-/// поэтому такой импорт он тоже запрещает.
+/// Тест не зависит от порядка: первый вызов процесса мог сделать и другой
+/// тест, поэтому исход первого вызова здесь не проверяется. После него флаг
+/// взят наверняка. Остальные тесты флага не трогают (`open_isolated`).
+#[test]
+fn a_second_open_in_the_process_touches_no_disk_and_is_unavailable() {
+    let first = tempdir().expect("каталог первого открытия");
+    let second = tempdir().expect("каталог второго открытия");
+    let second_data = second.path().join("данные");
+
+    drop(HistoryState::open(Ok(first.path().to_path_buf())));
+
+    let again = HistoryState::open(Ok(second_data.clone()));
+    let refused = again.store().expect_err("второе открытие отклонено");
+    assert_eq!(refused.reason, HistoryUnavailableReason::NoAccess);
+    assert!(
+        refused.message.contains("уже открыто"),
+        "{}",
+        refused.message
+    );
+    assert!(!second_data.exists(), "второе открытие тронуло диск");
+
+    // Мимо состояния — тем же флагом: так обходил сторож по исходникам
+    // псевдоним типа в мутации ревью.
+    let bypass = HistoryStore::open(&second_data);
+    assert!(
+        matches!(bypass, Err(HistoryOpenError::AlreadyOpen)),
+        "{bypass:?}"
+    );
+    assert!(
+        !second_data.exists(),
+        "открытие мимо состояния тронуло диск"
+    );
+}
+
+/// Сколько раз в строке кода встречается токен `HistoryStore::open` — с
+/// вызовом или ссылкой на функцию, но не `open_isolated` и прочие имена.
+fn open_tokens(code: &str) -> usize {
+    const TOKEN: &str = "HistoryStore::open";
+    code.match_indices(TOKEN)
+        .filter(|(at, _)| {
+            !code[at + TOKEN.len()..].starts_with(|c: char| c == '_' || c.is_alphanumeric())
+        })
+        .count()
+}
+
+/// Сторож по исходникам: токен `HistoryStore::open` в продакшен-коде стоит
+/// ровно в одном месте — в `HistoryState::open`.
+///
+/// Безопасность держит не он, а процессный флаг хранилища (тест выше):
+/// лишнее открытие диска не тронет. Сторож нужен, чтобы лишний вызов не
+/// дожил до запуска — там он забрал бы флаг первым, и история на сеанс
+/// тихо стала бы недоступна у настоящего владельца.
+///
+/// Что ловит: смотрятся все `.rs` под `src/`, кроме файлов `*_tests.rs`, и
+/// в них строки, не начинающиеся с `//`. Токен — с вызовом и без скобок
+/// (ссылка на функцию). Запрещены однострочный импорт с переименованием
+/// (`HistoryStore as …`) и однострочный псевдоним самого типа
+/// (`type … = …HistoryStore;`). Псевдоним чего-то, где `HistoryStore` лишь
+/// участвует (`type OpenStore = fn(&Path) -> Result<HistoryStore, …>`), не
+/// запрещён: через него `open` не позвать.
+///
+/// Что **не** ловит: псевдоним типа или импорт, разбитый на несколько
+/// строк; `Self::open` внутри `impl HistoryStore`; `<HistoryStore>::open`;
+/// обобщённый вызов `T::open` с `T = HistoryStore`; имя, собранное макросом;
+/// вызов в хвосте строки после блочного комментария и токен внутри
+/// строкового литерала (там он дал бы ложную тревогу, а не пропуск).
 #[test]
 fn the_store_is_opened_in_exactly_one_production_place() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -797,8 +1044,13 @@ fn the_store_is_opened_in_exactly_one_production_place() {
                     path.strip_prefix(&src).expect("под src").display(),
                     number + 1
                 );
-                calls.extend(code.matches("HistoryStore::open(").map(|_| place.clone()));
-                if code.contains("HistoryStore as ") {
+                calls.extend((0..open_tokens(code)).map(|_| place.clone()));
+                let type_alias = code.split_whitespace().any(|word| word == "type")
+                    && code.split_once('=').is_some_and(|(_, rhs)| {
+                        let rhs = rhs.trim().trim_end_matches(';').trim_end();
+                        rhs == "HistoryStore" || rhs.ends_with("::HistoryStore")
+                    });
+                if code.contains("HistoryStore as ") || type_alias {
                     aliases.push(place);
                 }
             }
@@ -808,23 +1060,27 @@ fn the_store_is_opened_in_exactly_one_production_place() {
     assert_eq!(
         aliases,
         Vec::<String>::new(),
-        "переименованный импорт HistoryStore"
+        "переименованный импорт или псевдоним типа HistoryStore"
     );
     assert_eq!(
         calls,
         vec!["commands/history.rs".to_owned() + ":" + &open_call_line().to_string()],
-        "HistoryStore::open зовётся не ровно в HistoryState::open"
+        "HistoryStore::open стоит не ровно в HistoryState::open"
     );
 }
 
-/// Номер строки единственного вызова — из самого `history.rs`, чтобы сторож
-/// сверял место, а не только количество.
+/// Номер строки единственного токена — из самого `history.rs`, чтобы сторож
+/// сверял место, а не только количество: первая строка кода с токеном после
+/// `impl HistoryState` (комментарии пропускаются так же, как в стороже).
 fn open_call_line() -> usize {
     let text = include_str!("history.rs");
-    let start = text.find("impl HistoryState").expect("impl HistoryState");
-    let offset = start
-        + text[start..]
-            .find("HistoryStore::open(")
-            .expect("вызов внутри impl HistoryState");
-    text[..offset].lines().count()
+    let mut in_impl = false;
+    for (number, line) in text.lines().enumerate() {
+        let code = line.trim_start();
+        in_impl |= code.starts_with("impl HistoryState");
+        if in_impl && !code.starts_with("//") && open_tokens(code) > 0 {
+            return number + 1;
+        }
+    }
+    panic!("токена HistoryStore::open внутри impl HistoryState нет");
 }

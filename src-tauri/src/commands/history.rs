@@ -7,12 +7,16 @@
 //!
 //! # Хранилище открывается ровно один раз за процесс
 //!
-//! [`HistoryState`] — единственный владелец [`HistoryStore`], и его
-//! единственный конструктор [`HistoryState::open`] — единственное место
-//! продакшен-кода, где зовётся `HistoryStore::open`. `main.rs` зовёт его один
-//! раз в `setup` и кладёт результат в состояние приложения (`Arc`), а
-//! команды получают уже открытое хранилище через `State` и каталога данных
-//! не видят вовсе — открыть второе им нечем. Оркестрация (TL-89) пишет Done
+//! Гарантию держит конструкция, а не договорённость: открытие хранилища
+//! забирает процессный флаг, и второй вызов за процесс — через
+//! [`HistoryState::open`] или мимо него — отклоняется, не трогая диск
+//! (`HistoryOpenError::AlreadyOpen`). Здесь такой отказ становится
+//! `unavailable { noAccess }` с текстом «хранилище уже открыто».
+//!
+//! [`HistoryState`] — единственный владелец [`HistoryStore`]. `main.rs` зовёт
+//! [`HistoryState::open`] один раз в `setup` и кладёт результат в состояние
+//! приложения (`Arc`), а команды получают уже открытое хранилище через
+//! `State` и каталога данных не видят вовсе. Оркестрация (TL-89) пишет Done
 //! через это же состояние, а не открывает своё.
 //!
 //! Почему это важно, а не аккуратность: замок единственности приложения
@@ -21,23 +25,43 @@
 //! Отказ открытия тоже хранится в состоянии: история на сеанс недоступна, и
 //! каждая команда отвечает этой причиной, не пытаясь открыть заново.
 //!
-//! Сторожей два (`history_tests.rs`): поведенческий — после удаления файла
-//! базы из-под открытого хранилища ни одна команда не создаёт его заново; и
-//! по исходникам — вызов `HistoryStore::open(` в продакшен-коде ровно один.
+//! Сторожей три (`history_tests.rs`):
+//! - **флаг** — главная защита: второй `HistoryState::open` и прямой
+//!   `HistoryStore::open` в том же процессе не создают ни каталога, ни файла
+//!   базы и отвечают отказом;
+//! - поведенческий — после удаления файла базы из-под открытого хранилища
+//!   ни одна команда не создаёт его заново;
+//! - по исходникам — место единственного обращения к `HistoryStore::open`.
+//!   Он нужен не для безопасности (её держит флаг), а чтобы лишний вызов не
+//!   дожил до запуска: там он забрал бы флаг первым, и история на сеанс
+//!   тихо стала бы недоступна. Текстовый поиск обходим — что он ловит и
+//!   что нет, записано в doc теста.
 //!
 //! # Блокирующая работа — вне асинхронного рантайма (Н-3)
 //!
 //! Чтение страницы проверяет статус файла каждой записи через `metadata`
 //! без потолка времени, и отключённый сетевой том задержал бы поток
 //! рантайма. «Показать в папке» делает `stat` и ждёт утилиту показа до
-//! потолка. Удаление и очистка — транзакции SQLite с `fsync`. Поэтому тела
-//! всех четырёх команд идут через [`off_runtime`] (`spawn_blocking`).
+//! потолка. Удаление и очистка — транзакции SQLite с `fsync`. Резолв
+//! системной «Загрузки» для `folderDisplay` — тоже обращение к ОС: на Linux
+//! это чтение `~/.config/user-dirs.dirs`, на Windows `SHGetKnownFolderPath`
+//! проверяет существование папки, в том числе сетевой. Поэтому тела всех
+//! четырёх команд, включая резолв, идут через [`off_runtime`]
+//! (`spawn_blocking`).
 //!
 //! Шва файловой системы в домене нет, поэтому неблокирование доказывается
-//! через параметры: чтение страницы ([`page_in`]) и показ ([`show_in`])
-//! принимают доменную операцию аргументом. Команда передаёт настоящую
-//! (`HistoryStore::page`, `os_reveal::reveal`), тест — ту же, но с рандеву
-//! на `current_thread`-рантайме.
+//! так:
+//! - чтение страницы ([`page_in`]) принимает параметрами доменное чтение и
+//!   резолвер «Загрузок», показ ([`show_in`]) — доменный показ. Команда
+//!   передаёт настоящие (`HistoryStore::page`, `download_dir()`,
+//!   `os_reveal::reveal`), тест — с рандеву на `current_thread`-рантайме;
+//! - удаление и очистка параметров не принимают: тест держит эксклюзивный
+//!   замок SQLite вторым соединением, а снимает его соседняя задача того же
+//!   рантайма. На потоке рантайма операция ждала бы замок до таймаута
+//!   занятости и отказала бы.
+//!
+//! Обёртка `history_page` сама не тестируется (нужен `AppHandle`): что
+//! резолв передаётся замыканием, а не значением, видно только из кода.
 //!
 //! # Перевод ошибок домена в контракт
 //!
@@ -71,6 +95,10 @@
 //!
 //! Печатаются только `id` записи, класс отказа и тексты доменных ошибок —
 //! ни ссылок, ни названий. Путь к файлу пользователя в лог не попадает.
+//! `id` записи и курсора приходят от фронтенда непроверенными, поэтому в
+//! лог и в `message` они идут через [`ShownId`]: обрезка и форма `{:?}`.
+//! У `history_page` строки лога идут в сток-параметр — тест видит их на
+//! вызове.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -79,8 +107,8 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::os_reveal::{self, RevealError};
 use crate::storage::history::{
-    self, HistoryDeleteError, HistoryRecord, HistoryRecordsPage, HistoryStorageError, HistoryStore,
-    StorageFailure,
+    self, HistoryDeleteError, HistoryOpenError, HistoryRecord, HistoryRecordsPage,
+    HistoryStorageError, HistoryStore, ShownId, StorageFailure,
 };
 use crate::types::{
     FolderDisplay, HistoryCommandError, HistoryCommandErrorKind, HistoryCursor, HistoryEntry,
@@ -99,15 +127,32 @@ pub struct HistoryState {
     store: Result<HistoryStore, HistoryUnavailableError>,
 }
 
+/// Способ открыть хранилище: в продакшене `HistoryStore::open` с процессным
+/// флагом, в тестах — без него.
+type OpenStore = fn(&Path) -> Result<HistoryStore, HistoryOpenError>;
+
 impl HistoryState {
     /// Открывает `history.sqlite` в каталоге данных приложения.
     ///
     /// `data_dir` — `Err` с диагностикой, если каталог данных не определился
     /// (`app_data_dir()`): тогда история на сеанс недоступна с причиной
     /// `noAccess`. Приложение при любом отказе запускается (Н-4).
+    ///
+    /// Второй вызов за процесс диска не трогает и даёт недоступную историю
+    /// (doc модуля).
     pub fn open(data_dir: Result<PathBuf, String>) -> Self {
+        Self::open_by(data_dir, HistoryStore::open)
+    }
+
+    /// [`Self::open`] без процессного флага — только для тестов.
+    #[cfg(test)]
+    fn open_isolated(data_dir: Result<PathBuf, String>) -> Self {
+        Self::open_by(data_dir, HistoryStore::open_isolated)
+    }
+
+    fn open_by(data_dir: Result<PathBuf, String>, open: OpenStore) -> Self {
         let store = match data_dir {
-            Ok(dir) => HistoryStore::open(&dir).map_err(|err| HistoryUnavailableError {
+            Ok(dir) => open(&dir).map_err(|err| HistoryUnavailableError {
                 reason: err.reason(),
                 message: err.to_string(),
             }),
@@ -145,13 +190,14 @@ pub async fn history_page(
     history: State<'_, Arc<HistoryState>>,
 ) -> Result<HistoryPage, HistoryUnavailableError> {
     // Тот же резолв системной «Загрузки», что у воркера очереди: по нему
-    // решается `folderDisplay` записи. Путь строится без обращения к диску.
-    let system_downloads = app.path().download_dir().ok();
+    // решается `folderDisplay` записи. Резолв — обращение к ОС (doc модуля,
+    // Н-3), поэтому передаётся замыканием и выполняется внутри `off_runtime`.
     page_in(
         Arc::clone(&history),
         cursor,
-        system_downloads,
+        move || app.path().download_dir().ok(),
         HistoryStore::page,
+        log_to_stderr,
     )
     .await
 }
@@ -196,30 +242,41 @@ where
     tokio::task::spawn_blocking(work).await
 }
 
-/// Тело `history_page` с доменным чтением параметром (doc модуля).
-async fn page_in<R>(
+/// Строка лога в stderr — сток лога команд в продакшене.
+fn log_to_stderr(line: &str) {
+    eprintln!("{line}");
+}
+
+/// Тело `history_page` (doc модуля): доменное чтение, резолвер системной
+/// «Загрузки» и сток лога — параметрами. Резолвер зовётся только после
+/// успешного чтения и только вне потока рантайма.
+async fn page_in<D, R, L>(
     state: Arc<HistoryState>,
     cursor: Option<HistoryCursor>,
-    system_downloads: Option<PathBuf>,
+    system_downloads: D,
     read: R,
+    log: L,
 ) -> Result<HistoryPage, HistoryUnavailableError>
 where
+    D: FnOnce() -> Option<PathBuf> + Send + 'static,
     R: FnOnce(
             &HistoryStore,
             Option<&HistoryCursor>,
         ) -> Result<HistoryRecordsPage, HistoryStorageError>
         + Send
         + 'static,
+    L: Fn(&str) + Clone + Send + 'static,
 {
+    let join_log = log.clone();
     off_runtime(move || {
         let store = state.store().map_err(Clone::clone)?;
         if let Some(line) = cursor.as_ref().and_then(foreign_cursor_log) {
-            eprintln!("{line}");
+            log(&line);
         }
         match read(store, cursor.as_ref()) {
-            Ok(page) => Ok(page_to_contract(page, system_downloads.as_deref())),
+            Ok(page) => Ok(page_to_contract(page, system_downloads().as_deref())),
             Err(err) => {
-                eprintln!("history_page: чтение отказало: {err}");
+                log(&format!("history_page: чтение отказало: {err}"));
                 Err(HistoryUnavailableError {
                     reason: read_failure_reason(err.failure),
                     message: err.to_string(),
@@ -229,7 +286,7 @@ where
     })
     .await
     .unwrap_or_else(|join| {
-        eprintln!("history_page: чтение прервалось: {join}");
+        join_log(&format!("history_page: чтение прервалось: {join}"));
         Err(HistoryUnavailableError {
             reason: HistoryUnavailableReason::NoAccess,
             message: format!("история: чтение прервалось — {join}"),
@@ -245,7 +302,10 @@ async fn delete_in(state: Arc<HistoryState>, id: String) -> Result<(), HistoryCo
                 HistoryDeleteError::UnknownRecord { .. } => HistoryCommandErrorKind::UnknownRecord,
                 HistoryDeleteError::Storage(_) => HistoryCommandErrorKind::WriteFailed,
             };
-            eprintln!("delete_history_record: запись {id} не удалена ({kind:?}): {err}");
+            eprintln!(
+                "delete_history_record: запись {} не удалена ({kind:?}): {err}",
+                ShownId(&id)
+            );
             HistoryCommandError {
                 kind,
                 message: err.to_string(),
@@ -280,13 +340,15 @@ async fn show_in<V>(
 where
     V: FnOnce(&Path) -> Result<(), RevealError> + Send + 'static,
 {
-    let logged_id = id.clone();
+    let logged_id = ShownId(&id).to_string();
     off_runtime(move || {
         let result = show_blocking(&state, &id, reveal);
         if let Err(err) = &result {
             eprintln!(
-                "show_in_folder: запись {id}: {:?} — {}",
-                err.kind, err.message
+                "show_in_folder: запись {}: {:?} — {}",
+                ShownId(&id),
+                err.kind,
+                err.message
             );
         }
         result
@@ -319,15 +381,16 @@ where
         })?
         .ok_or_else(|| ShowInFolderError {
             kind: ShowInFolderErrorKind::UnknownRecord,
-            message: format!("история: записи {id} нет"),
+            message: format!("история: записи {} нет", ShownId(id)),
         })?;
     // Путь — только через `file_path()`: запись из базы — непроверенный ввод.
     let Some(file) = record.file_path() else {
         return Err(ShowInFolderError {
             kind: launcher_failed_without_details(),
             message: format!(
-                "история: путь записи {id} не строится — папка не абсолютная или имя файла \
-                 не одно имя (запись изменена вне приложения)"
+                "история: путь записи {} не строится — папка не абсолютная или имя файла \
+                 не одно имя (запись изменена вне приложения)",
+                ShownId(id)
             ),
         });
     };
@@ -390,22 +453,16 @@ fn interrupted_write(command: &str, join: &tokio::task::JoinError) -> HistoryCom
 ///
 /// Такой курсор даёт пустую страницу (контракт), и без записи в лог
 /// испорченный на стороне UI курсор терялся бы молча. Класс назван явно —
-/// `foreignCursor`, чтобы его можно было искать. `id` печатается обрезанным:
-/// это непроверенный ввод произвольной длины.
+/// `foreignCursor`, чтобы его можно было искать. `id` — непроверенный ввод
+/// произвольной длины, он печатается через [`ShownId`].
 fn foreign_cursor_log(cursor: &HistoryCursor) -> Option<String> {
     if history::is_issued_cursor(cursor) {
         return None;
     }
-    const SHOWN_CHARS: usize = 40;
-    let shown: String = cursor.id.chars().take(SHOWN_CHARS).collect();
-    let cut = if cursor.id.chars().count() > SHOWN_CHARS {
-        "…"
-    } else {
-        ""
-    };
     Some(format!(
-        "history_page: курсор отклонён (класс foreignCursor): id {shown:?}{cut}, \
+        "history_page: курсор отклонён (класс foreignCursor): id {}, \
          finishedAtUnixSecs {} — ядро такой не выдавало, отдана пустая страница",
+        ShownId(&cursor.id),
         cursor.finished_at_unix_secs
     ))
 }

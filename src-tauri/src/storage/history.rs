@@ -56,6 +56,9 @@
 //! | нет прав на каталог или файл, файл открывается только на чтение | [`HistoryOpenError::NoAccess`] |
 //!
 //! Строки проверяются сверху вниз: первые две — до любого вызова SQLite.
+//! Всё это — у первого вызова за процесс. Второй и последующие диск не
+//! трогают вовсе и отвечают [`HistoryOpenError::AlreadyOpen`] (doc
+//! [`HistoryStore::open`]).
 //!
 //! **Отложить, а не удалить.** Порча — это данные пользователя, которые,
 //! возможно, ещё читаются чужим инструментом. Отложенное имя никогда не
@@ -165,6 +168,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use rusqlite::ffi::ErrorCode;
@@ -410,6 +414,13 @@ pub enum HistoryOpenError {
         to: u32,
         reason: String,
     },
+    /// Хранилище в этом процессе уже открывалось. Повторное открытие
+    /// отклонено до любого обращения к диску ([`HistoryStore::open`]).
+    #[error(
+        "история: хранилище уже открыто в этом процессе — повторное открытие отклонено, \
+         диск не тронут"
+    )]
+    AlreadyOpen,
 }
 
 fn newer_detail(found: i64, supported: u32, wal: bool) -> String {
@@ -428,6 +439,9 @@ impl HistoryOpenError {
             Self::NewerVersion { .. } => HistoryUnavailableReason::NewerVersion,
             Self::NoAccess { .. } => HistoryUnavailableReason::NoAccess,
             Self::MigrationFailed { .. } => HistoryUnavailableReason::MigrationFailed,
+            // Отдельной причины в контракте нет: для экрана это «история на
+            // сеанс недоступна», подробность — в `message`.
+            Self::AlreadyOpen => HistoryUnavailableReason::NoAccess,
         }
     }
 }
@@ -492,12 +506,42 @@ impl HistoryWriteError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HistoryDeleteError {
     /// Записи с таким id нет (или строка — не id, выданный ядром).
-    #[error("история: записи {id} нет")]
+    ///
+    /// `id` — непроверенный ввод, в тексте он через [`ShownId`].
+    #[error("история: записи {} нет", ShownId(.id))]
     UnknownRecord { id: String },
     /// База отказала.
     #[error(transparent)]
     Storage(#[from] HistoryStorageError),
 }
+
+/// Непроверенный `id` (записи или курсора) для строки лога и текста отказа.
+///
+/// Печатается в форме `{:?}` и не длиннее [`ShownId::MAX_CHARS`] знаков, с
+/// `…` при обрезке. Кавычки и экранирование — не косметика: перевод строки
+/// или возврат каретки внутри `id` иначе начал бы в логе новую строку,
+/// неотличимую от настоящей.
+pub(crate) struct ShownId<'a>(pub &'a str);
+
+impl ShownId<'_> {
+    /// Сколько знаков `id` показывается.
+    pub(crate) const MAX_CHARS: usize = 40;
+}
+
+impl fmt::Display for ShownId<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut chars = self.0.chars();
+        let shown: String = chars.by_ref().take(Self::MAX_CHARS).collect();
+        write!(f, "{shown:?}")?;
+        if chars.next().is_some() {
+            f.write_str("…")?;
+        }
+        Ok(())
+    }
+}
+
+/// Открывалось ли хранилище в этом процессе ([`HistoryStore::open`]).
+static OPENED_IN_PROCESS: AtomicBool = AtomicBool::new(false);
 
 /// Пометки, ждущие ответа без курсора.
 #[derive(Debug, Default)]
@@ -512,8 +556,6 @@ struct PendingNotices {
 /// под мьютексом, поэтому хранилище можно делить между потоками.
 #[derive(Debug)]
 pub struct HistoryStore {
-    #[allow(dead_code)] // читает только `path()`, у которого пока нет потребителя
-    path: PathBuf,
     conn: Mutex<Connection>,
     pending: Mutex<PendingNotices>,
 }
@@ -521,7 +563,31 @@ pub struct HistoryStore {
 impl HistoryStore {
     /// Открывает `history.sqlite` в каталоге данных приложения, создавая
     /// каталог и базу при необходимости. Доктрина отказов — в шапке модуля.
+    ///
+    /// **Ровно один раз за процесс.** Первый вызов забирает процессный
+    /// флаг — при любом исходе, в том числе при отказе. Второй и
+    /// последующие отвечают [`HistoryOpenError::AlreadyOpen`], не создавая
+    /// ни каталога, ни файла. Причина — ревью TL-85: замок единственности
+    /// приложения работает fail-open, а два открытия на испорченном файле
+    /// могли бы оставить одно соединение на уже отложенной копии.
+    ///
+    /// Флаг стоит здесь, а не в `commands::history::HistoryState::open`:
+    /// так его не обходит и вызов хранилища мимо состояния (мутация ревью
+    /// TL-90 через псевдоним типа). Цена: лишний вызов в продакшене не
+    /// ломает процесс, а забирает флаг первым, и история на сеанс
+    /// становится недоступна у того, кто пришёл вторым. Место единственного
+    /// вызова пинает сторож по исходникам в `commands::history`.
     pub fn open(data_dir: &Path) -> Result<Self, HistoryOpenError> {
+        if OPENED_IN_PROCESS.swap(true, Ordering::SeqCst) {
+            return Err(HistoryOpenError::AlreadyOpen);
+        }
+        Self::open_with(data_dir, MIGRATIONS)
+    }
+
+    /// [`Self::open`] без процессного флага — только для тестов: открытий
+    /// за тестовый процесс много, и порядок их не задан.
+    #[cfg(test)]
+    pub(crate) fn open_isolated(data_dir: &Path) -> Result<Self, HistoryOpenError> {
         Self::open_with(data_dir, MIGRATIONS)
     }
 
@@ -585,19 +651,12 @@ impl HistoryStore {
         migrate(&mut conn, &path, migrations)?;
 
         Ok(Self {
-            path,
             conn: Mutex::new(conn),
             pending: Mutex::new(PendingNotices {
                 base_recreated: recreated,
                 last_write_failed: None,
             }),
         })
-    }
-
-    /// Путь к файлу базы.
-    #[allow(dead_code)] // потребителя нет ни у команд, ни у TL-89 по плану
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Вставляет запись Done одной транзакцией и возвращает её id.
