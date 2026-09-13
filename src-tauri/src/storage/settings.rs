@@ -48,7 +48,7 @@
 //! | файла нет (и каталога нет) | умолчания | — | не создаётся |
 //! | пустой, не JSON, не объект, нет `version` или она не целое ≥ 1 | умолчания | `whole_file_reset` | откладывается под `settings.json.broken-<метка>` |
 //! | `version` больше [`SETTINGS_FORMAT_VERSION`] | умолчания | `whole_file_reset` | **не тронут**; копия байт в байт откладывается при первом сохранении |
-//! | файл не читается (права, каталог на месте файла) | умолчания | `whole_file_reset` | не тронут |
+//! | файл не читается (права, каталог на месте файла) | умолчания | `whole_file_reset` | откладывается под `settings.json.broken-<метка>` |
 //! | версия 1, поле отсутствует | умолчание поля | — | — |
 //! | версия 1, поле вне правил | умолчание поля, остальные как в файле | имя поля в `reset_fields` | — |
 //! | версия 1, неизвестный ключ | игнорируется | — | ключ переживает запись |
@@ -71,11 +71,15 @@
 //! прежние байты копируются под `.broken-<метка>`, и данные не теряются ни
 //! в одном из двух исходов.
 //!
-//! **Испорченный файл откладывается при чтении**, а не при сохранении: он
-//! уезжает под `.broken-<метка>` переименованием, и следующий запуск
-//! видит «файла нет», а не тот же мусор с той же пометкой. Если отложить не
-//! удалось (например, каталог только на чтение), файл остаётся на месте и
-//! копируется перед первым сохранением, как чужая версия.
+//! **Испорченный и нечитаемый файл откладываются при чтении**, а не при
+//! сохранении: они уезжают под `.broken-<метка>` переименованием, и
+//! следующий запуск видит «файла нет», а не тот же мусор с той же пометкой.
+//! Для нечитаемого это единственный способ не потерять настройки: `rename`
+//! права чтения файла не требует, и без откладывания первое же сохранение
+//! молча заняло бы его имя. Если отложить не удалось (например, каталог
+//! только на чтение), файл остаётся на месте и копируется перед первым
+//! сохранением, как чужая версия; у нечитаемого копия не удаётся, и
+//! сохранение отказывает `WriteFailed`, не тронув файл.
 //!
 //! **Отложенная копия не затирает прежнюю**: занятая метка получает суффикс
 //! `-1`, `-2`, … (приём истории). Метка — Unix-секунды.
@@ -102,7 +106,22 @@
 //!
 //! Двух писателей не бывает: приложение одно на пользователя (TL-20), а
 //! хранилище открывается один раз за процесс и живёт в состоянии Tauri
-//! (`manage`, TL-91). Сохранения внутри процесса сериализуются мьютексом.
+//! (`manage`, TL-91).
+//!
+//! # Замки
+//!
+//! Замков два, берутся всегда в одном порядке — запись, затем состояние:
+//!
+//! - **проверка значения** (`check_folder` с `canonicalize`, разбор шаблона,
+//!   диапазон попыток) идёт до любого замка: от состояния она не зависит, а
+//!   подвисший том не должен останавливать никого, кроме самого `set`;
+//! - **замок записи** держится на всё сохранение — от чтения значений, из
+//!   которых собирается файл, до подмены их в памяти. Сохранения поля не
+//!   теряют: второе видит в памяти результат первого;
+//! - **замок состояния** держится только на чтение значений для сборки
+//!   файла и на финальную подмену. Диск под ним не трогается, поэтому
+//!   [`SettingsStore::current`], который оркестрация зовёт на старте каждой
+//!   задачи (Р-4), не ждёт ни копии, ни `sync_all`, ни `rename`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -303,9 +322,14 @@ pub enum WholeFileProblem {
         found: u64,
         supported: u64,
     },
-    /// Файл не читается. Не тронут.
-    #[error("настройки {path} не читаются: {reason}")]
-    Unreadable { path: PathBuf, reason: String },
+    /// Файл не читается (права, каталог на месте файла).
+    #[error("настройки {path} не читаются ({reason}); {}", aside_detail(.set_aside))]
+    Unreadable {
+        path: PathBuf,
+        reason: String,
+        /// Куда отложен файл, либо почему отложить не удалось.
+        set_aside: Result<PathBuf, String>,
+    },
 }
 
 fn aside_detail(set_aside: &Result<PathBuf, String>) -> String {
@@ -422,6 +446,11 @@ fn unix_secs_label() -> String {
 pub struct SettingsStore {
     path: PathBuf,
     temp_path: PathBuf,
+    /// Замок записи: одно сохранение за раз, от сборки файла до подмены
+    /// значений в памяти. Берётся раньше `state`.
+    writer: Mutex<()>,
+    /// Замок состояния: только короткие чтения и подмена, диск под ним не
+    /// трогается.
     state: Mutex<State>,
     open_problem: Option<WholeFileProblem>,
     rename: RenameFn,
@@ -455,6 +484,7 @@ impl SettingsStore {
         Self {
             path,
             temp_path,
+            writer: Mutex::new(()),
             state: Mutex::new(state),
             open_problem,
             rename,
@@ -502,35 +532,25 @@ impl SettingsStore {
     /// Отказ проверки значения или записи; в обоих случаях файл и память
     /// прежние, пометки сброса не сняты.
     pub fn set(&self, patch: &SettingsPatch) -> Result<Settings, SettingsSetError> {
-        let mut state = self.lock();
-        let mut next = state.settings.clone();
+        // Проверка — до замков: `canonicalize` на подвисшем томе не должен
+        // держать ни читателей, ни очередь сохранений.
+        let accepted = accept_patch(patch)?;
 
-        match patch {
-            SettingsPatch::DestinationFolder(DestinationFolder::System) => {
-                next.destination = Destination::System;
-            }
-            SettingsPatch::DestinationFolder(DestinationFolder::Custom { path }) => {
-                let folder = check_folder(path).map_err(|err| SettingsSetError::Folder {
-                    problem: err.problem,
-                    reason: err.reason,
-                })?;
-                next.destination = Destination::Custom(folder);
-            }
-            SettingsPatch::NameTemplate(text) => {
-                next.name_template = accept_template(text)?;
-            }
-            SettingsPatch::MaxAttempts(value) => {
-                next.max_attempts = accept_attempts(*value)?;
-            }
-        }
+        let _writer = self.write_lock();
 
-        let bytes = file_bytes(&next, &state.extras).map_err(|err| self.write_failed(&err))?;
+        // Под замком состояния — только снимок значений для сборки файла.
+        let (next, bytes, preserve_before_save) = {
+            let state = self.lock();
+            let next = accepted.apply(state.settings.clone());
+            let bytes = file_bytes(&next, &state.extras).map_err(|err| self.write_failed(&err))?;
+            (next, bytes, state.preserve_before_save)
+        };
 
-        if state.preserve_before_save {
+        if preserve_before_save {
             preserve_copy(&self.path, self.label).map_err(|err| self.write_failed(&err))?;
             // Копия есть: повторная попытка после отказа ниже не плодит
             // вторую такую же.
-            state.preserve_before_save = false;
+            self.lock().preserve_before_save = false;
         }
 
         write_atomic(&self.path, &self.temp_path, &bytes, self.rename).map_err(|err| {
@@ -538,6 +558,7 @@ impl SettingsStore {
             self.write_failed(&err)
         })?;
 
+        let mut state = self.lock();
         state.settings = next;
         state.reset_fields.clear();
         state.whole_file_reset = false;
@@ -553,10 +574,53 @@ impl SettingsStore {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         // Под мьютексом только значения, каждое из которых целиком заменяется
-        // одним присваиванием после удачной записи; паника соседа не может
-        // оставить их наполовину изменёнными.
+        // одним присваиванием; паника соседа не может оставить их наполовину
+        // изменёнными.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn write_lock(&self) -> MutexGuard<'_, ()> {
+        // Под замком записи данных нет: отравление ничего не говорит о
+        // состоянии, файл на диске цел целиком (атомарная запись).
+        self.writer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Проверенное значение одного поля — результат проверки патча до замков.
+enum Accepted {
+    Destination(Destination),
+    Template(NameTemplate),
+    Attempts(u32),
+}
+
+impl Accepted {
+    /// Настройки с этим полем; два других — из `base`.
+    fn apply(self, mut base: Settings) -> Settings {
+        match self {
+            Self::Destination(destination) => base.destination = destination,
+            Self::Template(template) => base.name_template = template,
+            Self::Attempts(attempts) => base.max_attempts = attempts,
+        }
+        base
+    }
+}
+
+/// Проверка патча. От состояния хранилища не зависит и зовётся без замков.
+fn accept_patch(patch: &SettingsPatch) -> Result<Accepted, SettingsSetError> {
+    Ok(match patch {
+        SettingsPatch::DestinationFolder(DestinationFolder::System) => {
+            Accepted::Destination(Destination::System)
+        }
+        SettingsPatch::DestinationFolder(DestinationFolder::Custom { path }) => {
+            let folder = check_folder(path).map_err(|err| SettingsSetError::Folder {
+                problem: err.problem,
+                reason: err.reason,
+            })?;
+            Accepted::Destination(Destination::Custom(folder))
+        }
+        SettingsPatch::NameTemplate(text) => Accepted::Template(accept_template(text)?),
+        SettingsPatch::MaxAttempts(value) => Accepted::Attempts(accept_attempts(*value)?),
+    })
 }
 
 /// Шаблон из патча: сначала длина (работа на непроверенном вводе
@@ -621,11 +685,15 @@ fn load(path: &Path, temp_path: &Path, label: LabelFn) -> (State, Option<WholeFi
             );
         }
         Err(err) => {
+            // Не прочитали — не значит, что байт нет: убрать с дороги, как
+            // мусор, иначе первое сохранение займёт имя поверх настроек.
+            let set_aside = set_aside(path, label).map_err(|err| err.to_string());
             return (
-                whole_reset(false),
+                whole_reset(set_aside.is_err()),
                 Some(WholeFileProblem::Unreadable {
                     path: path.to_path_buf(),
                     reason: err.to_string(),
+                    set_aside,
                 }),
             );
         }

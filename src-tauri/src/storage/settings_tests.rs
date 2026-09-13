@@ -5,6 +5,9 @@ use super::*;
 use crate::download::name_template::validate_for_save;
 use crate::types::{QualityKind, SelectedQuality};
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Barrier, LazyLock, TryLockError};
+use std::time::{Duration, Instant};
 use tempfile::{tempdir, TempDir};
 
 /// Метка отложенной копии в тестах — постоянная, чтобы занятость имени
@@ -254,20 +257,123 @@ fn the_first_save_over_a_newer_version_keeps_its_bytes_aside() {
     assert!(!reopened.readout().whole_file_reset);
 }
 
-/// Файл, который не читается вовсе: пометка, файл не тронут.
+/// Каталог на месте файла не читается и откладывается, как мусор.
 #[test]
-fn an_unreadable_file_is_marked_and_left_in_place() {
+fn a_directory_in_place_of_the_file_is_set_aside() {
     let dir = tempdir().expect("временный каталог");
     fs::create_dir(settings_path(&dir)).expect("каталог на месте файла");
 
     let store = open(dir.path());
 
     assert_defaults_whole_reset(&store);
-    assert!(matches!(
-        store.open_problem(),
-        Some(WholeFileProblem::Unreadable { .. })
-    ));
-    assert!(settings_path(&dir).is_dir());
+    assert!(
+        matches!(
+            store.open_problem(),
+            Some(WholeFileProblem::Unreadable {
+                set_aside: Ok(_),
+                ..
+            })
+        ),
+        "{:?}",
+        store.open_problem()
+    );
+    assert!(broken_path(&dir, "").is_dir());
+    assert!(!settings_path(&dir).exists());
+}
+
+/// Воспроизведение ревью: корректный файл без права чтения. `rename` права
+/// чтения не требует, поэтому без откладывания первое сохранение молча
+/// заняло бы имя и настройки пропали бы.
+#[cfg(unix)]
+#[test]
+fn a_file_without_read_permission_is_set_aside_and_survives_a_save() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().expect("временный каталог");
+    write_object(&dir, &valid_object());
+    let before = fs::read(settings_path(&dir)).expect("файл");
+    fs::set_permissions(settings_path(&dir), fs::Permissions::from_mode(0o000)).expect("права");
+
+    let store = open(dir.path());
+
+    assert_defaults_whole_reset(&store);
+    assert!(
+        matches!(
+            store.open_problem(),
+            Some(WholeFileProblem::Unreadable {
+                set_aside: Ok(_),
+                ..
+            })
+        ),
+        "{:?}",
+        store.open_problem()
+    );
+    assert!(
+        !settings_path(&dir).exists(),
+        "файл остался под рабочим именем"
+    );
+
+    store
+        .set(&SettingsPatch::NameTemplate("{id}".to_owned()))
+        .expect("сохранение");
+
+    let aside = broken_path(&dir, "");
+    fs::set_permissions(&aside, fs::Permissions::from_mode(0o644)).expect("права назад");
+    assert_eq!(fs::read(&aside).expect("отложенная копия"), before);
+    assert_eq!(
+        names(dir.path()),
+        vec![
+            SETTINGS_FILE_NAME.to_owned(),
+            format!("{SETTINGS_FILE_NAME}{BROKEN_MARKER}{LABEL}")
+        ]
+    );
+}
+
+/// Нечитаемый файл, который не удалось отложить (каталог только на чтение
+/// в момент открытия): сохранение пытается скопировать его, копия не
+/// удаётся, и сохранение отказывает, не тронув файл.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_file_that_could_not_be_set_aside_refuses_the_save() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().expect("временный каталог");
+    write_object(&dir, &valid_object());
+    let before = fs::read(settings_path(&dir)).expect("файл");
+    fs::set_permissions(settings_path(&dir), fs::Permissions::from_mode(0o000)).expect("права");
+
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).expect("только чтение");
+    let store = open(dir.path());
+    let problem = store.open_problem().cloned();
+    // Каталог снова доступен на запись: отказ ниже обязан дать сам файл, а
+    // не каталог, который отклонил бы и прямую запись.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("права назад");
+
+    assert!(
+        matches!(
+            problem,
+            Some(WholeFileProblem::Unreadable {
+                set_aside: Err(_),
+                ..
+            })
+        ),
+        "{problem:?}"
+    );
+    assert_defaults_whole_reset(&store);
+
+    let result = store.set(&SettingsPatch::MaxAttempts(9));
+    let listing = names(dir.path());
+    fs::set_permissions(settings_path(&dir), fs::Permissions::from_mode(0o644))
+        .expect("права назад");
+
+    assert!(
+        matches!(result, Err(SettingsSetError::WriteFailed { .. })),
+        "{result:?}"
+    );
+    assert_eq!(fs::read(settings_path(&dir)).expect("файл"), before);
+    assert_eq!(listing, vec![SETTINGS_FILE_NAME.to_owned()]);
+    assert_eq!(store.current(), Settings::default());
+    assert!(store.readout().whole_file_reset, "отказ снял пометку");
 }
 
 #[test]
@@ -967,11 +1073,13 @@ fn garbage_that_could_not_be_set_aside_is_copied_once_before_the_save() {
     assert_eq!(open(dir.path()).current().max_attempts(), 2);
 }
 
+/// Каталог появился на месте файла после открытия: `rename` поверх него
+/// отказывает, временного файла не остаётся.
 #[test]
 fn a_directory_in_place_of_the_file_fails_the_save_without_leftovers() {
     let dir = tempdir().expect("временный каталог");
-    fs::create_dir(settings_path(&dir)).expect("каталог на месте файла");
     let store = open(dir.path());
+    fs::create_dir(settings_path(&dir)).expect("каталог на месте файла");
 
     let result = store.set(&SettingsPatch::MaxAttempts(2));
 
@@ -981,6 +1089,175 @@ fn a_directory_in_place_of_the_file_fails_the_save_without_leftovers() {
     );
     assert!(!store.temp_path().exists());
     assert!(settings_path(&dir).is_dir());
+}
+
+/// Метка, ведущая в несуществующий каталог: копия под `.broken-` не
+/// создаётся, а всё остальное настоящее.
+fn label_in_a_missing_directory() -> String {
+    format!("нет-каталога/{LABEL}")
+}
+
+/// Отказ копии перед первым сохранением поверх будущей версии — отказ
+/// сохранения: иначе её байты пропали бы без следа.
+#[test]
+fn a_failed_copy_of_a_newer_version_refuses_the_save() {
+    let dir = tempdir().expect("временный каталог");
+    let bytes = br#"{"version":9,"maxAttempts":3}"#;
+    write_file(&dir, bytes);
+    let store = SettingsStore::open_with(dir.path(), real_rename, label_in_a_missing_directory);
+
+    let result = store.set(&SettingsPatch::MaxAttempts(5));
+
+    assert!(
+        matches!(result, Err(SettingsSetError::WriteFailed { .. })),
+        "{result:?}"
+    );
+    assert_eq!(fs::read(settings_path(&dir)).expect("файл"), bytes);
+    assert_eq!(names(dir.path()), vec![SETTINGS_FILE_NAME.to_owned()]);
+    assert_eq!(store.current(), Settings::default());
+    assert!(store.readout().whole_file_reset, "отказ снял пометку");
+}
+
+// ───────────────────────────── замки ─────────────────────────────
+
+/// Запас ожидания в тестах замков. В верном коде ждать нечего — рандеву
+/// идут через барьеры, — и порог срабатывает только в сломанном, поэтому
+/// его величина не делает тест хрупким, а лишь ограничивает зависание.
+const LOCK_PATIENCE: Duration = Duration::from_secs(5);
+
+static SLOW_SAVE_ENTERED: LazyLock<Barrier> = LazyLock::new(|| Barrier::new(2));
+static SLOW_SAVE_RELEASE: LazyLock<Barrier> = LazyLock::new(|| Barrier::new(2));
+
+/// `rename`, который стоит, пока тест его не отпустит: сохранение прошло
+/// копию и `sync_all` и находится на последнем шаге записи.
+fn rename_held_by_the_test(from: &Path, to: &Path) -> io::Result<()> {
+    SLOW_SAVE_ENTERED.wait();
+    SLOW_SAVE_RELEASE.wait();
+    fs::rename(from, to)
+}
+
+/// Оркестрация зовёт `current()` на старте каждой задачи (Р-4): медленный
+/// диск под сохранением не должен останавливать загрузки.
+#[test]
+fn current_does_not_wait_for_a_slow_save() {
+    let dir = tempdir().expect("временный каталог");
+    write_object(&dir, &valid_object());
+    let store = Arc::new(SettingsStore::open_with(
+        dir.path(),
+        rename_held_by_the_test,
+        fixed_label,
+    ));
+
+    let writer = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || store.set(&SettingsPatch::MaxAttempts(9)))
+    };
+    SLOW_SAVE_ENTERED.wait();
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let reader = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            let _ = seen_tx.send((store.current(), store.readout()));
+        })
+    };
+    let seen = seen_rx.recv_timeout(LOCK_PATIENCE);
+
+    // Отпустить запись до любых проверок: иначе упавший тест оставит
+    // писателя висеть на барьере.
+    SLOW_SAVE_RELEASE.wait();
+    let saved = writer.join().expect("поток писателя");
+    reader.join().expect("поток читателя");
+
+    let (current, readout) = seen.expect("current() ждал, пока сохранение допишет файл");
+    assert_eq!(
+        current.max_attempts(),
+        3,
+        "значение в памяти сменилось до конца записи"
+    );
+    assert_eq!(readout.settings, current);
+    assert_eq!(saved.expect("сохранение").max_attempts(), 9);
+    assert_eq!(store.current().max_attempts(), 9);
+}
+
+static RACE_ENTERED: LazyLock<Barrier> = LazyLock::new(|| Barrier::new(2));
+static RACE_RELEASE: LazyLock<Barrier> = LazyLock::new(|| Barrier::new(2));
+static RACE_RENAMES: AtomicUsize = AtomicUsize::new(0);
+
+/// Первый `rename` стоит, пока тест его не отпустит; остальные проходят.
+fn first_rename_held_by_the_test(from: &Path, to: &Path) -> io::Result<()> {
+    if RACE_RENAMES.fetch_add(1, Ordering::SeqCst) == 0 {
+        RACE_ENTERED.wait();
+        RACE_RELEASE.wait();
+    }
+    fs::rename(from, to)
+}
+
+/// Два сохранения разных полей одновременно: оба поля в файле и в памяти.
+///
+/// Первое стоит на последнем шаге записи с уже собранным файлом. Если замок
+/// записи в этот момент свободен, второе проходит целиком, пока первое
+/// стоит, — гонка воспроизводится детерминированно, а не по везению
+/// планировщика. Если занят (верный код), второе ждёт первое.
+#[test]
+fn two_concurrent_saves_of_different_fields_keep_both() {
+    let dir = tempdir().expect("временный каталог");
+    write_object(&dir, &valid_object());
+    let store = Arc::new(SettingsStore::open_with(
+        dir.path(),
+        first_rename_held_by_the_test,
+        fixed_label,
+    ));
+    let template = "{title} [{quality}]";
+
+    let first = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || store.set(&SettingsPatch::MaxAttempts(9)))
+    };
+    RACE_ENTERED.wait();
+
+    let writer_free = !matches!(store.writer.try_lock(), Err(TryLockError::WouldBlock));
+    let second = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || store.set(&SettingsPatch::NameTemplate(template.to_owned())))
+    };
+    if writer_free {
+        let deadline = Instant::now() + LOCK_PATIENCE;
+        while !second.is_finished() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+    }
+
+    RACE_RELEASE.wait();
+    let first = first.join().expect("поток первого сохранения");
+    let second = second.join().expect("поток второго сохранения");
+
+    let on_disk: Value =
+        serde_json::from_slice(&fs::read(settings_path(&dir)).expect("файл")).expect("JSON");
+    let in_memory = store.current();
+    assert_eq!(
+        (
+            on_disk["maxAttempts"].clone(),
+            on_disk["nameTemplate"].clone()
+        ),
+        (json!(9), json!(template)),
+        "в файле потеряно поле; замок записи свободен во время записи: {writer_free}"
+    );
+    assert_eq!(
+        (in_memory.max_attempts(), in_memory.name_template()),
+        (9, template),
+        "в памяти потеряно поле"
+    );
+    assert_eq!(
+        open(dir.path()).current(),
+        in_memory,
+        "память разошлась с диском"
+    );
+    assert_eq!(first.map(|s| s.max_attempts()), Ok(9));
+    assert_eq!(
+        second.map(|s| (s.max_attempts(), s.name_template().to_owned())),
+        Ok((9, template.to_owned()))
+    );
 }
 
 // ───────────────────────────── пометки ─────────────────────────────
