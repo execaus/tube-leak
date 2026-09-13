@@ -8,7 +8,7 @@ import ts from 'typescript'
 import { describe, expect, it } from 'vitest'
 
 /**
- * Сторож палитры (TL-22, issue execaus/tube-leak#23), третий раунд.
+ * Сторож палитры (TL-22, issue execaus/tube-leak#23), четвёртый раунд.
  *
  * Вся палитра проекта живёт в `src/style.css` как CSS-переменные (см.
  * doc-комментарий того файла). Всё остальное в `src/` не должно заводить
@@ -154,6 +154,106 @@ import { describe, expect, it } from 'vitest'
  * `CssSyntaxError` сам — это не перехватывается. `ts.createSourceFile()`
  * никогда не бросает даже на нечитаемом коде — здесь строгая ручная
  * проверка `parseDiagnostics` после разбора.
+ *
+ * # Четвёртый раунд — имена внутри составных строк, интерполяция, обработчики
+ *
+ * Третье ревью намеренно ограничило `findScriptColorLiteral` (п. 3) —
+ * составная строка в скрипте проверялась только на hex/функцию, голые
+ * имена цветов ловились лишь как «значение строки целиком». Это
+ * пропускало реальный класс кода: строковые CSS-значения, которые
+ * заведомо являются CSS-значением по СИНТАКСИЧЕСКОМУ контексту, а не по
+ * догадке об их содержимом. Решение ведущего — не расширять поиск имён
+ * на все строки проекта (риск `Field`/`Window` из П-1 никуда не делся),
+ * а точно очертить, где строка гарантированно CSS-значение, и включать
+ * поиск имён только там:
+ *
+ * 1. **Ключ объекта, похожий на CSS-свойство, внутри «стилевого» объекта.**
+ *    «Стилевой объект» — это (а) весь объект(-ы), до которых можно дойти
+ *    внутри выражения директивы `:style`/`v-bind:style` (сама директива —
+ *    однозначный признак: значение обязано быть объектом стилей или
+ *    строкой инлайн-CSS, см. п. 2), либо (б) любой объектный литерал в
+ *    файле `.ts`/`.js`, просканированном целиком (`scanFile` — не
+ *    `<script>`/`<script setup>` внутри `.vue`: у директивы `:style` уже
+ *    есть свой явный признак контекста, а для остального скрипта SFC
+ *    оставлен прежний, более узкий охват — за пределами прямого требования
+ *    брифа). «Похожий на CSS-свойство» ключ — без списка известных
+ *    CSS-свойств: попытка использовать транзитивный `mdn-data` (в графе
+ *    только как зависимость `jsdom → css-tree`, не объявлен ни в одном
+ *    `package.json` проекта) отклонена — не наша зависимость, может
+ *    исчезнуть при любом обновлении `jsdom`, никак не защищено. Вместо
+ *    этого — честная эвристика по форме: kebab-форма ключа (camelCase
+ *    приводится к kebab, уже kebab остаётся как есть) совпадает с
+ *    `^-?[a-z]+(-[a-z]+)*$` (`isCssPropertyLikeKey`). Она пропустит и
+ *    некоторые не-CSS ключи с «похожей» формой (`{ status: 'dark red' }`) —
+ *    названный компромисс, симметричный решению п. 3 предыдущего раунда
+ *    («лучше поймать лишнее, чем пропустить настоящий цвет», см. «Честный
+ *    компромисс» ниже).
+ * 2. **Присваивание в цепочку `....style` и вызов `....setProperty(...)`.**
+ *    `el.style = ...`, `el.style.cssText = ...`, `el.style.color = ...` —
+ *    правая часть присваивания гарантированно CSS-значение вне
+ *    зависимости от имени конкретного свойства (`isStylePropertyAccessChain`
+ *    ищет сегмент `style` где угодно в цепочке доступа слева). Аналогично
+ *    второй аргумент вызова, где свойство доступа названо `setProperty`
+ *    (`el.style.setProperty('color', value)` — CSSOM API, синтаксически
+ *    однозначен независимо от приёмника слева).
+ * 3. **Директива `:style`/`v-bind:style`, чьё выражение целиком — строка.**
+ *    `:style="'border: 1px solid red'"` — это не JS-объект, а инлайн-CSS
+ *    текст, синтаксически неотличимый от статического `style="..."`.
+ *    `scanStyleDirectiveExpression` разбирает выражение директивы,
+ *    снимает обёрточные скобки и, если под ними — ровно строковый литерал
+ *    (`StringLiteral`/`NoSubstitutionTemplateLiteral` без подстановок),
+ *    отдаёт его текст в тот же CSS-путь (`scanInlineStyleValue`/postcss),
+ *    что и статический атрибут `style="..."`, — а не в скриптовый разбор
+ *    строковых литералов. Если же под скобками не строка (объект,
+ *    тернарник, …), выражение уходит в обычный скриптовый разбор с
+ *    признаком «стилевой объект» (п. 1а).
+ *
+ * Вне этих трёх точек имена цветов внутри составной строки по-прежнему не
+ * ищутся — асимметрия с CSS-декларациями (см. предыдущий раздел) остаётся
+ * в силе для прозы, `v-if`/`v-bind`(не `style`)/произвольных вызовов и
+ * объектов внутри `<script setup>`: `it('Field and red window', …)`
+ * (проза в описании теста) по-прежнему зелёная, закреплено фикстурой ниже.
+ *
+ * # Шаблонные литералы с подстановкой — статические части
+ *
+ * Второй раунд сознательно не проверял `` `${x}px solid red` `` — у
+ * статических частей шаблонного литерала с подстановкой (`TemplateHead`/
+ * `TemplateMiddle`/`TemplateTail`) свой тип узла, не входящий в
+ * `StringLiteral`/`NoSubstitutionTemplateLiteral`. Четвёртый раунд достаёт
+ * их тем же обходом (`ts.forEachChild` и так спускается в `head`/
+ * `templateSpans[].literal` — они настоящие дочерние узлы AST, отдельного
+ * обхода не нужно) и применяет к тексту КАЖДОЙ части ту же грамматику, что
+ * и к обычной строке в том же контексте, — с одним отличием: `checkFragmentLiteral`
+ * никогда не включает `isWholeValueColor` (проверку «весь текст — это
+ * цвет»), потому что статическая часть — это не «всё значение», а его
+ * кусок; для неё «функции цвета и hex — всегда, имена — только в
+ * контекстах п. 1–3 выше» в чистом виде, без искажения от совпадения
+ * куска с именем цвета целиком вне этих контекстов.
+ *
+ * # Обработчики `v-on`/`@`, `v-for`, `v-slot` — разбор без ложного padения
+ *
+ * Прежняя реализация заворачивала ЛЮБОЕ выражение директивы в `(...)`,
+ * чтобы `{ color: 'red' }` разобрался как объектный литерал. Это ломало
+ * три формы, валидные для Vue, но не являющиеся одиночным выражением в
+ * скобках:
+ *
+ * - `v-on`/`@` — значение directive это список STATEMENT'ов
+ *   (`open = false; emit('close')`), не выражение; `(a; b)` — синтаксическая
+ *   ошибка TS. Такие директивы (`prop.name === 'on'`) разбираются как
+ *   обычный модуль, без обёрточных скобок (`scanScriptModule` и так не
+ *   оборачивает — этим и отличается от `scanScriptExpression`).
+ * - `v-for` — `item of items`/`(item, index) in items` не выражение
+ *   (левая часть — паттерн объявления, не значение). `@vue/compiler-sfc`
+ *   уже разбирает форму сам и кладёт готовый результат в
+ *   `prop.forParseResult.source` — проверяется только он (правая часть,
+ *   после `in`/`of`, ровно как просит бриф), без ручного разбора текста
+ *   по `in`/`of` и без риска ошибиться на форме с деструктуризацией слева.
+ * - `v-slot`/`#slot` с деструктуризацией (`{ a, b }`, `{ a: renamed }`,
+ *   `{ a, ...rest }`, значения по умолчанию `{ a = 1 }`) — измерено
+ *   отдельно (см. отчёт по задаче): обёртка в скобки `({ ... })` уже
+ *   разбирается TS без ошибки для всех этих форм (валидный синтаксис
+ *   ObjectLiteralExpression с сокращёнными свойствами), падения не было —
+ *   фикстуры ниже это закрепляют как регресс-барьер, без изменения кода.
  */
 
 const SRC_DIR = join(dirname(fileURLToPath(import.meta.url)))
@@ -330,6 +430,79 @@ function findScriptColorLiteral(text: string): string | null {
   return containsHexOrFunctionColor(text)
 }
 
+/**
+ * Проверка ЦЕЛОГО строкового литерала (`StringLiteral`/
+ * `NoSubstitutionTemplateLiteral`) с учётом контекста (см. doc-комментарий
+ * файла, «Четвёртый раунд»): в контекстах п. 1–3 — полная грамматика
+ * (`findCssColorLiteral`, имена включены), иначе — прежний ограниченный
+ * разбор (`findScriptColorLiteral`).
+ */
+function checkWholeLiteral(text: string, allowNames: boolean): string | null {
+  return allowNames ? findCssColorLiteral(text) : findScriptColorLiteral(text)
+}
+
+/**
+ * Проверка СТАТИЧЕСКОЙ ЧАСТИ шаблонного литерала с подстановкой
+ * (`TemplateHead`/`TemplateMiddle`/`TemplateTail`, текст без `${…}`).
+ * В отличие от `checkWholeLiteral`, никогда не применяет `isWholeValueColor`:
+ * часть — это кусок значения, а не всё значение, и совпадение куска с
+ * именем цвета целиком вне контекстов п. 1–3 не должно ложно сработать
+ * (см. doc-комментарий файла, «Шаблонные литералы с подстановкой»).
+ * Функции цвета и hex ищутся всегда, имена — только если `allowNames`.
+ */
+function checkFragmentLiteral(text: string, allowNames: boolean): string | null {
+  const hexOrFunction = containsHexOrFunctionColor(text)
+  if (hexOrFunction !== null) return hexOrFunction
+  if (!allowNames) return null
+
+  const stripped = stripNonPaletteConstructs(text)
+  const namedColor = stripped.match(NAMED_OR_SYSTEM_COLOR_RE)
+  return namedColor && namedColor[0] !== undefined ? namedColor[0] : null
+}
+
+// ---------------------------------------------------------------------------
+// Контексты «строка гарантированно CSS-значение» (Б-1, четвёртый раунд)
+// ---------------------------------------------------------------------------
+
+// Ключ объекта, похожий на CSS-свойство: без списка известных свойств (см.
+// doc-комментарий файла — почему транзитивный `mdn-data` отклонён), честная
+// эвристика по форме после приведения camelCase к kebab-case.
+const CSS_PROPERTY_KEY_RE = /^-?[a-z]+(-[a-z]+)*$/
+
+function toKebabCase(key: string): string {
+  return key.replace(/[A-Z]/g, (ch) => `-${ch.toLowerCase()}`)
+}
+
+function isCssPropertyLikeKey(key: string): boolean {
+  return CSS_PROPERTY_KEY_RE.test(toKebabCase(key))
+}
+
+/** Имя простого/строкового/числового свойства объекта; `null` для вычисляемого ключа (`[expr]: value`) — тогда контекст не форсируется. */
+function getObjectPropertyKeyText(name: ts.PropertyName): string | null {
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text
+  return null
+}
+
+/**
+ * true, если цепочка доступа к свойству где-то содержит сегмент `style`
+ * (`el.style = …`, `el.style.cssText = …`, `el.style.color = …`) — тогда
+ * правая часть присваивания достоверно CSS-значение независимо от имени
+ * конкретного свойства, без эвристики по ключу.
+ */
+function isStylePropertyAccessChain(expr: ts.Expression): boolean {
+  let current: ts.Expression = expr
+  while (ts.isPropertyAccessExpression(current)) {
+    if (current.name.text === 'style') return true
+    current = current.expression
+  }
+  return false
+}
+
+/** `x.style.setProperty(name, value)` — CSSOM API, синтаксически однозначен независимо от приёмника `x`. */
+function isSetPropertyCall(node: ts.CallExpression): boolean {
+  return ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'setProperty'
+}
+
 // ---------------------------------------------------------------------------
 // CSS: `.css`-файлы, `<style>`-блоки SFC, инлайн `style="..."`
 // ---------------------------------------------------------------------------
@@ -390,25 +563,80 @@ function assertNoParseErrors(sourceFile: ts.SourceFile, label: string): void {
   }
 }
 
-function walkStringLiterals(node: ts.Node, onLiteral: (text: string) => void): void {
+/**
+ * Рекурсивный обход AST скрипта с распространением контекста «строка —
+ * гарантированно CSS-значение» (`allowNames`, см. doc-комментарий файла,
+ * «Четвёртый раунд»). `objectStyleContext` — входной признак «мы внутри
+ * `.ts`-модуля целиком или внутри выражения директивы `:style`»: только
+ * тогда ключ объекта, похожий на CSS-свойство, форсирует `allowNames` для
+ * своего значения (п. 1). Присваивание в цепочку `....style` и вызов
+ * `....setProperty(...)` (п. 2) форсируют `allowNames` независимо от
+ * `objectStyleContext` — это отдельный, более узкий и самодостаточный
+ * признак. Как только `allowNames` стал `true` для узла, он остаётся
+ * `true` для всего поддерева (сброса вниз по дереву не бывает — CSS-текст
+ * внутри CSS-текста не превращается обратно в прозу).
+ */
+function collectColorLiterals(
+  node: ts.Node,
+  allowNames: boolean,
+  objectStyleContext: boolean,
+  label: string,
+  violations: string[],
+): void {
   if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
-    onLiteral(node.text)
+    const literal = checkWholeLiteral(node.text, allowNames)
+    if (literal !== null) {
+      violations.push(`${label}: строковый литерал "${node.text}" содержит цвет "${literal}"`)
+    }
+    return
   }
-  ts.forEachChild(node, (child) => walkStringLiterals(child, onLiteral))
+
+  if (ts.isTemplateHead(node) || ts.isTemplateMiddleOrTemplateTail(node)) {
+    const literal = checkFragmentLiteral(node.text, allowNames)
+    if (literal !== null) {
+      violations.push(`${label}: часть шаблонного литерала "${node.text}" содержит цвет "${literal}"`)
+    }
+    return
+  }
+
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+    && isStylePropertyAccessChain(node.left)) {
+    collectColorLiterals(node.left, allowNames, objectStyleContext, label, violations)
+    collectColorLiterals(node.right, true, objectStyleContext, label, violations)
+    return
+  }
+
+  if (ts.isCallExpression(node) && isSetPropertyCall(node)) {
+    collectColorLiterals(node.expression, allowNames, objectStyleContext, label, violations)
+    node.arguments.forEach((arg, index) => {
+      collectColorLiterals(arg, index === 1 ? true : allowNames, objectStyleContext, label, violations)
+    })
+    return
+  }
+
+  if (ts.isPropertyAssignment(node)) {
+    const keyText = getObjectPropertyKeyText(node.name)
+    const valueAllowNames = allowNames
+      || (objectStyleContext && keyText !== null && isCssPropertyLikeKey(keyText))
+    collectColorLiterals(node.initializer, valueAllowNames, objectStyleContext, label, violations)
+    return
+  }
+
+  ts.forEachChild(node, (child) => collectColorLiterals(child, allowNames, objectStyleContext, label, violations))
+}
+
+interface ScanScriptOptions {
+  /** См. doc-комментарий `collectColorLiterals` — п. 1 «Четвёртого раунда». */
+  objectStyleContext?: boolean
 }
 
 /** Полный модуль/скрипт (`.ts`/`.js`, содержимое `<script>`/`<script setup>`). */
-function scanScriptModule(sourceText: string, label: string): string[] {
+function scanScriptModule(sourceText: string, label: string, options: ScanScriptOptions = {}): string[] {
   const sourceFile = ts.createSourceFile(label, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
   assertNoParseErrors(sourceFile, label)
 
   const violations: string[] = []
-  walkStringLiterals(sourceFile, (text) => {
-    const literal = findScriptColorLiteral(text)
-    if (literal !== null) {
-      violations.push(`${label}: строковый литерал "${text}" содержит цвет "${literal}"`)
-    }
-  })
+  collectColorLiterals(sourceFile, false, options.objectStyleContext ?? false, label, violations)
   return violations
 }
 
@@ -416,10 +644,49 @@ function scanScriptModule(sourceText: string, label: string): string[] {
  * Фрагмент выражения из шаблона (`exp.content` директивы/интерполяции —
  * не полноценный файл, а кусок вроде `{ color: 'red' }` или `a ? b : c`).
  * Заворачивается в скобки, чтобы `{ ... }` разобрался как объектный
- * литерал (выражение), а не как statement-блок.
+ * литерал (выражение), а не как statement-блок. Используется для всех
+ * директив, КРОМЕ `:style` (свой путь — `scanStyleDirectiveExpression`),
+ * `v-on`/`@` (список statement'ов — `scanScriptModule` без обёртки) и
+ * `v-for` (проверяется только `forParseResult.source`, см.
+ * `scanTemplateProp`).
  */
 function scanScriptExpression(exprText: string, label: string): string[] {
   return scanScriptModule(`(${exprText})`, label)
+}
+
+/** Снимает обёрточные скобки: `((expr))` → `expr`. */
+function unwrapParens(expr: ts.Expression): ts.Expression {
+  let current = expr
+  while (ts.isParenthesizedExpression(current)) {
+    current = current.expression
+  }
+  return current
+}
+
+/**
+ * Выражение директивы `:style`/`v-bind:style` (см. doc-комментарий файла,
+ * «Четвёртый раунд», п. 3): если выражение целиком — строковый литерал
+ * (`:style="'border: 1px solid red'"`), это инлайн-CSS текст, а не JS —
+ * разбирается тем же путём, что статический атрибут `style="..."`
+ * (`scanInlineStyleValue`/postcss). Иначе — обычный скриптовый разбор с
+ * признаком «стилевой объект» (п. 1а): любой объектный литерал внутри
+ * этого выражения (включая ветки тернарника) — стилевой.
+ */
+function scanStyleDirectiveExpression(exprText: string, label: string): string[] {
+  const sourceFile = ts.createSourceFile(label, `(${exprText})`, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  assertNoParseErrors(sourceFile, label)
+
+  const [firstStatement] = sourceFile.statements
+  if (firstStatement !== undefined && ts.isExpressionStatement(firstStatement)) {
+    const inner = unwrapParens(firstStatement.expression)
+    if (ts.isStringLiteral(inner) || ts.isNoSubstitutionTemplateLiteral(inner)) {
+      return scanInlineStyleValue(inner.text, `${label} (строка стиля)`)
+    }
+  }
+
+  const violations: string[] = []
+  collectColorLiterals(sourceFile, false, true, label, violations)
+  return violations
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +718,13 @@ interface RawTemplateProp {
   value?: RawExprNode
   arg?: RawExprNode
   exp?: RawExprNode
+  // Только у `v-for` (`prop.name === 'for'`) — `@vue/compiler-sfc` сам
+  // разбирает форму `значение in/of источник` (в т. ч. с деструктуризацией
+  // и индексом слева) и кладёт готовую правую часть сюда. Проверяется
+  // только `source` — левая часть является паттерном объявления, не
+  // значением, ей нечего вычислять (см. doc-комментарий файла, «Четвёртый
+  // раунд»).
+  forParseResult?: { source?: RawExprNode }
 }
 
 function collectElementText(node: RawTemplateNode): string {
@@ -482,10 +756,39 @@ function scanTemplateProp(prop: RawTemplateProp, label: string, violations: stri
   }
 
   if (prop.type === 7) {
-    // Динамическая привязка (`:style`, `:fill`, `v-bind`, `v-if`, …).
+    // Директива. `prop.name` — имя самой директивы (`bind`/`on`/`for`/
+    // `slot`/`if`/…, без `v-`), не аргумента: `:style` и `v-on:click` дают
+    // 'bind' и 'on' соответственно, а имя атрибута/события — в `prop.arg`.
+    const directiveName = prop.name ?? ''
+    const argOrName = prop.arg?.content ?? directiveName
+
+    if (directiveName === 'for') {
+      // `item of items`/`(item, index) in items` — не выражение (левая
+      // часть — паттерн объявления), проверяется только правая часть,
+      // уже разобранная самим `@vue/compiler-sfc` (см. `RawTemplateProp`).
+      const source = prop.forParseResult?.source?.content
+      if (source !== undefined) {
+        violations.push(...scanScriptExpression(source, `${label} v-for (источник) "${source}"`))
+      }
+      return
+    }
+
     const exprText = prop.exp?.content
     if (exprText === undefined) return
-    const argOrName = prop.arg?.content ?? prop.name ?? ''
+
+    if (directiveName === 'on') {
+      // Список statement'ов (`open = false; emit('close')`), не выражение —
+      // обёртка в скобки здесь синтаксическая ошибка, нужен обычный
+      // модульный разбор без обёртки.
+      violations.push(...scanScriptModule(exprText, `${label} @${argOrName}="${exprText}"`))
+      return
+    }
+
+    if (directiveName === 'bind' && argOrName.toLowerCase() === 'style') {
+      violations.push(...scanStyleDirectiveExpression(exprText, `${label} :style="${exprText}"`))
+      return
+    }
+
     violations.push(...scanScriptExpression(exprText, `${label} :${argOrName}="${exprText}"`))
   }
 }
@@ -571,7 +874,9 @@ function scanFile(absolutePath: string, label: string): string[] {
   const source = readFileSync(absolutePath, 'utf-8')
 
   if (absolutePath.endsWith('.css')) return scanCssText(source, label)
-  if (absolutePath.endsWith('.ts') || absolutePath.endsWith('.js')) return scanScriptModule(source, label)
+  if (absolutePath.endsWith('.ts') || absolutePath.endsWith('.js')) {
+    return scanScriptModule(source, label, { objectStyleContext: true })
+  }
   if (absolutePath.endsWith('.vue')) return scanVueFile(source, label)
   if (absolutePath.endsWith('.svg') || absolutePath.endsWith('.html')) return scanMarkupFile(source, label)
 
@@ -640,8 +945,18 @@ function templateViolations(templateInner: string): string[] {
   return scanVueFile(`<template>${templateInner}</template>`, 'fixture.vue')
 }
 
-function scriptViolations(scriptBody: string): string[] {
-  return scanScriptModule(scriptBody, 'fixture.ts')
+function scriptViolations(scriptBody: string, objectStyleContext = false): string[] {
+  return scanScriptModule(scriptBody, 'fixture.ts', { objectStyleContext })
+}
+
+/**
+ * Симулирует реальное сканирование `.ts`-файла: `scanFile` передаёт
+ * `objectStyleContext: true` для `.ts`/`.js` (см. doc-комментарий файла,
+ * «Четвёртый раунд», п. 1б) — обычный `scriptViolations` без аргумента
+ * симулирует более узкий контекст (фрагмент/`<script setup>`).
+ */
+function moduleScriptViolations(scriptBody: string): string[] {
+  return scriptViolations(scriptBody, true)
 }
 
 describe('сторож — фикстуры-мутации ловятся (два предыдущих раунда ревью)', () => {
@@ -733,6 +1048,117 @@ describe('сторож — не даёт заявленных ложных ср�
     ['класс с несколькими словами — не цвет целиком', () => templateViolations('<div class="btn primary" />')],
   ])('не краснеет: %s', (_label, run) => {
     expect(run()).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Б-1 (четвёртый раунд) — имена цветов внутри составных строк, по контексту
+// ---------------------------------------------------------------------------
+
+describe('Б-1: имена цветов внутри составной строки ловятся в контекстах п. 1–3', () => {
+  it.each([
+    [
+      'ключ объекта в :style похож на CSS-свойство (border)',
+      () => templateViolations('<div :style="{ border: \'1px solid red\' }" />'),
+    ],
+    [
+      'ключ объекта в .ts-модуле похож на CSS-свойство (camelCase boxShadow)',
+      () => moduleScriptViolations("export const cardStyle = { boxShadow: '0 0 0 2px white' }"),
+    ],
+    [
+      'выражение :style целиком — строка инлайн-CSS',
+      () => templateViolations('<div :style="\'border: 1px solid red\'" />'),
+    ],
+  ])('краснеет: %s', (_label, run) => {
+    expect(run()).not.toEqual([])
+  })
+
+  it('не краснеет: проза с системными цветами вне контекстов п. 1–3 ("Field and red window")', () => {
+    // Требование ведущего — закрепление конкретно этого случая: `Field` и
+    // `Window` легитимные системные цвета CSS **и** обычные английские
+    // слова (см. doc-комментарий `findScriptColorLiteral`). Проверяется в
+    // контексте целого `.ts`-модуля (`moduleScriptViolations`, как реально
+    // сканируется `*.test.ts`), чтобы доказать: новый поиск имён по ключу
+    // объекта не расширился до произвольного текстового аргумента вызова —
+    // здесь нет ни одного объектного литерала с CSS-подобным ключом, ни
+    // `.style`-цепочки, ни `setProperty`.
+    expect(moduleScriptViolations("it('Field and red window', () => {})")).toEqual([])
+  })
+
+  it('.style-цепочка ловит составное имя независимо от объектного контекста', () => {
+    expect(scriptViolations("el.style.border = '1px solid red'")).not.toEqual([])
+  })
+
+  it('setProperty ловит составное имя во втором аргументе', () => {
+    expect(scriptViolations("el.style.setProperty('border', '1px solid red')")).not.toEqual([])
+  })
+
+  it('ключ объекта, НЕ похожий на CSS-свойство по форме, не форсирует имена (снаружи стилевого контекста)', () => {
+    // `2fast` — не проходит `^-?[a-z]+(-[a-z]+)*$` (цифра), поэтому даже в
+    // .ts-модуле не считается CSS-свойством — составное имя внутри не ищется.
+    expect(moduleScriptViolations("const x = { '2fast': 'go red now' }")).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Интерполяция шаблонных литералов — статические части (дешёвый пункт 1)
+// ---------------------------------------------------------------------------
+
+describe('интерполяция: статические части шаблонного литерала с подстановкой', () => {
+  it('функция цвета в статической части :style-объекта (hsl(${hue}, ...))', () => {
+    const violations = templateViolations(
+      '<div :style="{ background: `hsl(${hue}, 70%, 45%)` }" />',
+    )
+    expect(violations).not.toEqual([])
+  })
+
+  it('составное имя в хвосте шаблонного литерала внутри .style-присваивания', () => {
+    const violations = scriptViolations(
+      'el.style.cssText = `color: ${c}; border: 1px solid red`',
+    )
+    expect(violations).not.toEqual([])
+  })
+
+  it('не краснеет: статическая часть без цвета, вне контекстов п. 1–3 (ширина прогресса)', () => {
+    expect(templateViolations('<div :style="{ width: `${percent}%` }" />')).toEqual([])
+  })
+
+  it('не краснеет: голое имя цвета как ЧАСТЬ (не всё значение) статического текста вне контекста', () => {
+    // `checkFragmentLiteral` не применяет `isWholeValueColor` — иначе кусок
+    // "red" в `${x}red` ловился бы как «имя целиком» даже вне контекстов
+    // п. 1–3, а это не то же самое, что «имя внутри составной строки».
+    expect(scriptViolations('const label = `${prefix}red`')).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Обработчики v-on/v-for/v-slot — разбор не падает (дешёвый пункт 2)
+// ---------------------------------------------------------------------------
+
+describe('v-on/v-for/v-slot: выражение разбирается без падения', () => {
+  it.each([
+    ['v-on со списком statement\'ов через ;', () => templateViolations('<button @click="open = false; emit(\'close\')">x</button>')],
+    ['v-for с item of items', () => templateViolations('<div v-for="item of items" :key="item.id">{{ item }}</div>')],
+    ['v-for с деструктуризацией и индексом', () => templateViolations('<div v-for="(item, index) in items" :key="index">{{ item }}</div>')],
+    ['v-slot с деструктуризацией', () => templateViolations('<template v-slot="{ a, b }"><span>{{ a }}</span></template>')],
+    ['#slot (сокращение) с переименованием', () => templateViolations('<template #default="{ item: renamedItem }"><span>{{ renamedItem }}</span></template>')],
+    ['v-slot со значением по умолчанию при деструктуризации', () => templateViolations('<template v-slot="{ a = 1 }"><span>{{ a }}</span></template>')],
+  ])('не падает и не краснеет: %s', (_label, run) => {
+    expect(run()).toEqual([])
+  })
+
+  it('v-on: реальное нарушение внутри statement всё равно ловится (парсинг не глушит проверку)', () => {
+    const violations = templateViolations(
+      '<button @click="el.style.color = \'red\'; emit(\'close\')">x</button>',
+    )
+    expect(violations).not.toEqual([])
+  })
+
+  it('v-for: цвет в источнике (правой части) ловится', () => {
+    // Надуманный, но валидный случай: показывает, что проверяется именно
+    // `forParseResult.source`, а не отбрасывается совсем.
+    const violations = templateViolations('<div v-for="item of (\'#ff0000\')" />')
+    expect(violations).not.toEqual([])
   })
 })
 
