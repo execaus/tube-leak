@@ -579,6 +579,60 @@ describe('HistoryScreen — обновление по активации вкл�
 
     expect(invokeMock).not.toHaveBeenCalled()
   })
+
+  function historyPageCallCount(): number {
+    return invokeMock.mock.calls.filter(([cmd]) => cmd === 'history_page').length
+  }
+
+  it('C1: монтирование на «Главном», затем открыть/уйти/открыть вкладку «История» — по одному запросу на монтирование и на каждое открытие, ни одного на уход', async () => {
+    invokeMock.mockResolvedValue({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const wrapper = mount(HistoryScreen, { attachTo: host, props: { active: false } })
+    await flushPromises()
+    const atStart = historyPageCallCount()
+
+    await wrapper.setProps({ active: true })
+    await flushPromises()
+    const afterOpen = historyPageCallCount()
+
+    await wrapper.setProps({ active: false })
+    await flushPromises()
+    const afterLeave = historyPageCallCount()
+
+    await wrapper.setProps({ active: true })
+    await flushPromises()
+
+    expect([atStart, afterOpen, afterLeave, historyPageCallCount()]).toStrictEqual([1, 2, 2, 3])
+  })
+
+  it('C2: приложение стартует сразу на вкладке «История» (`active: true` с монтирования) — запрос ровно один, второй от `watch` не задваивается', async () => {
+    invokeMock.mockResolvedValue({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    mount(HistoryScreen, { attachTo: host, props: { active: true } })
+    await flushPromises()
+
+    expect(historyPageCallCount()).toBe(1)
+  })
+})
+
+describe('HistoryScreen — выход из недоступности по активации вкладки (U3, правки ревью TL-93, третий раунд)', () => {
+  it('unavailable от «Удалить» держит блокировку, пока пользователь остаётся на вкладке; уход и возврат на «Историю» её снимают', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const wrapper = mount(HistoryScreen, { attachTo: host, props: { active: true } })
+    await flushPromises()
+
+    invokeMock.mockRejectedValueOnce({ kind: 'unavailable', reason: 'noAccess', message: 'diag' })
+    await wrapper.findAll('button').find((b) => b.text() === 'Удалить')?.trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.history-screen__unavailable').exists()).toBe(true)
+
+    invokeMock.mockResolvedValue({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    await wrapper.setProps({ active: false })
+    await wrapper.setProps({ active: true })
+    await flushPromises()
+
+    expect(wrapper.find('.history-screen__unavailable').exists()).toBe(false)
+    expect(wrapper.findAll('.history-screen__entry')).toHaveLength(1)
+  })
 })
 
 describe('HistoryScreen — живая зона структурных изменений (дизайн E5, «Доступность»)', () => {

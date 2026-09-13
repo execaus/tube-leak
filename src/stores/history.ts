@@ -131,6 +131,11 @@ function mergeNotices(current: HistoryNotice[], incoming: HistoryNotice[]): Hist
   return toAdd.length > 0 ? [...current, ...toAdd] : current
 }
 
+/** `true`, когда среди пометок ответа есть «база пересоздана» — см. doc «Пересоздание базы» у {@link useHistoryStore}. */
+function hasBaseRecreatedNotice(notices: HistoryNotice[]): boolean {
+  return notices.some((n) => n.kind === 'baseRecreated')
+}
+
 /**
  * Домен «история загрузок» (эпик E5, TL-93) — один Pinia-стор на домен
  * (CLAUDE.md), отдельный от `downloadTask.ts` (очередь — другой домен).
@@ -199,7 +204,62 @@ function mergeNotices(current: HistoryNotice[], incoming: HistoryNotice[]): Hist
  * ответа на новый. Сторож — монотонный счётчик `refreshCallId`, тот же
  * приём, что `generation` в `useProbe.ts`: каждый вызов запоминает своё
  * значение при старте и сверяет его перед тем, как что-либо записать в
- * состояние; несовпадение — работа отброшена целиком, и успех, и отказ.
+ * состояние (список/курсор/доступность); несовпадение — эта часть работы
+ * отброшена.
+ *
+ * # Пометки сливаются из ЛЮБОГО ответа (Б-1, правки ревью TL-93, третий раунд)
+ *
+ * Второй раунд отбрасывал устаревший по `refreshCallId` ответ **целиком** —
+ * вместе с однократной пометкой ядра, которую этот ответ несёт. Ядро шлёт
+ * `queue://changed` дважды подряд на каждый `Done` при непустой очереди
+ * (`commit`, затем `pump`), так что почти всегда первый из двух запущенных
+ * {@link refreshFirst} успевает устареть раньше, чем пользователь видит его
+ * ответ, — и пометка терялась систематически, а не изредка. Исправление:
+ * {@link mergeNotices} вызывается на **каждом** успешном ответе, до всех
+ * проверок `callId`/`listGeneration` ниже и независимо от их исхода. Список,
+ * курсор и `availability` по-прежнему берутся только из «выигравшего» по
+ * актуальности ответа — сливаются только пометки.
+ *
+ * # Поколения списка — loadMore/удаление/очистка не пересекаются с устаревшим ответом
+ * (мелочи Б-1, правки ревью TL-93, третий раунд)
+ *
+ * `refreshCallId` упорядочивает только вызовы {@link refreshFirst} между
+ * собой. Он не защищает от другой гонки: {@link refreshFirst} или
+ * {@link loadMore} в полёте, пока пользователь успешно нажал «Удалить» или
+ * «Очистить» — тогда пришедший позже ответ несёт данные **до** этого
+ * изменения, и его наивное применение воскресит то, что уже убрано. Второй
+ * счётчик, `listGeneration`, отслеживает именно структурные изменения
+ * списка:
+ *
+ * - продвигается на единицу при успешном {@link clearHistory}, при успешном
+ *   {@link deleteRecord} (включая тихое удаление по `unknownRecord`) и при
+ *   каждом случае, когда {@link refreshFirst} **заменяет** уже показанные
+ *   записи — сброс целиком, сброс к пустому списку, безусловный сброс по
+ *   «база пересоздана» и замена префикса (даже когда после замены список
+ *   выглядит так же, как выглядел бы без неё — дешевле отбросить лишний раз
+ *   параллельный запрос, чем пропустить случай, где замена префикса и
+ *   вправду отличается);
+ * - не продвигается на самой первой загрузке (`!hasLoadedOnce`) — до неё
+ *   `nextCursor` ещё не выдан, и {@link loadMore} физически не может быть в
+ *   полёте.
+ *
+ * {@link refreshFirst} и {@link loadMore} запоминают текущее значение
+ * `listGeneration` при старте и сверяют его перед тем, как записать
+ * список/курсор в состояние; несовпадение отбрасывает именно эту часть
+ * ответа (пометки из {@link refreshFirst}, как сказано выше, сливаются
+ * всё равно).
+ *
+ * # Пересоздание базы — сброс безусловный (мелочь №3, правки ревью TL-93, третий раунд)
+ *
+ * `AUTOINCREMENT` новой базы начинает счёт заново, так что id страницы,
+ * пришедшей после пересоздания, может случайно совпасть с id, уже видимым
+ * в списке. Проверка «последний id свежей страницы есть в списке» в этом
+ * случае нашла бы совпадение не по смыслу, а по совпадению — и тогда
+ * список смешался бы с записями из уже несуществующей базы, а старый
+ * `nextCursor` пережил бы пересоздание, которое обязано было его стереть.
+ * Пометка `baseRecreated` в ответе без курсора обходит эту сверку целиком:
+ * список и курсор берутся из свежей страницы безусловно, даже если
+ * совпадение id формально нашлось бы.
  */
 export const useHistoryStore = defineStore('history', () => {
   const entries = ref<HistoryEntry[]>([])
@@ -227,8 +287,14 @@ export const useHistoryStore = defineStore('history', () => {
   let hasLoadedOnce = false
   let unlistenQueue: UnlistenFn | undefined
   let listeningQueue: Promise<void> | undefined
-  /** Сторож гонки {@link refreshFirst} — см. doc-комментарий класса, «Гонка двух refreshFirst». */
+  /** Сторож гонки {@link refreshFirst} против {@link refreshFirst} — см. doc-комментарий класса, «Гонка двух refreshFirst». */
   let refreshCallId = 0
+  /** Сторож структурных изменений списка — см. doc-комментарий класса, «Поколения списка». */
+  let listGeneration = 0
+
+  function bumpListGeneration(): void {
+    listGeneration += 1
+  }
 
   function applyPageError(err: unknown): void {
     if (isHistoryUnavailableError(err)) {
@@ -243,36 +309,60 @@ export const useHistoryStore = defineStore('history', () => {
   /** Первая страница (без курсора) — сверяет её с уже показанным списком. См. doc класса выше, «Первая страница». */
   async function refreshFirst(): Promise<void> {
     const callId = ++refreshCallId
+    const generationAtStart = listGeneration
     try {
       const page = await invoke<HistoryPage>(HISTORY_PAGE_COMMAND, { cursor: undefined })
-      if (callId !== refreshCallId) return // отброшен более новым вызовом, пока этот был в полёте
+
+      // Б-1 (правки ревью TL-93, третий раунд): пометки сливаются из ЛЮБОГО
+      // ответа — раньше проверок ниже и независимо от их исхода. См. doc
+      // класса, «Пометки сливаются из ЛЮБОГО ответа».
+      notices.value = mergeNotices(notices.value, page.notices)
+
+      if (callId !== refreshCallId) return // отброшен более новым вызовом refreshFirst, пока этот был в полёте
       availability.value = undefined
       ipcFailure.value = false
 
+      if (listGeneration !== generationAtStart) {
+        // Список успел структурно измениться («Удалить»/«Очистить») пока
+        // этот ответ был в полёте — он несёт данные до этого изменения, и
+        // применить их значило бы воскресить то, что пользователь только
+        // что убрал (G3/G4, правки ревью TL-93, третий раунд). Пометки уже
+        // слиты выше; список и курсор не трогаем.
+        return
+      }
+
       const knownIdsBefore = new Set(entries.value.map((e) => e.id))
       const isLiveUpdate = hasLoadedOnce
+      const isBaseRecreated = hasBaseRecreatedNotice(page.notices)
 
       if (!hasLoadedOnce) {
         entries.value = page.entries
         nextCursor.value = page.nextCursor
         hasLoadedOnce = true
+      } else if (isBaseRecreated) {
+        // Пересоздание базы (мелочь №3, правки ревью TL-93, третий раунд):
+        // сброс безусловный, без сверки со списком — см. doc класса.
+        entries.value = page.entries
+        nextCursor.value = page.nextCursor
+        bumpListGeneration()
       } else if (page.entries.length === 0) {
         entries.value = []
         nextCursor.value = page.nextCursor
+        bumpListGeneration()
       } else {
         const lastFreshId = page.entries[page.entries.length - 1]!.id
         const splitIndex = entries.value.findIndex((e) => e.id === lastFreshId)
         if (splitIndex === -1) {
           entries.value = page.entries
           nextCursor.value = page.nextCursor
+          bumpListGeneration()
         } else {
           const tail = entries.value.slice(splitIndex + 1)
           entries.value = [...page.entries, ...tail]
           // `nextCursor` умышленно не трогается здесь — см. doc класса.
+          bumpListGeneration()
         }
       }
-
-      notices.value = mergeNotices(notices.value, page.notices)
 
       // Живая зона (дизайн E5, «Доступность»): «структурные изменения... —
       // отдельной скрытой aria-live="polite" строкой», а не пересказом
@@ -321,15 +411,30 @@ export const useHistoryStore = defineStore('history', () => {
     await refreshFirst()
   }
 
-  /** «Показать ещё» (Ф-4) — курсор идёт в запрос как получен от предыдущего ответа `history_page`, не собирается заново из полей записи (см. doc-комментарий теста `history.test.ts`, «Курсор как есть»). */
+  /**
+   * «Показать ещё» (Ф-4) — курсор идёт в запрос как получен от предыдущего
+   * ответа `history_page`, не собирается заново из полей записи (см.
+   * doc-комментарий теста `history.test.ts`, «Курсор как есть»).
+   *
+   * `generationAtStart` (G2/U2, правки ревью TL-93, третий раунд) — этот
+   * запрос продолжает список таким, каким он был на момент вызова; если
+   * пока он был в полёте список успел структурно замениться
+   * ({@link refreshFirst} со сбросом/заменой префикса, успешные
+   * «Удалить»/«Очистить», см. doc класса «Поколения списка»), его хвост
+   * либо задублирует уже показанные id, либо продолжит список, которого
+   * больше нет, — ответ отбрасывается целиком, без записи в состояние.
+   */
   async function loadMore(): Promise<void> {
     if (!nextCursor.value || isLoadingMore.value) return
+    const generationAtStart = listGeneration
     isLoadingMore.value = true
     try {
       const page = await invoke<HistoryPage>(HISTORY_PAGE_COMMAND, { cursor: nextCursor.value })
+      if (listGeneration !== generationAtStart) return
       entries.value = [...entries.value, ...page.entries]
       nextCursor.value = page.nextCursor
     } catch (err) {
+      if (listGeneration !== generationAtStart) return
       applyPageError(err)
     } finally {
       isLoadingMore.value = false
@@ -354,12 +459,14 @@ export const useHistoryStore = defineStore('history', () => {
     try {
       await invoke<void>(DELETE_HISTORY_RECORD_COMMAND, { id })
       entries.value = entries.value.filter((e) => e.id !== id)
+      bumpListGeneration()
       showInFolderErrors.value = withoutKey(showInFolderErrors.value, id)
       commandError.value = undefined
     } catch (err) {
       const failure = toHistoryCommandFailure(err)
       if (failure.kind === 'unknownRecord') {
         entries.value = entries.value.filter((e) => e.id !== id)
+        bumpListGeneration()
         return
       }
       if (failure.kind === 'unavailable') {
@@ -387,6 +494,7 @@ export const useHistoryStore = defineStore('history', () => {
       showInFolderErrors.value = {}
       commandError.value = undefined
       hasLoadedOnce = false
+      bumpListGeneration()
     } catch (err) {
       const failure = toHistoryCommandFailure(err)
       if (failure.kind === 'unavailable') {
