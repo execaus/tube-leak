@@ -1,0 +1,64 @@
+{
+  "_capture": {
+    "note": "Адрес видео отвечает 404: у 133 нет даже строки Destination, звук при этом скачивается целиком; код 1, ERROR в stderr.",
+    "reality": "live",
+    "method": "local-server",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "--progress-delta",
+      "0.3",
+      "--socket-timeout",
+      "10",
+      "-f",
+      "133,139",
+      "-P",
+      "home:<destination>",
+      "-o",
+      "Big Buck Bunny.f%(format_id)s.%(ext)s",
+      "--load-info-json",
+      "<infoJson>"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-09-13",
+    "select": "133,139",
+    "served": {
+      "133": "404",
+      "139": {
+        "file": "a139.m4a",
+        "bytes": 323730
+      }
+    },
+    "title": "Big Buck Bunny",
+    "requests": [
+      {
+        "path": "/404",
+        "range": null,
+        "status": 404
+      },
+      {
+        "path": "/a139.m4a",
+        "range": null,
+        "status": 200
+      }
+    ]
+  },
+  "exitCode": 1,
+  "stdout": "[info] aqz-KE-bpKQ: Downloading 2 format(s): 133, 139\n[download] Destination: <destination>/Big Buck Bunny.f139.m4a\n@tl-progress|downloading|1024|323730|NA|NA|NA|NA|NA|139\n@tl-progress|downloading|130048|323730|NA|429774.56024091167|0|NA|NA|139\n@tl-progress|downloading|261120|323730|NA|390087.76858373795|0|NA|NA|139\n@tl-progress|finished|323730|323730|NA|381406.7196267904|NA|NA|NA|139\n",
+  "stderr": "ERROR: unable to download video data: HTTP Error 404: Not Found\nWARNING: aqz-KE-bpKQ: writing DASH m4a. Only some players support this container. Install ffmpeg to fix this automatically\n",
+  "lineTimesMs": [
+    420,
+    436,
+    436,
+    738,
+    1106,
+    1283
+  ],
+  "listingBefore": [],
+  "listingAfter": [
+    "Big Buck Bunny.f139.m4a"
+  ]
+}

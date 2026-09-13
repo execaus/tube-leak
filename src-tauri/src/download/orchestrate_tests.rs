@@ -12,13 +12,13 @@
 //! финализация переименовывает — «что осталось на диске» проверяется
 //! обходом каталога, а не утверждением о намерениях.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tempfile::TempDir;
 
 use super::*;
-use crate::download::fixtures;
+use crate::download::fixtures::{self, DESTINATION_PLACEHOLDER, SINGLE_LAUNCH_FIXTURES};
 use crate::download::merge::MERGE_TIMEOUT_SECS;
 use crate::download::progress::parse_line;
 use crate::download::retry::{MAX_ATTEMPTS, NO_PROGRESS_TIMEOUT, SOCKET_TIMEOUT_SECS};
@@ -38,6 +38,10 @@ enum Step {
     Creates(String),
     /// Висеть, пока не убьют. Так выглядит процесс, который отменяют.
     HangUntilCancelled,
+    /// Сдвинуть управляемые часы рантайма — процесс молчит это время.
+    /// Работает только под `tokio::time::pause()` и без него падает, а не
+    /// ждёт по-настоящему.
+    Advance(Duration),
 }
 
 /// Сценарий одного запуска.
@@ -94,6 +98,11 @@ impl Script {
         self.steps.push(Step::HangUntilCancelled);
         self
     }
+
+    fn advance(mut self, by: Duration) -> Self {
+        self.steps.push(Step::Advance(by));
+        self
+    }
 }
 
 /// Один состоявшийся запуск: argv и сроки, которые оркестрация выставила.
@@ -102,6 +111,10 @@ struct Call {
     argv: Vec<String>,
     /// Срок, с которым запуск начался.
     first_deadline: Instant,
+    /// Строки stdout, отданные запуском, по порядку.
+    lines: Vec<String>,
+    /// Момент каждой строки по часам оркестрации ([`monotonic_now`]).
+    line_times: Vec<Instant>,
     /// Сроки, возвращённые обработчиком строк, по одному на строку.
     deadlines: Vec<Option<Instant>>,
 }
@@ -118,6 +131,14 @@ struct ScriptedLauncher {
     dir: PathBuf,
     scripts: StdMutex<VecDeque<Script>>,
     calls: StdMutex<Vec<Call>>,
+    /// Задача, чьё состояние снимается после каждой строки.
+    observed: StdMutex<Option<Arc<DownloadTask>>>,
+    /// (строка, состояние задачи сразу после её обработки).
+    ///
+    /// Снимок, а не события приёмника: троттлинг глотает события одного
+    /// вида, а снимок обновляется на каждой строке (doc `Emitter::emit`),
+    /// и только по нему видно, к какому потоку отнесена **каждая** строка.
+    snapshots: StdMutex<Vec<(String, DownloadProgress)>>,
 }
 
 impl ScriptedLauncher {
@@ -126,11 +147,28 @@ impl ScriptedLauncher {
             dir: dir.to_path_buf(),
             scripts: StdMutex::new(scripts.into()),
             calls: StdMutex::new(Vec::new()),
+            observed: StdMutex::new(None),
+            snapshots: StdMutex::new(Vec::new()),
         }
     }
 
     fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
+    }
+
+    fn formats_asked(&self) -> Vec<String> {
+        self.calls()
+            .iter()
+            .map(|call| call.value_of("-f").expect("-f обязателен").to_string())
+            .collect()
+    }
+
+    fn observe(&self, task: &Arc<DownloadTask>) {
+        *self.observed.lock().unwrap() = Some(Arc::clone(task));
+    }
+
+    fn snapshots(&self) -> Vec<(String, DownloadProgress)> {
+        self.snapshots.lock().unwrap().clone()
     }
 }
 
@@ -153,17 +191,31 @@ impl DownloadLauncher for ScriptedLauncher {
             let mut call = Call {
                 argv: args.iter().map(|arg| (*arg).to_string()).collect(),
                 first_deadline,
+                lines: Vec::new(),
+                line_times: Vec::new(),
                 deadlines: Vec::new(),
             };
 
             for step in &script.steps {
                 match step {
-                    Step::Line(line) => call.deadlines.push(on_line(line)),
+                    Step::Line(line) => {
+                        call.lines.push(line.clone());
+                        call.line_times.push(monotonic_now());
+                        call.deadlines.push(on_line(line));
+                        let observed = self.observed.lock().unwrap().clone();
+                        if let Some(task) = observed {
+                            self.snapshots
+                                .lock()
+                                .unwrap()
+                                .push((line.clone(), task.snapshot()));
+                        }
+                    }
                     Step::Creates(name) => {
                         std::fs::write(self.dir.join(name), b"stream bytes")
                             .expect("сценарий обязан уметь создать файл");
                     }
                     Step::HangUntilCancelled => handle.cancelled().await,
+                    Step::Advance(by) => tokio::time::advance(*by).await,
                 }
             }
 
@@ -185,35 +237,49 @@ struct ScriptedFfmpeg {
     /// Висеть, пока не убьют.
     hangs: bool,
     calls: AtomicUsize,
+    /// Входы каждой склейки: (видео, звук) — значения двух `-i` по порядку.
+    inputs: StdMutex<Vec<(String, String)>>,
 }
 
 impl ScriptedFfmpeg {
-    fn merging() -> Self {
+    fn with(fails: bool, hangs: bool) -> Self {
         Self {
-            fails: false,
-            hangs: false,
+            fails,
+            hangs,
             calls: AtomicUsize::new(0),
+            inputs: StdMutex::new(Vec::new()),
         }
+    }
+
+    fn merging() -> Self {
+        Self::with(false, false)
     }
 
     fn failing() -> Self {
-        Self {
-            fails: true,
-            hangs: false,
-            calls: AtomicUsize::new(0),
-        }
+        Self::with(true, false)
     }
 
     fn hanging() -> Self {
-        Self {
-            fails: false,
-            hangs: true,
-            calls: AtomicUsize::new(0),
-        }
+        Self::with(false, true)
     }
 
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// Имена файлов, ушедших в склейку видео и звуком, — по последней
+    /// склейке.
+    fn last_input_names(&self) -> (String, String) {
+        let name = |path: &str| {
+            Path::new(path.strip_prefix("file:").unwrap_or(path))
+                .file_name()
+                .expect("вход склейки — путь к файлу")
+                .to_string_lossy()
+                .into_owned()
+        };
+        let inputs = self.inputs.lock().unwrap();
+        let (video, audio) = inputs.last().expect("склейка была");
+        (name(video), name(audio))
     }
 }
 
@@ -226,6 +292,17 @@ impl FfmpegLauncher for ScriptedFfmpeg {
     ) -> Pin<Box<dyn Future<Output = Result<RunOutput, SidecarError>> + Send + 'a>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            let inputs: Vec<String> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "-i")
+                .map(|pair| pair[1].to_string())
+                .collect();
+            if let [video, audio] = inputs.as_slice() {
+                self.inputs
+                    .lock()
+                    .unwrap()
+                    .push((video.clone(), audio.clone()));
+            }
 
             if self.hangs {
                 handle.cancelled().await;
@@ -330,9 +407,16 @@ fn request(streams: QualityStreams) -> StartDownloadRequest {
             height_px: Some(720),
         },
         streams,
-        size: QualitySize::Known { bytes: 22_157_855 },
+        size: QualitySize::Known {
+            bytes: LAUNCH_ITEM_BYTES,
+        },
     }
 }
+
+/// Оценка размера пункта `133 + 139` в запросе — сумма размеров, которые
+/// отдавал локальный сервер при съёмке `single-launch` (894 838 + 323 730).
+/// Та же величина, что дал бы разбор E2: сумма `filesize` форматов пункта.
+const LAUNCH_ITEM_BYTES: u64 = 894_838 + 323_730;
 
 /// Строки прогресса одного формата из снятой живьём фикстуры.
 fn fixture_progress(fixture: &str, format_id: &str) -> Vec<String> {
@@ -388,18 +472,108 @@ async fn run_two_streams(
     task
 }
 
-/// Сценарии успешного скачивания двух потоков из фикстуры.
+/// Сценарий успешного скачивания двух потоков **одним** запуском (TL-48) —
+/// снятый запуск `-f 133,139` (`single-launch/video-and-audio.json`).
 fn two_stream_scripts(dir: &Path) -> Vec<Script> {
-    vec![
-        Script::ok()
-            .line(&destination_line(dir, "Big Buck Bunny.f133.mp4"))
-            .lines(fixture_progress("video-and-audio.json", "133"))
-            .creates("Big Buck Bunny.f133.mp4"),
-        Script::ok()
-            .line(&destination_line(dir, "Big Buck Bunny.f139.m4a"))
-            .lines(fixture_progress("video-and-audio.json", "139"))
-            .creates("Big Buck Bunny.f139.m4a"),
-    ]
+    vec![launch_script("video-and-audio.json", dir)]
+}
+
+/// Сценарий из снятой фикстуры одного запуска (TL-48).
+///
+/// Строки, код и stderr — как сняты, с папкой теста вместо плейсхолдера.
+/// От себя сценарий добавляет только то, что yt-dlp делает с диском:
+/// файлы из `listingBefore` появляются до первой строки, файл потока — на
+/// строке `finished` его формата, под именем из его `Destination`. Что
+/// из этого вышло, сверяется с `listingAfter` той же съёмки: иначе
+/// сценарий мог бы тихо разойтись с диском, который видел настоящий
+/// yt-dlp.
+fn launch_script(name: &str, dir: &Path) -> Script {
+    launch_script_with(name, dir, |_| None)
+}
+
+/// То же, но перед строкой сдвигаются управляемые часы на то, что вернёт
+/// `pause` (только под `tokio::time::pause()`).
+fn launch_script_with(
+    name: &str,
+    dir: &Path,
+    mut pause: impl FnMut(&str) -> Option<Duration>,
+) -> Script {
+    let launch = fixtures::single_launch(name);
+    let folder = dir.display().to_string();
+    let mut script = Script {
+        exit_code: launch.exit_code,
+        stderr: launch.stderr.replace(DESTINATION_PLACEHOLDER, &folder),
+        ..Script::default()
+    };
+
+    let mut on_disk = BTreeSet::new();
+    for file in &launch.listing_before {
+        script = script.creates(file);
+        on_disk.insert(file.clone());
+    }
+
+    let mut destinations: Vec<String> = Vec::new();
+    for raw in launch.stdout.lines() {
+        let line = raw.replace(DESTINATION_PLACEHOLDER, &folder);
+        if let Some(by) = pause(&line) {
+            script = script.advance(by);
+        }
+        script = script.line(&line);
+
+        match parse_line(&line) {
+            StdoutLine::Destination { path } => destinations.push(
+                Path::new(path)
+                    .file_name()
+                    .expect("Destination называет файл")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            StdoutLine::Progress(sample) if sample.status == SampleStatus::Finished => {
+                let marker = format!(".f{}.", sample.format_id);
+                if let Some(file) = destinations.iter().find(|file| file.contains(&marker)) {
+                    script = script.creates(file);
+                    on_disk.insert(file.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        on_disk.into_iter().collect::<Vec<_>>(),
+        launch.listing_after,
+        "{name}: сценарий разошёлся с тем, что осталось на диске при съёмке"
+    );
+    script
+}
+
+/// Строки прогресса одного формата из снятой фикстуры одного запуска.
+fn launch_progress(name: &str, format_id: &str) -> Vec<String> {
+    fixtures::single_launch(name)
+        .stdout
+        .lines()
+        .filter(|line| {
+            matches!(parse_line(line), StdoutLine::Progress(sample) if sample.format_id == format_id)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Ни одна строка не пришла позже срока, выставленного перед ней: настоящий
+/// запуск ([`crate::sidecar::run_streaming`]) снял бы процесс по сроку.
+fn assert_no_line_outlives_its_deadline(call: &Call) {
+    let mut deadline = Some(call.first_deadline);
+    for (index, at) in call.line_times.iter().enumerate() {
+        if let Some(deadline) = deadline {
+            assert!(
+                *at < deadline,
+                "строка {index} {:?} пришла позже срока на {:?} — процесс был бы снят",
+                call.lines[index],
+                at.duration_since(deadline)
+            );
+        }
+        deadline = call.deadlines[index];
+    }
 }
 
 // ─────────────────────── Аргументы запуска (Ф-1) ───────────────────────
@@ -461,7 +635,11 @@ async fn every_launch_carries_the_arguments_the_parser_and_the_watchdog_stand_on
         launcher.calls()
     };
 
-    assert_eq!(launcher_calls.len(), 2, "по запуску на поток");
+    assert_eq!(
+        launcher_calls.len(),
+        1,
+        "один запуск на задачу — одно извлечение адреса (TL-48)"
+    );
     for call in &launcher_calls {
         assert_eq!(
             call.value_of("--progress-template"),
@@ -479,9 +657,11 @@ async fn every_launch_carries_the_arguments_the_parser_and_the_watchdog_stand_on
 }
 
 #[tokio::test]
-async fn each_launch_asks_for_exactly_one_format() {
-    // Объединённый запрос (`133+139`) yt-dlp склеил бы сам — своим
-    // ffmpeg, найденным в PATH, — и Ф-9 перестал бы выполняться.
+async fn one_launch_asks_for_every_stream_separately() {
+    // TL-48: один запуск, одно извлечение адреса. Объединённый запрос
+    // (`133+139`) yt-dlp склеил бы сам — своим ffmpeg, найденным в PATH, —
+    // и Ф-9 перестал бы выполняться; запятая просит те же два формата
+    // по отдельности (замер в шапке `orchestrate`).
     let dir = tempfile::tempdir().unwrap();
     let task = new_task(request(streams(Some("133"), Some("139"))));
     let launcher = ScriptedLauncher::new(dir.path(), two_stream_scripts(dir.path()));
@@ -500,7 +680,11 @@ async fn each_launch_asks_for_exactly_one_format() {
         .iter()
         .map(|call| call.value_of("-f").expect("-f обязателен").to_string())
         .collect();
-    assert_eq!(formats, ["133", "139"]);
+    assert_eq!(
+        formats,
+        ["133,139"],
+        "оба потока одним запуском, каждый — отдельным результатом выбора"
+    );
     for format in &formats {
         assert!(
             !format.contains('+'),
@@ -997,19 +1181,18 @@ async fn cancelling_in_downloading_removes_every_partial_file() {
     let sink = RecordingSink::new();
     // Первый поток скачан целиком, второй качается и оставляет `.part`,
     // а рядом — служебный хвост фрагментного протокола.
+    // Один запуск на оба потока (TL-48): убить надо тот же процесс, что
+    // уже отдал видео.
     let launcher = ScriptedLauncher::new(
         dir.path(),
-        vec![
-            Script::ok()
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f133.mp4"))
-                .lines(fixture_progress("video-and-audio.json", "133"))
-                .creates("Big Buck Bunny.f133.mp4"),
-            Script::ok()
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f139.m4a"))
-                .creates("Big Buck Bunny.f139.m4a.part")
-                .creates("Big Buck Bunny.f139.m4a.ytdl")
-                .hangs(),
-        ],
+        vec![Script::ok()
+            .line(&destination_line(dir.path(), "Big Buck Bunny.f133.mp4"))
+            .lines(fixture_progress("video-and-audio.json", "133"))
+            .creates("Big Buck Bunny.f133.mp4")
+            .line(&destination_line(dir.path(), "Big Buck Bunny.f139.m4a"))
+            .creates("Big Buck Bunny.f139.m4a.part")
+            .creates("Big Buck Bunny.f139.m4a.ytdl")
+            .hangs()],
     );
 
     let canceller = Arc::clone(&task);
@@ -1329,14 +1512,11 @@ async fn a_stream_already_on_disk_is_not_downloaded_again() {
     };
     let launcher = ScriptedLauncher::new(
         dir.path(),
-        vec![
-            Script::ok()
-                .creates("Big Buck Bunny.f133.mp4")
-                .line(&already("Big Buck Bunny.f133.mp4")),
-            Script::ok()
-                .creates("Big Buck Bunny.f139.m4a")
-                .line(&already("Big Buck Bunny.f139.m4a")),
-        ],
+        vec![Script::ok()
+            .creates("Big Buck Bunny.f133.mp4")
+            .line(&already("Big Buck Bunny.f133.mp4"))
+            .creates("Big Buck Bunny.f139.m4a")
+            .line(&already("Big Buck Bunny.f139.m4a"))],
     );
 
     run_task(
@@ -1350,6 +1530,725 @@ async fn a_stream_already_on_disk_is_not_downloaded_again() {
 
     assert!(matches!(sink.last(), DownloadProgress::Done { .. }));
     assert_eq!(dir_listing(dir.path()), ["Big Buck Bunny.mp4"]);
+}
+
+// ─────────────── Атрибуция по формату и имени файла (TL-48) ───────────────
+
+/// Подпись потока в состоянии задачи.
+fn stream_of_snapshot(progress: &DownloadProgress) -> Option<DownloadStream> {
+    match progress {
+        DownloadProgress::Downloading(DownloadingState::Running { stream, .. }) => *stream,
+        _ => None,
+    }
+}
+
+fn percent_of_snapshot(progress: &DownloadProgress) -> Option<u8> {
+    match progress {
+        DownloadProgress::Downloading(DownloadingState::Running { percent, .. }) => {
+            percent.map(DownloadPercent::value)
+        }
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn every_progress_line_of_one_launch_goes_to_the_stream_of_its_format() {
+    // Критерий 3 задачи: процесс один, потоков два — факт запуска больше
+    // ничего не говорит о том, чей это вывод. Строки сняты запуском
+    // `-f 133,139` (`single-launch/video-and-audio.json`), и каждая
+    // проверяется по отдельности через
+    // снимок задачи — троттлинг событий здесь ничего не прячет.
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let launcher = ScriptedLauncher::new(dir.path(), two_stream_scripts(dir.path()));
+    launcher.observe(&task);
+    let ffmpeg = ScriptedFfmpeg::merging();
+
+    run_task(&task, &launcher, &ffmpeg, &RecordingSink::new(), dir.path()).await;
+
+    let video_lines = launch_progress("video-and-audio.json", "133");
+    let audio_lines = launch_progress("video-and-audio.json", "139");
+    assert!(
+        !video_lines.is_empty() && !audio_lines.is_empty(),
+        "фикстура обязана нести строки обоих форматов"
+    );
+
+    let mut checked = (0, 0);
+    let mut last_video_percent = None;
+    for (line, snapshot) in launcher.snapshots() {
+        let expected = if video_lines.contains(&line) {
+            checked.0 += 1;
+            DownloadStream::Video
+        } else if audio_lines.contains(&line) {
+            checked.1 += 1;
+            DownloadStream::Audio
+        } else {
+            continue;
+        };
+        assert_eq!(
+            stream_of_snapshot(&snapshot),
+            Some(expected),
+            "строка {line:?} отнесена не к своему потоку"
+        );
+        if expected == DownloadStream::Video {
+            last_video_percent = percent_of_snapshot(&snapshot);
+        }
+    }
+    assert_eq!(checked, (video_lines.len(), audio_lines.len()));
+
+    // Байты тоже легли к своему потоку: к концу видео у звука ещё нет
+    // точного размера, и знаменатель — оценка пункта из запроса
+    // (`LAUNCH_ITEM_BYTES`, правило агрегации «оценка E2 для потоков без
+    // точного размера»). Видео закончилось на своей доле: 894 838 из
+    // 1 218 568 — 73 %, а не на сотне, как было бы, уйди строки звука
+    // в видео.
+    assert_eq!(last_video_percent, Some(73));
+    assert_eq!(
+        percent_of_snapshot(&launcher.snapshots().last().unwrap().1),
+        Some(100)
+    );
+    assert_eq!(
+        ffmpeg.last_input_names(),
+        (
+            "Big Buck Bunny.f133.mp4".to_string(),
+            "Big Buck Bunny.f139.m4a".to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn stream_files_are_attributed_by_name_and_not_by_the_order_of_lines() {
+    // yt-dlp обходит `-f 133,139` в порядке селектора, но ядро на порядок
+    // не опирается: здесь звук назван первым. Сопоставление «первый
+    // незабранный поток — первому пути» склеило бы звук как видео.
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::ok()
+            .line(&destination_line(dir.path(), "Big Buck Bunny.f139.m4a"))
+            .lines(fixture_progress("video-and-audio.json", "139"))
+            .creates("Big Buck Bunny.f139.m4a")
+            .line(&destination_line(dir.path(), "Big Buck Bunny.f133.mp4"))
+            .lines(fixture_progress("video-and-audio.json", "133"))
+            .creates("Big Buck Bunny.f133.mp4")],
+    );
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let sink = RecordingSink::new();
+
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
+
+    assert_eq!(
+        ffmpeg.last_input_names(),
+        (
+            "Big Buck Bunny.f133.mp4".to_string(),
+            "Big Buck Bunny.f139.m4a".to_string()
+        ),
+        "видео и звук склейки — по именам файлов"
+    );
+    assert!(matches!(sink.last(), DownloadProgress::Done { .. }));
+}
+
+#[tokio::test]
+async fn a_launch_that_finds_the_video_on_disk_closes_it_and_downloads_only_the_audio() {
+    // Снятый повтор (`single-launch/video-already-downloaded.json`): видео
+    // уже на диске, yt-dlp печатает для него `has already been downloaded`
+    // и `finished` без байт (М-1), затем качает звук. Видео закрывается по
+    // имени файла, без единой строки `downloading`, и в проценте весит свой
+    // полный размер.
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![launch_script("video-already-downloaded.json", dir.path())],
+    );
+    launcher.observe(&task);
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let sink = RecordingSink::new();
+
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
+
+    let audio_lines = launch_progress("video-already-downloaded.json", "139");
+    let audio_percents: Vec<Option<u8>> = launcher
+        .snapshots()
+        .iter()
+        .filter(|(line, _)| audio_lines.contains(line))
+        .map(|(_, snapshot)| percent_of_snapshot(snapshot))
+        .collect();
+    assert_eq!(audio_percents.len(), audio_lines.len());
+    assert_eq!(
+        audio_percents.first(),
+        Some(&Some(73)),
+        "на первом байте звука видео уже весит свои 894 838 из 1 218 568: \
+         {audio_percents:?}"
+    );
+    assert_eq!(audio_percents.last(), Some(&Some(100)));
+    assert_eq!(launcher.formats_asked(), ["133,139"]);
+    assert_eq!(
+        ffmpeg.last_input_names(),
+        (
+            "Big Buck Bunny.f133.mp4".to_string(),
+            "Big Buck Bunny.f139.m4a".to_string()
+        )
+    );
+    assert!(matches!(sink.last(), DownloadProgress::Done { .. }));
+}
+
+#[test]
+fn only_a_name_built_by_our_template_belongs_to_a_stream() {
+    let dir = Path::new("/папка назначения");
+    let owns = |format_id: &str, name: &str| {
+        is_file_of_stream("Big Buck Bunny", format_id, &dir.join(name))
+    };
+
+    assert!(owns("133", "Big Buck Bunny.f133.mp4"));
+    assert!(owns("140-drc", "Big Buck Bunny.f140-drc.m4a"));
+
+    // Чужой формат, формат с общим началом, другая основа.
+    assert!(!owns("133", "Big Buck Bunny.f139.m4a"));
+    assert!(!owns("133", "Big Buck Bunny.f1333.mp4"));
+    assert!(!owns("140", "Big Buck Bunny.f140-drc.m4a"));
+    assert!(!owns("133", "Big Buck Bunny 2.f133.mp4"));
+    // Рабочие хвосты — не файл потока.
+    assert!(!owns("133", "Big Buck Bunny.f133.mp4.part"));
+    assert!(!owns("133", "Big Buck Bunny.f133.temp.mp4"));
+    assert!(!owns("133", "Big Buck Bunny.f133."));
+    // Идентификатор с точкой не делает соседа владельцем.
+    assert!(owns("sb.0", "Big Buck Bunny.fsb.0.mhtml"));
+    assert!(!owns("sb", "Big Buck Bunny.fsb.0.mhtml"));
+    // Совпадает только имя, а не каталог.
+    assert!(!is_file_of_stream(
+        "Big Buck Bunny",
+        "133",
+        Path::new("/Big Buck Bunny.f133.mp4/другое.mp4")
+    ));
+}
+
+#[test]
+fn the_selector_joins_the_streams_with_a_comma_and_never_a_plus() {
+    assert_eq!(format_selector(["133", "139"]), "133,139");
+    assert_eq!(format_selector(["140"]), "140");
+}
+
+#[tokio::test]
+async fn a_retry_after_an_interrupted_launch_asks_only_for_what_is_still_missing() {
+    // Снятые запуски. У `-f 133,139` адрес видео отвечает 404, а звук
+    // скачивается целиком, код 1 (`single-launch/video-404.json`): отказ
+    // одного формата не останавливает другой. Повтор обязан заказать только
+    // видео (`single-launch/video-only.json`) — звук уже забран.
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![
+            launch_script("video-404.json", dir.path()),
+            launch_script("video-only.json", dir.path()),
+        ],
+    );
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let sink = RecordingSink::new();
+
+    tokio::time::pause();
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
+    tokio::time::resume();
+
+    assert_eq!(launcher.formats_asked(), ["133,139", "133"]);
+    assert_eq!(
+        ffmpeg.last_input_names(),
+        (
+            "Big Buck Bunny.f133.mp4".to_string(),
+            "Big Buck Bunny.f139.m4a".to_string()
+        ),
+        "видео из первой попытки не потеряно"
+    );
+    assert!(matches!(sink.last(), DownloadProgress::Done { .. }));
+}
+
+#[tokio::test]
+async fn a_format_that_fell_out_of_the_selection_is_a_stale_format() {
+    // Р-1 ревью TL-48, снятый вывод (`single-launch/one-format-missing.json`):
+    // в метаданных нет 139, yt-dlp выбирает только 133, качает видео и
+    // выходит с кодом 0 при пустом stderr. До TL-48 отдельный запуск на 139
+    // давал `staleFormat` — тот же класс обязан получиться и здесь, а не
+    // «ошибка склейки» с повтором, который не поможет никогда.
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![launch_script("one-format-missing.json", dir.path())],
+    );
+
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
+
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("формат пропал — отказ: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::StaleFormat);
+    assert!(!error.retryable, "повтор тем же форматом бесполезен");
+    assert_eq!(
+        error.partial_data,
+        PartialData::Removed,
+        "скачанное видео без звука пункта не нужно — как у staleFormat до TL-48"
+    );
+    assert_eq!(dir_listing(dir.path()), Vec::<String>::new());
+    assert_eq!(launcher.calls().len(), 1);
+    assert_eq!(ffmpeg.calls(), 0, "склейки не было");
+}
+
+#[tokio::test]
+async fn a_format_that_fell_out_of_the_selection_of_an_interrupted_launch_is_stale_too() {
+    // Перечень печатается до первого байта: если он уже без 139, обрыв
+    // после него повтором этот формат не вернёт. Сценарий собран из снятых
+    // строк `one-format-missing.json` (перечень, Destination, два байта) и
+    // снятого stderr обрыва; вместе живьём они не снимались.
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let sink = RecordingSink::new();
+    let folder = dir.path().display().to_string();
+    let lines: Vec<String> = fixtures::single_launch("one-format-missing.json")
+        .stdout
+        .lines()
+        .take(4)
+        .map(|line| line.replace(DESTINATION_PLACEHOLDER, &folder))
+        .collect();
+    assert!(
+        matches!(parse_line(&lines[0]), StdoutLine::SelectedFormats { .. }),
+        "сценарий обязан нести перечень"
+    );
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::failing(1, &connection_lost_stderr())
+            .lines(lines)
+            .creates("Big Buck Bunny.f133.mp4.part")],
+    );
+
+    tokio::time::pause();
+    run_task(
+        &task,
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        dir.path(),
+    )
+    .await;
+    tokio::time::resume();
+
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("формат пропал — отказ, а не повторы: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::StaleFormat);
+    assert_eq!(launcher.calls().len(), 1, "повторов не было");
+    assert_eq!(dir_listing(dir.path()), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_selected_stream_whose_file_was_never_named_is_asked_for_again() {
+    // Прежняя ветка, названная честно: перечень называет оба формата, код 0,
+    // а файла звука yt-dlp не назвал. Что стало с потоком, не узнать;
+    // склеивать нечего, и повтор спрашивает только звук. Сценарий собран из
+    // снятого `video-and-audio.json`, обрезанного на `finished` видео, —
+    // живьём такого вывода не видели.
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let sink = RecordingSink::new();
+    let folder = dir.path().display().to_string();
+    let lines: Vec<String> = fixtures::single_launch("video-and-audio.json")
+        .stdout
+        .lines()
+        .map(|line| line.replace(DESTINATION_PLACEHOLDER, &folder))
+        .take_while(|line| !line.contains(".f139."))
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("@tl-progress|finished|") && line.ends_with("|133")),
+        "сценарий доходит до конца видео"
+    );
+    let first = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::ok().lines(lines).creates("Big Buck Bunny.f133.mp4")],
+    );
+    run_task(&task, &first, &ScriptedFfmpeg::merging(), &sink, dir.path()).await;
+
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("без файла звука склеивать нечего: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::MergeFailed);
+    assert!(error.retryable);
+
+    task.set_progress(DownloadProgress::Queued);
+    let already = format!(
+        "[download] {} has already been downloaded",
+        dir.path().join("Big Buck Bunny.f139.m4a").display()
+    );
+    let second = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::ok()
+            .creates("Big Buck Bunny.f139.m4a")
+            .line(&already)],
+    );
+    run_task(
+        &task,
+        &second,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        dir.path(),
+    )
+    .await;
+
+    assert_eq!(second.formats_asked(), ["139"]);
+    assert!(matches!(sink.last(), DownloadProgress::Done { .. }));
+}
+
+#[tokio::test]
+async fn a_failure_that_removes_the_streams_also_forgets_that_they_were_done() {
+    // `videoUnavailable` повторяем и при этом удаляет частичное. Видео
+    // было забрано до отказа — после подчистки его на диске нет, и повтор
+    // обязан заказать его снова, а не склеивать отсутствующий файл.
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let sink = RecordingSink::new();
+    let first = ScriptedLauncher::new(
+        dir.path(),
+        vec![
+            Script::failing(1, &fixtures::outcome("video-unavailable.json").stderr)
+                .line(&destination_line(dir.path(), "Big Buck Bunny.f133.mp4"))
+                .lines(fixture_progress("video-and-audio.json", "133"))
+                .creates("Big Buck Bunny.f133.mp4"),
+        ],
+    );
+    run_task(&task, &first, &ScriptedFfmpeg::merging(), &sink, dir.path()).await;
+
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("недоступный ролик — отказ: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::VideoUnavailable);
+    assert_eq!(error.partial_data, PartialData::Removed);
+    assert!(
+        error.retryable,
+        "класс повторяем — иначе сценарию неоткуда взяться"
+    );
+
+    task.set_progress(DownloadProgress::Queued);
+    let second = ScriptedLauncher::new(dir.path(), two_stream_scripts(dir.path()));
+    run_task(
+        &task,
+        &second,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        dir.path(),
+    )
+    .await;
+
+    assert_eq!(second.formats_asked(), ["133,139"]);
+    assert!(matches!(sink.last(), DownloadProgress::Done { .. }));
+}
+
+#[test]
+fn the_single_launch_fixtures_were_shot_with_the_arguments_of_the_app() {
+    // Утверждение README набора «сняты с argv приложения» — проверяемое:
+    // argv съёмки обязан совпасть с тем, что строит `download_args`, кроме
+    // хвоста — вместо `-- <ссылка>` у съёмки `--load-info-json <файл>`.
+    // Сменят аргументы запуска — этот тест покраснеет, и набор переснимут.
+    const TAIL: &str = ".f%(format_id)s.%(ext)s";
+
+    for name in SINGLE_LAUNCH_FIXTURES {
+        let capture = fixtures::single_launch(name).capture;
+        let value_of = |flag: &str| -> String {
+            let at = capture
+                .argv
+                .iter()
+                .position(|arg| arg == flag)
+                .unwrap_or_else(|| panic!("{name}: в argv съёмки нет {flag}"));
+            capture.argv[at + 1].clone()
+        };
+        let selector = value_of("-f");
+        let template = value_of("-o");
+        let stem = template
+            .strip_suffix(TAIL)
+            .unwrap_or_else(|| panic!("{name}: шаблон имени не наш: {template}"));
+        assert_eq!(
+            download_stem(&sanitized_stem(stem, "aqz-KE-bpKQ")),
+            stem,
+            "{name}: основа имени съёмки — не та, что приложение построило бы из названия"
+        );
+
+        let destination = format!("home:{DESTINATION_PLACEHOLDER}");
+        let mut expected: Vec<String> = download_args(&selector, &destination, &template, URL)
+            .into_iter()
+            .map(|arg| {
+                if arg == PROGRESS_TEMPLATE {
+                    "<progressTemplate>".to_string()
+                } else {
+                    arg.to_string()
+                }
+            })
+            .collect();
+        let expected_tail = expected.split_off(expected.len() - 2);
+        assert_eq!(expected_tail, ["--", URL]);
+
+        let mut shot = capture.argv.clone();
+        let shot_tail = shot.split_off(shot.len() - 2);
+        assert_eq!(shot_tail, ["--load-info-json", "<infoJson>"], "{name}");
+        assert_eq!(shot, expected, "{name}: съёмка шла не с argv приложения");
+    }
+}
+
+#[tokio::test]
+async fn after_a_removing_failure_the_new_download_rearms_the_watchdog_and_the_percent() {
+    // Р-2 ревью TL-48. `videoUnavailable` повторяем и удаляет частичное:
+    // видео, забранное целиком, стёрто. Повтор качает его с нуля, и каждый
+    // его новый байт обязан продлевать срок сторожа, а процент — начинаться
+    // с нуля, а не стоять на удалённом.
+    //
+    // Время управляемое: строка раз в 3 с. Видеопоток повтора тянется
+    // дольше порога сторожа, и срок, не продлённый его байтами, истёк бы
+    // посреди здоровой загрузки.
+    tokio::time::pause();
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let sink = RecordingSink::new();
+
+    let first = ScriptedLauncher::new(
+        dir.path(),
+        vec![
+            Script::failing(1, &fixtures::outcome("video-unavailable.json").stderr)
+                .line(&destination_line(dir.path(), "Big Buck Bunny.f133.mp4"))
+                .lines(launch_progress("video-and-audio.json", "133"))
+                .creates("Big Buck Bunny.f133.mp4"),
+        ],
+    );
+    first.observe(&task);
+    run_task(&task, &first, &ScriptedFfmpeg::merging(), &sink, dir.path()).await;
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("недоступный ролик — отказ: {:?}", sink.last());
+    };
+    assert_eq!(
+        (error.kind, error.partial_data),
+        (DownloadErrorKind::VideoUnavailable, PartialData::Removed)
+    );
+    assert_eq!(
+        first
+            .snapshots()
+            .last()
+            .and_then(|(_, snapshot)| percent_of_snapshot(snapshot)),
+        Some(73),
+        "видео было забрано целиком до отказа"
+    );
+
+    task.set_progress(DownloadProgress::Queued);
+    let second = ScriptedLauncher::new(
+        dir.path(),
+        vec![launch_script_with(
+            "video-and-audio.json",
+            dir.path(),
+            |_| Some(Duration::from_secs(3)),
+        )],
+    );
+    second.observe(&task);
+    run_task(
+        &task,
+        &second,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        dir.path(),
+    )
+    .await;
+    tokio::time::resume();
+
+    let call = &second.calls()[0];
+    let mut high_water = 0;
+    let mut advancing = 0;
+    for (index, line) in call.lines.iter().enumerate() {
+        let StdoutLine::Progress(sample) = parse_line(line) else {
+            continue;
+        };
+        let Some(bytes) = sample.downloaded_bytes else {
+            continue;
+        };
+        if sample.format_id != "133" || bytes <= high_water {
+            continue;
+        }
+        high_water = bytes;
+        advancing += 1;
+        assert_eq!(
+            call.deadlines[index],
+            Some(call.line_times[index] + NO_PROGRESS_TIMEOUT),
+            "строка {index} {line:?}: новые байты повтора обязаны продлить срок"
+        );
+    }
+    assert_eq!(advancing, 6, "у видео повтора шесть строк с новыми байтами");
+    assert_no_line_outlives_its_deadline(call);
+
+    let first_video_line = &launch_progress("video-and-audio.json", "133")[0];
+    let (_, after_first_byte) = second
+        .snapshots()
+        .into_iter()
+        .find(|(line, _)| line == first_video_line)
+        .expect("строка была");
+    assert_eq!(
+        percent_of_snapshot(&after_first_byte),
+        Some(0),
+        "1 024 байта из 1 218 568 — ноль, а не 73 удалённых процента"
+    );
+    assert!(matches!(sink.last(), DownloadProgress::Done { .. }));
+}
+
+#[tokio::test]
+async fn the_gap_between_two_streams_of_one_launch_gets_a_full_window() {
+    // М-2 ревью TL-48. До TL-48 звук качал новый процесс, и промежуток до
+    // его первого байта держал полный срок от старта процесса. Теперь
+    // процесс один, и тот же промежуток обязан получить полный срок от
+    // начала потока — первой строки, называющей его файл.
+    //
+    // Строки сняты (`single-launch/video-and-audio.json`), время растянуто:
+    // строка раз в секунду, а стык — 15 с от `finished` видео до
+    // `Destination` звука и ещё 15 с до его первого байта. Локальный сервер
+    // съёмки отвечал за миллисекунды; растяжение — единственное допущение.
+    tokio::time::pause();
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let sink = RecordingSink::new();
+    let seam = Duration::from_secs(15);
+    let mut previous = String::new();
+    let script = launch_script_with("video-and-audio.json", dir.path(), |line| {
+        let pause = match parse_line(&previous) {
+            StdoutLine::Progress(sample)
+                if sample.status == SampleStatus::Finished && sample.format_id == "133" =>
+            {
+                seam
+            }
+            StdoutLine::Destination { path } if path.ends_with(".f139.m4a") => seam,
+            _ => Duration::from_secs(1),
+        };
+        previous = line.to_string();
+        Some(pause)
+    });
+    let launcher = ScriptedLauncher::new(dir.path(), vec![script]);
+
+    run_task(
+        &task,
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        dir.path(),
+    )
+    .await;
+    tokio::time::resume();
+
+    let call = &launcher.calls()[0];
+    let audio_start = call
+        .lines
+        .iter()
+        .position(|line| {
+            matches!(parse_line(line), StdoutLine::Destination { path } if path.ends_with(".f139.m4a"))
+        })
+        .expect("Destination звука был");
+    assert_eq!(
+        (
+            call.line_times[audio_start].duration_since(call.line_times[audio_start - 1]),
+            call.line_times[audio_start + 1].duration_since(call.line_times[audio_start]),
+        ),
+        (seam, seam),
+        "стык обязан быть растянут — иначе тест ничего не проверяет"
+    );
+    assert_eq!(
+        call.deadlines[audio_start],
+        Some(call.line_times[audio_start] + NO_PROGRESS_TIMEOUT),
+        "у звука полный срок от начала потока"
+    );
+    assert_no_line_outlives_its_deadline(call);
+    assert!(matches!(sink.last(), DownloadProgress::Done { .. }));
+}
+
+#[tokio::test]
+async fn a_title_carrying_the_already_downloaded_phrase_still_closes_its_stream() {
+    // М-3 ревью TL-48, снятый вывод (`single-launch/phrase-in-title.json`):
+    // звук уже на диске, а в названии стоит та самая фраза. Путь обязан
+    // кончаться перед последней, иначе файл звука не принадлежит никому.
+    const TITLE: &str = "Big Buck Bunny has already been downloaded";
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = request(streams(Some("133"), Some("139")));
+    req.title = TITLE.to_string();
+    let task = new_task(req);
+    assert_eq!(
+        download_stem(&sanitized_stem(TITLE, "aqz-KE-bpKQ")),
+        TITLE,
+        "фраза целиком доходит до имени частичного файла"
+    );
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let sink = RecordingSink::new();
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![launch_script("phrase-in-title.json", dir.path())],
+    );
+
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
+
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: format!("{TITLE}.mp4")
+        }
+    );
+    assert_eq!(
+        ffmpeg.last_input_names(),
+        (format!("{TITLE}.f133.mp4"), format!("{TITLE}.f139.m4a"))
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_line_naming_the_same_stream_does_not_extend_the_watchdog() {
+    // Граница потока продлевает срок один раз на поток за запуск (doc
+    // `note_stream_start`): замерший процесс, повторяющий строку о том же
+    // файле, жить на ней не может. Сценарий собран из снятых строк видео и
+    // той же `Destination`, повторённой дважды, — живьём yt-dlp так не делал.
+    tokio::time::pause();
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let destination = destination_line(dir.path(), "Big Buck Bunny.f133.mp4");
+    let video = launch_progress("video-and-audio.json", "133");
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![
+            Script::failing(1, &fixtures::outcome("video-unavailable.json").stderr)
+                .line(&destination)
+                .lines(video.iter().take(3).cloned())
+                .advance(Duration::from_secs(15))
+                .line(&destination)
+                .advance(Duration::from_secs(15))
+                .line(&destination),
+        ],
+    );
+
+    run_task(
+        &task,
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &RecordingSink::new(),
+        dir.path(),
+    )
+    .await;
+    tokio::time::resume();
+
+    let call = &launcher.calls()[0];
+    let last_byte = 3;
+    assert!(matches!(
+        parse_line(&call.lines[last_byte]),
+        StdoutLine::Progress(_)
+    ));
+    let deadline = call.deadlines[last_byte].expect("срок выставлен");
+    assert_eq!(
+        (call.deadlines[4], call.deadlines[5]),
+        (Some(deadline), Some(deadline)),
+        "повтор строки о том же файле срок не двигает"
+    );
+    assert!(
+        call.line_times[5] >= deadline,
+        "без новых байт третья `Destination` приходит уже за сроком — процесс был бы снят"
+    );
 }
 
 // ─────────────────── Сторож продвижения и подготовки ───────────────────
@@ -1611,7 +2510,7 @@ async fn a_retry_after_a_failed_merge_only_merges_again() {
     let failing = ScriptedFfmpeg::failing();
     let launcher = ScriptedLauncher::new(dir.path(), two_stream_scripts(dir.path()));
     run_task(&task, &launcher, &failing, &sink, dir.path()).await;
-    assert_eq!(launcher.calls().len(), 2);
+    assert_eq!(launcher.calls().len(), 1, "оба потока одним запуском");
 
     // Повтор — продолжение той же задачи: тот же id, ни одного нового
     // запуска yt-dlp, только склейка. Решение «повторять ли» принимает

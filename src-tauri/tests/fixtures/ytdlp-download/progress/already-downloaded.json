@@ -1,22 +1,43 @@
 {
   "_capture": {
-    "note": "Тот же запуск по уже скачанному файлу: ни одной строки прогресса, ни status=finished — только [download] e.m4a has already been downloaded. Поток, который качать не пришлось, о себе не сообщает ничего.",
+    "note": "Запуск с argv приложения по уже скачанному файлу: ни одной строки downloading — только [download] <путь> has already been downloaded и следом finished, у которого downloaded_bytes = NA, а total_bytes — размер файла на диске. Снята без обращения к YouTube (см. README, раздел про already-downloaded). Прежняя съёмка этой фикстуры (с YouTube, 2026-08-26) строки finished не имела: она шла с -P temp:., и замер TL-48 показал, что именно этот аргумент её убирает.",
+    "reality": "live",
+    "method": "local-server",
     "argv": [
       "--no-playlist",
       "--newline",
       "--progress-template",
       "<progressTemplate>",
+      "--progress-delta",
+      "0.3",
+      "--socket-timeout",
+      "10",
       "-f",
       "140",
-      "-o",
-      "e.%(ext)s",
       "-P",
-      "temp:.",
-      "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+      "home:<destination>",
+      "-o",
+      "Big Buck Bunny.f%(format_id)s.%(ext)s",
+      "--load-info-json",
+      "<infoJson>"
     ],
     "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
     "ytDlpVersion": "2026.08.19",
-    "capturedAt": "2026-08-26"
+    "capturedAt": "2026-09-13",
+    "select": "140",
+    "served": {
+      "140": {
+        "file": "a140.m4a",
+        "bytes": 323730
+      }
+    },
+    "title": "Big Buck Bunny",
+    "requests": [],
+    "listingBefore": [
+      "Big Buck Bunny.f140.m4a"
+    ],
+    "exitCode": 0,
+    "stderr": ""
   },
-  "stdout": "[youtube] Extracting URL: https://www.youtube.com/watch?v=aqz-KE-bpKQ\n[youtube] aqz-KE-bpKQ: Downloading webpage\n[youtube] aqz-KE-bpKQ: Downloading visionos player API JSON\n[youtube] aqz-KE-bpKQ: Downloading m3u8 information\n[info] aqz-KE-bpKQ: Downloading 1 format(s): 140\n[download] e.m4a has already been downloaded\n"
+  "stdout": "[info] aqz-KE-bpKQ: Downloading 1 format(s): 140\n[download] <destination>/Big Buck Bunny.f140.m4a has already been downloaded\n@tl-progress|finished|NA|323730|NA|NA|NA|NA|NA|140\n"
 }
