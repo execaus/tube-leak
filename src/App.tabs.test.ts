@@ -648,6 +648,78 @@ describe('App — живая зона строки статуса (TL-92, пра
     expect(wrapper.get('.queue-status-announcer').text()).toBe('«Ролик A» — Только аудио · Скачивание · 40 %')
   })
 
+  it('stays silent on «Главный» even as the percent changes, instead of announcing every step (Б-3, третий раунд, регрессия к ревью TL-45)', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () =>
+        Promise.resolve({
+          tasks: [
+            {
+              taskId: 't1',
+              title: 'Ролик A',
+              quality: { kind: 'audioOnly' },
+              plan: 'singleStream',
+              phase: 'downloading',
+              state: 'running',
+              percent: 40,
+            },
+          ],
+          awaitingContinue: false,
+        } satisfies QueueSnapshot),
+    })
+    const wrapper = await mountReady()
+    expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('true')
+    expect(wrapper.get('.queue-status-announcer').text()).toBe('')
+
+    emitQueueChanged({
+      tasks: [
+        {
+          taskId: 't1',
+          title: 'Ролик A',
+          quality: { kind: 'audioOnly' },
+          plan: 'singleStream',
+          phase: 'downloading',
+          state: 'running',
+          percent: 41,
+        },
+      ],
+      awaitingContinue: false,
+    })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.queue-status-announcer').text()).toBe('')
+  })
+
+  it('starts announcing the status text once the user switches away from «Главный» to «История»', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () =>
+        Promise.resolve({
+          tasks: [
+            {
+              taskId: 't1',
+              title: 'Ролик A',
+              quality: { kind: 'audioOnly' },
+              plan: 'singleStream',
+              phase: 'downloading',
+              state: 'running',
+              percent: 40,
+            },
+          ],
+          awaitingContinue: false,
+        } satisfies QueueSnapshot),
+    })
+    const wrapper = await mountReady()
+    expect(wrapper.get('.queue-status-announcer').text()).toBe('')
+
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.queue-status-announcer').text()).toContain('«Ролик A» — Только аудио · Скачивание · 40 %')
+  })
+
   it('moves focus to the current panel heading when the status row disappears while «На главный» was focused, instead of dropping it to <body> (Н-3)', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
@@ -876,22 +948,45 @@ describe('App — атрибуты ARIA панели вкладок (TL-92, пр
 })
 
 /**
- * Н-1 (правки ревью TL-92, второй раунд) — под панелью вкладок должна
- * быть одна линия, не две. Раньше нижняя граница `.tabs` шла вместе с
- * безусловным `<hr class="screen__divider">` сразу следом — визуально две
- * черты почти вплотную. Проверка структурная (соседство узлов через DOM
- * `querySelector('.tabs + hr')`), не через вычисленные CSS-стили: `<style
- * scoped>` компонента не гарантированно применяется к дереву в jsdom так
- * же, как в браузере, а соседство тегов — факт разметки независимо от
- * того, применились ли стили.
+ * Н-1 (правки ревью TL-92, второй, затем третий раунд) — под панелью
+ * вкладок должна быть одна линия, не две. Раньше нижняя граница `.tabs`
+ * шла вместе с безусловным `<hr class="screen__divider">` сразу следом —
+ * визуально две черты почти вплотную.
+ *
+ * Проверка структурная (соседство узлов через обход DOM), не через
+ * вычисленные CSS-стили: `<style scoped>` компонента не гарантированно
+ * применяется к дереву в jsdom так же, как в браузере, а соседство тегов
+ * — факт разметки независимо от того, применились ли стили.
+ *
+ * Третий раунд: `querySelector('.tabs + hr')` проверяет только
+ * непосредственного соседа `.tabs`, а с TL-92 (правки ревью, третий
+ * раунд, Н-3/Б-3) сразу за `.tabs` всегда стоит постоянный `<p
+ * class="queue-status-announcer">` живой зоны — `<hr>`, вставленный сразу
+ * после этого `<p>` (а не после `.tabs` напрямую), для прежней проверки
+ * невидим. {@link dividersBetweenTabsAndFirstPanel} вместо этого обходит
+ * все соседние узлы от `.tabs` до первой секции `[role="tabpanel"]`
+ * (первая из трёх всегда «Главный» — они все время в DOM, `v-show`, не
+ * `v-if`, К-14) и считает `<hr>` среди них — не важно, к какому именно
+ * промежуточному узлу он приклеен.
  */
+function dividersBetweenTabsAndFirstPanel(wrapper: Awaited<ReturnType<typeof mountReady>>): number {
+  const tabsEl = wrapper.get('.tabs').element
+  let node = tabsEl.nextElementSibling
+  let count = 0
+  while (node && node.getAttribute('role') !== 'tabpanel') {
+    if (node.tagName === 'HR') count++
+    node = node.nextElementSibling
+  }
+  return count
+}
+
 describe('App — одна линия под вкладками, не две (TL-92, правки ревью, Н-1)', () => {
-  it('no <hr> is glued directly after .tabs when the status row is hidden — the single line is the .tabs border itself', async () => {
+  it('no <hr> appears anywhere between .tabs and the first panel when the status row is hidden — the single line is the .tabs border itself', async () => {
     const wrapper = await mountReady()
-    expect(wrapper.find('.tabs + hr').exists()).toBe(false)
+    expect(dividersBetweenTabsAndFirstPanel(wrapper)).toBe(0)
   })
 
-  it('still exactly one divider appears before the panel when the status row is shown — between the row and the panel, not between the tabs and the row', async () => {
+  it('exactly one divider appears between .tabs and the first panel when the status row is shown', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
       check_sidecar: () => Promise.resolve(okReport),
@@ -907,7 +1002,7 @@ describe('App — одна линия под вкладками, не две (TL
     await tabButton(wrapper, 'История').trigger('click')
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.find('.tabs + hr').exists()).toBe(false)
+    expect(dividersBetweenTabsAndFirstPanel(wrapper)).toBe(1)
     expect(wrapper.find('.queue-status-row + hr').exists()).toBe(true)
   })
 })

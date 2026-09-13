@@ -512,12 +512,21 @@ watch(showQueueStatusRow, (visible, wasVisible) => {
       не видит), декоративный «●» сюда не входит: это чисто текстовая
       копия для скринридера, видимая строка ниже несёт тот же текст для
       зрячих пользователей.
+
+      Текст зоны зависит от `showQueueStatusRow`, не только от
+      `queueStatusText` (Б-3, правки ревью TL-92, третий раунд):
+      `queueStatusText` вычисляется и на «Главном» (там прогресс несёт
+      `DownloadPanel`/`QueueSection` своими средствами, см. комментарий в
+      `DownloadPanel.vue`), и раньше эта зона озвучивала там каждый процент
+      второй раз — регрессия к тому, что ревью TL-45 сознательно убрало.
+      На «Истории»/«Настройках» `showQueueStatusRow` совпадает с наличием
+      текста, так что там поведение не меняется.
     -->
     <p
       class="visually-hidden queue-status-announcer"
       aria-live="polite"
     >
-      {{ queueStatusText ?? '' }}
+      {{ showQueueStatusRow ? queueStatusText : '' }}
     </p>
 
     <!--
