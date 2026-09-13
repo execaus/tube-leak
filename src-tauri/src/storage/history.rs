@@ -50,33 +50,65 @@
 //! |---|---|
 //! | файла нет или он пуст | создаёт базу, применяет все миграции |
 //! | версия ниже текущей | доводит миграциями; отказ шага — откат шага, [`HistoryOpenError::MigrationFailed`] |
+//! | рядом лежит `history.sqlite-wal` или заголовок объявляет WAL — при любом содержимом файла | **не открывает и не пишет**, [`HistoryOpenError::NewerVersion`] с `wal: true` |
 //! | версия выше текущей или отрицательная | **не открывает и не пишет**, [`HistoryOpenError::NewerVersion`] |
-//! | не SQLite (заголовок) или порча (`PRAGMA quick_check`, `SQLITE_NOTADB`, `SQLITE_CORRUPT`) | откладывает файл под `history.sqlite.broken-<unix-секунды>`, заводит новую базу, пометка [`HistoryNotice::BaseRecreated`] |
+//! | не SQLite (заголовок) или порча (`PRAGMA integrity_check`, `SQLITE_NOTADB`, `SQLITE_CORRUPT`) | откладывает файл под `history.sqlite.broken-<unix-секунды>`, заводит новую базу, пометка [`HistoryNotice::BaseRecreated`] |
 //! | нет прав на каталог или файл, файл открывается только на чтение | [`HistoryOpenError::NoAccess`] |
 //!
+//! Строки проверяются сверху вниз: первые две — до любого вызова SQLite.
+//!
 //! **Отложить, а не удалить.** Порча — это данные пользователя, которые,
-//! возможно, ещё читаются чужим инструментом. Вместе с файлом уезжают его
-//! спутники `-journal`, `-wal`, `-shm` — под тем же новым именем с тем же
-//! суффиксом. Это не аккуратность, а условие целостности. Горячий журнал,
-//! оставшийся рядом с новой пустой базой, SQLite удалил бы как «не горячий».
-//! А под именем отложенной копии он остаётся парой к ней, и `sqlite3` на
-//! этой копии его применит. Отложенное имя никогда не затирает прежнюю
-//! отложенную копию: занятая метка получает суффикс `-1`, `-2`, …
+//! возможно, ещё читаются чужим инструментом. Отложенное имя никогда не
+//! затирает прежнюю отложенную копию: занятая метка получает суффикс `-1`,
+//! `-2`, … Что именно окажется под этим именем, зависит от того, где порча
+//! замечена.
 //!
-//! **Почему `quick_check`, а не `integrity_check`.** Ф-1 (г) допускает оба.
-//! `integrity_check` сверяет ещё и содержимое индексов с таблицей. На истории
-//! без предела размера (Р-7) это растущая цена каждого старта. А
-//! `quick_check` — один линейный проход по страницам без сверки индексов,
-//! и он ловит то, что делает базу нечитаемой. Цена названа: рассинхрон
-//! индекса с таблицей при целых страницах этой проверкой не ловится.
+//! - **Файл отвергнут по заголовку** (не SQLite). SQLite его не открывал, и
+//!   файл уезжает байт в байт вместе со спутниками (`-journal`, `-shm`) под
+//!   тем же новым именем с тем же суффиксом. Журнал, оставшийся рядом с
+//!   новой пустой базой, SQLite удалил бы как «не горячий». Под именем
+//!   отложенной копии он остаётся парой к ней.
+//! - **Порча страниц в настоящей SQLite-базе** (заголовок цел, отказ
+//!   `integrity_check`, `SQLITE_CORRUPT`, `SQLITE_NOTADB`). Это замечено уже
+//!   внутри SQLite. Горячий `-journal` SQLite применяет при первом обращении
+//!   (`PRAGMA user_version` в `connect`), то есть до откладывания, и сам
+//!   убирает. Копия — база **после** штатного восстановления журнала, а не
+//!   байт в байт то, что лежало на диске. Данные при этом не теряются: то же
+//!   восстановление сделал бы любой клиент SQLite.
 //!
-//! **Остаточный риск «не переписывать».** Заголовок проверяется до SQLite,
-//! но заголовок файла в режиме WAL может отставать от WAL-файла. Если более
-//! новая версия приложения когда-нибудь перейдёт на WAL и упадёт, не сделав
-//! checkpoint, в заголовке останется наша версия. Тогда SQLite при открытии
-//! применит WAL, повторная проверка `PRAGMA user_version` откажет, но
-//! checkpoint к этому моменту уже случится. Сейчас WAL не использует ни одна
-//! версия приложения.
+//! `-wal` сюда не доходит ни в одном случае: с ним открытие отказывает
+//! раньше (ниже). [`set_aside`] переносит его по-прежнему, но только как
+//! запас на случай, если этот порядок когда-нибудь поменяют.
+//!
+//! **Проверка — `integrity_check`** (Ф-1 г, issue #92). Кроме целости
+//! страниц она сверяет содержимое индексов с таблицей, и рассинхрон
+//! `history_newest_first` с таблицей тоже считается порчей. Цена каждого
+//! старта растёт с историей (Р-7), но по замеру ревью разница с
+//! `quick_check` — около 15 мс на 100 000 записей в релизной сборке.
+//!
+//! **WAL не открывается вовсе.** Эта версия WAL не создаёт, значит его
+//! создала будущая версия приложения или чужой инструмент. Опасен он
+//! дважды.
+//!
+//! - Заголовок файла в режиме WAL может отставать от `-wal`: в заголовке
+//!   наша версия схемы, а в журнале уже новее.
+//! - SQLite применяет найденный рядом `-wal` при первом чтении, даже если
+//!   заголовок объявляет журнал `DELETE`. Чужой `-wal` рядом с нашей базой
+//!   подменил бы её страницы, `page` отдал бы `no such table`, а закрытие
+//!   перенесло бы подмену в файл, и история пропала бы без `.broken`-копии.
+//!   Рядом с пустым файлом SQLite этот `-wal` удалил бы.
+//!
+//! Порядок «сначала открыть в SQLite, потом сверить версию» опоздал бы:
+//! изменения к моменту сверки уже на диске. Поэтому до любого
+//! вызова SQLite, только по файловой системе и байтам заголовка, проверяются
+//! два признака: существует `history.sqlite-wal` (в том числе символьной
+//! ссылкой) и байт 18 или 19 заголовка (версия формата записи и чтения)
+//! равен 2. Любой из них — [`HistoryOpenError::NewerVersion`], файлы не
+//! тронуты.
+//!
+//! Остаточный риск — `-wal`, появившийся между проверкой и открытием. Его
+//! может создать только другой процесс, а единственность открытия
+//! хранилища — TL-90.
 //!
 //! # Порядок и курсор
 //!
@@ -153,8 +185,17 @@ pub const HISTORY_FILE_NAME: &str = "history.sqlite";
 /// Метка отложенной испорченной базы: `history.sqlite.broken-<метка>`.
 const BROKEN_MARKER: &str = ".broken-";
 
+/// Суффикс WAL-журнала базы.
+const WAL_SUFFIX: &str = "-wal";
+
 /// Спутники файла базы, которые SQLite ищет по имени базы с суффиксом.
-const SIDE_FILE_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+const SIDE_FILE_SUFFIXES: [&str; 3] = ["-journal", WAL_SUFFIX, "-shm"];
+
+/// Смещения версий формата записи и чтения в заголовке (по байту).
+const FILE_FORMAT_OFFSETS: [usize; 2] = [18, 19];
+
+/// Значение версии формата у базы в режиме WAL (`1` — классический журнал).
+const WAL_FILE_FORMAT: u8 = 2;
 
 /// Магическая строка заголовка файла SQLite 3.
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -328,16 +369,27 @@ pub struct HistoryRecordsPage {
 /// Почему история в этом сеансе не открылась.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HistoryOpenError {
-    /// Схема базы новее этой сборки (или версия вообще не наша). Файл не
-    /// открыт в SQLite и не изменён.
-    #[error(
-        "история {path}: база чужой версии схемы {found}, эта сборка знает \
-         версии до {supported} — файл не тронут"
-    )]
+    /// База, которую эта сборка не может тронуть, не рискуя чужими данными.
+    /// Файл не открыт в SQLite, ни он, ни спутники не изменены.
+    ///
+    /// Сюда входят:
+    /// - версия схемы выше известной этой сборке;
+    /// - отрицательная `user_version` — консервативно, текст отказа для
+    ///   неё неточен (см. [`refuse_foreign_version`]);
+    /// - база в режиме журнала, которого эта версия не создаёт: рядом лежит
+    ///   `history.sqlite-wal` или заголовок объявляет WAL (`wal == true`).
+    ///   Тогда `found` — версия из заголовка, если он есть, иначе `0`, и
+    ///   причина отказа — журнал, а не версия.
+    ///
+    /// Причина в контракте одна — `newerVersion`: WAL создаёт только
+    /// будущая версия приложения.
+    #[error("история {path}: {} — файл не тронут", newer_detail(*.found, *.supported, *.wal))]
     NewerVersion {
         path: PathBuf,
         found: i64,
         supported: u32,
+        /// Отказ по признаку WAL, а не по версии схемы.
+        wal: bool,
     },
     /// Нет прав на каталог данных или файл базы, либо файл не читается.
     #[error("история {path}: нет доступа — {reason}")]
@@ -355,8 +407,17 @@ pub enum HistoryOpenError {
     },
 }
 
+fn newer_detail(found: i64, supported: u32, wal: bool) -> String {
+    if wal {
+        "база в режиме журнала WAL, которого эта сборка не создаёт".to_owned()
+    } else {
+        format!("база чужой версии схемы {found}, эта сборка знает версии до {supported}")
+    }
+}
+
 impl HistoryOpenError {
-    /// Причина в форме контракта.
+    /// Причина в форме контракта. Для [`Self::NewerVersion`] это и чужая
+    /// версия схемы, и база в режиме журнала, которого эта версия не создаёт.
     pub fn reason(&self) -> HistoryUnavailableReason {
         match self {
             Self::NewerVersion { .. } => HistoryUnavailableReason::NewerVersion,
@@ -468,12 +529,28 @@ impl HistoryStore {
         fs::create_dir_all(data_dir)
             .map_err(|err| no_access(format!("каталог данных не создаётся: {err}")))?;
 
+        // До любого вызова SQLite: только файловая система и байты заголовка.
+        let header = inspect_header(&path)
+            .map_err(|err| no_access(format!("файл базы не читается: {err}")))?;
+        let wal_beside = exists_no_follow(&with_suffix(&path, WAL_SUFFIX))
+            .map_err(|err| no_access(format!("спутник {WAL_SUFFIX} не проверяется: {err}")))?;
+        let (header_version, wal_header) = match header {
+            Header::Sqlite { user_version, wal } => (user_version, wal),
+            Header::Absent | Header::Foreign => (0, false),
+        };
+        if wal_beside || wal_header {
+            return Err(HistoryOpenError::NewerVersion {
+                path,
+                found: header_version,
+                supported,
+                wal: true,
+            });
+        }
+
         let mut recreated = false;
-        match inspect_header(&path)
-            .map_err(|err| no_access(format!("файл базы не читается: {err}")))?
-        {
+        match header {
             Header::Absent => {}
-            Header::Sqlite { user_version } => {
+            Header::Sqlite { user_version, .. } => {
                 refuse_foreign_version(&path, user_version, supported)?;
             }
             Header::Foreign => {
@@ -881,8 +958,9 @@ fn schema_version_of(migrations: &[&str]) -> u32 {
 enum Header {
     /// Файла нет или он пуст — SQLite заведёт базу с нуля.
     Absent,
-    /// Заголовок SQLite 3 с этой `user_version`.
-    Sqlite { user_version: i64 },
+    /// Заголовок SQLite 3 с этой `user_version`; `wal` — байт 18 или 19
+    /// (версия формата записи или чтения) равен 2.
+    Sqlite { user_version: i64, wal: bool },
     /// Не SQLite: чужая магическая строка или файл короче заголовка.
     Foreign,
 }
@@ -907,15 +985,26 @@ fn inspect_header(path: &Path) -> io::Result<Header> {
     else {
         return Ok(Header::Foreign);
     };
+    let wal = FILE_FORMAT_OFFSETS
+        .iter()
+        .any(|&offset| head.get(offset) == Some(&WAL_FILE_FORMAT));
     Ok(Header::Sqlite {
         user_version: i64::from(i32::from_be_bytes(bytes)),
+        wal,
     })
 }
 
 /// Единственное место, где решается «версия наша или нет».
 ///
 /// Зовётся дважды: по заголовку до SQLite и по `PRAGMA user_version` после
-/// открытия (заголовок в WAL может отставать, см. шапку).
+/// открытия — страховка, что SQLite видит ту же версию, что и заголовок.
+///
+/// Отрицательная `user_version` — тоже [`HistoryOpenError::NewerVersion`].
+/// Эта сборка такую не пишет, и отказ консервативен: файл сохраняется, а не
+/// откладывается и не переписывается. Текст отказа для такого файла
+/// неточен: «чужой версии схемы -1, эта сборка знает версии до 1» звучит как
+/// «база новее», хотя она просто не наша. Отдельной причины для этого в
+/// контракте нет.
 fn refuse_foreign_version(path: &Path, found: i64, supported: u32) -> Result<(), HistoryOpenError> {
     match u32::try_from(found) {
         Ok(version) if version <= supported => Ok(()),
@@ -923,6 +1012,7 @@ fn refuse_foreign_version(path: &Path, found: i64, supported: u32) -> Result<(),
             path: path.to_path_buf(),
             found,
             supported,
+            wal: false,
         }),
     }
 }
@@ -978,7 +1068,7 @@ fn connect(path: &Path, supported: u32) -> Result<Connection, Connect> {
     let found = user_version(&conn).map_err(Connect::from_sqlite)?;
     refuse_foreign_version(path, found, supported).map_err(Connect::Foreign)?;
 
-    let verdicts = quick_check(&conn).map_err(Connect::from_sqlite)?;
+    let verdicts = integrity_check(&conn).map_err(Connect::from_sqlite)?;
     if verdicts != ["ok"] {
         return Err(Connect::Corrupt(verdicts.join("; ")));
     }
@@ -989,8 +1079,8 @@ fn user_version(conn: &Connection) -> rusqlite::Result<i64> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
 }
 
-fn quick_check(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut statement = conn.prepare("PRAGMA quick_check")?;
+fn integrity_check(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut statement = conn.prepare("PRAGMA integrity_check")?;
     let verdicts = statement
         .query_map([], |row| row.get(0))?
         .collect::<Result<Vec<String>, _>>()?;

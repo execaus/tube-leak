@@ -251,7 +251,8 @@ fn the_header_version_matches_what_sqlite_reports() {
         assert_eq!(
             inspect_header(&path).expect("заголовок читается"),
             Header::Sqlite {
-                user_version: version
+                user_version: version,
+                wal: false,
             }
         );
     }
@@ -290,11 +291,15 @@ fn a_newer_base_is_refused_and_left_byte_for_byte() {
         match &result {
             Err(
                 err @ HistoryOpenError::NewerVersion {
-                    found, supported, ..
+                    found,
+                    supported,
+                    wal,
+                    ..
                 },
             ) => {
                 assert_eq!(*found, version);
                 assert_eq!(*supported, SCHEMA_VERSION);
+                assert!(!wal, "отказ по версии назван отказом по WAL");
                 assert_eq!(err.reason(), HistoryUnavailableReason::NewerVersion);
             }
             other => panic!("база версии {version} открыта как {other:?}"),
@@ -345,20 +350,29 @@ fn text_garbage_is_set_aside_and_a_new_base_is_created() {
     }
 }
 
-/// Спутник испорченной базы уезжает вместе с ней и под её новым именем:
-/// оставшийся рядом с новой пустой базой журнал SQLite удалил бы.
+/// Файл, отвергнутый по заголовку (не SQLite), SQLite не открывал: он и
+/// его `-journal` уезжают байт в байт под новым именем. Журнал, оставшийся
+/// рядом с новой пустой базой, SQLite удалил бы.
+///
+/// Про SQLite-базу с порчей страниц тест ничего не утверждает: там горячий
+/// журнал применяет сам SQLite ещё до откладывания (шапка модуля).
 #[test]
-fn a_hot_journal_travels_with_the_broken_base() {
+fn a_journal_beside_a_base_rejected_by_header_travels_byte_for_byte() {
     let dirs = dirs();
     let data = dirs.data.path();
     let journal = with_suffix(&db_path(data), "-journal");
-    fs::write(db_path(data), "не база ".repeat(40)).expect("фикстура");
+    let garbage = "не база ".repeat(40);
+    fs::write(db_path(data), &garbage).expect("фикстура");
     fs::write(&journal, b"journal bytes").expect("фикстура");
 
     let _store = open(data);
 
     let copies = broken_copies(data);
     assert_eq!(copies.len(), 1, "отложенных копий: {copies:?}");
+    assert_eq!(
+        fs::read(&copies[0]).expect("копия читается"),
+        garbage.as_bytes()
+    );
     assert_eq!(
         fs::read(with_suffix(&copies[0], "-journal")).expect("журнал уехал с базой"),
         b"journal bytes"
@@ -370,7 +384,7 @@ fn a_hot_journal_travels_with_the_broken_base() {
 }
 
 /// Порча внутри настоящей базы SQLite (заголовок цел, страницы — нет)
-/// ловится `quick_check` и обрабатывается так же, как мусор.
+/// ловится `integrity_check` и обрабатывается так же, как мусор.
 #[test]
 fn a_base_with_corrupted_pages_is_set_aside() {
     let dirs = dirs();
@@ -395,7 +409,10 @@ fn a_base_with_corrupted_pages_is_set_aside() {
     fs::write(db_path(data), &bytes).expect("порча записана");
     assert!(matches!(
         inspect_header(&db_path(data)),
-        Ok(Header::Sqlite { user_version: 1 })
+        Ok(Header::Sqlite {
+            user_version: 1,
+            wal: false
+        })
     ));
 
     let store = open(data);
@@ -406,6 +423,148 @@ fn a_base_with_corrupted_pages_is_set_aside() {
     let page = store.page(None).expect("страница новой базы");
     assert!(page.records.is_empty());
     assert_eq!(page.notices, vec![HistoryNotice::BaseRecreated]);
+}
+
+/// Пара «главный файл — `-wal`» с непримененными кадрами.
+///
+/// Главный файл в режиме WAL хранит в заголовке `header_version`, а кадры
+/// в `-wal` поднимают её до `wal_version` и дописывают строку. Байты
+/// снимаются, пока соединение открыто: закрытие перенесло бы кадры в файл
+/// и удалило бы `-wal`.
+fn wal_pair(scratch: &Path, header_version: i64, wal_version: i64) -> (Vec<u8>, Vec<u8>) {
+    let path = scratch.join("wal-source.sqlite");
+    let conn = Connection::open(&path).expect("фикстура-база создаётся");
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+        .expect("режим WAL");
+    assert_eq!(mode, "wal");
+    conn.execute_batch("CREATE TABLE foreign_t (x INTEGER); INSERT INTO foreign_t VALUES (1);")
+        .expect("фикстура-схема");
+    conn.pragma_update(None, "user_version", header_version)
+        .expect("версия заголовка");
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .expect("перенос в файл");
+    conn.query_row("PRAGMA wal_autocheckpoint = 0", [], |_| Ok(()))
+        .expect("автоперенос выключен");
+    conn.execute_batch("INSERT INTO foreign_t VALUES (2);")
+        .expect("кадр в WAL");
+    conn.pragma_update(None, "user_version", wal_version)
+        .expect("версия в WAL");
+
+    let main = fs::read(&path).expect("главный файл читается");
+    let wal = fs::read(with_suffix(&path, WAL_SUFFIX)).expect("-wal читается");
+    assert!(!wal.is_empty(), "кадров в -wal нет");
+    drop(conn);
+    (main, wal)
+}
+
+/// Отказ из-за WAL: `NewerVersion` с признаком журнала, каталог данных
+/// байт в байт тот же, включая `-wal`.
+fn assert_refused_as_wal_and_untouched(data: &Path, expected_found: i64) {
+    let before = snapshot(data);
+
+    let result = HistoryStore::open(data);
+
+    match &result {
+        Err(
+            err @ HistoryOpenError::NewerVersion {
+                found,
+                supported,
+                wal: true,
+                ..
+            },
+        ) => {
+            assert_eq!(*found, expected_found);
+            assert_eq!(*supported, SCHEMA_VERSION);
+            assert_eq!(err.reason(), HistoryUnavailableReason::NewerVersion);
+        }
+        other => panic!("база с признаком WAL открыта как {other:?}"),
+    }
+    drop(result);
+    assert_eq!(
+        snapshot(data),
+        before,
+        "каталог данных изменился после отказа по WAL"
+    );
+}
+
+/// Сценарий ревью (а): заголовок объявляет версию 1, а в `-wal` лежит
+/// версия 2. SQLite применил бы кадры при первом чтении, и отказ по
+/// `PRAGMA user_version` пришёл бы после изменения файла.
+#[test]
+fn a_version_1_header_with_a_version_2_wal_is_refused_untouched() {
+    let dirs = dirs();
+    let data = dirs.data.path();
+    let (main, wal) = wal_pair(dirs.downloads.path(), 1, 2);
+    fs::write(db_path(data), &main).expect("фикстура");
+    fs::write(with_suffix(&db_path(data), WAL_SUFFIX), &wal).expect("фикстура");
+    assert_eq!(
+        inspect_header(&db_path(data)).expect("заголовок читается"),
+        Header::Sqlite {
+            user_version: 1,
+            wal: true
+        },
+        "фикстура не та: в заголовке должна быть версия 1 в режиме WAL"
+    );
+
+    assert_refused_as_wal_and_untouched(data, 1);
+}
+
+/// Сценарий ревью (б): наша база в режиме DELETE с записями и чужой `-wal`
+/// рядом. Заголовок чист, ловит только проверка существования `-wal`.
+/// Без неё `open` успешен, `page` отдаёт `no such table: history`, а после
+/// закрытия история уничтожена без `.broken`-копии.
+///
+/// Мутация, которую тест обязан ловить: убрать проверку `-wal`.
+#[test]
+fn a_delete_mode_base_with_a_foreign_wal_is_refused_untouched() {
+    let dirs = dirs();
+    let data = dirs.data.path();
+    let folder = dirs.downloads.path();
+    let store = open(data);
+    for n in 1..=3 {
+        store.insert(&record(folder, n, 100 + n)).expect("вставка");
+    }
+    drop(store);
+    let scratch = tempdir().expect("временный каталог");
+    let (_, foreign_wal) = wal_pair(scratch.path(), 1, 7);
+    fs::write(with_suffix(&db_path(data), WAL_SUFFIX), &foreign_wal).expect("фикстура");
+    assert_eq!(
+        inspect_header(&db_path(data)).expect("заголовок читается"),
+        Header::Sqlite {
+            user_version: 1,
+            wal: false
+        },
+        "фикстура не та: заголовок должен быть в режиме DELETE"
+    );
+
+    assert_refused_as_wal_and_untouched(data, 1);
+}
+
+/// Заголовок объявляет WAL, а `-wal` рядом нет (журнал был перенесён и
+/// удалён). Ловит только проверка байтов 18–19: иначе SQLite открыл бы
+/// базу в режиме WAL.
+///
+/// Мутация, которую тест обязан ловить: убрать проверку байтов заголовка.
+#[test]
+fn a_wal_mode_header_without_a_wal_file_is_refused_untouched() {
+    let dirs = dirs();
+    let data = dirs.data.path();
+    let (main, _) = wal_pair(dirs.downloads.path(), 1, 1);
+    fs::write(db_path(data), &main).expect("фикстура");
+
+    assert_refused_as_wal_and_untouched(data, 1);
+}
+
+/// Чужой `-wal` рядом с пустым или отсутствующим файлом SQLite удалил бы.
+#[test]
+fn a_wal_beside_a_missing_base_is_refused_untouched() {
+    let dirs = dirs();
+    let data = dirs.data.path();
+    let (_, wal) = wal_pair(dirs.downloads.path(), 1, 2);
+    fs::write(with_suffix(&db_path(data), WAL_SUFFIX), &wal).expect("фикстура");
+
+    assert_refused_as_wal_and_untouched(data, 0);
 }
 
 /// Вторая порча с той же меткой не затирает первую отложенную копию.
@@ -1150,6 +1309,15 @@ fn ids_of(store: &HistoryStore) -> Vec<i64> {
 
 /// Н-3, Ф-7: обе страничные выборки идут по индексу и не сортируют во
 /// временном дереве — список не деградирует от размера.
+///
+/// Первая страница законно обходит индекс с начала (`SCAN ... USING INDEX`)
+/// и останавливается на `LIMIT`. Страница после курсора обязана **искать**
+/// по индексу с условием на время (`SEARCH ... (finished_at_unix_secs<?)`):
+/// полный проход индекса с фильтром на каждой строке тоже «по индексу и без
+/// сортировки», но растёт с глубиной листания.
+///
+/// Мутация, которую тест обязан ловить: `finished_at_unix_secs + 0` в
+/// условии курсора — план становится `SCAN`.
 #[test]
 fn the_index_serves_both_page_queries_without_sorting() {
     let dirs = dirs();
@@ -1169,16 +1337,24 @@ fn the_index_serves_both_page_queries_without_sorting() {
         })
     };
 
-    for detail in [
-        plan(PAGE_FIRST_SQL, params![31]),
-        plan(PAGE_AFTER_SQL, params![10, 5, 31]),
-    ] {
-        assert!(
-            detail.contains("history_newest_first"),
-            "план без индекса: {detail}"
-        );
+    let first = plan(PAGE_FIRST_SQL, params![31]);
+    let after = plan(PAGE_AFTER_SQL, params![10, 5, 31]);
+    for detail in [&first, &after] {
         assert!(!detail.contains("TEMP B-TREE"), "план сортирует: {detail}");
     }
+    assert_eq!(
+        first, "SCAN history USING INDEX history_newest_first",
+        "первая страница не по индексу"
+    );
+    assert!(
+        after
+            .starts_with("SEARCH history USING INDEX history_newest_first (finished_at_unix_secs<"),
+        "страница после курсора не ищет по индексу со временем: {after}"
+    );
+    assert!(
+        !after.contains("SCAN"),
+        "страница после курсора сканирует: {after}"
+    );
 }
 
 /// Строковая форма id — только каноническая.

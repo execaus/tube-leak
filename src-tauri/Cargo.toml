@@ -251,9 +251,22 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # новыми строками. Класс дефекта flate2 (зависимость от фичи, включённой
 # чужой веткой графа) здесь не воспроизводится.
 #
-# Строки лока: четыре названных крейта плюс vcpkg 0.2.15. vcpkg — это
-# build-зависимость libsqlite3-sys, она живёт на host-стороне и в целевой
-# граф не попадает. cc и pkg-config в локе уже были. У libsqlite3-sys есть
+# Строки лока: четыре названных крейта плюс vcpkg 0.2.15. cc и pkg-config
+# в локе уже были. Команда Н-5 build-рёбер не видит, поэтому build-сторона
+# перемерена отдельно: та же разница `до`/`после`, но с `-e normal,build`:
+#
+#   cargo tree -e normal,build --target <тройка> --prefix none \
+#     | sed 's/ (\*)$//' | sort -u
+#
+#   тройка                      к четырём названным
+#   aarch64-apple-darwin        + vcpkg 0.2.15, pkg-config 0.3.34
+#   x86_64-pc-windows-msvc      + vcpkg 0.2.15, pkg-config 0.3.34
+#   x86_64-unknown-linux-gnu    + vcpkg 0.2.15
+#
+# Оба — build-зависимости libsqlite3-sys: собираются на host только для
+# её build.rs и в бинарник не попадают. На Linux pkg-config в build-графе
+# уже был (его тянет system-deps у привязок GTK и webkit2gtk), поэтому прибавки
+# нет. Исчезнувших крейтов нет ни на одной тройке. У libsqlite3-sys есть
 # `links = "sqlite3"`, это единственный C-код набора (амальгама SQLite).
 # `bundled_bindings` — готовые привязки, bindgen и libclang не нужны.
 #
