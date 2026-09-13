@@ -191,6 +191,17 @@ const resumeBannerText = computed(() =>
   margin-bottom: 0.75rem;
   background: var(--color-accent-soft);
   border-radius: 0.3rem;
+  /*
+   * TL-22 ревью: в тёмной теме баннер почти сливается с фоном окна
+   * (контраст 1.18:1) — нужна отделяющая рамка. `box-shadow`, а не
+   * `border`: высота этого блока не задана явно (auto, по контенту), а
+   * настоящий `border` добавил бы 2px к итоговой высоте независимо от
+   * `box-sizing` — «светлая тема не должна измениться ни на пиксель» не
+   * выполнилось бы даже с прозрачным цветом. `box-shadow` в блочную
+   * модель не входит вообще, поэтому светлое значение токена
+   * (`transparent`) даёт буквально нулевое отличие от прежнего вида.
+   */
+  box-shadow: inset 0 0 0 1px var(--color-banner-border);
 }
 
 .queue-section__banner-text {

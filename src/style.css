@@ -77,6 +77,15 @@
   --color-accent: #1a73e8;
   --color-accent-soft: #eef4fd;
   --color-error: #b3261e;
+
+  /*
+   * Обводка баннера очереди (TL-22, ревью раунда 3, issue
+   * execaus/tube-leak#23): в светлой теме баннер и так контрастен фону,
+   * рамка не нужна — прозрачная, чтобы вид не изменился ни на пиксель
+   * (см. doc-комментарий `.queue-section__banner` в `QueueSection.vue`
+   * про то, почему это `box-shadow`, а не `border`).
+   */
+  --color-banner-border: transparent;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -103,6 +112,13 @@
 
     --color-accent-soft: #0f2338;
     --color-error: #f28b82;
+
+    /*
+     * Баннер почти сливается с окном в тёмной теме (контраст фона к окну
+     * 1.18:1) — тонкая рамка того же оттенка, что обычная граница тёмной
+     * темы, отделяет его от фона без нового оттенка в палитре.
+     */
+    --color-banner-border: var(--color-border);
   }
 }
 
