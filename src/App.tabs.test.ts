@@ -15,6 +15,18 @@ import type { YtDlpPrepared } from '@/types/generated/ytdlp'
  * `App.download.test.ts` (очередь E3 → E4) — здесь проверяется именно
  * навигация и то, что переключение вкладки не задевает состояние ни
  * «Главного», ни стора очереди (критерий приёмки эпика К-14).
+ *
+ * # Второй раунд (правки ревью)
+ *
+ * Б-1 — клавиатура переведена на «автоматическую активацию» (см.
+ * `focusTab`/`pressOnFocused` ниже и doc `activateTabFromKeyboard` в
+ * `App.vue`): первая версия тестов слала `keydown` прямо на `tablist`, а
+ * не на реально сфокусированный элемент, и не увидела, что второе нажатие
+ * стрелки подряд било мимо в настоящем браузере. Б-2 — проверки строки
+ * статуса прицельно читают `.queue-status-row`, не `wrapper.text()`
+ * целиком (см. doc блока «строка состояния очереди» ниже — скрытая секция
+ * «Главного» рисует те же слова). С-1/С-2/Н-1/Н-3/Н-4 — отдельные блоки в
+ * конце файла.
  */
 
 const invokeMock = vi.fn()
@@ -34,13 +46,23 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: (...args: [string, Handler]) => listenMock(...args),
 }))
 
-// Диалог выхода (TL-46/TL-47) не тема этого файла — окно замокано так,
-// чтобы `onCloseRequested` просто никогда не резолвился (тот же приём,
-// что `App.test.ts`), никакой из тестов ниже не трогает закрытие окна.
+/**
+ * Диалог выхода (TL-46/TL-47) не главная тема этого файла (полная матрица
+ * — `App.download.test.ts`), но правки ревью TL-92 (С-1) требуют доказать,
+ * что он работает и с неглавной вкладки — для этого окно замокано по-
+ * настоящему (тот же приём, что `App.download.test.ts`), а не подвешенным
+ * навечно промисом: обработчик закрытия и `destroy` перехватываются.
+ */
+type CloseHandler = (event: { preventDefault: () => void }) => void | Promise<void>
+let capturedCloseHandler: CloseHandler | undefined
+const destroyMock = vi.fn(() => Promise.resolve())
 vi.mock('@tauri-apps/api/window', () => ({
   getCurrentWindow: () => ({
-    onCloseRequested: () => new Promise<() => void>(() => {}),
-    destroy: () => Promise.resolve(),
+    onCloseRequested: (handler: CloseHandler) => {
+      capturedCloseHandler = handler
+      return Promise.resolve(() => {})
+    },
+    destroy: destroyMock,
   }),
 }))
 
@@ -72,6 +94,15 @@ function emitProgress(payload: DownloadProgressEvent): void {
   handlers.get('download://progress')?.({ payload })
 }
 
+function emitQueueChanged(snapshot: QueueSnapshot): void {
+  handlers.get('queue://changed')?.({ payload: snapshot })
+}
+
+/** Симулирует попытку пользователя закрыть окно (крестик, Cmd+Q…). */
+async function attemptWindowClose(): Promise<void> {
+  await capturedCloseHandler?.({ preventDefault: vi.fn() })
+}
+
 function routeInvoke(handlersByCommand: Record<string, () => Promise<unknown>>) {
   const withDefaults: Record<string, () => Promise<unknown>> = {
     // Снимок очереди — дефолт «пусто», явно переданный обработчик той же
@@ -94,6 +125,8 @@ beforeEach(() => {
   listenMock.mockClear()
   unlistenMock.mockClear()
   handlers.clear()
+  capturedCloseHandler = undefined
+  destroyMock.mockClear()
   setActivePinia(createPinia())
   routeInvoke({
     prepare_ytdlp: () => Promise.resolve(preparedWarm),
@@ -141,6 +174,26 @@ function tabPanel(wrapper: Awaited<ReturnType<typeof mountReady>>, id: string) {
   const panel = wrapper.find(`#${id}`)
   if (!panel.exists()) throw new Error(`panel not found: ${id}`)
   return panel
+}
+
+/** Кладёт настоящий DOM-фокус на кнопку-вкладку по её `id` (`#tab-<id>`). */
+function focusTab(wrapper: Awaited<ReturnType<typeof mountReady>>, tabId: string): HTMLElement {
+  const el = wrapper.get(`#tab-${tabId}`).element as HTMLElement
+  el.focus()
+  return el
+}
+
+/**
+ * Отправляет `keydown` на элемент, реально сфокусированный сейчас
+ * (`document.activeElement`), а не на контейнер `tablist` напрямую (Б-1,
+ * правки ревью TL-92, второй раунд, doc-комментарий этого файла ниже) —
+ * `bubbles: true`, потому что обработчик висит на `.tabs`, и событию
+ * нужно всплыть от кнопки до него, как в настоящем браузере.
+ */
+async function pressOnFocused(key: string): Promise<void> {
+  const target = document.activeElement as HTMLElement
+  target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }))
+  await flushPromises()
 }
 
 describe('App — панель вкладок (TL-92, дизайн E5 «Навигация»)', () => {
@@ -257,68 +310,132 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
   })
 })
 
-describe('App — клавиатура вкладок: стрелки, Home/End (TL-92)', () => {
-  it('ArrowRight cycles Главный → История → Настройки → Главный', async () => {
+/**
+ * Клавиатура `tablist`: стрелки, Home/End (правки ревью TL-92, второй
+ * раунд, Б-1).
+ *
+ * Первая версия этих тестов слала `keydown` прямо на `[role="tablist"]`
+ * (`tablist.trigger('keydown', …)`), а не на элемент, реально
+ * сфокусированный в этот момент, — и была зелёной даже с багом, который
+ * она была обязана поймать: обработчик реагировал на первое нажатие, но
+ * `selectTab` переводил фокус на заголовок панели (вне `tablist`), и
+ * второе нажатие подряд било мимо в настоящем браузере (`keydown` с
+ * заголовка до контейнера не всплывает). Искусственный вызов `.trigger()`
+ * на самом контейнере этого не видел — событие и так рождалось на нём.
+ * Ниже — `focusTab`/`pressOnFocused`: фокус выставляется по-настоящему,
+ * событие уходит с `document.activeElement` и должно дойти до `tablist`
+ * всплытием, как в реальном взаимодействии.
+ */
+describe('App — клавиатура вкладок: стрелки, Home/End (TL-92, правки ревью, Б-1)', () => {
+  it('three ArrowRight presses in a row cycle Главный → История → Настройки → Главный, each delivered to the newly focused tab (обязательный тест Б-1)', async () => {
     const wrapper = await mountReady()
-    const tablist = wrapper.get('[role="tablist"]')
+    focusTab(wrapper, 'main')
 
-    await tablist.trigger('keydown', { key: 'ArrowRight' })
-    await wrapper.vm.$nextTick()
+    await pressOnFocused('ArrowRight')
     expect(tabButton(wrapper, 'История').attributes('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(wrapper.get('#tab-history').element)
 
-    await tablist.trigger('keydown', { key: 'ArrowRight' })
-    await wrapper.vm.$nextTick()
+    await pressOnFocused('ArrowRight')
     expect(tabButton(wrapper, 'Настройки').attributes('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(wrapper.get('#tab-settings').element)
 
-    await tablist.trigger('keydown', { key: 'ArrowRight' })
-    await wrapper.vm.$nextTick()
+    await pressOnFocused('ArrowRight')
     expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(wrapper.get('#tab-main').element)
   })
 
-  it('ArrowLeft from «Главный» wraps around to «Настройки»', async () => {
+  it('ArrowLeft from «Главный» wraps around to «Настройки» and moves focus there', async () => {
     const wrapper = await mountReady()
-    const tablist = wrapper.get('[role="tablist"]')
+    focusTab(wrapper, 'main')
 
-    await tablist.trigger('keydown', { key: 'ArrowLeft' })
-    await wrapper.vm.$nextTick()
+    await pressOnFocused('ArrowLeft')
     expect(tabButton(wrapper, 'Настройки').attributes('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(wrapper.get('#tab-settings').element)
   })
 
-  it('End jumps to «Настройки», Home jumps back to «Главный»', async () => {
+  it('End jumps to «Настройки», Home jumps back to «Главный», focus follows both times', async () => {
     const wrapper = await mountReady()
-    const tablist = wrapper.get('[role="tablist"]')
+    focusTab(wrapper, 'main')
 
-    await tablist.trigger('keydown', { key: 'End' })
-    await wrapper.vm.$nextTick()
+    await pressOnFocused('End')
     expect(tabButton(wrapper, 'Настройки').attributes('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(wrapper.get('#tab-settings').element)
 
-    await tablist.trigger('keydown', { key: 'Home' })
-    await wrapper.vm.$nextTick()
+    await pressOnFocused('Home')
     expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(wrapper.get('#tab-main').element)
   })
 
-  it('keyboard activation also moves focus into the new panel heading (дизайн: не остаётся на кнопке-вкладке)', async () => {
+  it('keyboard activation keeps focus on the newly selected tab button, not the panel heading (дизайн «Фокус при переключении экрана»: заголовок — только после клика/«На главный»)', async () => {
     const wrapper = await mountReady()
-    const tablist = wrapper.get('[role="tablist"]')
+    focusTab(wrapper, 'main')
 
-    await tablist.trigger('keydown', { key: 'End' })
-    await wrapper.vm.$nextTick()
+    await pressOnFocused('End')
 
-    const heading = tabPanel(wrapper, 'tabpanel-settings').get('h2')
-    expect(document.activeElement).toBe(heading.element)
+    const heading = tabPanel(wrapper, 'tabpanel-settings').get('h2').element
+    expect(document.activeElement).not.toBe(heading)
+    expect(document.activeElement).toBe(wrapper.get('#tab-settings').element)
   })
 
   it('unrelated keys (e.g. Tab) are ignored by the tablist handler', async () => {
     const wrapper = await mountReady()
-    const tablist = wrapper.get('[role="tablist"]')
+    focusTab(wrapper, 'main')
 
-    await tablist.trigger('keydown', { key: 'Tab' })
-    await wrapper.vm.$nextTick()
+    await pressOnFocused('Tab')
+    expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('true')
+  })
+
+  it('ArrowUp/ArrowDown are left alone — tablist is horizontal, browser scrolling must not be blocked (Н-4)', async () => {
+    const wrapper = await mountReady()
+    focusTab(wrapper, 'main')
+
+    const target = document.activeElement as HTMLElement
+    const down = new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })
+    target.dispatchEvent(down)
+    await flushPromises()
+    expect(down.defaultPrevented).toBe(false)
+    expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('true')
+
+    const up = new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true })
+    target.dispatchEvent(up)
+    await flushPromises()
+    expect(up.defaultPrevented).toBe(false)
     expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('true')
   })
 })
 
-describe('App — строка состояния очереди под вкладками (TL-92, дизайн «Навигация»)', () => {
+describe('App — клик по вкладке: фокус (TL-92, правки ревью, Н-4)', () => {
+  it('clicking the already-active tab does not move focus anywhere', async () => {
+    const wrapper = await mountReady()
+    const mainButtonEl = focusTab(wrapper, 'main')
+    expect(document.activeElement).toBe(mainButtonEl)
+
+    await tabButton(wrapper, 'Главный').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    // Мутация (doc-комментарий `selectTab` в `App.vue`): убрать защиту
+    // «тот же таб — не трогать фокус» — и фокус уедет на `<h1>`, хотя
+    // никакого настоящего переключения не произошло.
+    expect(document.activeElement).toBe(mainButtonEl)
+    expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('true')
+  })
+})
+
+/**
+ * Строка состояния очереди под вкладками (TL-92, дизайн «Навигация»).
+ *
+ * Правки ревью (Б-2): каждая проверка текста читает `.queue-status-row`
+ * прицельно, а не `wrapper.text()` целиком. `v-show` держит «Главный» в
+ * DOM всегда, и его секция «Очередь загрузок» рисует ровно те же слова
+ * («Между загрузками устанавливается обновлённый yt-dlp», сама
+ * `QueueSection.vue`) независимо от активной вкладки, как только в списке
+ * есть хоть одна задача, — `wrapper.text()` находил бы совпадение даже
+ * без единой строчки кода компактной строки статуса. Тест на пауле
+ * обновления ниже — ровно тот случай: он попадал в эту ловушку буквально
+ * (задача есть, `pauseReason: 'ytDlpUpdate'` рисует тот же текст в
+ * скрытой секции «Главного»).
+ */
+describe('App — строка состояния очереди под вкладками (TL-92, дизайн «Навигация», правки ревью Б-2/С-3)', () => {
   it('never renders on «Главный», even with an active task — the full queue section already plays that role there', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
@@ -343,7 +460,7 @@ describe('App — строка состояния очереди под вкла
     expect(wrapper.find('.queue-status-row').exists()).toBe(false)
   })
 
-  it('shows the active-task line (title · phase · percent) on «История», hidden again back on «Главный»', async () => {
+  it('shows the active-task line (bullet · title · phase · percent) on «История», hidden again back on «Главный»', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
       check_sidecar: () => Promise.resolve(okReport),
@@ -368,8 +485,15 @@ describe('App — строка состояния очереди под вкла
     await tabButton(wrapper, 'История').trigger('click')
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.find('.queue-status-row').exists()).toBe(true)
-    expect(wrapper.text()).toContain('«Ролик A» — Только аудио · Скачивание · 40 %')
+    const row = wrapper.get('.queue-status-row')
+    expect(row.text()).toContain('«Ролик A» — Только аудио · Скачивание · 40 %')
+
+    // «●» перед названием активной задачи (С-3, макет дизайна
+    // «Навигация») — декоративный, `aria-hidden`, не входит в живую зону
+    // (см. описание ниже).
+    const bullet = row.find('[aria-hidden="true"]')
+    expect(bullet.exists()).toBe(true)
+    expect(bullet.text()).toBe('●')
 
     await tabButton(wrapper, 'Главный').trigger('click')
     await wrapper.vm.$nextTick()
@@ -392,11 +516,12 @@ describe('App — строка состояния очереди под вкла
     await tabButton(wrapper, 'Настройки').trigger('click')
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.text()).toContain('«Ролик A» — Только аудио · Подготовка')
-    expect(wrapper.text()).not.toMatch(/Подготовка\s*·/)
+    const row = wrapper.get('.queue-status-row')
+    expect(row.text()).toContain('«Ролик A» — Только аудио · Подготовка')
+    expect(row.text()).not.toMatch(/Подготовка\s*·/)
   })
 
-  it('shows the yt-dlp update pause line when pauseReason is ytDlpUpdate, on «Настройки»', async () => {
+  it('shows the yt-dlp update pause line when pauseReason is ytDlpUpdate, on «Настройки» — exact design copy, no bullet, no tail (С-3)', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
       check_sidecar: () => Promise.resolve(okReport),
@@ -413,10 +538,22 @@ describe('App — строка состояния очереди под вкла
     await tabButton(wrapper, 'Настройки').trigger('click')
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.text()).toContain('Между загрузками устанавливается обновлённый yt-dlp')
+    // Прицельно `.queue-status-row`, не весь `wrapper.text()` (Б-2,
+    // doc-комментарий блока выше): скрытая секция «Главного» рисует тот
+    // же текст через `QueueSection.vue` для того же снимка очереди, и
+    // `wrapper.text()` не отличил бы одно от другого.
+    const row = wrapper.get('.queue-status-row')
+    expect(row.text()).toContain('Между загрузками устанавливается обновлённый yt-dlp')
+    // Хвост «— обычно занимает меньше минуты» — только у полной секции
+    // очереди/диалога выхода, не у компактной строки статуса (С-3, своя
+    // константа `STATUS_ROW_YT_DLP_UPDATE_PAUSE_TEXT`, а не
+    // `YT_DLP_UPDATE_PAUSE_TEXT`).
+    expect(row.text()).not.toContain('обычно занимает меньше минуты')
+    // Пауза — не активная задача: без декоративного «●».
+    expect(row.find('[aria-hidden="true"]').exists()).toBe(false)
   })
 
-  it('shows the resumed-after-restart waiting line when awaitingContinue and no active task yet', async () => {
+  it('shows the resumed-after-restart waiting line when awaitingContinue and no active task yet, without a bullet', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
       check_sidecar: () => Promise.resolve(okReport),
@@ -433,7 +570,9 @@ describe('App — строка состояния очереди под вкла
     await tabButton(wrapper, 'История').trigger('click')
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.text()).toContain('Очередь приостановлена — 2 задачи ждут')
+    const row = wrapper.get('.queue-status-row')
+    expect(row.text()).toContain('Очередь приостановлена — 2 задачи ждут')
+    expect(row.find('[aria-hidden="true"]').exists()).toBe(false)
   })
 
   it('shows nothing at all when the queue is empty and inactive, on any non-main tab', async () => {
@@ -445,6 +584,135 @@ describe('App — строка состояния очереди под вкла
     await tabButton(wrapper, 'Настройки').trigger('click')
     await wrapper.vm.$nextTick()
     expect(wrapper.find('.queue-status-row').exists()).toBe(false)
+  })
+
+  it('mutation guard: removing the ytDlpUpdate pause branch from queueStatusText would only be caught scoped to .queue-status-row, not by wrapper.text() (Б-2 doc)', async () => {
+    // Не мутирует исходник — фиксирует утверждение отдельно от предыдущего
+    // теста: полный `wrapper.text()` содержит фразу паузы, даже когда
+    // строки статуса вовсе нет на экране (задача есть, но пользователь на
+    // «Главном» — секция очереди видна напрямую, не через строку статуса).
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () =>
+        Promise.resolve({
+          tasks: [
+            { taskId: 't1', title: 'Ролик A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' },
+          ],
+          awaitingContinue: false,
+          pauseReason: 'ytDlpUpdate',
+        } satisfies QueueSnapshot),
+    })
+    const wrapper = await mountReady()
+    // На «Главном» строки статуса нет вовсе — она не для этой вкладки.
+    expect(wrapper.find('.queue-status-row').exists()).toBe(false)
+    // …и тем не менее тот же текст уже виден на экране — через полную
+    // секцию очереди, а не через компактную строку.
+    expect(wrapper.text()).toContain('Между загрузками устанавливается обновлённый yt-dlp')
+  })
+})
+
+describe('App — живая зона строки статуса (TL-92, правки ревью, Н-3)', () => {
+  it('the announcer exists in the DOM from mount, before there is anything to announce, and is not itself the visible row', async () => {
+    const wrapper = await mountReady()
+    const announcer = wrapper.get('.queue-status-announcer')
+    expect(announcer.attributes('aria-live')).toBe('polite')
+    expect(announcer.text()).toBe('')
+    expect(announcer.classes()).not.toContain('queue-status-row')
+  })
+
+  it('the announcer mirrors the same text as the visible row once the queue has something to say, without the decorative bullet', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () =>
+        Promise.resolve({
+          tasks: [
+            {
+              taskId: 't1',
+              title: 'Ролик A',
+              quality: { kind: 'audioOnly' },
+              plan: 'singleStream',
+              phase: 'downloading',
+              state: 'running',
+              percent: 40,
+            },
+          ],
+          awaitingContinue: false,
+        } satisfies QueueSnapshot),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.queue-status-announcer').text()).toBe('«Ролик A» — Только аудио · Скачивание · 40 %')
+  })
+
+  it('moves focus to the current panel heading when the status row disappears while «На главный» was focused, instead of dropping it to <body> (Н-3)', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () =>
+        Promise.resolve({
+          tasks: [
+            {
+              taskId: 't1',
+              title: 'Ролик A',
+              quality: { kind: 'audioOnly' },
+              plan: 'singleStream',
+              phase: 'downloading',
+              state: 'running',
+              percent: 40,
+            },
+          ],
+          awaitingContinue: false,
+        } satisfies QueueSnapshot),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    const backButton = wrapper.findAll('button').find((b) => b.text() === 'На главный')
+    expect(backButton).toBeDefined()
+    ;(backButton!.element as HTMLElement).focus()
+    expect(document.activeElement).toBe(backButton!.element)
+
+    // Очередь опустела (задача скрыта/снята) — строка статуса пропадает
+    // вместе с кнопкой, на которой стоял фокус.
+    emitQueueChanged({ tasks: [], awaitingContinue: false })
+    await wrapper.vm.$nextTick()
+    await flushPromises()
+
+    expect(wrapper.find('.queue-status-row').exists()).toBe(false)
+    const heading = tabPanel(wrapper, 'tabpanel-history').get('h2').element
+    expect(document.activeElement).toBe(heading)
+  })
+
+  it('does not touch focus when the status row disappears while focus was elsewhere (e.g. the История heading itself)', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () =>
+        Promise.resolve({
+          tasks: [
+            { taskId: 't1', title: 'Ролик A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'fetching' },
+          ],
+          awaitingContinue: false,
+        } satisfies QueueSnapshot),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    const heading = tabPanel(wrapper, 'tabpanel-history').get('h2').element
+    expect(document.activeElement).toBe(heading)
+
+    emitQueueChanged({ tasks: [], awaitingContinue: false })
+    await wrapper.vm.$nextTick()
+    await flushPromises()
+
+    expect(wrapper.find('.queue-status-row').exists()).toBe(false)
+    expect(document.activeElement).toBe(heading)
   })
 })
 
@@ -503,5 +771,143 @@ describe('App — К-14: переключение вкладок не теряе
     // порвалась и не пересоздавалась при переключении вкладок.
     const queueStateCallsAfter = invokeMock.mock.calls.filter(([cmd]) => cmd === 'queue_state').length
     expect(queueStateCallsAfter).toBe(queueStateCallsBefore)
+  })
+})
+
+/**
+ * С-1 (правки ревью TL-92, второй раунд) — диалог подтверждения выхода
+ * (Р-2, TL-46/TL-47) подписан на верхнем уровне `App.vue`, независимо от
+ * активной вкладки; полная матрица его поведения — `App.download.test.ts`.
+ * Здесь — ровно тот сценарий ревью (взят из R2 черновика ревьюера),
+ * которого раньше не было в ветке: попытка выйти **с «Истории»**, а не
+ * только с «Главного».
+ */
+describe('App — диалог подтверждения выхода с неглавной вкладки (TL-92, правки ревью, С-1)', () => {
+  it('shows the dialog while on «История», keeps destroy from firing, and «Остаться» returns focus to the История heading', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () =>
+        Promise.resolve({
+          tasks: [
+            {
+              taskId: 't1',
+              title: 'Ролик A',
+              quality: { kind: 'audioOnly' },
+              plan: 'singleStream',
+              phase: 'downloading',
+              state: 'running',
+              percent: 40,
+            },
+          ],
+          awaitingContinue: false,
+        } satisfies QueueSnapshot),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+    const heading = tabPanel(wrapper, 'tabpanel-history').get('h2').element
+
+    await attemptWindowClose()
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.text()).toContain('Очередь ещё не завершена')
+    expect(destroyMock).not.toHaveBeenCalled()
+
+    await wrapper.findAll('button').find((b) => b.text() === 'Остаться')?.trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.text()).not.toContain('Очередь ещё не завершена')
+    expect(destroyMock).not.toHaveBeenCalled()
+    expect(document.activeElement).toBe(heading)
+    expect(tabButton(wrapper, 'История').attributes('aria-selected')).toBe('true')
+  })
+})
+
+/**
+ * С-2 (правки ревью TL-92, второй раунд) — атрибуты ARIA паттерна tabs,
+ * помимо тех, что уже покрыты косвенно (`aria-selected` в тестах клика/
+ * клавиатуры выше). Каждый тест снимает ровно один атрибут — мутация
+ * «удалить атрибут» роняет соответствующий тест и никакой другой.
+ */
+describe('App — атрибуты ARIA панели вкладок (TL-92, правки ревью, С-2)', () => {
+  it('roving tabindex: the active tab is 0, the other two are -1, and it moves with the selection', async () => {
+    const wrapper = await mountReady()
+    expect(tabButton(wrapper, 'Главный').attributes('tabindex')).toBe('0')
+    expect(tabButton(wrapper, 'История').attributes('tabindex')).toBe('-1')
+    expect(tabButton(wrapper, 'Настройки').attributes('tabindex')).toBe('-1')
+
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(tabButton(wrapper, 'Главный').attributes('tabindex')).toBe('-1')
+    expect(tabButton(wrapper, 'История').attributes('tabindex')).toBe('0')
+    expect(tabButton(wrapper, 'Настройки').attributes('tabindex')).toBe('-1')
+  })
+
+  it('aria-selected is "true" for exactly the active tab and "false" for the other two', async () => {
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'Настройки').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('false')
+    expect(tabButton(wrapper, 'История').attributes('aria-selected')).toBe('false')
+    expect(tabButton(wrapper, 'Настройки').attributes('aria-selected')).toBe('true')
+  })
+
+  it('aria-controls on each tab is exactly the id of its own panel', async () => {
+    const wrapper = await mountReady()
+    expect(tabButton(wrapper, 'Главный').attributes('aria-controls')).toBe('tabpanel-main')
+    expect(tabButton(wrapper, 'История').attributes('aria-controls')).toBe('tabpanel-history')
+    expect(tabButton(wrapper, 'Настройки').attributes('aria-controls')).toBe('tabpanel-settings')
+
+    for (const tabId of ['main', 'history', 'settings']) {
+      const controls = wrapper.get(`#tab-${tabId}`).attributes('aria-controls')
+      expect(wrapper.find(`#${controls}`).exists()).toBe(true)
+    }
+  })
+
+  it('every panel has aria-labelledby pointing back at its own tab id', async () => {
+    const wrapper = await mountReady()
+    expect(tabPanel(wrapper, 'tabpanel-main').attributes('aria-labelledby')).toBe('tab-main')
+    expect(tabPanel(wrapper, 'tabpanel-history').attributes('aria-labelledby')).toBe('tab-history')
+    expect(tabPanel(wrapper, 'tabpanel-settings').attributes('aria-labelledby')).toBe('tab-settings')
+  })
+})
+
+/**
+ * Н-1 (правки ревью TL-92, второй раунд) — под панелью вкладок должна
+ * быть одна линия, не две. Раньше нижняя граница `.tabs` шла вместе с
+ * безусловным `<hr class="screen__divider">` сразу следом — визуально две
+ * черты почти вплотную. Проверка структурная (соседство узлов через DOM
+ * `querySelector('.tabs + hr')`), не через вычисленные CSS-стили: `<style
+ * scoped>` компонента не гарантированно применяется к дереву в jsdom так
+ * же, как в браузере, а соседство тегов — факт разметки независимо от
+ * того, применились ли стили.
+ */
+describe('App — одна линия под вкладками, не две (TL-92, правки ревью, Н-1)', () => {
+  it('no <hr> is glued directly after .tabs when the status row is hidden — the single line is the .tabs border itself', async () => {
+    const wrapper = await mountReady()
+    expect(wrapper.find('.tabs + hr').exists()).toBe(false)
+  })
+
+  it('still exactly one divider appears before the panel when the status row is shown — between the row and the panel, not between the tabs and the row', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () =>
+        Promise.resolve({
+          tasks: [
+            { taskId: 't1', title: 'Ролик A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'fetching' },
+          ],
+          awaitingContinue: false,
+        } satisfies QueueSnapshot),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.find('.tabs + hr').exists()).toBe(false)
+    expect(wrapper.find('.queue-status-row + hr').exists()).toBe(true)
   })
 })

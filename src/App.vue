@@ -28,7 +28,7 @@
  * не требует четвёртой раскладки только ради доли секунды ожидания.
  */
 import { storeToRefs } from 'pinia'
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 
 import ExitConfirmDialog from '@/components/ExitConfirmDialog.vue'
 import ProbeSection from '@/components/ProbeSection.vue'
@@ -53,7 +53,7 @@ import {
   type ActiveQueueTaskPhase,
   getActiveQueueStatusText,
   getStatusRowWaitingText,
-  YT_DLP_UPDATE_PAUSE_TEXT,
+  STATUS_ROW_YT_DLP_UPDATE_PAUSE_TEXT,
 } from '@/utils/queueTexts'
 
 // Версия приложения известна локально и не зависит от sidecar (дизайн E1,
@@ -219,6 +219,17 @@ const activeTab = ref<TabId>('main')
 const mainHeadingEl = ref<HTMLHeadingElement | null>(null)
 const historyHeadingEl = ref<HTMLHeadingElement | null>(null)
 const settingsHeadingEl = ref<HTMLHeadingElement | null>(null)
+// Контейнер `tablist` (правки ревью TL-92, Б-1) — нужен, чтобы найти DOM-узел
+// только что выбранной кнопки-вкладки после клавиатурной активации (см.
+// {@link activateTabFromKeyboard}); заголовки панелей уже держат
+// собственные ref-ы выше, кнопкам вкладок отдельные ref-ы заводить незачем
+// — один запрос по `id` внутри уже известного контейнера дешевле пяти
+// новых переменных.
+const tablistEl = ref<HTMLDivElement | null>(null)
+// Кнопка «На главный» строки состояния (правки ревью TL-92, Н-3) — нужна
+// только чтобы определить, что фокус в момент исчезновения строки стоял
+// именно на ней (см. watcher `showQueueStatusRow` ниже).
+const backToMainButtonEl = ref<HTMLButtonElement | null>(null)
 
 function headingElFor(tab: TabId): HTMLHeadingElement | null {
   switch (tab) {
@@ -233,31 +244,69 @@ function headingElFor(tab: TabId): HTMLHeadingElement | null {
   }
 }
 
+function tabButtonElFor(tab: TabId): HTMLButtonElement | null {
+  return tablistEl.value?.querySelector<HTMLButtonElement>(`#tab-${tab}`) ?? null
+}
+
 /**
- * Переключение вкладки — клик по кнопке, стрелки/Home/End в `tablist`
- * ниже и кнопка «На главный» строки состояния все идут через одну и ту
- * же функцию (дизайн «Навигация», «Фокус при переключении экрана»):
- * `aria-selected`/видимость панелей меняются синхронно с `activeTab`,
- * а сразу после — фокус программно переводится на `<h2 tabindex="-1">`
- * в начале новой панели (у «Главного» — уже существующий `<h1>`, тоже с
- * `tabindex="-1"` теперь). Повторный вызов `.focus()` на уже
- * сфокусированном элементе (пользователь и так на нём) — обычное
- * поведение DOM, не требует отдельной проверки здесь.
+ * Переключение вкладки кликом мыши по кнопке и кнопкой «На главный» строки
+ * состояния (дизайн «Фокус при переключении экрана»): `aria-selected`/
+ * видимость панелей меняются синхронно с `activeTab`, а сразу после —
+ * фокус программно переводится на `<h2 tabindex="-1">` в начале новой
+ * панели (у «Главного» — уже существующий `<h1>`).
+ *
+ * Повторный клик по уже активной вкладке фокус не трогает вовсе (Н-4,
+ * правки ревью TL-92, второй раунд) — без этой защиты клик по вкладке, на
+ * которой пользователь и так стоит, отбирал бы фокус у элемента, который
+ * он только что нажал, и передавал его заголовку без единого настоящего
+ * переключения.
+ *
+ * Клавиатурная активация стрелками/Home/End идёт **не** через эту
+ * функцию — см. {@link activateTabFromKeyboard} и его doc-комментарий о
+ * том, почему автоматическая активация обязана переводить фокус на новую
+ * кнопку-вкладку, а не на заголовок панели.
  */
 async function selectTab(tab: TabId): Promise<void> {
+  if (activeTab.value === tab) return
   activeTab.value = tab
   await nextTick()
   headingElFor(tab)?.focus()
 }
 
 /**
- * Клавиатура `tablist` (дизайн «Навигация», практика ARIA tabs): стрелки
- * циклически двигают выбор, Home/End — к первой/последней вкладке.
- * Активация — сразу по нажатию (не раздельные «фокус» и «активация»):
- * дизайн явно требует уводить фокус с кнопки-вкладки в панель при любом
- * переключении, так что отдельного шага подтверждения (Enter/Space) не
- * остаётся, и удерживать фокус на самой вкладке между нажатиями стрелок
- * незачем.
+ * Клавиатурная активация `tablist` (Б-1, правки ревью TL-92, второй
+ * раунд) — стандартный паттерн ARIA tabs «автоматическая активация»:
+ * стрелка/Home/End сразу меняют `activeTab` **и** переводят фокус на саму
+ * новую кнопку-вкладку, а не на заголовок панели, как раньше.
+ *
+ * Первая версия (см. историю файла) переводила фокус на заголовок панели
+ * при любом переключении, включая клавиатурное, — и следующее нажатие
+ * стрелки било мимо: `keydown` висит на самом `tablist`
+ * ({@link handleTablistKeydown}), а заголовок панели вне `tablist`, и
+ * событие с него до контейнера не всплывает. Держать фокус внутри
+ * `tablist` (на кнопке) — единственный способ, чтобы второе, третье и
+ * последующие нажатия стрелки подряд продолжали доходить до обработчика.
+ */
+function activateTabFromKeyboard(tab: TabId): void {
+  activeTab.value = tab
+  void nextTick().then(() => {
+    tabButtonElFor(tab)?.focus()
+  })
+}
+
+/**
+ * Клавиатура `tablist` (дизайн «Навигация», практика ARIA tabs):
+ * ArrowLeft/ArrowRight циклически двигают выбор, Home/End — к первой/
+ * последней вкладке; активация — сразу по нажатию, без отдельного шага
+ * подтверждения (Enter/Space), см. doc {@link activateTabFromKeyboard}
+ * про то, куда при этом уходит фокус.
+ *
+ * ArrowUp/ArrowDown осознанно не обрабатываются и не глушатся (Н-4,
+ * правки ревью TL-92, второй раунд): панель вкладок горизонтальная
+ * (`aria-orientation` по умолчанию, отдельно не выставлен), а
+ * ArrowUp/ArrowDown в браузере — это прокрутка страницы; отбирать её
+ * компоненту, для которого эти клавиши не значат ничего по паттерну ARIA
+ * tabs, не за чем.
  */
 function handleTablistKeydown(event: KeyboardEvent): void {
   const ids = TABS.map((t) => t.id)
@@ -265,11 +314,9 @@ function handleTablistKeydown(event: KeyboardEvent): void {
   let nextIndex: number
   switch (event.key) {
     case 'ArrowRight':
-    case 'ArrowDown':
       nextIndex = (currentIndex + 1) % ids.length
       break
     case 'ArrowLeft':
-    case 'ArrowUp':
       nextIndex = (currentIndex - 1 + ids.length) % ids.length
       break
     case 'Home':
@@ -282,7 +329,7 @@ function handleTablistKeydown(event: KeyboardEvent): void {
       return
   }
   event.preventDefault()
-  void selectTab(ids[nextIndex]!)
+  activateTabFromKeyboard(ids[nextIndex]!)
 }
 
 /**
@@ -331,9 +378,18 @@ const activeQueueStatusText = computed<string | undefined>(() => {
   return undefined
 })
 
+/**
+ * Текст паузы на обновление yt-dlp — **свой** для строки состояния, не
+ * `YT_DLP_UPDATE_PAUSE_TEXT` (правки ревью TL-92, С-3): та константа несёт
+ * хвост «— обычно занимает меньше минуты», нужный полной секции «Очередь
+ * загрузок» (`QueueSection.vue`) и диалогу выхода, но лишний в компактной
+ * однострочной сводке дизайна E5 «Навигация» — макет называет ровно
+ * «Между загрузками устанавливается обновлённый yt-dlp», без второго
+ * предложения.
+ */
 const queueStatusText = computed<string | undefined>(() => {
   if (activeQueueStatusText.value !== undefined) return activeQueueStatusText.value
-  if (pauseReason.value === 'ytDlpUpdate') return YT_DLP_UPDATE_PAUSE_TEXT
+  if (pauseReason.value === 'ytDlpUpdate') return STATUS_ROW_YT_DLP_UPDATE_PAUSE_TEXT
   if (awaitingContinue.value) {
     const waitingCount = queueTasks.value.filter((t) => !isTerminalQueuePhase(t.phase)).length
     if (waitingCount > 0) return getStatusRowWaitingText(waitingCount)
@@ -347,6 +403,25 @@ const queueStatusText = computed<string | undefined>(() => {
  * вторым источником того же самого).
  */
 const showQueueStatusRow = computed(() => activeTab.value !== 'main' && queueStatusText.value !== undefined)
+
+/**
+ * Н-3 (правки ревью TL-92, второй раунд): если фокус стоял на кнопке «На
+ * главный» в момент, когда строка состояния пропадает (задача завершилась,
+ * пауза кончилась), `v-if` убирает саму кнопку вместе со строкой — без
+ * этого наблюдателя фокус молча падает на `<body>`. `watch` по умолчанию
+ * выполняется до патча DOM (`flush: 'pre'`), поэтому в колбэке
+ * `backToMainButtonEl.value` — это ещё старый, ещё не удалённый узел, и
+ * сравнение с `document.activeElement` застаёт фокус на месте; после
+ * `nextTick()` (узел уже удалён) фокус переводится на заголовок текущей
+ * панели — ту же цель, что и у обычного переключения вкладки.
+ */
+watch(showQueueStatusRow, (visible, wasVisible) => {
+  if (visible || !wasVisible) return
+  if (document.activeElement !== backToMainButtonEl.value) return
+  void nextTick().then(() => {
+    headingElFor(activeTab.value)?.focus()
+  })
+})
 </script>
 
 <template>
@@ -392,7 +467,18 @@ const showQueueStatusRow = computed(() => activeTab.value !== 'main' && queueSta
       изменений внутри), а «История»/«Настройки» не зависят от готовности
       sidecar вовсе.
     -->
+    <!--
+      Одна линия под панелью вкладок, не две (Н-1, правки ревью TL-92,
+      второй раунд): раньше нижняя граница `.tabs` (акцент под выбранной
+      вкладкой плюс серая полоса на всю ширину контейнера) шла вместе с
+      безусловным `<hr class="screen__divider">` сразу следом — макет
+      рисует ровно одну черту здесь. Граница у `.tabs` и остаётся
+      единственной линией; второй `<hr>` (ниже, перед содержимым панели)
+      условный и по-прежнему появляется только вместе со строкой
+      состояния — это отдельная, вторая черта макета, а не дубль первой.
+    -->
     <div
+      ref="tablistEl"
       class="tabs"
       role="tablist"
       aria-label="Разделы приложения"
@@ -414,22 +500,49 @@ const showQueueStatusRow = computed(() => activeTab.value !== 'main' && queueSta
       </button>
     </div>
 
-    <hr class="screen__divider">
+    <!--
+      Живая зона строки состояния — постоянный контейнер, не `v-if` (Н-3,
+      правки ревью TL-92, второй раунд, тот же приём, что
+      `probe-section__inline-error` в `ProbeSection.vue`): если создавать
+      элемент с `aria-live` только в момент появления текста, скринридер
+      не видит самого узла заранее и первое объявление теряется — нет
+      наблюдаемого изменения внутри уже зарегистрированной живой зоны,
+      есть только появление нового узла с текстом сразу внутри. Визуально
+      скрыт (`.visually-hidden`, не `display: none` — иначе AT его тоже
+      не видит), декоративный «●» сюда не входит: это чисто текстовая
+      копия для скринридера, видимая строка ниже несёт тот же текст для
+      зрячих пользователей.
+    -->
+    <p
+      class="visually-hidden queue-status-announcer"
+      aria-live="polite"
+    >
+      {{ queueStatusText ?? '' }}
+    </p>
 
     <!--
       Компактная строка состояния очереди (дизайн «Навигация») — видна
       только на «Истории»/«Настройках», пока где-то реально идёт или ждёт
       загрузка: на «Главном» её роль и так играет полная секция «Очередь
       загрузок» ниже. Кнопка «На главный» просто переключает вкладку, не
-      эмитит никаких команд.
+      эмитит никаких команд. Без собственного `aria-live` (правки ревью
+      TL-92, Н-3) — живая зона теперь только у постоянного узла выше,
+      второй `aria-live` на том же тексте озвучил бы его дважды.
     -->
     <p
       v-if="showQueueStatusRow"
       class="queue-status-row"
-      aria-live="polite"
     >
-      <span class="queue-status-row__text">{{ queueStatusText }}</span>
+      <span class="queue-status-row__text">
+        <span
+          v-if="activeQueueStatusText !== undefined"
+          class="queue-status-row__bullet"
+          aria-hidden="true"
+        >●</span>
+        {{ queueStatusText }}
+      </span>
       <button
+        ref="backToMainButtonEl"
         type="button"
         class="tap-target"
         @click="selectTab('main')"
@@ -660,6 +773,13 @@ const showQueueStatusRow = computed(() => activeTab.value !== 'main' && queueSta
   display: flex;
   gap: 0.25rem;
   margin-top: 1rem;
+  /*
+   * Раньше нижний отступ давал соседний безусловный `<hr>` (его верхнее
+   * поле 1.5rem) — теперь эта же линия и есть единственная черта под
+   * панелью (Н-1, правки ревью TL-92, второй раунд), поэтому поле
+   * переезжает сюда, чтобы раскладка ниже не сдвинулась.
+   */
+  margin-bottom: 1.5rem;
   border-bottom: 1px solid var(--color-border);
 }
 
@@ -693,6 +813,11 @@ const showQueueStatusRow = computed(() => activeTab.value !== 'main' && queueSta
   white-space: nowrap;
 }
 
+/* «●» перед названием активной задачи (С-3, правки ревью TL-92, второй раунд, макет дизайна «Навигация») — декоративный отступ до текста, сам знак aria-hidden в разметке. */
+.queue-status-row__bullet {
+  margin-right: 0.35rem;
+}
+
 /*
  * Заголовки-цели программного фокуса при переключении вкладки (дизайн
  * «Фокус при переключении экрана») — та же рамка, что у `.tap-target`,
@@ -702,5 +827,25 @@ h1:focus-visible,
 h2:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;
+}
+
+/*
+ * Постоянная живая зона строки состояния (Н-3, правки ревью TL-92, второй
+ * раунд) — видна только скринридеру: `position: absolute` + `clip`, не
+ * `display: none`/`visibility: hidden` (те убрали бы узел из дерева
+ * доступности вместе с текстом). Тот же приём, что `.visually-hidden` в
+ * `SidecarStatusRow.vue` — не общий класс между файлами (`<style scoped>`
+ * в каждом компоненте), а не повторно используемый через дублирование.
+ */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 </style>

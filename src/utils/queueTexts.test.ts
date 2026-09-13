@@ -5,6 +5,7 @@ import {
   getResumeBannerText,
   getStatusRowWaitingText,
   getWaitingStatusText,
+  STATUS_ROW_YT_DLP_UPDATE_PAUSE_TEXT,
   YT_DLP_UPDATE_PAUSE_TEXT,
 } from './queueTexts'
 
@@ -71,6 +72,19 @@ describe('YT_DLP_UPDATE_PAUSE_TEXT', () => {
   it('is a non-empty, self-contained explanation — not borrowed from YtDlpUpdateBlock', () => {
     expect(YT_DLP_UPDATE_PAUSE_TEXT.length).toBeGreaterThan(0)
     expect(YT_DLP_UPDATE_PAUSE_TEXT).toContain('yt-dlp')
+  })
+})
+
+describe('STATUS_ROW_YT_DLP_UPDATE_PAUSE_TEXT (TL-92, правки ревью, С-3)', () => {
+  it('is exactly the design copy, without the "usually under a minute" tail that the full queue section carries', () => {
+    expect(STATUS_ROW_YT_DLP_UPDATE_PAUSE_TEXT).toBe(
+      'Между загрузками устанавливается обновлённый yt-dlp',
+    )
+  })
+
+  it('is a different string object from the queue-section constant, not a re-export under a new name', () => {
+    expect(STATUS_ROW_YT_DLP_UPDATE_PAUSE_TEXT).not.toBe(YT_DLP_UPDATE_PAUSE_TEXT)
+    expect(YT_DLP_UPDATE_PAUSE_TEXT).toContain(STATUS_ROW_YT_DLP_UPDATE_PAUSE_TEXT)
   })
 })
 

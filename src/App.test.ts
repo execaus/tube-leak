@@ -2,6 +2,7 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { onlyVisible } from '@/test-utils/visiblePanel'
 import type { SidecarCheckReport, SidecarCheckResult } from '@/types/generated/sidecar'
 import type { YtDlpPrepareError, YtDlpPrepareEvent, YtDlpPrepared } from '@/types/generated/ytdlp'
 
@@ -149,10 +150,18 @@ function routeInvoke(handlers: Record<string, () => Promise<unknown>>) {
  * Настройки» рендерится безусловно поверх всего экрана (дизайн E5
  * «Навигация») и не относится к тому, что проверяет этот файл, — набор
  * вкладок свой собственный тест (`App.tabs.test.ts`).
+ *
+ * `onlyVisible` (правки ревью TL-92, Н-6) — панели переключаются `v-show`,
+ * не `v-if` (К-14), значит «Главный» не единственная секция в DOM: как
+ * только TL-93/TL-94 положат в плейсхолдеры «Истории»/«Настроек» настоящие
+ * кнопки, без этого фильтра `buttonLabels` начал бы видеть их тоже —
+ * несмотря на то, что панели с ними не видны, пока активна «Главный», ни
+ * этому файлу, ни его тестам они не нужны. Фильтр по видимости решает это
+ * раз и навсегда, вместо того чтобы «чинить» список фильтрами по классу
+ * компонента при каждом новом экране.
  */
 function buttonLabels(wrapper: ReturnType<typeof mount>): string[] {
-  return wrapper
-    .findAll('button')
+  return onlyVisible(wrapper.findAll('button'))
     .filter((b) => b.attributes('role') !== 'tab')
     .map((b) => b.text())
 }
