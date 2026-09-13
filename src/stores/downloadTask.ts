@@ -130,6 +130,37 @@ function isTerminalPhase(phase: DownloadPhase): boolean {
 }
 
 /**
+ * Верно только в единственной фазе, где у таймера зависания вообще есть
+ * что мерить — реально идущей `downloading`/`running` (doc
+ * `softStallSeconds` в сторе: «единственное состояние, где есть
+ * скорость», дизайн E3 «Три разных нет движения», п.1). `waitingRetry` —
+ * честная пауза со своим обратным отсчётом, не то же самое «Downloading,
+ * только с другим числом» (doc `DownloadingState` в
+ * `src/types/generated/download.ts`), и таймер зависания её не трогает.
+ *
+ * Исчерпывающий `switch` по `task.phase`, тот же приём, что
+ * {@link isTerminalPhase} (правки ревью TL-98, Н-6): восьмая фаза
+ * контракта роняет `npm run type-check` на вызове {@link assertNever}, а
+ * не молча проходит мимо белого списка.
+ */
+function isStallableDownload(task: QueueTask): boolean {
+  const phase = task.phase
+  switch (phase) {
+    case 'queued':
+    case 'fetching':
+    case 'merging':
+    case 'done':
+    case 'failed':
+    case 'cancelled':
+      return false
+    case 'downloading':
+      return task.state === 'running'
+    default:
+      return assertNever(phase)
+  }
+}
+
+/**
  * Фаза `next.phase`, если она вообще терминальна ({@link QueueTaskOutcomePhase}) —
  * `undefined` иначе. Тот же приём исчерпывающего `switch` (Н-6), что и
  * {@link isTerminalPhase} выше: план и здесь не сравнением строк.
@@ -331,6 +362,15 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
   let listeningQueue: Promise<void> | undefined
   let lastEventAt = 0
   let stallTimer: ReturnType<typeof setInterval> | undefined
+  /**
+   * Задача, на которую сейчас ориентирован таймер зависания —
+   * `undefined`, когда он не запущен. Заведена отдельно от
+   * {@link activeTask}: смена активной задачи обязана перезавести
+   * таймер с нуля (issue 86, критерий приёмки №3), а не унаследовать
+   * `lastEventAt`/`softStallSeconds` чужой задачи только потому, что та
+   * заняла ту же позицию в списке.
+   */
+  let stallTaskId: string | undefined
   // Окно двойного клика (doc класса выше, «Окно двойного клика»).
   let commandInFlight = false
 
@@ -339,6 +379,7 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
       clearInterval(stallTimer)
       stallTimer = undefined
     }
+    stallTaskId = undefined
     softStallSeconds.value = undefined
   }
 
@@ -347,18 +388,52 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
     softStallSeconds.value = undefined
   }
 
-  function ensureStallTimer(): void {
-    if (stallTimer !== undefined) return
-    stallTimer = setInterval(() => {
-      const current = firstTask.value
-      if (!current || current.phase !== 'downloading' || current.state !== 'running') {
-        clearStallTimer()
-        return
-      }
-      const elapsedMs = Date.now() - lastEventAt
-      softStallSeconds.value =
-        elapsedMs >= SOFT_STALL_THRESHOLD_MS ? Math.floor(elapsedMs / 1000) : undefined
-    }, SOFT_STALL_TICK_MS)
+  function tickStallTimer(): void {
+    const current = activeTask.value
+    if (current === undefined || current.taskId !== stallTaskId || !isStallableDownload(current)) {
+      clearStallTimer()
+      return
+    }
+    const elapsedMs = Date.now() - lastEventAt
+    softStallSeconds.value =
+      elapsedMs >= SOFT_STALL_THRESHOLD_MS ? Math.floor(elapsedMs / 1000) : undefined
+  }
+
+  /**
+   * Единственное место, которое решает судьбу таймера зависания —
+   * вызывается после **любого** изменения `tasks.value` (оба канала:
+   * {@link handleProgressEvent} и {@link applySnapshot}), а не только по
+   * самому событию прогресса: активная задача может смениться и полным
+   * снимком очереди, без единого `download://progress` по новой задаче
+   * (issue 86 — например, предыдущая завершилась и слот занят следующей
+   * ещё в фазе `queued`/`fetching`, до её первого прогресса).
+   *
+   * - Активной нет либо её фаза не «качается прямо сейчас»
+   *   ({@link isStallableDownload}) — таймер остановлен, индикатор снят.
+   *   Терминальная задача таймер не держит никогда.
+   * - Активная сменилась (другой `taskId`) — таймер перезаводится с
+   *   нуля: старое сообщение о зависании не переносится на новую задачу
+   *   просто потому, что та заняла ту же позицию в списке (issue 86,
+   *   критерий приёмки №3).
+   * - Активная та же — ничего не трогаем: {@link noteActivity} уже
+   *   обновил `lastEventAt` на настоящем событии прогресса, а
+   *   посторонний снимок (постановка ещё одной задачи в хвост, например)
+   *   не обязан сбрасывать уже накопленное подозрение на зависание.
+   */
+  function syncStallTimer(): void {
+    const current = activeTask.value
+    if (current === undefined || !isStallableDownload(current)) {
+      clearStallTimer()
+      return
+    }
+    if (stallTaskId !== current.taskId) {
+      stallTaskId = current.taskId
+      lastEventAt = Date.now()
+      softStallSeconds.value = undefined
+    }
+    if (stallTimer === undefined) {
+      stallTimer = setInterval(tickStallTimer, SOFT_STALL_TICK_MS)
+    }
   }
 
   function handleProgressEvent(event: { payload: DownloadProgressEvent }): void {
@@ -389,10 +464,8 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
 
     if (rest.phase === 'downloading' && rest.state === 'running') {
       noteActivity()
-      ensureStallTimer()
-    } else {
-      clearStallTimer()
     }
+    syncStallTimer()
   }
 
   function ensureProgressListening(): Promise<void> {
@@ -437,6 +510,9 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
     awaitingContinue.value = snapshot.awaitingContinue
     pauseReason.value = snapshot.pauseReason
     if (outcomeText !== undefined) pushOutcomeAnnouncement(outcomeText)
+    // Активная задача могла смениться этим самым снимком, без единого
+    // `download://progress` по новой (issue 86, doc {@link syncStallTimer}).
+    syncStallTimer()
   }
 
   function ensureQueueListening(): Promise<void> {
@@ -474,6 +550,26 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
       console.error('queue_state rejected', err)
     }
   }
+
+  /**
+   * Активная задача — та, которую прямо сейчас ведёт воркер: первая
+   * **нетерминальная** в списке, а не позиция `tasks.value[0]`. Тот же
+   * критерий, что держит сама очередь ядра (Р-4/Р-1, `pump` в
+   * `src-tauri/src/queue/scheduler.rs`: слот один, следующая стартует
+   * строго по FIFO среди нетерминальных).
+   *
+   * Голова списка — это позиция, не смысл: терминальная и ещё не
+   * скрытая задача («Скрыть» — отдельное действие пользователя,
+   * `dismiss_queue_task`) остаётся на прежнем месте сколько угодно, пока
+   * следующая уже качается (issue 86; воспроизводимо тривиальным путём —
+   * скачал, не скрыл, начал следующую: `start_download` ставит новую
+   * задачу в хвост, `pump` берёт в работу первую нетерминальную). Единственный
+   * потребитель этого геттера — таймер зависания
+   * ({@link syncStallTimer}); в отличие от {@link firstTask} ниже это не
+   * временный долг TL-75/#89 — смотреть на позицию для таймера было
+   * никогда не верно, вне зависимости от исхода #89.
+   */
+  const activeTask = computed(() => tasks.value.find((t) => !isTerminalPhase(t.phase)))
 
   /**
    * Первая задача списка — источник для трёх геттеров обратной
@@ -551,7 +647,12 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
         ...initialQueueTaskPhaseFields(started.phase),
       } as QueueTask
       tasks.value = [...tasks.value, newTask]
-      clearStallTimer()
+      // Не безусловный `clearStallTimer()` (до TL-79): постановка новой
+      // задачи в хвост (Ф-2) не трогает уже идущую активную — если та
+      // качается и уже накопила подозрение на зависание, посторонний
+      // клик «Скачать» не должен молча его стереть. `syncStallTimer()`
+      // сам решает, менялась ли активная задача (doc функции выше).
+      syncStallTimer()
     } catch (err) {
       console.error('start_download rejected', err)
       const failure = toDownloadCommandFailure(err)

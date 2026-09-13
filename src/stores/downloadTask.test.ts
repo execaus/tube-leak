@@ -473,6 +473,91 @@ describe('useDownloadTaskStore — мягкий индикатор зависа�
 })
 
 /**
+ * Issue 86: `firstTask`/`tasks.value[0]` — позиция, не смысл. Планировщик
+ * ядра (`pump`, `src-tauri/src/queue/scheduler.rs`) держит терминальную
+ * задачу на её месте до явного «Скрыть» и берёт в работу первую
+ * **нетерминальную**; это делает состав «терминальная в голове, рабочая
+ * дальше» воспроизводимым тривиально — скачал, не скрыл, начал
+ * следующую. Таймер зависания обязан следить за активной задачей по
+ * смыслу, а не за позицией `[0]`.
+ */
+describe('useDownloadTaskStore — таймер зависания смотрит на активную задачу, не на позицию (issue 86)', () => {
+  it('a terminal, not-yet-hidden task at the head of the list does not blind the timer to the second task, which is actually downloading', async () => {
+    const store = useDownloadTaskStore()
+    invokeMock.mockResolvedValueOnce({ tasks: [], awaitingContinue: false } satisfies QueueSnapshot)
+    await store.initialize()
+
+    // Воспроизведение состава из issue 86: терминальная задача в голове
+    // (не скрыта), рабочая — дальше.
+    emitQueueChanged({
+      awaitingContinue: false,
+      tasks: [
+        { taskId: 'a', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } },
+        { taskId: 'b', title: 'B', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'downloading', state: 'running', percent: 10 },
+      ],
+    })
+
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    expect(store.softStallSeconds).toBeGreaterThanOrEqual(5)
+  })
+
+  it('a terminal task at the head with no active task behind it — no stall message ever appears', async () => {
+    const store = useDownloadTaskStore()
+    invokeMock.mockResolvedValueOnce({ tasks: [], awaitingContinue: false } satisfies QueueSnapshot)
+    await store.initialize()
+
+    emitQueueChanged({
+      awaitingContinue: false,
+      tasks: [
+        { taskId: 'a', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } },
+      ],
+    })
+
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(store.softStallSeconds).toBeUndefined()
+  })
+
+  it('the active task changes — the timer restarts for the new one, the old stall message is not carried over', async () => {
+    const store = useDownloadTaskStore()
+    invokeMock.mockResolvedValueOnce({ tasks: [], awaitingContinue: false } satisfies QueueSnapshot)
+    await store.initialize()
+
+    emitQueueChanged({
+      awaitingContinue: false,
+      tasks: [
+        { taskId: 'a', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'downloading', state: 'running', percent: 10 },
+      ],
+    })
+
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(store.softStallSeconds).toBeGreaterThanOrEqual(5)
+
+    // 'a' завершилась, слот занял 'b' — тем же снимком, без единого
+    // download://progress по новой задаче.
+    emitQueueChanged({
+      awaitingContinue: false,
+      tasks: [
+        { taskId: 'a', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } },
+        { taskId: 'b', title: 'B', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'downloading', state: 'running', percent: 0 },
+      ],
+    })
+
+    // Сообщение про 'a' не переезжает на 'b' по факту смены активной задачи.
+    expect(store.softStallSeconds).toBeUndefined()
+
+    // И не появляется раньше своего порога для новой задачи — отсчёт
+    // действительно начался заново, а не унаследовал старый `lastEventAt`.
+    await vi.advanceTimersByTimeAsync(4_000)
+    expect(store.softStallSeconds).toBeUndefined()
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(store.softStallSeconds).toBeGreaterThanOrEqual(5)
+  })
+})
+
+/**
  * TL-98 (issue 105), правки ревью, второй раунд, С-2 — уровень стора, не
  * `App.vue`: `outcomeTextForTransition`/`findSnapshotOutcomeText` не
  * зависят ни от одной вкладки и заслуживают собственных тестов, а не
