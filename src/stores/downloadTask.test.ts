@@ -245,7 +245,7 @@ describe('useDownloadTaskStore — cancel/retry/hide/resume: отказ кома
     emitQueueChanged({
       awaitingContinue: false,
       tasks: [
-        { taskId: 'a', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3' },
+        { taskId: 'a', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } },
         { taskId: 'b', title: 'B', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' },
         { taskId: 'c', title: 'C', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'cancelled', partialData: 'removed' },
       ],
@@ -357,12 +357,12 @@ describe('useDownloadTaskStore — task/progress/isActive: обратная со
     await store.start(request)
     expect(store.isActive).toBe(true)
 
-    emitProgress({ taskId: 'task-1', phase: 'done', fileName: 'video.mp4' })
+    emitProgress({ taskId: 'task-1', phase: 'done', fileName: 'video.mp4', folderDisplay: { kind: 'systemDownloads' } })
     expect(store.isActive).toBe(false)
     // `progress`/`task` продолжают показывать терминальную задачу — тот
     // же приём, что и в E3 (панель рисует Done/Failed/Cancelled тем же
     // `progress`); терминальность решает только `isActive`.
-    expect(store.progress).toStrictEqual({ phase: 'done', fileName: 'video.mp4' })
+    expect(store.progress).toStrictEqual({ phase: 'done', fileName: 'video.mp4', folderDisplay: { kind: 'systemDownloads' } })
   })
 
   it('is not active when no task exists', () => {
@@ -377,7 +377,7 @@ describe('useDownloadTaskStore — task/progress/isActive: обратная со
     emitQueueChanged({
       awaitingContinue: false,
       tasks: [
-        { taskId: 'a', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3' },
+        { taskId: 'a', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } },
         { taskId: 'b', title: 'B', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'downloading', state: 'running' },
       ],
     })

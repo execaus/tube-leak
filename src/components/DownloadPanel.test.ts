@@ -72,7 +72,7 @@ describe('DownloadPanel — степпер фаз (нетерминальные 
       props: {
         displayTitle: TITLE,
         plan: 'videoAndAudio',
-        progress: { phase: 'done', fileName: 'video.mp4' },
+        progress: { phase: 'done', fileName: 'video.mp4', folderDisplay: { kind: 'systemDownloads' } },
       },
     })
 
@@ -140,7 +140,7 @@ describe('DownloadPanel — одна живая зона за раз, проце
       props: {
         displayTitle: TITLE,
         plan: 'videoAndAudio',
-        progress: { phase: 'done', fileName: 'x.mp4' },
+        progress: { phase: 'done', fileName: 'x.mp4', folderDisplay: { kind: 'systemDownloads' } },
       },
     })
 
@@ -366,7 +366,7 @@ describe('DownloadPanel — Готово', () => {
       props: {
         displayTitle: TITLE,
         plan: 'videoAndAudio',
-        progress: { phase: 'done', fileName: 'Как приручить дракона.mp4' },
+        progress: { phase: 'done', fileName: 'Как приручить дракона.mp4', folderDisplay: { kind: 'systemDownloads' } },
       },
     })
 
@@ -381,7 +381,7 @@ describe('DownloadPanel — Готово', () => {
       props: {
         displayTitle: TITLE,
         plan: 'videoAndAudio',
-        progress: { phase: 'done', fileName: 'x.mp4' },
+        progress: { phase: 'done', fileName: 'x.mp4', folderDisplay: { kind: 'systemDownloads' } },
       },
     })
     await wrapper.find('button').trigger('click')

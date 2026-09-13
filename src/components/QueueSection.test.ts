@@ -38,6 +38,7 @@ const done: QueueTask = {
   plan: 'singleStream',
   phase: 'done',
   fileName: 'Прошлый ролик.mp3',
+  folderDisplay: { kind: 'systemDownloads' },
 }
 
 describe('QueueSection — пустое состояние', () => {
