@@ -1,4 +1,5 @@
-import type { PartialData } from '@/types/generated/download'
+import type { FolderDisplay, PartialData } from '@/types/generated/download'
+import { assertNever } from './assertNever'
 
 /**
  * Тексты о судьбе частично скачанных данных (Ф-8), выведенные строго из
@@ -8,6 +9,29 @@ import type { PartialData } from '@/types/generated/download'
  * присланное значение (doc-комментарий `DownloadError.partialData` в
  * `src/types/generated/download.ts`).
  */
+
+/**
+ * Название папки для панели Done (Ф-15, TL-95).
+ *
+ * Контракт называет папку объединением, а не готовой строкой (см.
+ * doc-комментарий {@link FolderDisplay} в `src/types/generated/download.ts`):
+ * Rust отдаёт факт («это системная „Загрузки“» либо «это свой путь»), а
+ * текст с кавычками вокруг «Загрузки» — дело UI. Системная папка
+ * показывается в кавычках («Загрузки»), как раньше при жёстко зашитом
+ * тексте; свой путь — без кавычек и без сокращения, тем же принципом, что
+ * путь папки в записи истории и в настройках: путь — факт, а не текст для
+ * украшения.
+ */
+export function getFolderDisplayText(folderDisplay: FolderDisplay): string {
+  switch (folderDisplay.kind) {
+    case 'systemDownloads':
+      return '«Загрузки»'
+    case 'custom':
+      return folderDisplay.path
+    default:
+      return assertNever(folderDisplay)
+  }
+}
 
 /** Дополнительное предложение после пояснения ошибки в терминальной панели Failed. */
 export function getFailedPartialDataNote(partialData: PartialData): string {
