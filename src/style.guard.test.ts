@@ -254,6 +254,63 @@ import { describe, expect, it } from 'vitest'
  *   разбирается TS без ошибки для всех этих форм (валидный синтаксис
  *   ObjectLiteralExpression с сокращёнными свойствами), падения не было —
  *   фикстуры ниже это закрепляют как регресс-барьер, без изменения кода.
+ *
+ * # Пятый раунд (TL-96, issue execaus/tube-leak#103) — ложные срабатывания и less
+ *
+ * Третье ревью нашло три формы, где сторож либо ловил то, что не является
+ * цветом презентационно, либо тихо пропускал `<style lang="less">`:
+ *
+ * 1. **Статический атрибут — только белый список презентационных
+ *    атрибутов.** `role="menu"`, `aria-haspopup="menu"` (системные цвета
+ *    `menu`/`background` — обычные слова в НЕ-цветовых атрибутах) и
+ *    `<MyBadge tone="green" />` (проп компонента) раньше ловились
+ *    `isWholeValueColor` наравне с `fill="red"` — п. 2 doc-комментария
+ *    четвёртого раунда специально исключал только `class`, остальное
+ *    считалось презентационным по умолчанию. Теперь «целиком является
+ *    цветом» проверяется только для `COLOR_PRESENTATION_ATTRIBUTES`
+ *    (SVG presentation attributes, которые несут цвет, + `style`) — белый
+ *    список, не чёрный: `role`/`aria-*`/пропсы компонентов/`class` не
+ *    входят и не проверяются вовсе, чем бы они ни оказались. Мутация,
+ *    доказывающая границы списка (см. отчёт по задаче): расширение до
+ *    «всех атрибутов» красит `role="menu"`/`tone="green"`; сужение до
+ *    пустого зеленит `fill="red"` (тест на этот случай тогда краснеет).
+ * 2. **`:class`/`v-bind:class` не проверяется.** Значение этой привязки —
+ *    список имён CSS-классов, а не CSS-значение; `:class="'red'"` ловился
+ *    как обычный строковый литерал в скрипте (`isWholeValueColor` в
+ *    `findScriptColorLiteral` не знает про контекст «это атрибут class»).
+ *    Симметрично статическому `class` (уже не в белом списке п. 1) —
+ *    отдельная проверка `directiveName === 'bind' && argOrName === 'class'`
+ *    в `scanTemplateProp` останавливает разбор до того, как значение
+ *    попадёт в скриптовый путь.
+ * 3. **Имя CSS-свойства в значении `transition`/`transition-property`/
+ *    `will-change` — не цвет.** `transition: background 0.2s ease`
+ *    называет свойство `background` для анимации; `background` — валидный
+ *    (устаревший) системный цвет CSS2, и `findCssColorLiteral` ловил его
+ *    как обычное значение. Ни у одного из этих трёх свойств нет позиции,
+ *    где голое ИМЯ цвета было бы допустимым значением (список: имена
+ *    CSS-свойств, `all`, `none`, время, timing-функция) — `findDeclarationColorLiteral`
+ *    для них использует только `containsHexOrFunctionColor` (hex/функции
+ *    без имён), минуя `findCssColorLiteral` целиком. Другие свойства не
+ *    затронуты: асимметрия точечная, по имени свойства декларации, а не
+ *    по позиции внутри значения (что потребовало бы разбора формата
+ *    transition-shorthand, который CSS не запрещает записывать в любом
+ *    порядке компонентов).
+ * 4. **`<style lang="less">` падает, а не молчит.** `@brand: #ff0000` —
+ *    валидный less, но для `postcss.parse()` это просто at-rule без блока
+ *    (`@brand` — имя, `: #ff0000` — параметры), значение никогда не
+ *    попадает в `walkDecls`, тест был «зелёным», ничего не проверив. Less
+ *    не установлен в проекте и разбирать его синтаксис (переменные `@x`,
+ *    вложенность, миксины) не планируется — вместо этого `lang`,
+ *    отличный от `css`/не заданного/`scss` (белый список
+ *    `SUPPORTED_STYLE_LANGS`, scss уже используется в проекте), приводит к
+ *    падению с понятным сообщением ДО вызова `postcss.parse` — тот же
+ *    принцип «неразобранное — падение», что и для синтаксических ошибок
+ *    (см. выше). Проверяется в обеих точках, где в коде вызывается
+ *    `scanCssText` для содержимого `<style>`: `descriptor.styles[]`
+ *    настоящих `.vue`-файлов (`style.lang`) и вложенный `<style>` внутри
+ *    `.svg`/`.html`, разобранный как обычный элемент шаблона
+ *    (`getStaticAttrValue(node, 'lang')` — для него нет отдельного поля
+ *    `lang`, только атрибут).
  */
 
 const SRC_DIR = join(dirname(fileURLToPath(import.meta.url)))
@@ -315,6 +372,20 @@ const COLOR_FUNCTION_NAMES = [
   'rgba', 'rgb', 'hsla', 'hsl', 'hwb', 'lab', 'lch', 'oklab', 'oklch', 'color-mix', 'color',
   'light-dark',
 ]
+
+// Статические атрибуты, презентационно несущие цвет (белый список из
+// SVG presentation attributes + HTML `style`), — только они проверяются на
+// «значение целиком является цветом» (TL-96, issue execaus/tube-leak#103).
+// `role="menu"`/`aria-haspopup="menu"` (системный цвет как обычное слово в
+// не-цветовом атрибуте) и `<MyBadge tone="green" />` (проп компонента) не
+// входят в белый список и не проверяются вовсе — они не задают цвет
+// презентационно, а совпадение слова со значением палитры для них
+// случайно. `class` тоже не проверяется (см. doc-комментарий
+// `scanTemplateProp`, `:class`) — здесь достаточно не включать его в
+// список.
+const COLOR_PRESENTATION_ATTRIBUTES = new Set([
+  'fill', 'stroke', 'stop-color', 'flood-color', 'lighting-color', 'color',
+])
 
 // Дефис — часть «слова» для наших целей: `red-arrow.png`/`darkred-theme`
 // не должны совпадать с именем `red`/`darkred` целиком (см. doc-комментарий
@@ -507,6 +578,27 @@ function isSetPropertyCall(node: ts.CallExpression): boolean {
 // CSS: `.css`-файлы, `<style>`-блоки SFC, инлайн `style="..."`
 // ---------------------------------------------------------------------------
 
+// Свойства, у которых идентификатор в значении стоит в позиции ИМЕНИ
+// CSS-свойства, а не цвета (TL-96, issue execaus/tube-leak#103):
+// `transition: background 0.2s ease` называет свойство `background` для
+// анимации, а не значение — устаревший системный цвет CSS2 `Background`
+// тут ни при чём, только случайное совпадение слова. Ни `transition`/
+// `transition-property`, ни `will-change` не имеют положения, где голое
+// ИМЯ цвета было бы допустимым значением (список: имена свойств, `all`,
+// `none`, время, timing-функция) — поэтому для них голые имена цветов не
+// ищутся вовсе. hex/цветовые функции по-прежнему проверяются
+// `containsHexOrFunctionColor` (защитный барьер: они тоже не валидны в
+// этих свойствах, но раз уж грамматика их ищет "где угодно в значении",
+// сознательно не сужаем эту часть проверки).
+const PROPERTY_NAME_POSITION_PROPS = new Set(['transition', 'transition-property', 'will-change'])
+
+function findDeclarationColorLiteral(prop: string, value: string): string | null {
+  if (PROPERTY_NAME_POSITION_PROPS.has(prop.toLowerCase())) {
+    return containsHexOrFunctionColor(value)
+  }
+  return findCssColorLiteral(value)
+}
+
 /**
  * Разбирает CSS через postcss и проверяет каждую декларацию: `--*` —
  * нарушение сама по себе, любое значение — через грамматику цвета.
@@ -525,7 +617,7 @@ function scanCssText(cssText: string, label: string): string[] {
       )
       return
     }
-    const literal = findCssColorLiteral(decl.value)
+    const literal = findDeclarationColorLiteral(decl.prop, decl.value)
     if (literal !== null) {
       violations.push(`${label}: "${decl.prop}: ${decl.value}" содержит цвет "${literal}"`)
     }
@@ -537,6 +629,25 @@ function scanCssText(cssText: string, label: string): string[] {
 /** Инлайн `style="..."` — та же проверка деклараций, обёрнутая в фиктивный селектор. */
 function scanInlineStyleValue(value: string, label: string): string[] {
   return scanCssText(`a{${value}}`, label)
+}
+
+// less не установлен в проекте (TL-96, issue execaus/tube-leak#103):
+// `@brand: #ff0000;` в less синтаксически валиден и для postcss (это просто
+// at-rule без блока) — сторож молча пропустил бы значение. Вместо разбора
+// less-специфичного синтаксиса (переменные `@x`, вложенность, миксины) —
+// падение с понятным сообщением, «неразобранное — падение» (тот же принцип,
+// что и для синтаксических ошибок CSS/шаблона/скрипта). scss оставлен
+// разрешённым белым списком (не «всё, кроме less» — «всё, кроме
+// перечисленного»): его синтаксис, отличный от plain CSS (вложенность,
+// `&`, свои переменные), сторожем специально не разбирается — как и
+// раньше, соответствующие ошибки ловит сам `postcss.parse`, если до них
+// дойдёт.
+const SUPPORTED_STYLE_LANGS = new Set(['css', 'scss'])
+
+function assertSupportedStyleLang(lang: string | undefined, label: string): void {
+  if (lang !== undefined && !SUPPORTED_STYLE_LANGS.has(lang.toLowerCase())) {
+    throw new Error(`${label}: неподдерживаемый язык стилей "${lang}"`)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -734,6 +845,12 @@ function collectElementText(node: RawTemplateNode): string {
     .join('')
 }
 
+/** Значение статического атрибута элемента по имени, `undefined` если атрибута нет или он динамический. */
+function getStaticAttrValue(node: RawTemplateNode, attrName: string): string | undefined {
+  const prop = (node.props ?? []).find((p) => p.type === 6 && p.name === attrName)
+  return prop?.value?.content
+}
+
 function scanTemplateProp(prop: RawTemplateProp, label: string, violations: string[]): void {
   if (prop.type === 6) {
     // Статический атрибут.
@@ -745,6 +862,13 @@ function scanTemplateProp(prop: RawTemplateProp, label: string, violations: stri
       violations.push(...scanInlineStyleValue(value, `${label} style="${value}"`))
       return
     }
+
+    // Только презентационные цветовые атрибуты проверяются на «значение
+    // целиком является цветом» (TL-96, белый список
+    // `COLOR_PRESENTATION_ATTRIBUTES`) — `role`, `aria-*`, пропсы
+    // компонентов (`tone`, …) и `class` не несут цвет презентационно и не
+    // проверяются вовсе, что бы ни оказалось их значением.
+    if (!COLOR_PRESENTATION_ATTRIBUTES.has(name.toLowerCase())) return
 
     // «Целиком является цветом» — строгое равенство, не «содержит» (см.
     // doc-комментарий файла, п. 2): `class="btn primary"` не должен
@@ -789,6 +913,12 @@ function scanTemplateProp(prop: RawTemplateProp, label: string, violations: stri
       return
     }
 
+    // `:class`/`v-bind:class` не несёт цвет презентационно (TL-96): значение
+    // — список имён CSS-классов, а не CSS-значение, поэтому слово-цвет в
+    // нём (`:class="'red'"`) не проверяется вовсе — симметрично статическому
+    // `class`, не входящему в `COLOR_PRESENTATION_ATTRIBUTES`.
+    if (directiveName === 'bind' && argOrName.toLowerCase() === 'class') return
+
     violations.push(...scanScriptExpression(exprText, `${label} :${argOrName}="${exprText}"`))
   }
 }
@@ -808,6 +938,8 @@ function scanTemplateAst(node: RawTemplateNode, label: string, violations: strin
   if (node.type === 1) {
     const tag = (node.tag ?? '').toLowerCase()
     if (tag === 'style') {
+      const lang = getStaticAttrValue(node, 'lang')
+      assertSupportedStyleLang(lang, `${label} <style lang="${lang ?? 'css'}">`)
       violations.push(...scanCssText(collectElementText(node), `${label} <style>`))
       return
     }
@@ -848,6 +980,7 @@ function scanVueFile(source: string, label: string): string[] {
     scanTemplateAst(descriptor.template.ast as unknown as RawTemplateNode, label, violations)
   }
   for (const style of descriptor.styles) {
+    assertSupportedStyleLang(style.lang, `${label} <style lang="${style.lang ?? 'css'}">`)
     violations.push(...scanCssText(style.content, `${label} <style>`))
   }
   if (descriptor.script) {
@@ -1159,6 +1292,109 @@ describe('v-on/v-for/v-slot: выражение разбирается без п
     // `forParseResult.source`, а не отбрасывается совсем.
     const violations = templateViolations('<div v-for="item of (\'#ff0000\')" />')
     expect(violations).not.toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// TL-96 (issue execaus/tube-leak#103), пятый раунд — ложные срабатывания и less
+// ---------------------------------------------------------------------------
+
+function sfcViolations(source: string): string[] {
+  return scanVueFile(source, 'fixture.vue')
+}
+
+describe('TL-96: статический атрибут — только белый список презентационных атрибутов', () => {
+  it.each([
+    ['role="menu" — не цветовой атрибут', () => templateViolations('<div role="menu" />')],
+    ['aria-haspopup="menu" — не цветовой атрибут', () => templateViolations('<button aria-haspopup="menu" />')],
+    ['проп компонента tone="green"', () => templateViolations('<MyBadge tone="green" />')],
+    ['class="green" — class не проверяется', () => templateViolations('<div class="green" />')],
+  ])('не краснеет: %s', (_label, run) => {
+    expect(run()).toEqual([])
+  })
+
+  it.each([
+    ['fill="red" остаётся нарушением (белый список не ослеплён)', () => templateViolations('<path fill="red" />')],
+    ['stroke="blue" остаётся нарушением', () => templateViolations('<path stroke="blue" />')],
+    ['color="red" остаётся нарушением', () => templateViolations('<font color="red" />')],
+    ['style="color: red" остаётся нарушением', () => templateViolations('<div style="color: red" />')],
+  ])('краснеет: %s', (_label, run) => {
+    expect(run()).not.toEqual([])
+  })
+})
+
+describe('TL-96: :class/v-bind:class не проверяется', () => {
+  it.each([
+    [':class="\'red\'" — статическая строка', () => templateViolations('<div :class="\'red\'" />')],
+    ['v-bind:class с тем же значением (полная форма)', () => templateViolations('<div v-bind:class="\'red\'" />')],
+    [':class с объектной формой', () => templateViolations('<div :class="{ red: isActive }" />')],
+  ])('не краснеет: %s', (_label, run) => {
+    expect(run()).toEqual([])
+  })
+
+  it(':style на том же элементе продолжает проверяться, когда рядом :class', () => {
+    const violations = templateViolations('<div :class="\'red\'" :style="{ color: \'red\' }" />')
+    expect(violations).not.toEqual([])
+  })
+})
+
+describe('TL-96: имя CSS-свойства в transition/transition-property/will-change — не цвет', () => {
+  it.each([
+    ['transition: background 0.2s ease', () => cssViolations('.a { transition: background 0.2s ease; }')],
+    ['transition-property: список свойств', () => cssViolations('.a { transition-property: background, color; }')],
+    ['will-change: список свойств', () => cssViolations('.a { will-change: transform, background; }')],
+    ['transition: color 0.2s — "color" тоже имя свойства', () => cssViolations('.a { transition: color 0.2s linear; }')],
+  ])('не краснеет: %s', (_label, run) => {
+    expect(run()).toEqual([])
+  })
+
+  it.each([
+    // Регресс-барьер: асимметрия точечная (по имени СВОЙСТВА декларации),
+    // а не глобальное ослабление грамматики — `background: red` (реальное
+    // цветовое свойство, не из PROPERTY_NAME_POSITION_PROPS) по-прежнему
+    // ловится.
+    ['background: red — реальное свойство вне исключения', () => cssViolations('.a { background: red; }')],
+    // Защитный барьер: hex/цветовая функция в этих трёх свойствах всё
+    // равно ловится — исключены только голые ИМЕНА, а не вся грамматика.
+    ['will-change с hex где угодно в значении (защитный барьер)', () => cssViolations('.a { will-change: #ff0000; }')],
+    ['transition-property с цветовой функцией (защитный барьер)', () => cssViolations('.a { transition-property: rgb(255, 0, 0); }')],
+  ])('краснеет: %s', (_label, run) => {
+    expect(run()).not.toEqual([])
+  })
+})
+
+describe('TL-96: <style lang="less"> падает как неподдерживаемый язык стилей', () => {
+  it('SFC .vue со <style lang="less"> падает с понятным сообщением', () => {
+    const source = [
+      '<template><div /></template>',
+      '<style lang="less">',
+      '@brand: #ff0000;',
+      '.a { color: @brand; }',
+      '</style>',
+    ].join('\n')
+
+    expect(() => sfcViolations(source)).toThrow(/неподдерживаемый язык стилей/)
+  })
+
+  it('вложенный <style lang="less"> внутри .svg/.html (обёрнутый в <template>) тоже падает', () => {
+    const source = '<svg><style lang="less">@brand: #ff0000;</style></svg>'
+    expect(() => scanMarkupFile(source, 'fixture.svg')).toThrow(/неподдерживаемый язык стилей/)
+  })
+
+  it('не краснеет и не падает: <style> без lang (по умолчанию css) работает как раньше', () => {
+    const source = '<template><div /></template>\n<style>\n.a { border: 1px solid var(--color-border); }\n</style>\n'
+    expect(sfcViolations(source)).toEqual([])
+  })
+
+  it('не падает: <style lang="scss"> разрешён и по-прежнему ловит настоящие нарушения', () => {
+    const source = [
+      '<template><div /></template>',
+      '<style lang="scss">',
+      '.a { color: red; }',
+      '</style>',
+    ].join('\n')
+
+    expect(sfcViolations(source)).not.toEqual([])
   })
 })
 
