@@ -14,7 +14,9 @@ mod update;
 mod ytdlp;
 
 pub use download::{cancel_download, retry_download, start_download};
-pub use history::{clear_history, delete_history_record, history_page, show_in_folder};
+pub use history::{
+    clear_history, delete_history_record, history_page, show_in_folder, HistoryState,
+};
 pub use probe::{cancel_probe, probe_url};
 pub use queue::{dismiss_queue_task, queue_state, resume_queue};
 pub use settings::{preview_name_template, settings_get, settings_set};
