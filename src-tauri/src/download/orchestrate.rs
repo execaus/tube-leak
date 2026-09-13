@@ -1943,4 +1943,4 @@ fn entries_by_prefix(destination: &Path, prefixes: &[String]) -> Vec<PathBuf> {
 
 #[cfg(test)]
 #[path = "orchestrate_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -18,6 +18,10 @@ pub use history::{clear_history, delete_history_record, history_page, show_in_fo
 pub use probe::{cancel_probe, probe_url};
 pub use queue::{dismiss_queue_task, queue_state, resume_queue};
 pub use settings::{preview_name_template, settings_get, settings_set};
+// Образец предпросмотра — для тестов шаблона имени (TL-86): пример дизайна
+// проверяется на тех же константах, что возьмёт команда, а не на копии.
+#[cfg(test)]
+pub(crate) use settings::{PREVIEW_SAMPLE_QUALITY, PREVIEW_SAMPLE_TITLE, PREVIEW_SAMPLE_VIDEO_ID};
 pub use sidecar::check_sidecar;
 pub use update::{
     check_ytdlp_update, roll_back_ytdlp, start_ytdlp_update_schedule, ytdlp_update_state,
