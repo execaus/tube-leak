@@ -84,6 +84,11 @@
 mod clock;
 mod commands;
 mod download;
+// Глушитель по той же причине, что у `storage::history`: домен опережает
+// потребителя. Снимает TL-90, когда команда `show_in_folder` позовёт
+// `os_reveal::reveal`.
+#[allow(dead_code)]
+mod os_reveal;
 mod probe;
 mod queue;
 mod sidecar;
