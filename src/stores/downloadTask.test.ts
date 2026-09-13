@@ -438,7 +438,7 @@ describe('useDownloadTaskStore — мягкий индикатор зависа�
  * следующую. Таймер зависания обязан следить за активной задачей по
  * смыслу, а не за позицией `[0]`.
  */
-describe('useDownloadTaskStore — таймер зависания смотрит на активную задачу, не на позицию (issue 86)', () => {
+describe('useDownloadTaskStore — таймер зависания смотрит на активную задачу, не на позицию (issue #86)', () => {
   it('a terminal, not-yet-hidden task at the head of the list does not blind the timer to the second task, which is actually downloading', async () => {
     const store = useDownloadTaskStore()
     invokeMock.mockResolvedValueOnce({ tasks: [], awaitingContinue: false } satisfies QueueSnapshot)
@@ -520,7 +520,7 @@ describe('useDownloadTaskStore — таймер зависания смотри�
  * зависят ни от одной вкладки и заслуживают собственных тестов, а не
  * только косвенной проверки через смонтированное дерево `App.vue`.
  */
-describe('useDownloadTaskStore — живая зона исходов outcomeAnnouncement (TL-98, issue 105, правки ревью С-2)', () => {
+describe('useDownloadTaskStore — живая зона исходов outcomeAnnouncement (TL-98, issue #105, правки ревью С-2)', () => {
   it('R1: reverse order — queue://changed reports Done first, then download://progress reports the same Done — one announcement, not two', async () => {
     // `initialize()` перед `start()` — подписка на `queue://changed`
     // нужна именно этому тесту (`emitQueueChanged` иначе холостой, doc
