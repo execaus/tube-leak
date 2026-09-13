@@ -98,7 +98,7 @@ impl Variable {
 
 /// Кусок разобранного шаблона.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Segment {
+pub(super) enum Segment {
     /// Текст шаблона как есть. Санитизируется вместе со всем результатом.
     Literal(String),
     /// Место подстановки.
@@ -204,7 +204,8 @@ impl NameTemplate {
     }
 
     /// Разобранные куски шаблона.
-    pub fn segments(&self) -> &[Segment] {
+    #[cfg(test)]
+    pub(super) fn segments(&self) -> &[Segment] {
         &self.segments
     }
 
@@ -255,8 +256,10 @@ pub struct TemplateContext<'a> {
     /// Название ролика.
     pub title: &'a str,
     /// Id ролика: значение `{id}` и основа запасного имени. Одно поле на
-    /// оба места намеренно — у `{title}` это и даёт тождество с E3, где
-    /// запасное имя строилось из того же id.
+    /// оба места намеренно. Тождество `{title}` с E3 держится, только если
+    /// вызывающий передаёт тот же id, что E3 брал для запасного имени, —
+    /// `video_id_of(url)`, а не канонический id TL-72 (решение ведущего
+    /// по ревью TL-86, записано в #97).
     pub video_id: &'a str,
     /// Выбранный пункт качества.
     pub quality: SelectedQuality,
