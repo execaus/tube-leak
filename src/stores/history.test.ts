@@ -158,6 +158,57 @@ describe('useHistoryStore — refresh on queue://changed does not drop pages alr
   })
 })
 
+describe('useHistoryStore — живая зона (дизайн E5, «Доступность»)', () => {
+  it('stays silent on the very first load (mounting is not a live structural change)', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [entry()], notices: [] } satisfies HistoryPage)
+    const store = useHistoryStore()
+
+    await store.initialize()
+
+    expect(store.liveAnnouncement).toBe('')
+  })
+
+  it('announces once a genuinely new entry arrives via queue://changed after the first load', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+    expect(store.liveAnnouncement).toBe('')
+
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '2' }), entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    emitQueueChanged()
+    await vi.waitFor(() => expect(store.entries).toHaveLength(2))
+
+    expect(store.liveAnnouncement).toBe('Добавлена новая запись')
+  })
+
+  it('stays silent when queue://changed fires but nothing genuinely new arrived', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    emitQueueChanged()
+    await vi.waitFor(() => expect(invokeMock).toHaveBeenCalledTimes(2))
+
+    expect(store.liveAnnouncement).toBe('')
+  })
+
+  it('does not announce for a page loaded via the user-initiated «Показать ещё» either', async () => {
+    invokeMock.mockResolvedValueOnce({
+      entries: [entry({ id: '1' })],
+      nextCursor: { finishedAtUnixSecs: 1, id: '1' },
+      notices: [],
+    } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '2' })], notices: [] } satisfies HistoryPage)
+    await store.loadMore()
+
+    expect(store.liveAnnouncement).toBe('')
+  })
+})
+
 describe('useHistoryStore — пометки (Ф-3/С-10)', () => {
   it('shows both notices at once when both arrive together (mutation: taking only the first must fail this)', async () => {
     invokeMock.mockResolvedValueOnce({

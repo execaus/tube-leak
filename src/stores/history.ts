@@ -135,6 +135,8 @@ export const useHistoryStore = defineStore('history', () => {
   const commandError = ref<HistoryCommandFailure>()
   /** Отказ «Показать в папке» по каждой затронутой записи (Ф-8) — не общий баннер: у каждой строки свой файл и своя причина. */
   const showInFolderErrors = ref<Record<string, ShowInFolderFailure>>({})
+  /** Текст скрытой живой зоны экрана (дизайн E5, «Доступность») — см. doc {@link refreshFirst}. */
+  const liveAnnouncement = ref('')
 
   let hasLoadedOnce = false
   let unlistenQueue: UnlistenFn | undefined
@@ -155,11 +157,22 @@ export const useHistoryStore = defineStore('history', () => {
       availability.value = undefined
       const known = new Set(entries.value.map((e) => e.id))
       const fresh = page.entries.filter((e) => !known.has(e.id))
+      const isLiveUpdate = hasLoadedOnce
       entries.value = [...fresh, ...entries.value]
       notices.value = page.notices
       if (!hasLoadedOnce) {
         nextCursor.value = page.nextCursor
         hasLoadedOnce = true
+      }
+      // Живая зона (дизайн E5, «Доступность»): «структурные изменения... —
+      // отдельной скрытой aria-live="polite" строкой», а не пересказом
+      // содержимого списка целиком. Только для настоящего фонового
+      // обновления (после первой загрузки, то есть по `queue://changed`) и
+      // только когда реально добавилась хотя бы одна новая запись — ни
+      // самая первая загрузка, ни «Показать ещё» (пользователь и так видит
+      // результат своего клика) сюда не попадают.
+      if (isLiveUpdate && fresh.length > 0) {
+        liveAnnouncement.value = 'Добавлена новая запись'
       }
     } catch (err) {
       applyPageError(err)
@@ -280,6 +293,7 @@ export const useHistoryStore = defineStore('history', () => {
     isLoadingMore,
     commandError,
     showInFolderErrors,
+    liveAnnouncement,
     initialize,
     loadMore,
     dismissNotice,

@@ -99,6 +99,20 @@ function onClearConfirmed(): void {
 
 <template>
   <div class="history-screen">
+    <!--
+      Живая зона структурных изменений списка (дизайн E5, «Доступность»):
+      «не пересказом содержимого» — короткий текст, не перечитывание всего
+      списка. Постоянный узел, не создаваемый по условию (тот же приём, что
+      `queue-status-announcer` в `App.vue`): скринридер должен знать про
+      регион заранее, иначе первое объявление теряется.
+    -->
+    <p
+      class="visually-hidden history-screen__announcer"
+      aria-live="polite"
+    >
+      {{ store.liveAnnouncement }}
+    </p>
+
     <template v-if="store.availability">
       <p class="history-screen__unavailable">
         {{ getHistoryUnavailableText(store.availability.reason) }}
@@ -255,6 +269,25 @@ function onClearConfirmed(): void {
 </template>
 
 <style scoped>
+/*
+ * Скрыт визуально, виден скринридеру (`position: absolute` + `clip`, не
+ * `display: none`/`visibility: hidden` — те убрали бы узел из дерева
+ * доступности вместе с текстом). Тот же приём, что `.visually-hidden` в
+ * `App.vue`/`SidecarStatusRow.vue` — не общий класс между файлами
+ * (`<style scoped>` в каждом компоненте), а не дублирование намеренно.
+ */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .history-screen__unavailable {
   max-width: 40rem;
   line-height: 1.4;

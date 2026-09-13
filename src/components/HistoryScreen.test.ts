@@ -334,3 +334,25 @@ describe('HistoryScreen — обновление по queue://changed', () => {
     expect(wrapper.findAll('.history-screen__entry')).toHaveLength(3)
   })
 })
+
+describe('HistoryScreen — живая зона структурных изменений (дизайн E5, «Доступность»)', () => {
+  it('the announcer exists in the DOM from mount, silent before anything structural happens', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const wrapper = await mountScreen()
+
+    const announcer = wrapper.get('.history-screen__announcer')
+    expect(announcer.attributes('aria-live')).toBe('polite')
+    expect(announcer.text()).toBe('')
+  })
+
+  it('announces a short text, not the row content, when a new entry arrives via queue://changed', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const wrapper = await mountScreen()
+
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '2' }), entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    handlers.get('queue://changed')?.({ payload: undefined })
+    await flushPromises()
+
+    expect(wrapper.get('.history-screen__announcer').text()).toBe('Добавлена новая запись')
+  })
+})
