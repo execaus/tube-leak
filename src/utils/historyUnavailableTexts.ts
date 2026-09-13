@@ -46,6 +46,11 @@ export function getHistoryUnavailableText(reason: HistoryUnavailableReason): str
         'до текущей версии приложения. Файл остался на прежней версии и не ' +
         'повреждён — сообщите об этом, если увидите снова.'
       )
+    case 'storageFailed':
+      return (
+        'История недоступна в этом сеансе: не удалось прочитать базу данных. ' +
+        'Файл не тронут — перезапустите tube-leak; если повторится, сообщите об этом.'
+      )
     default:
       return assertNever(reason)
   }

@@ -39,6 +39,8 @@ export function getTemplateProblemText(problem: TemplateProblem): string {
       return `Ошибка в шаблоне (символ ${problem.position}): лишняя закрывающая скобка «}», не открытая до неё.`
     case 'noVariables':
       return 'В шаблоне нет ни одной переменной — все файлы получили бы одно имя. Добавьте, например, {title} или {id}.'
+    case 'tooLong':
+      return `Шаблон слишком длинный: не больше ${problem.max} символов.`
   }
 }
 

@@ -29,6 +29,7 @@ const KNOWN_UNAVAILABLE_REASONS = knownKindsOf({
   newerVersion: true,
   noAccess: true,
   migrationFailed: true,
+  storageFailed: true,
 } satisfies Record<HistoryUnavailableError['reason'], true>)
 
 function isHistoryUnavailableError(value: unknown): value is HistoryUnavailableError {

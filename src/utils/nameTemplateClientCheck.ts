@@ -24,6 +24,16 @@ import type { TemplateProblem } from '@/types/generated/settings'
 const KNOWN_TEMPLATE_VARIABLES: ReadonlySet<string> = new Set(['title', 'id', 'quality', 'date'])
 
 /**
+ * Предел длины шаблона в символах Unicode (скалярах, `[...s].length`) — тот
+ * же, что `NAME_TEMPLATE_MAX_CHARS` в `src-tauri/src/storage/settings.rs`
+ * (TL-87). Ядро проверяет длину **до** разбора (`check_template_length`, и у
+ * сохранения, и у предпросмотра, TL-91), поэтому и здесь длина проверяется
+ * первой. В контракт число не выведено — сверка значения с ядром входит в
+ * общую фикстуру #107/#108.
+ */
+export const NAME_TEMPLATE_MAX_CHARS = 200
+
+/**
  * Быстрая клиентская проверка формы шаблона (дизайн E5, «Шаблон имени»,
  * п. 3): гейт кнопки «Сохранить» до окончательной проверки на сервере.
  * Возвращает `undefined`, если по форме шаблон выглядит допустимым —
@@ -41,6 +51,9 @@ const KNOWN_TEMPLATE_VARIABLES: ReadonlySet<string> = new Set(['title', 'id', 'q
  */
 export function validateNameTemplateDraft(template: string): TemplateProblem | undefined {
   const chars = Array.from(template)
+  if (chars.length > NAME_TEMPLATE_MAX_CHARS) {
+    return { kind: 'tooLong', max: NAME_TEMPLATE_MAX_CHARS }
+  }
   let sawVariable = false
   let i = 0
 

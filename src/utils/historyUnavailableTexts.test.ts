@@ -26,3 +26,13 @@ describe('getHistoryUnavailableText', () => {
     expect(() => getHistoryUnavailableText('bogus' as HistoryUnavailableReason)).toThrow()
   })
 })
+
+describe('getHistoryUnavailableText — storageFailed (TL-91)', () => {
+  it('names a read failure of an opened base, distinct from the other reasons', () => {
+    const text = getHistoryUnavailableText('storageFailed')
+    expect(text).toContain('не удалось прочитать базу данных')
+    for (const other of ['newerVersion', 'noAccess', 'migrationFailed'] as const) {
+      expect(text).not.toBe(getHistoryUnavailableText(other))
+    }
+  })
+})

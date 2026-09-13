@@ -117,3 +117,10 @@ describe('getPreviewFailureDisplay', () => {
 it('PREVIEW_UNAVAILABLE_TEXT is not the same string as the generic save-failed text (mutation guard for the writeFailed/preview mix-up)', () => {
   expect(PREVIEW_UNAVAILABLE_TEXT).not.toBe(SETTINGS_SAVE_FAILED_TEXT)
 })
+
+describe('getTemplateProblemText — tooLong (TL-91)', () => {
+  it('names the limit from the problem, not a hardcoded number', () => {
+    expect(getTemplateProblemText({ kind: 'tooLong', max: 200 })).toBe('Шаблон слишком длинный: не больше 200 символов.')
+    expect(getTemplateProblemText({ kind: 'tooLong', max: 7 })).toContain('не больше 7 символов')
+  })
+})

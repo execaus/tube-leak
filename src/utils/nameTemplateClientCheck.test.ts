@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { validateNameTemplateDraft } from './nameTemplateClientCheck'
+import { NAME_TEMPLATE_MAX_CHARS, validateNameTemplateDraft } from './nameTemplateClientCheck'
 
 describe('validateNameTemplateDraft', () => {
   it('accepts a template built only from known variables and literals', () => {
@@ -52,6 +52,33 @@ describe('validateNameTemplateDraft', () => {
       kind: 'unknownVariable',
       position: 2,
       name: 'channel',
+    })
+  })
+})
+
+describe('validateNameTemplateDraft — предел длины (TL-91)', () => {
+  it('accepts exactly NAME_TEMPLATE_MAX_CHARS characters', () => {
+    const template = '{title}' + 'x'.repeat(NAME_TEMPLATE_MAX_CHARS - 7)
+    expect([...template].length).toBe(NAME_TEMPLATE_MAX_CHARS)
+    expect(validateNameTemplateDraft(template)).toBeUndefined()
+  })
+
+  it('rejects one character over the limit as tooLong', () => {
+    const template = '{title}' + 'x'.repeat(NAME_TEMPLATE_MAX_CHARS - 6)
+    expect(validateNameTemplateDraft(template)).toStrictEqual({ kind: 'tooLong', max: NAME_TEMPLATE_MAX_CHARS })
+  })
+
+  it('counts Unicode scalars, not UTF-16 units, as the core does', () => {
+    const atLimit = '{title}' + '😀'.repeat(NAME_TEMPLATE_MAX_CHARS - 7)
+    expect(atLimit.length).toBeGreaterThan(NAME_TEMPLATE_MAX_CHARS)
+    expect(validateNameTemplateDraft(atLimit)).toBeUndefined()
+    expect(validateNameTemplateDraft(atLimit + '😀')).toStrictEqual({ kind: 'tooLong', max: NAME_TEMPLATE_MAX_CHARS })
+  })
+
+  it('checks the length before parsing, as the core does', () => {
+    expect(validateNameTemplateDraft('{'.repeat(NAME_TEMPLATE_MAX_CHARS + 1))).toStrictEqual({
+      kind: 'tooLong',
+      max: NAME_TEMPLATE_MAX_CHARS,
     })
   })
 })
