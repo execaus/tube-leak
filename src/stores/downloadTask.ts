@@ -6,7 +6,6 @@ import { computed, onScopeDispose, ref } from 'vue'
 import type {
   DownloadCommandError,
   DownloadPhase,
-  DownloadPlan,
   DownloadProgress,
   DownloadProgressEvent,
   DownloadStarted,
@@ -17,8 +16,7 @@ import { assertNever } from '@/utils/assertNever'
 import { resolveDownloadCommandErrorText } from '@/utils/downloadCommandErrorTexts'
 import { knownKindsOf } from '@/utils/knownKinds'
 import { getQueueOutcomeAnnouncementText, type QueueTaskOutcomePhase } from '@/utils/queueTexts'
-import { toDownloadProgress } from '@/utils/queueTaskProgress'
-import { formatTaskDisplayTitle, quoteTaskTitle } from '@/utils/queueTaskTitle'
+import { quoteTaskTitle } from '@/utils/queueTaskTitle'
 
 const START_DOWNLOAD_COMMAND = 'start_download'
 const CANCEL_DOWNLOAD_COMMAND = 'cancel_download'
@@ -41,21 +39,6 @@ const QUEUE_CHANGED_EVENT = 'queue://changed'
 /** Порог локального косметического индикатора зависания (дизайн E3, «Числа»). */
 const SOFT_STALL_THRESHOLD_MS = 5_000
 const SOFT_STALL_TICK_MS = 1_000
-
-/** То, что панель держит про текущую задачу помимо серверного `DownloadProgress`. */
-export interface DownloadTask {
-  taskId: string
-  plan: DownloadPlan
-  /**
-   * Заголовок панели — ««Название» — качество» ({@link formatTaskDisplayTitle}).
-   * Для активной задачи очереди строится из тех же двух полей
-   * ({@link QueueTask.title}/{@link QueueTask.quality}), что переживают
-   * перезапуск приложения (Ф-9 E4) — тем самым заголовок остаётся верным
-   * и после восстановления по снимку, а не только сразу после клика
-   * «Скачать» (требование С-13/TL-45, п.6, унаследованное TL-75).
-   */
-  displayTitle: string
-}
 
 /**
  * Белый список семи классов `DownloadCommandError['kind']`, выведенный из
@@ -296,15 +279,17 @@ function initialQueueTaskPhaseFields(phase: DownloadPhase): DownloadProgress {
  *    подписка на событие, тот же приём, что `check_sidecar` (Ф-9 E1) и
  *    `useYtDlpUpdate` (эпик E6): не polling.
  *
- * # Обратная совместимость: `task`/`progress`/`isActive`
+ * # Чего здесь больше нет: `task`/`progress`/`isActive`
  *
- * Три производных геттера сохранены буквально ради существующих
- * потребителей вне этого файла (`useExitConfirmation.ts`/TL-46) —
- * TL-76 переведёт диалог выхода на срез всей очереди отдельной задачей;
- * до тех пор они остаются проекцией **активной** задачи списка (ровно
- * одной, Р-1: `phase` не `queued` и не терминальна) — то же самое
- * значение, которое эти поля несли до TL-75, когда задача была ровно
- * одна.
+ * TL-75 оставил три производных геттера (проекцию первой задачи списка)
+ * буквально ради существующих потребителей вне этого файла
+ * (`useExitConfirmation.ts`/TL-46); TL-76 перевёл диалог выхода на срез
+ * всей очереди, и снаружи их с тех пор не читал никто — только их
+ * собственные тесты (TL-82, issue 89, долг заведён и назван вслух в
+ * TL-75/TL-76). `firstTask`, от которого они были образованы,
+ * `tasks.value[0]`, тоже удалён вместе с ними: единственный сторонний
+ * потребитель — таймер зависания — с TL-79 (issue 86) смотрит на
+ * {@link activeTask} (первая **нетерминальная**, не позиция).
  *
  * # Окно двойного клика — на весь стор, не на задачу
  *
@@ -563,56 +548,14 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
    * `dismiss_queue_task`) остаётся на прежнем месте сколько угодно, пока
    * следующая уже качается (issue 86; воспроизводимо тривиальным путём —
    * скачал, не скрыл, начал следующую: `start_download` ставит новую
-   * задачу в хвост, `pump` берёт в работу первую нетерминальную). Единственный
-   * потребитель этого геттера — таймер зависания
-   * ({@link syncStallTimer}); в отличие от {@link firstTask} ниже это не
-   * временный долг TL-75/#89 — смотреть на позицию для таймера было
-   * никогда не верно, вне зависимости от исхода #89.
+   * задачу в хвост, `pump` берёт в работу первую нетерминальную).
+   * Единственный потребитель этого геттера — таймер зависания
+   * ({@link syncStallTimer}). До TL-82 (issue 89) рядом стоял `firstTask`
+   * (`tasks.value[0]`, позиция, а не смысл) — источник трёх временных
+   * геттеров обратной совместимости; он удалён вместе с ними, потому что
+   * таймер зависания на нём с TL-79 уже не строится.
    */
   const activeTask = computed(() => tasks.value.find((t) => !isTerminalPhase(t.phase)))
-
-  /**
-   * Первая задача списка — источник для трёх геттеров обратной
-   * совместимости ниже (`task`/`progress`/`isActive`). До TL-75 в сторе
-   * было ровно одно место для одной задачи независимо от её фазы —
-   * терминальной в том числе (панель E3 рисует Done/Failed/Cancelled тем
-   * же `progress`, что и нетерминальные фазы). `tasks.value[0]` — тот же
-   * снимок для однозадачного случая (единственный, который проверяют
-   * `useExitConfirmation.ts`/его тесты сегодня); для по-настоящему
-   * многозадачной очереди это временный, заведомо неполный выбор
-   * («первая добавленная», не «единственная, которую стоит спросить при
-   * выходе») — TL-76 (issue #83) заменит его срезом всей очереди.
-   * Компонент, который различает `queued` и реально идущую фазу для
-   * рендера списка (`DownloadPanel` vs `QueueWaitingRow`), —
-   * `QueueSection.vue`, у него собственный критерий (`isPanelPhase`),
-   * независимый от этого геттера.
-   */
-  const firstTask = computed(() => tasks.value[0])
-
-  /** Обратная совместимость — см. doc класса выше, «Обратная совместимость». */
-  const task = computed<DownloadTask | undefined>(() => {
-    const current = firstTask.value
-    if (!current) return undefined
-    return {
-      taskId: current.taskId,
-      plan: current.plan,
-      displayTitle: formatTaskDisplayTitle(current.title, current.quality),
-    }
-  })
-
-  /** Обратная совместимость — см. doc класса выше, «Обратная совместимость». */
-  const progress = computed<DownloadProgress | undefined>(() => {
-    const current = firstTask.value
-    return current ? toDownloadProgress(current) : undefined
-  })
-
-  /**
-   * Обратная совместимость — см. doc класса выше, «Обратная
-   * совместимость». Ровно та же проверка, что была в E3 до TL-75:
-   * задача существует и не терминальна (`queued` в их числе — задел
-   * под очередь появился в контракте, а не в этом геттере).
-   */
-  const isActive = computed(() => firstTask.value !== undefined && !isTerminalPhase(firstTask.value.phase))
 
   /** Скрывает баннер отказа команды («Скрыть» на нём же). */
   function dismissCommandError(): void {
@@ -770,12 +713,9 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
     tasks,
     awaitingContinue,
     pauseReason,
-    task,
-    progress,
     softStallSeconds,
     commandError,
     outcomeAnnouncement,
-    isActive,
     initialize,
     start,
     cancel,

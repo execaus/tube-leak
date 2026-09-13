@@ -9,11 +9,13 @@ import type { QueueTask } from '@/types/generated/queue'
  * «форма выбрана так, чтобы совпадать с `DownloadProgressEvent`»), плюс
  * `taskId`/`title`/`quality`/`plan` — этот util отбрасывает именно их.
  *
- * Общий util, а не приватная функция стора или `QueueSection.vue`:
- * используется обеими сторонами (обратная совместимость
- * `useDownloadTaskStore.progress` и рендер каждой активной/терминальной
- * строки списка) — дублировать одну и ту же проекцию было бы вторым
- * местом, которому расходиться с контрактом.
+ * Общий util, а не приватная функция одного места: используется сразу
+ * несколькими сторонами (`useExitConfirmation.ts` — прогресс активной
+ * задачи диалога выхода; `QueueSection.vue`/`App.vue` — рендер каждой
+ * активной/терминальной строки списка) — дублировать одну и ту же
+ * проекцию в каждой было бы вторым местом, которому расходиться с
+ * контрактом. До TL-82 (issue 89) третьей стороной была ещё и временная
+ * обратная совместимость `useDownloadTaskStore.progress` — она удалена.
  */
 export function toDownloadProgress(task: QueueTask): DownloadProgress {
   const { taskId, title, quality, plan, ...progress } = task

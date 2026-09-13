@@ -23,8 +23,10 @@ import { windowExitPort as defaultWindowExitPort, type WindowExitPort } from './
  *
  * До TL-76 композабл читал `store.task`/`store.progress`/`store.isActive`
  * — временную проекцию первой задачи списка, которую TL-75 оставил
- * намеренно (doc `useDownloadTaskStore` в `src/stores/downloadTask.ts`,
- * «Обратная совместимость»). Теперь вход — сам список `tasks` плюс
+ * намеренно; TL-82 (issue 89) убрал эти геттеры из стора совсем, когда
+ * подтвердилось, что читать их больше некому (doc `useDownloadTaskStore`
+ * в `src/stores/downloadTask.ts`, «Чего здесь больше нет»). Теперь вход
+ * этого композабла — сам список `tasks` плюс
  * `awaitingContinue`/`pauseReason` уровня очереди, из которых считаются:
  * - `activeTask` — задача, реально выполняющаяся прямо сейчас (голова
  *   нетерминального подсписка, Р-4: активная задача всегда первая среди
