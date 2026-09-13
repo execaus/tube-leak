@@ -850,7 +850,7 @@ describe('App — К-14: переключение вкладок не теряе
     expect(queueStateCallsAfter).toBe(queueStateCallsBefore)
   })
 
-  it('a page loaded via «Показать ещё» on «История» (TL-93) survives a trip to «Главный» and back — HistoryScreen is not unmounted', async () => {
+  it('a page loaded via «Показать ещё» on «История» (TL-93) survives a trip to «Главный» and back — HistoryScreen is not unmounted, and returning to «История» does refresh the first page (правки ревью TL-93, второй раунд, п. 7)', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
       check_sidecar: () => Promise.resolve(okReport),
@@ -883,22 +883,23 @@ describe('App — К-14: переключение вкладок не теряе
     await tabButton(wrapper, 'Главный').trigger('click')
     await wrapper.vm.$nextTick()
     await tabButton(wrapper, 'История').trigger('click')
-    await wrapper.vm.$nextTick()
+    await flushPromises()
 
+    // Тот же курсорный «хвост» (id «2», подгруженный «Показать ещё») всё
+    // ещё виден — `HistoryScreen` не был размонтирован (`v-show`, К-14), и
+    // алгоритм сверки первой страницы (Б-2/С-1, doc-класс `useHistoryStore`)
+    // заменяет только префикс списка до последнего id свежей страницы
+    // («1»), не трогая хвост за ним.
     expect(wrapper.findAll('.history-screen__entry')).toHaveLength(2)
 
-    // `history_page` не запрашивается повторно только оттого, что
-    // пользователь ушёл и вернулся: `v-show` держит `HistoryScreen`
-    // смонтированным всегда, `onMounted` срабатывает один раз при монтаже
-    // `App.vue` (doc `activeTab` в `App.vue`, doc-класс `useHistoryStore`).
-    // Мутация «`v-show` → `v-if` на секции «Истории»» размонтировала бы
-    // `HistoryScreen` при уходе и вызвала бы `onMounted` заново при
-    // возврате — этот счётчик вырос бы, и подгруженная вторая страница
-    // (id «2») пропала бы вместе с ним, потому что настоящий
-    // `history_page` (мок задан лишь единожды через `mockImplementationOnce`
-    // выше) на повторный вызов ответил бы `unexpected invoke`.
+    // Инверсия исходного теста (правки ревью TL-93, второй раунд, п. 7):
+    // возврат на «Историю» **обязан** перезапросить первую страницу —
+    // решение ведущего подключить обновление первой страницы к активации
+    // вкладки, не только к монтированию и `queue://changed`. Мутация
+    // «watch по `props.active` убран» вернула бы это число к
+    // `historyPageCallsBefore` без изменений.
     const historyPageCallsAfter = invokeMock.mock.calls.filter(([cmd]) => cmd === 'history_page').length
-    expect(historyPageCallsAfter).toBe(historyPageCallsBefore)
+    expect(historyPageCallsAfter).toBe(historyPageCallsBefore + 1)
   })
 })
 
@@ -1060,5 +1061,67 @@ describe('App — одна линия под вкладками, не две (TL
 
     expect(dividersBetweenTabsAndFirstPanel(wrapper)).toBe(1)
     expect(wrapper.find('.queue-status-row + hr').exists()).toBe(true)
+  })
+})
+
+/**
+ * С-7 (правки ревью TL-93, второй раунд): «если записей нет — на заголовок
+ * экрана» / «после подтверждённой «Очистить» — на заголовок экрана».
+ * `HistoryScreen.vue` не владеет узлом `<h2>История</h2>` (он в `App.vue`,
+ * К-14) и эмитит `request-heading-focus`, а не двигает фокус сам —
+ * поэтому конечная проверка (реальный `document.activeElement`) идёт
+ * здесь, на смонтированном целиком `App`, а не в изолированных тестах
+ * `HistoryScreen.test.ts` (там нет самого узла, на который нужно навести
+ * фокус, — см. doc-комментарий этого пропа/эмита в `HistoryScreen.vue`).
+ */
+describe('App — фокус после «Удалить»/«Очистить» на экране истории уходит на заголовок панели (TL-93, правки ревью, второй раунд, С-7)', () => {
+  const oneEntry = {
+    id: '1',
+    videoId: 'a',
+    url: 'u',
+    title: 'A',
+    quality: { kind: 'audioOnly' as const },
+    fileName: 'a.mp3',
+    folderDisplay: { kind: 'systemDownloads' as const },
+    sizeBytes: 1,
+    finishedAtUnixSecs: 1,
+    fileStatus: { kind: 'present' as const },
+  }
+
+  it('deleting the only remaining row moves focus to the История heading', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      history_page: () => Promise.resolve({ entries: [oneEntry], notices: [] }),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await flushPromises()
+
+    invokeMock.mockResolvedValueOnce(undefined)
+    await wrapper.findAll('button').find((b) => b.text() === 'Удалить')?.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.findAll('.history-screen__entry')).toHaveLength(0)
+    expect(document.activeElement).toBe(tabPanel(wrapper, 'tabpanel-history').get('h2').element)
+  })
+
+  it('confirming «Очистить всё» moves focus to the История heading, not to the (now gone) «Очистить» button', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      history_page: () => Promise.resolve({ entries: [oneEntry], notices: [] }),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await flushPromises()
+
+    await wrapper.findAll('button').find((b) => b.text() === 'Очистить')?.trigger('click')
+    invokeMock.mockResolvedValueOnce(undefined)
+    await wrapper.findAll('button').find((b) => b.text() === 'Очистить всё')?.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('История пуста')
+    expect(document.activeElement).toBe(tabPanel(wrapper, 'tabpanel-history').get('h2').element)
   })
 })

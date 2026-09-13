@@ -19,7 +19,7 @@ export function getHistoryCommandErrorText(kind: HistoryCommandErrorKind): Histo
     case 'unknownRecord':
       return {
         title: 'Запись не найдена',
-        explanation: 'Похоже, список устарел — обновите историю (переключите вкладку и вернитесь) и попробуйте снова.',
+        explanation: 'Похоже, список устарел.',
       }
     case 'writeFailed':
       return {

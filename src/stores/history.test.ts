@@ -38,6 +38,13 @@ function entry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
   }
 }
 
+/** Строит `n` записей с id/`finishedAtUnixSecs` от `from` вниз до `to` включительно (для сценариев с большим числом записей, R3/R4). */
+function entriesRange(from: number, to: number): HistoryEntry[] {
+  const out: HistoryEntry[] = []
+  for (let i = from; i >= to; i--) out.push(entry({ id: String(i), finishedAtUnixSecs: i }))
+  return out
+}
+
 function emitQueueChanged(): void {
   handlers.get('queue://changed')?.({ payload: undefined })
 }
@@ -62,7 +69,10 @@ describe('useHistoryStore.initialize', () => {
 
     await store.initialize()
 
-    expect(invokeMock).toHaveBeenCalledWith('history_page', { cursor: undefined, limit: 30 })
+    // С-2 (правки ревью TL-93, второй раунд): у `history_page` только
+    // `cursor` — размер страницы решает константа ядра, аргумента `limit`
+    // на стороне клиента нет.
+    expect(invokeMock).toHaveBeenCalledWith('history_page', { cursor: undefined })
     expect(store.entries.map((e) => e.id)).toStrictEqual(['2', '1'])
     expect(store.nextCursor).toStrictEqual({ finishedAtUnixSecs: 1_000, id: '1' })
     expect(store.notices).toStrictEqual([{ kind: 'baseRecreated' }])
@@ -92,8 +102,35 @@ describe('useHistoryStore.initialize', () => {
   })
 })
 
+describe('useHistoryStore — С-6: отказ history_page, который не типизированная HistoryUnavailableError', () => {
+  it('a non-typed rejection of the very first page is flagged distinctly from a real empty history (mutation guard for R10 — the ipcFailure branch, not "loaded+empty")', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    invokeMock.mockRejectedValueOnce(new Error('ipc broken'))
+    const store = useHistoryStore()
+
+    await store.initialize()
+
+    expect(store.loaded).toBe(true)
+    expect(store.availability).toBeUndefined()
+    expect(store.ipcFailure).toBe(true)
+    expect(store.entries).toStrictEqual([])
+  })
+
+  it('a subsequent successful refresh clears the ipcFailure flag', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    invokeMock.mockRejectedValueOnce(new Error('ipc broken'))
+    const store = useHistoryStore()
+    await store.initialize()
+    expect(store.ipcFailure).toBe(true)
+
+    invokeMock.mockResolvedValueOnce({ entries: [], notices: [] } satisfies HistoryPage)
+    emitQueueChanged()
+    await vi.waitFor(() => expect(store.ipcFailure).toBe(false))
+  })
+})
+
 describe('useHistoryStore — loadMore (Ф-4, курсор как есть)', () => {
-  it('passes the exact cursor object received from the previous page, not a rebuilt one (mutation: reconstructing it must fail this assertion)', async () => {
+  it('passes the exact cursor object received from the previous page, not a rebuilt one', async () => {
     const cursor = { finishedAtUnixSecs: 500, id: '7' }
     invokeMock.mockResolvedValueOnce({
       entries: [entry({ id: '9' })],
@@ -106,7 +143,18 @@ describe('useHistoryStore — loadMore (Ф-4, курсор как есть)', ()
     invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '3' })], notices: [] } satisfies HistoryPage)
     await store.loadMore()
 
-    expect(invokeMock).toHaveBeenLastCalledWith('history_page', { cursor, limit: 30 })
+    // С-8 (правки ревью TL-93, второй раунд): честная формулировка того,
+    // что здесь на самом деле проверяется. «Пересборка курсора из его же
+    // двух полей» (`{ finishedAtUnixSecs: cursor.value.finishedAtUnixSecs,
+    // id: cursor.value.id }`) дала бы структурно то же самое значение и
+    // этой проверкой не ловится — глубокое равенство `toHaveBeenLastCalledWith`
+    // не отличает «взято как есть» от «собрано заново из тех же двух
+    // полей значения». Ловится другой, настоящий баг: если бы курсор
+    // строился из данных **записи** (`entry({id:'9'}).finishedAtUnixSecs`,
+    // `.id`), а не из `nextCursor`, ответ команды, тестовые данные нарочно
+    // расходятся (курсор — `{500, '7'}`, последняя запись — `{9,
+    // 1_756_130_400}`), и вызов не совпал бы с ожидаемым.
+    expect(invokeMock).toHaveBeenLastCalledWith('history_page', { cursor })
     expect(store.entries.map((e) => e.id)).toStrictEqual(['9', '3'])
     expect(store.nextCursor).toBeUndefined()
   })
@@ -123,8 +171,84 @@ describe('useHistoryStore — loadMore (Ф-4, курсор как есть)', ()
   })
 })
 
-describe('useHistoryStore — refresh on queue://changed does not drop pages already loaded via «Показать ещё»', () => {
-  it('prepends only genuinely new entries to the front, leaving the tail (loaded by loadMore) untouched, and keeps the pagination cursor pointing past that tail', async () => {
+describe('useHistoryStore — сверка первой страницы со списком (Б-2/С-1, правки ревью TL-93, второй раунд)', () => {
+  it('R1 (исправлено): fileStatus у уже показанной записи обновляется свежим ответом, а не остаётся устаревшим', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+    expect(store.entries[0]!.fileStatus).toStrictEqual({ kind: 'present' })
+
+    invokeMock.mockResolvedValueOnce({
+      entries: [entry({ id: '1', fileStatus: { kind: 'missing', folderExists: false } })],
+      notices: [],
+    } satisfies HistoryPage)
+    emitQueueChanged()
+
+    await vi.waitFor(() => expect(store.entries[0]!.fileStatus).toStrictEqual({ kind: 'missing', folderExists: false }))
+  })
+
+  it('R2 (исправлено): пустая свежая страница (например, после пересоздания базы) сбрасывает список, а не оставляет устаревшие записи на экране', async () => {
+    invokeMock.mockResolvedValueOnce({
+      entries: [entry({ id: '3' }), entry({ id: '2' }), entry({ id: '1' })],
+      notices: [],
+    } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+
+    invokeMock.mockResolvedValueOnce({ entries: [], notices: [{ kind: 'baseRecreated' }] } satisfies HistoryPage)
+    emitQueueChanged()
+
+    await vi.waitFor(() => expect(store.notices).toHaveLength(1))
+    expect(store.entries).toStrictEqual([])
+    expect(store.nextCursor).toBeUndefined()
+  })
+
+  it('R3 (исправлено): больше страницы новых записей между обновлениями — список сброшен к свежей странице целиком, курсор свежий', async () => {
+    invokeMock.mockResolvedValueOnce({
+      entries: entriesRange(100, 71),
+      nextCursor: { finishedAtUnixSecs: 71, id: '71' },
+      notices: [],
+    } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+    expect(store.entries).toHaveLength(30)
+
+    invokeMock.mockResolvedValueOnce({
+      entries: entriesRange(140, 111),
+      nextCursor: { finishedAtUnixSecs: 111, id: '111' },
+      notices: [],
+    } satisfies HistoryPage)
+    emitQueueChanged()
+
+    await vi.waitFor(() => expect(store.entries.map((e) => e.id)[0]).toBe('140'))
+    expect(store.entries).toHaveLength(30)
+    expect(store.nextCursor).toStrictEqual({ finishedAtUnixSecs: 111, id: '111' })
+    // «Дыра» 110..101 никогда не будет загружена — цена сброса, названная
+    // в doc-комментарии класса `useHistoryStore` («Первая страница»).
+    expect(store.entries.map((e) => e.id)).not.toContain('105')
+  })
+
+  it('R4 (исправлено): после «Очистить» полная первая страница снова даёт «Показать ещё» (курсор не потерян)', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+
+    invokeMock.mockResolvedValueOnce(undefined)
+    await store.clearHistory()
+    expect(store.entries).toStrictEqual([])
+
+    invokeMock.mockResolvedValueOnce({
+      entries: entriesRange(131, 102),
+      nextCursor: { finishedAtUnixSecs: 102, id: '102' },
+      notices: [],
+    } satisfies HistoryPage)
+    emitQueueChanged()
+
+    await vi.waitFor(() => expect(store.entries).toHaveLength(30))
+    expect(store.nextCursor).toStrictEqual({ finishedAtUnixSecs: 102, id: '102' })
+  })
+
+  it('prepends a genuinely new record above the tail loaded via «Показать ещё», replacing only the matched prefix and leaving the pagination cursor pointing past that tail', async () => {
     invokeMock.mockResolvedValueOnce({
       entries: [entry({ id: '3' })],
       nextCursor: { finishedAtUnixSecs: 300, id: '3' },
@@ -141,9 +265,6 @@ describe('useHistoryStore — refresh on queue://changed does not drop pages alr
     await store.loadMore()
     expect(store.entries.map((e) => e.id)).toStrictEqual(['3', '2'])
 
-    // Новая завершённая загрузка появилась выше уже показанного — курсорless
-    // ответ содержит и новую запись, и уже видимую «3» (сортировка по
-    // (finishedAt, id) не поменялась).
     invokeMock.mockResolvedValueOnce({
       entries: [entry({ id: '4' }), entry({ id: '3' })],
       nextCursor: { finishedAtUnixSecs: 300, id: '3' },
@@ -155,6 +276,87 @@ describe('useHistoryStore — refresh on queue://changed does not drop pages alr
     // Курсор продолжения не переписан из ответа обновления — «Показать ещё»
     // должно уйти за уже показанный хвост («2»), а не повторить то, что уже видно.
     expect(store.nextCursor).toStrictEqual({ finishedAtUnixSecs: 200, id: '2' })
+  })
+
+  it('does not overwrite the tail when queue://changed fires but nothing genuinely new arrived on the first page', async () => {
+    invokeMock.mockResolvedValueOnce({
+      entries: [entry({ id: '3' })],
+      nextCursor: { finishedAtUnixSecs: 300, id: '3' },
+      notices: [],
+    } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+
+    invokeMock.mockResolvedValueOnce({
+      entries: [entry({ id: '2' })],
+      nextCursor: { finishedAtUnixSecs: 200, id: '2' },
+      notices: [],
+    } satisfies HistoryPage)
+    await store.loadMore()
+
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '3' })], nextCursor: { finishedAtUnixSecs: 300, id: '3' }, notices: [] } satisfies HistoryPage)
+    emitQueueChanged()
+    await vi.waitFor(() => expect(invokeMock).toHaveBeenCalledTimes(3))
+
+    expect(store.entries.map((e) => e.id)).toStrictEqual(['3', '2'])
+  })
+})
+
+describe('useHistoryStore — гонка двух refreshFirst (правки ревью TL-93, второй раунд)', () => {
+  it('applies only the response of the most recently started refreshFirst, even if it resolves before an older, still in-flight one', async () => {
+    const store = useHistoryStore()
+
+    let resolveOlder: ((page: HistoryPage) => void) | undefined
+    invokeMock.mockImplementationOnce(() => new Promise((resolve) => (resolveOlder = resolve)))
+    const olderCall = store.refreshFirst()
+
+    let resolveNewer: ((page: HistoryPage) => void) | undefined
+    invokeMock.mockImplementationOnce(() => new Promise((resolve) => (resolveNewer = resolve)))
+    const newerCall = store.refreshFirst()
+
+    // Более новый запрос отвечает первым по часам стенда...
+    resolveNewer!({ entries: [entry({ id: 'newer' })], notices: [] } satisfies HistoryPage)
+    await newerCall
+    expect(store.entries.map((e) => e.id)).toStrictEqual(['newer'])
+
+    // ...а более старый — только теперь. Его ответ обязан быть отброшен
+    // целиком: применить его значило бы откатить экран к устаревшим данным.
+    resolveOlder!({ entries: [entry({ id: 'older' })], notices: [] } satisfies HistoryPage)
+    await olderCall
+
+    expect(store.entries.map((e) => e.id)).toStrictEqual(['newer'])
+  })
+
+  it('discards a stale rejection the same way it discards a stale resolve', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const store = useHistoryStore()
+
+    let rejectOlder: ((err: unknown) => void) | undefined
+    invokeMock.mockImplementationOnce(() => new Promise((_resolve, reject) => (rejectOlder = reject)))
+    const olderCall = store.refreshFirst()
+
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: 'newer' })], notices: [] } satisfies HistoryPage)
+    await store.refreshFirst()
+    expect(store.entries.map((e) => e.id)).toStrictEqual(['newer'])
+
+    rejectOlder!(new Error('stale ipc failure'))
+    await olderCall.catch(() => undefined)
+
+    // Устаревший отказ не должен ни включить `ipcFailure`, ни стереть уже
+    // применённые новые данные.
+    expect(store.ipcFailure).toBe(false)
+    expect(store.entries.map((e) => e.id)).toStrictEqual(['newer'])
+  })
+
+  it('one invoke("history_page") call per queue://changed event, no extra calls from the race guard itself', async () => {
+    invokeMock.mockResolvedValue({ entries: [], notices: [] } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+    invokeMock.mockClear()
+
+    for (let i = 0; i < 5; i++) emitQueueChanged()
+    await vi.waitFor(() => expect(invokeMock).toHaveBeenCalledTimes(5))
+    expect(invokeMock.mock.calls.every(([cmd]) => cmd === 'history_page')).toBe(true)
   })
 })
 
@@ -168,17 +370,24 @@ describe('useHistoryStore — живая зона (дизайн E5, «Досту
     expect(store.liveAnnouncement).toBe('')
   })
 
-  it('announces once a genuinely new entry arrives via queue://changed after the first load', async () => {
+  it('announces once, naming the entry, when a genuinely new record arrives via queue://changed after the first load', async () => {
     invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
     const store = useHistoryStore()
     await store.initialize()
     expect(store.liveAnnouncement).toBe('')
 
-    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '2' }), entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    invokeMock.mockResolvedValueOnce({
+      entries: [entry({ id: '2', title: 'Новый ролик' }), entry({ id: '1' })],
+      notices: [],
+    } satisfies HistoryPage)
     emitQueueChanged()
     await vi.waitFor(() => expect(store.entries).toHaveLength(2))
 
-    expect(store.liveAnnouncement).toBe('Добавлена новая запись')
+    // Мелочи правок ревью TL-93 (второй раунд): текст меняется с
+    // названием — та же строка `"Добавлена новая запись"` дважды подряд
+    // не была бы замечена скринридером (aria-live озвучивает изменение
+    // текста, не факт присваивания одного и того же значения).
+    expect(store.liveAnnouncement).toContain('Новый ролик')
   })
 
   it('stays silent when queue://changed fires but nothing genuinely new arrived', async () => {
@@ -209,7 +418,7 @@ describe('useHistoryStore — живая зона (дизайн E5, «Досту
   })
 })
 
-describe('useHistoryStore — пометки (Ф-3/С-10)', () => {
+describe('useHistoryStore — пометки (Ф-3/С-10, Б-1 правки ревью TL-93, второй раунд)', () => {
   it('shows both notices at once when both arrive together (mutation: taking only the first must fail this)', async () => {
     invokeMock.mockResolvedValueOnce({
       entries: [],
@@ -250,6 +459,28 @@ describe('useHistoryStore — пометки (Ф-3/С-10)', () => {
 
     expect(store.notices).toStrictEqual([{ kind: 'baseRecreated' }])
   })
+
+  it('R5 (исправлено): пометка не гаснет сама на следующем пустом queue://changed — уходит только через dismissNotice', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [], notices: [] } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+
+    invokeMock.mockResolvedValueOnce({
+      entries: [entry({ id: '1' })],
+      notices: [{ kind: 'lastWriteFailed', cause: 'diskFull' }],
+    } satisfies HistoryPage)
+    emitQueueChanged() // Done зафиксирован, пометка приходит
+    await vi.waitFor(() => expect(store.notices).toHaveLength(1))
+
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    emitQueueChanged() // следующее событие очереди — пустой ответ без пометок
+    await vi.waitFor(() => expect(invokeMock).toHaveBeenCalledTimes(3))
+
+    expect(store.notices).toStrictEqual([{ kind: 'lastWriteFailed', cause: 'diskFull' }])
+
+    store.dismissNotice('lastWriteFailed')
+    expect(store.notices).toStrictEqual([])
+  })
 })
 
 describe('useHistoryStore.deleteRecord', () => {
@@ -265,7 +496,7 @@ describe('useHistoryStore.deleteRecord', () => {
     expect(store.entries.map((e) => e.id)).toStrictEqual(['2'])
   })
 
-  it('keeps the row and records a typed commandError on unknownRecord', async () => {
+  it('С-3 (правки ревью TL-93, второй раунд): unknownRecord removes the row silently — no commandError, the goal (row gone) is already achieved', async () => {
     invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
     const store = useHistoryStore()
     await store.initialize()
@@ -273,8 +504,33 @@ describe('useHistoryStore.deleteRecord', () => {
     invokeMock.mockRejectedValueOnce({ kind: 'unknownRecord', message: 'diag' })
     await store.deleteRecord('1')
 
+    expect(store.entries).toStrictEqual([])
+    expect(store.commandError).toBeUndefined()
+  })
+
+  it('records a typed commandError on writeFailed and keeps the row', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+
+    invokeMock.mockRejectedValueOnce({ kind: 'writeFailed', message: 'diag' })
+    await store.deleteRecord('1')
+
     expect(store.entries.map((e) => e.id)).toStrictEqual(['1'])
-    expect(store.commandError).toStrictEqual({ kind: 'unknownRecord', message: 'diag' })
+    expect(store.commandError).toStrictEqual({ kind: 'writeFailed', message: 'diag' })
+  })
+
+  it('мелочи (правки ревью TL-93, второй раунд): unavailable blocks the whole screen, the same way history_page does — no commandError banner', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+
+    invokeMock.mockRejectedValueOnce({ kind: 'unavailable', reason: 'noAccess', message: 'diag' })
+    await store.deleteRecord('1')
+
+    expect(store.availability).toStrictEqual({ reason: 'noAccess', message: 'diag' })
+    expect(store.commandError).toBeUndefined()
+    expect(store.entries.map((e) => e.id)).toStrictEqual(['1'])
   })
 })
 
@@ -306,6 +562,19 @@ describe('useHistoryStore.clearHistory', () => {
 
     expect(store.entries).toHaveLength(1)
     expect(store.commandError).toStrictEqual({ kind: 'writeFailed', message: 'diag' })
+  })
+
+  it('мелочи (правки ревью TL-93, второй раунд): unavailable blocks the whole screen instead of a commandError banner', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+
+    invokeMock.mockRejectedValueOnce({ kind: 'unavailable', reason: 'migrationFailed', message: 'diag' })
+    await store.clearHistory()
+
+    expect(store.availability).toStrictEqual({ reason: 'migrationFailed', message: 'diag' })
+    expect(store.commandError).toBeUndefined()
+    expect(store.entries).toHaveLength(1)
   })
 })
 
@@ -354,5 +623,31 @@ describe('useHistoryStore.showInFolder', () => {
     await store.showInFolder(store.entries[0]!)
 
     expect(store.showInFolderErrors['1']).toStrictEqual({ kind: 'launcherFailed', details: { exitCode: 1 }, message: 'diag' })
+  })
+
+  it('С-3 (правки ревью TL-93, второй раунд): unknownRecord marks the row goneFromHistory and re-requests the first page, instead of advising to "refresh history"', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+
+    invokeMock.mockRejectedValueOnce({ kind: 'unknownRecord', message: 'diag' })
+    invokeMock.mockResolvedValueOnce({ entries: [], notices: [] } satisfies HistoryPage)
+    await store.showInFolder(store.entries[0]!)
+    await vi.waitFor(() => expect(invokeMock).toHaveBeenCalledTimes(3))
+
+    expect(store.showInFolderErrors['1']).toStrictEqual({ kind: 'goneFromHistory' })
+    expect(invokeMock).toHaveBeenLastCalledWith('history_page', { cursor: undefined })
+  })
+
+  it('мелочи (правки ревью TL-93, второй раунд): unavailable blocks the whole screen instead of a per-row error', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const store = useHistoryStore()
+    await store.initialize()
+
+    invokeMock.mockRejectedValueOnce({ kind: 'unavailable', reason: 'noAccess', message: 'diag' })
+    await store.showInFolder(store.entries[0]!)
+
+    expect(store.availability).toStrictEqual({ reason: 'noAccess', message: 'diag' })
+    expect(store.showInFolderErrors['1']).toBeUndefined()
   })
 })

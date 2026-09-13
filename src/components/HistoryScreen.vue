@@ -9,14 +9,28 @@
  * Состояние и все вызовы `invoke` живут в `useHistoryStore` (один Pinia-стор
  * на домен, CLAUDE.md) — компонент только читает срез стора и эмитит клики
  * в его действия, тот же приём, что `QueueSection`/`downloadTaskStore`.
+ *
+ * # Обновление первой страницы по активации вкладки (Б-2/С-1, правки ревью
+ * TL-93, второй раунд)
+ *
+ * `App.vue` держит все три панели смонтированными постоянно (`v-show`,
+ * К-14) — у `HistoryScreen` поэтому нет своего события «монтирования при
+ * переходе на вкладку», и решение ведущего подключить обновление первой
+ * страницы «при активации вкладки «История»» реализовано пропом
+ * `active: boolean` (`App.vue` передаёт `activeTab === 'history'`), а не
+ * вторым `onMounted`/`watch(() => ...)` внутри самого `App.vue`, читающим
+ * приватности стора извне: компонент, которому нужно действие, сам решает,
+ * когда его вызвать, `App.vue` лишь сообщает факт «эта вкладка теперь
+ * видна» — тот же приём, что уже передаёт эту секцию через `v-show`.
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 
 import { useHistoryStore } from '@/stores/history'
 import type { HistoryEntry } from '@/types/generated/history'
 import { getFolderDisplayText } from '@/utils/downloadOutcomeTexts'
 import { fileContainer } from '@/utils/fileContainer'
-import { formatApproxSize } from '@/utils/formatApproxSize'
+import { formatExactSize } from '@/utils/formatExactSize'
+import { formatHistoryMessage } from '@/utils/formatHistoryMessage'
 import { formatRelativeTime } from '@/utils/formatRelativeTime'
 import {
   getHistoryCommandErrorText,
@@ -24,10 +38,11 @@ import {
 } from '@/utils/historyCommandErrorTexts'
 import { getHistoryFileStatusText } from '@/utils/historyFileStatusTexts'
 import { getHistoryNoticeText } from '@/utils/historyNoticeTexts'
-import { getHistoryUnavailableText } from '@/utils/historyUnavailableTexts'
+import { getHistoryUnavailableText, HISTORY_IPC_FAILURE_TEXT } from '@/utils/historyUnavailableTexts'
 import {
   getLauncherFailureDetails,
   getShowInFolderErrorText,
+  HISTORY_ROW_GONE_TEXT,
   NON_CONTRACTUAL_SHOW_IN_FOLDER_ERROR_TEXT,
 } from '@/utils/historyShowInFolderTexts'
 import { formatTaskDisplayTitle } from '@/utils/queueTaskTitle'
@@ -35,16 +50,56 @@ import { unixSecsToIso } from '@/utils/unixSecsToIso'
 
 import ClearHistoryConfirmDialog from './ClearHistoryConfirmDialog.vue'
 
+const props = withDefaults(
+  defineProps<{
+    /** Активна ли сейчас вкладка «История» (`App.vue`, `activeTab === 'history'`) — см. doc-класса выше. */
+    active?: boolean
+  }>(),
+  {
+    // По умолчанию `false` — тесты, которым переход между вкладками
+    // безразличен (большинство `HistoryScreen.test.ts`), монтируют
+    // компонент без этого пропа вовсе; `App.vue` всегда передаёт его явно.
+    active: false,
+  },
+)
+
+const emit = defineEmits<{
+  /**
+   * С-7 (правки ревью TL-93, второй раунд): «если записей нет — на
+   * заголовок экрана». Заголовок `<h2>История</h2>` — узел `App.vue`
+   * (К-14), этот компонент не владеет им и не должен: эмит — то же
+   * разделение ответственности, что и у пропа `active` выше, только в
+   * обратную сторону (ребёнок просит родителя подвинуть фокус на элемент,
+   * которым родитель управляет).
+   */
+  requestHeadingFocus: []
+}>()
+
 const store = useHistoryStore()
 
 onMounted(() => {
   void store.initialize()
 })
 
+/**
+ * Активация вкладки «История» перезапрашивает первую страницу (решение
+ * ведущего, ревью TL-93, второй раунд, п. 7) — `watch`, не `immediate`:
+ * самая первая загрузка уже покрыта `onMounted` выше независимо от того,
+ * какая вкладка активна изначально («Главный»); здесь важен только
+ * переход `false → true`, переход в обратную сторону (уход со вкладки)
+ * ничего не запрашивает.
+ */
+watch(
+  () => props.active,
+  (isActive) => {
+    if (isActive) void store.refreshFirst()
+  },
+)
+
 function entryMetaLine(entry: HistoryEntry): string {
   const parts = [
     fileContainer(entry.fileName),
-    formatApproxSize({ kind: 'known', bytes: entry.sizeBytes }),
+    formatExactSize(entry.sizeBytes),
     formatRelativeTime(unixSecsToIso(entry.finishedAtUnixSecs)),
   ].filter((part) => part.length > 0)
   return parts.join(' · ')
@@ -64,22 +119,27 @@ function deleteAriaLabel(entry: HistoryEntry): string {
   return `Удалить запись ${formatTaskDisplayTitle(entry.title, entry.quality)} из истории`
 }
 
-function showInFolderErrorText(entry: HistoryEntry) {
+/** Готовая строка построчной ошибки «Показать в папке» (С-4: форма «Заголовок: пояснение», без двоеточия при пустом пояснении). */
+function showInFolderErrorMessage(entry: HistoryEntry): string | undefined {
   const failure = store.showInFolderErrors[entry.id]
   if (!failure) return undefined
-  return failure.kind === undefined ? NON_CONTRACTUAL_SHOW_IN_FOLDER_ERROR_TEXT : getShowInFolderErrorText(failure)
+  if (failure.kind === 'goneFromHistory') return HISTORY_ROW_GONE_TEXT
+  const text = failure.kind === undefined ? NON_CONTRACTUAL_SHOW_IN_FOLDER_ERROR_TEXT : getShowInFolderErrorText(failure)
+  return formatHistoryMessage(text.title, text.explanation)
 }
 
 function showInFolderErrorDetails(entry: HistoryEntry) {
   const failure = store.showInFolderErrors[entry.id]
-  if (!failure || failure.kind === undefined) return undefined
+  if (!failure || failure.kind === undefined || failure.kind === 'goneFromHistory') return undefined
   return getLauncherFailureDetails(failure)
 }
 
-const commandErrorText = computed(() => {
+/** Готовая строка баннера отказа `delete_history_record`/`clear_history` (С-4, та же форма). */
+const commandErrorMessage = computed(() => {
   const failure = store.commandError
   if (!failure) return undefined
-  return failure.kind === undefined ? NON_CONTRACTUAL_HISTORY_COMMAND_ERROR_TEXT : getHistoryCommandErrorText(failure)
+  const text = failure.kind === undefined ? NON_CONTRACTUAL_HISTORY_COMMAND_ERROR_TEXT : getHistoryCommandErrorText(failure)
+  return formatHistoryMessage(text.title, text.explanation)
 })
 
 /**
@@ -91,14 +151,80 @@ const knownRecordCountForClear = computed(() => (store.nextCursor ? undefined : 
 
 const showClearConfirm = ref(false)
 
-function onClearConfirmed(): void {
+/**
+ * Корень компонента (С-7) — нужен только чтобы после удаления строки
+ * найти кнопки «Удалить» уже обновлённого списка (см.
+ * {@link focusAfterRowRemoval}); искать их через `document` целиком было
+ * бы правильно только в продакшене, но не в модульных тестах, где на
+ * странице бывает не один экземпляр экрана подряд.
+ */
+const rootEl = ref<HTMLElement>()
+
+/**
+ * После «Удалить» (С-7, правки ревью TL-93, второй раунд): фокус уходит на
+ * «Удалить» следующей записи; если следующей нет — на «Удалить»
+ * предыдущей; если записей не осталось вовсе — на заголовок экрана.
+ *
+ * `removedIndex` — позиция удалённой строки в **старом** списке. После
+ * удаления кнопки последующих строк сдвигаются на одну позицию вверх, так
+ * что кнопка на той же позиции `removedIndex` в **новом**, уже
+ * перерисованном списке — это кнопка ровно той записи, что раньше шла
+ * следующей; если удалённая была последней, эта позиция уже вне границ
+ * нового (более короткого) списка, и в дело идёт предыдущая позиция.
+ */
+function focusAfterRowRemoval(removedIndex: number): void {
+  const buttons = rootEl.value?.querySelectorAll<HTMLButtonElement>('.history-screen__delete-button')
+  if (!buttons || buttons.length === 0) {
+    emit('requestHeadingFocus')
+    return
+  }
+  const target = buttons[removedIndex] ?? buttons[removedIndex - 1]
+  target?.focus()
+}
+
+/**
+ * Клик «Удалить» — оборачивает `store.deleteRecord` управлением фокуса
+ * (С-7). Строка не считается удалённой только по факту вызова: отказ
+ * `writeFailed`/неконтрактный сбой оставляет её на месте (см.
+ * `useHistoryStore.deleteRecord`), и тогда фокус не трогается вовсе —
+ * кнопка, на которую только что нажали, никуда не делась.
+ */
+async function onDeleteClick(entry: HistoryEntry): Promise<void> {
+  const removedIndex = store.entries.findIndex((e) => e.id === entry.id)
+  await store.deleteRecord(entry.id)
+  await nextTick()
+  const stillThere = store.entries.some((e) => e.id === entry.id)
+  if (stillThere || removedIndex === -1) return
+  focusAfterRowRemoval(removedIndex)
+}
+
+/**
+ * Подтверждение «Очистить всё» (С-7): фокус на заголовок экрана — не на
+ * то, что вернул бы `ClearHistoryConfirmDialog` сам по себе
+ * (`previouslyFocused.focus()` на кнопке «Очистить» toolbar'а), потому
+ * что после успешной очистки список пуст и toolbar вместе с той кнопкой
+ * пропадает из DOM: `.focus()` на отсоединённом узле не делает ничего, и
+ * фокус тихо падает на `<body>` (ровно так тест ревьюера A2 воспроизводил
+ * дефект). Явный эмит здесь выполняется **после** того, как диалог уже
+ * закрылся и его `onUnmounted` уже попытался восстановить фокус — так что
+ * итоговое состояние всегда одно и то же, независимо от гонки между
+ * закрытием диалога и ответом `clear_history`.
+ */
+async function onClearConfirmed(): Promise<void> {
   showClearConfirm.value = false
-  void store.clearHistory()
+  await store.clearHistory()
+  await nextTick()
+  if (store.entries.length === 0) {
+    emit('requestHeadingFocus')
+  }
 }
 </script>
 
 <template>
-  <div class="history-screen">
+  <div
+    ref="rootEl"
+    class="history-screen"
+  >
     <!--
       Живая зона структурных изменений списка (дизайн E5, «Доступность»):
       «не пересказом содержимого» — короткий текст, не перечитывание всего
@@ -119,18 +245,39 @@ function onClearConfirmed(): void {
       </p>
     </template>
 
+    <!--
+      С-6 (правки ревью TL-93, второй раунд): исключение самого IPC-вызова
+      на первой странице — тоже блокирующее состояние, не «История пуста»
+      (см. doc {@link import('@/utils/historyUnavailableTexts').HISTORY_IPC_FAILURE_TEXT}).
+    -->
+    <template v-else-if="store.ipcFailure">
+      <p class="history-screen__unavailable">
+        {{ HISTORY_IPC_FAILURE_TEXT }}
+      </p>
+    </template>
+
     <template v-else>
       <ul
         v-if="store.notices.length > 0"
         class="history-screen__notices"
       >
+        <!--
+          `role="status"` — не на самом `<li>` (мелочи правок ревью TL-93,
+          второй раунд): роль `status` на элементе списка стирает его
+          неявную роль `listitem`, и скринридер перестаёт видеть список как
+          список (не сообщает «список, N элементов»/номер элемента). Живая
+          зона — на вложенном `<p>` с текстом, `<li>` остаётся обычным
+          пунктом.
+        -->
         <li
           v-for="notice in store.notices"
           :key="notice.kind"
           class="history-screen__banner"
-          role="status"
         >
-          <p class="history-screen__banner-text">
+          <p
+            class="history-screen__banner-text"
+            role="status"
+          >
             ⚠ {{ getHistoryNoticeText(notice) }}
           </p>
           <button
@@ -144,11 +291,11 @@ function onClearConfirmed(): void {
       </ul>
 
       <p
-        v-if="commandErrorText"
+        v-if="commandErrorMessage"
         class="history-screen__command-error"
         role="alert"
       >
-        {{ commandErrorText.title }}: {{ commandErrorText.explanation }}
+        {{ commandErrorMessage }}
         <button
           type="button"
           class="tap-target"
@@ -194,11 +341,11 @@ function onClearConfirmed(): void {
               </p>
 
               <p
-                v-if="showInFolderErrorText(entry)"
+                v-if="showInFolderErrorMessage(entry)"
                 class="history-screen__entry-error"
                 role="alert"
               >
-                {{ showInFolderErrorText(entry)!.title }}: {{ showInFolderErrorText(entry)!.explanation }}
+                {{ showInFolderErrorMessage(entry) }}
               </p>
               <details v-if="showInFolderErrorDetails(entry)">
                 <summary>Подробнее</summary>
@@ -225,9 +372,9 @@ function onClearConfirmed(): void {
                 </button>
                 <button
                   type="button"
-                  class="tap-target"
+                  class="tap-target history-screen__delete-button"
                   :aria-label="deleteAriaLabel(entry)"
-                  @click="store.deleteRecord(entry.id)"
+                  @click="onDeleteClick(entry)"
                 >
                   Удалить
                 </button>

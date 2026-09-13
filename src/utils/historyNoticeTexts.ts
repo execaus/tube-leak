@@ -19,7 +19,7 @@ function getWriteFailureReasonText(cause: HistoryWriteFailure): string {
     case 'noAccess':
       return 'нет доступа на запись'
     case 'storageFailed':
-      return 'хранилище истории вернуло отказ'
+      return 'не удалось записать файл истории'
     default:
       return assertNever(cause)
   }

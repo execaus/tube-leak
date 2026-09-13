@@ -688,6 +688,14 @@ watch(showQueueStatusRow, (visible, wasVisible) => {
       Экран истории (TL-93, Ф-4…Ф-6, Ф-8, С-1…С-4, С-10) — заголовок и его
       фокус-цель остаются здесь (К-14), содержимое ниже целиком несёт
       `HistoryScreen`; не зависит от готовности sidecar (дизайн «Навигация»).
+
+      Правки ревью TL-93 (второй раунд): `:active` сообщает `HistoryScreen`
+      о собственной видимости (решение ведущего — перезапрашивать первую
+      страницу и при активации вкладки, не только при монтировании и
+      `queue://changed`; doc-класс `HistoryScreen.vue`), а
+      `@request-heading-focus` — обратная связь для С-7 («Удалить»
+      последней строки/подтверждённая «Очистить» переводят фокус на этот
+      же `<h2>`, которым `HistoryScreen` не владеет).
     -->
     <section
       v-show="activeTab === 'history'"
@@ -701,7 +709,10 @@ watch(showQueueStatusRow, (visible, wasVisible) => {
       >
         История
       </h2>
-      <HistoryScreen />
+      <HistoryScreen
+        :active="activeTab === 'history'"
+        @request-heading-focus="historyHeadingEl?.focus()"
+      />
     </section>
 
     <!--

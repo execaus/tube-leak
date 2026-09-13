@@ -20,7 +20,7 @@ describe('getHistoryNoticeText', () => {
       'Последняя запись не сохранена: нет доступа на запись.',
     )
     expect(getHistoryNoticeText({ kind: 'lastWriteFailed', cause: 'storageFailed' })).toContain(
-      'Последняя запись не сохранена: хранилище истории вернуло отказ.',
+      'Последняя запись не сохранена: не удалось записать файл истории.',
     )
   })
 

@@ -47,7 +47,7 @@ export function getShowInFolderErrorText(kind: ShowInFolderErrorKind): ShowInFol
     case 'unknownRecord':
       return {
         title: 'Запись не найдена',
-        explanation: 'Похоже, список устарел — обновите историю и попробуйте снова.',
+        explanation: 'Похоже, список устарел.',
       }
     case 'unavailable':
       return {
@@ -69,3 +69,15 @@ export const NON_CONTRACTUAL_SHOW_IN_FOLDER_ERROR_TEXT: ShowInFolderErrorText = 
   title: 'Не удалось выполнить команду',
   explanation: 'Не удалось разобрать причину отказа. Попробуйте ещё раз.',
 }
+
+/**
+ * Нейтральное сообщение строки при `unknownRecord` у «Показать в папке»
+ * (С-3, правки ревью TL-93, второй раунд): не совет переключить вкладку
+ * или обновить историю вручную (`useHistoryStore.showInFolder` уже сам
+ * перезапрашивает первую страницу в этот момент, doc-комментарий там же) —
+ * просто факт, без действия, которое пользователю и так не нужно
+ * выполнять руками. Одна строка, без заголовка (нет `explanation` —
+ * {@link import('./formatHistoryMessage').formatHistoryMessage} отдаёт её
+ * как есть, без двоеточия).
+ */
+export const HISTORY_ROW_GONE_TEXT = 'Этой записи больше нет в истории.'
