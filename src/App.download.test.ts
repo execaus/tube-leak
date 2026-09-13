@@ -110,6 +110,11 @@ function routeInvoke(handlersByCommand: Record<string, () => Promise<unknown>>) 
     // дефолт «пусто», явно переданный обработчик той же команды имеет
     // приоритет (тот же приём, что `ytdlp_update_state` в `App.test.ts`).
     queue_state: () => Promise.resolve(EMPTY_QUEUE_SNAPSHOT),
+    // Первая страница истории (эпик E5, TL-93): `HistoryScreen` рендерится
+    // безусловно под вкладкой «История» (`v-show`, К-14) и запрашивает её в
+    // своём `onMounted`, который срабатывает сразу при монтаже `App.vue` —
+    // этот файл не про историю, поэтому дефолт «пусто».
+    history_page: () => Promise.resolve({ entries: [], notices: [] }),
     ...handlersByCommand,
   }
   invokeMock.mockImplementation((command: string) => {

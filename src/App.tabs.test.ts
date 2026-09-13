@@ -108,6 +108,11 @@ function routeInvoke(handlersByCommand: Record<string, () => Promise<unknown>>) 
     // Снимок очереди — дефолт «пусто», явно переданный обработчик той же
     // команды имеет приоритет (тот же приём, что `App.download.test.ts`).
     queue_state: () => Promise.resolve(EMPTY_QUEUE_SNAPSHOT),
+    // Первая страница истории (эпик E5, TL-93): `HistoryScreen` рендерится
+    // безусловно под вкладкой «История» (`v-show`, К-14) и запрашивает её
+    // сразу при монтаже `App.vue`, независимо от активной вкладки — дефолт
+    // «пусто», явно переданный обработчик той же команды имеет приоритет.
+    history_page: () => Promise.resolve({ entries: [], notices: [] }),
     ...handlersByCommand,
   }
   invokeMock.mockImplementation((command: string) => {
@@ -237,7 +242,7 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
     await wrapper.vm.$nextTick()
 
     expect(tabPanel(wrapper, 'tabpanel-history').isVisible()).toBe(true)
-    expect(wrapper.text()).toContain('Здесь появится история завершённых загрузок.')
+    expect(wrapper.text()).toContain('История пуста. Здесь появятся ролики после первой завершённой загрузки.')
 
     resolvePrepare(preparedWarm)
     await flushPromises()
@@ -255,7 +260,7 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
     expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('false')
     expect(tabPanel(wrapper, 'tabpanel-history').isVisible()).toBe(true)
     expect(tabPanel(wrapper, 'tabpanel-main').isVisible()).toBe(false)
-    expect(wrapper.text()).toContain('Здесь появится история завершённых загрузок.')
+    expect(wrapper.text()).toContain('История пуста. Здесь появятся ролики после первой завершённой загрузки.')
 
     const heading = tabPanel(wrapper, 'tabpanel-history').get('h2')
     expect(document.activeElement).toBe(heading.element)
@@ -844,6 +849,58 @@ describe('App — К-14: переключение вкладок не теряе
     const queueStateCallsAfter = invokeMock.mock.calls.filter(([cmd]) => cmd === 'queue_state').length
     expect(queueStateCallsAfter).toBe(queueStateCallsBefore)
   })
+
+  it('a page loaded via «Показать ещё» on «История» (TL-93) survives a trip to «Главный» and back — HistoryScreen is not unmounted, and returning to «История» does refresh the first page (правки ревью TL-93, второй раунд, п. 7)', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      history_page: () =>
+        Promise.resolve({
+          entries: [{ id: '1', videoId: 'a', url: 'u', title: 'A', quality: { kind: 'audioOnly' }, fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' }, sizeBytes: 1, finishedAtUnixSecs: 1, fileStatus: { kind: 'present' } }],
+          nextCursor: { finishedAtUnixSecs: 1, id: '1' },
+          notices: [],
+        }),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    invokeMock.mockImplementationOnce((command: string) => {
+      if (command === 'history_page') {
+        return Promise.resolve({
+          entries: [{ id: '2', videoId: 'b', url: 'u', title: 'B', quality: { kind: 'audioOnly' }, fileName: 'b.mp3', folderDisplay: { kind: 'systemDownloads' }, sizeBytes: 1, finishedAtUnixSecs: 0, fileStatus: { kind: 'present' } }],
+          notices: [],
+        })
+      }
+      throw new Error(`unexpected invoke: ${command}`)
+    })
+    await wrapper.findAll('button').find((b) => b.text() === 'Показать ещё')?.trigger('click')
+    await flushPromises()
+    expect(wrapper.findAll('.history-screen__entry')).toHaveLength(2)
+
+    const historyPageCallsBefore = invokeMock.mock.calls.filter(([cmd]) => cmd === 'history_page').length
+
+    await tabButton(wrapper, 'Главный').trigger('click')
+    await wrapper.vm.$nextTick()
+    await tabButton(wrapper, 'История').trigger('click')
+    await flushPromises()
+
+    // Тот же курсорный «хвост» (id «2», подгруженный «Показать ещё») всё
+    // ещё виден — `HistoryScreen` не был размонтирован (`v-show`, К-14), и
+    // алгоритм сверки первой страницы (Б-2/С-1, doc-класс `useHistoryStore`)
+    // заменяет только префикс списка до последнего id свежей страницы
+    // («1»), не трогая хвост за ним.
+    expect(wrapper.findAll('.history-screen__entry')).toHaveLength(2)
+
+    // Инверсия исходного теста (правки ревью TL-93, второй раунд, п. 7):
+    // возврат на «Историю» **обязан** перезапросить первую страницу —
+    // решение ведущего подключить обновление первой страницы к активации
+    // вкладки, не только к монтированию и `queue://changed`. Мутация
+    // «watch по `props.active` убран» вернула бы это число к
+    // `historyPageCallsBefore` без изменений.
+    const historyPageCallsAfter = invokeMock.mock.calls.filter(([cmd]) => cmd === 'history_page').length
+    expect(historyPageCallsAfter).toBe(historyPageCallsBefore + 1)
+  })
 })
 
 /**
@@ -1004,5 +1061,67 @@ describe('App — одна линия под вкладками, не две (TL
 
     expect(dividersBetweenTabsAndFirstPanel(wrapper)).toBe(1)
     expect(wrapper.find('.queue-status-row + hr').exists()).toBe(true)
+  })
+})
+
+/**
+ * С-7 (правки ревью TL-93, второй раунд): «если записей нет — на заголовок
+ * экрана» / «после подтверждённой «Очистить» — на заголовок экрана».
+ * `HistoryScreen.vue` не владеет узлом `<h2>История</h2>` (он в `App.vue`,
+ * К-14) и эмитит `request-heading-focus`, а не двигает фокус сам —
+ * поэтому конечная проверка (реальный `document.activeElement`) идёт
+ * здесь, на смонтированном целиком `App`, а не в изолированных тестах
+ * `HistoryScreen.test.ts` (там нет самого узла, на который нужно навести
+ * фокус, — см. doc-комментарий этого пропа/эмита в `HistoryScreen.vue`).
+ */
+describe('App — фокус после «Удалить»/«Очистить» на экране истории уходит на заголовок панели (TL-93, правки ревью, второй раунд, С-7)', () => {
+  const oneEntry = {
+    id: '1',
+    videoId: 'a',
+    url: 'u',
+    title: 'A',
+    quality: { kind: 'audioOnly' as const },
+    fileName: 'a.mp3',
+    folderDisplay: { kind: 'systemDownloads' as const },
+    sizeBytes: 1,
+    finishedAtUnixSecs: 1,
+    fileStatus: { kind: 'present' as const },
+  }
+
+  it('deleting the only remaining row moves focus to the История heading', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      history_page: () => Promise.resolve({ entries: [oneEntry], notices: [] }),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await flushPromises()
+
+    invokeMock.mockResolvedValueOnce(undefined)
+    await wrapper.findAll('button').find((b) => b.text() === 'Удалить')?.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.findAll('.history-screen__entry')).toHaveLength(0)
+    expect(document.activeElement).toBe(tabPanel(wrapper, 'tabpanel-history').get('h2').element)
+  })
+
+  it('confirming «Очистить всё» moves focus to the История heading, not to the (now gone) «Очистить» button', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      history_page: () => Promise.resolve({ entries: [oneEntry], notices: [] }),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await flushPromises()
+
+    await wrapper.findAll('button').find((b) => b.text() === 'Очистить')?.trigger('click')
+    invokeMock.mockResolvedValueOnce(undefined)
+    await wrapper.findAll('button').find((b) => b.text() === 'Очистить всё')?.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('История пуста')
+    expect(document.activeElement).toBe(tabPanel(wrapper, 'tabpanel-history').get('h2').element)
   })
 })
