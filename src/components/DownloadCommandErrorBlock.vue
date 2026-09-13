@@ -75,7 +75,7 @@ const text = computed(() =>
   margin: 0 0 0.75rem;
   max-width: 40rem;
   line-height: 1.4;
-  color: #333;
+  color: var(--color-text-secondary);
 }
 
 .download-command-error__actions {
@@ -94,7 +94,7 @@ const text = computed(() =>
 }
 
 .tap-target:focus-visible {
-  outline: 2px solid #1a73e8;
+  outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
 </style>

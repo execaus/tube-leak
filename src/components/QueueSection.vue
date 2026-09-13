@@ -189,13 +189,13 @@ const resumeBannerText = computed(() =>
 .queue-section__banner {
   padding: 0.75rem;
   margin-bottom: 0.75rem;
-  background: #eef4fd;
+  background: var(--color-accent-soft);
   border-radius: 0.3rem;
 }
 
 .queue-section__banner-text {
   margin: 0 0 0.5rem;
-  color: #333;
+  color: var(--color-text-secondary);
 }
 
 .queue-section__pause {
@@ -203,7 +203,7 @@ const resumeBannerText = computed(() =>
   align-items: center;
   gap: 0.5rem;
   margin: 0.75rem 0;
-  color: #555;
+  color: var(--color-text-muted);
 }
 
 .queue-section__list {
@@ -217,7 +217,7 @@ const resumeBannerText = computed(() =>
 }
 
 .queue-section__task--active {
-  border-left: 3px solid #1a73e8;
+  border-left: 3px solid var(--color-accent);
   padding-left: 0.75rem;
 }
 
@@ -248,7 +248,7 @@ const resumeBannerText = computed(() =>
 }
 
 .tap-target:focus-visible {
-  outline: 2px solid #1a73e8;
+  outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
 </style>

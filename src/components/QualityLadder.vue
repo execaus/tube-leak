@@ -104,7 +104,7 @@ function select(index: number): void {
 }
 
 .ladder__row:focus-within {
-  outline: 2px solid #1a73e8;
+  outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
 
@@ -119,7 +119,7 @@ function select(index: number): void {
 }
 
 .ladder__size {
-  color: #555;
+  color: var(--color-text-muted);
 }
 
 .tap-target {

@@ -71,7 +71,7 @@ const statusText = computed(() => getWaitingStatusText(props.aheadCount, props.a
 <style scoped>
 .queue-waiting-row {
   padding: 0.75rem 0;
-  border-bottom: 1px solid #eee;
+  border-bottom: 1px solid var(--color-border-subtle);
 }
 
 .queue-waiting-row__title {
@@ -81,7 +81,7 @@ const statusText = computed(() => getWaitingStatusText(props.aheadCount, props.a
 
 .queue-waiting-row__status {
   margin: 0 0 0.5rem;
-  color: #555;
+  color: var(--color-text-muted);
 }
 
 .queue-waiting-row__actions {
@@ -100,7 +100,7 @@ const statusText = computed(() => getWaitingStatusText(props.aheadCount, props.a
 }
 
 .tap-target:focus-visible {
-  outline: 2px solid #1a73e8;
+  outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
 </style>

@@ -303,7 +303,7 @@ function toggleDetails(): void {
 }
 
 .tap-target:focus-visible {
-  outline: 2px solid #1a73e8;
+  outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
 
@@ -312,7 +312,7 @@ function toggleDetails(): void {
   padding: 0.5rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.8rem;
-  background: rgba(0, 0, 0, 0.04);
+  background: var(--color-surface-subtle);
   white-space: pre-wrap;
   word-break: break-word;
 }

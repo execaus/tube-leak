@@ -139,7 +139,7 @@ function onKeydown(event: KeyboardEvent): void {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.35);
+  background: var(--color-overlay);
   z-index: 100;
 }
 
@@ -147,9 +147,9 @@ function onKeydown(event: KeyboardEvent): void {
   max-width: 28rem;
   margin: 1rem;
   padding: 1.25rem;
-  background: #fff;
+  background: var(--color-surface);
   border-radius: 0.5rem;
-  box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, 0.25);
+  box-shadow: 0 0.5rem 1.5rem var(--color-shadow);
 }
 
 .exit-confirm-dialog__heading {
@@ -160,7 +160,7 @@ function onKeydown(event: KeyboardEvent): void {
 .exit-confirm-dialog__body {
   margin: 0 0 1rem;
   line-height: 1.4;
-  color: #333;
+  color: var(--color-text-secondary);
 }
 
 .exit-confirm-dialog__actions {
@@ -180,21 +180,21 @@ function onKeydown(event: KeyboardEvent): void {
 }
 
 .tap-target:focus-visible {
-  outline: 2px solid #1a73e8;
+  outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
 
 .exit-confirm-dialog__stay {
   font-weight: 600;
-  border: 1px solid #1a73e8;
-  background: #1a73e8;
-  color: #fff;
+  border: 1px solid var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-on-accent);
   border-radius: 0.3rem;
 }
 
 .exit-confirm-dialog__exit {
   border: none;
   background: transparent;
-  color: #b3261e;
+  color: var(--color-error);
 }
 </style>

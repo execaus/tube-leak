@@ -148,13 +148,13 @@ function onDownloadClick(): void {
 
 .video-card__channel {
   margin: 0 0 0.25rem;
-  color: #555;
+  color: var(--color-text-muted);
   font-size: 0.9rem;
 }
 
 .video-card__duration {
   margin: 0;
-  color: #555;
+  color: var(--color-text-muted);
 }
 
 .video-card__download {
@@ -172,7 +172,7 @@ function onDownloadClick(): void {
 }
 
 .tap-target:focus-visible {
-  outline: 2px solid #1a73e8;
+  outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
 </style>
