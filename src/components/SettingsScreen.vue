@@ -19,7 +19,7 @@
  * теперь видна», а решение перезапросить настройки принимает сам компонент
  * (тот же приём, что и у `HistoryScreen.vue`, doc-класс там же).
  */
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import { pickDestinationFolder } from '@/composables/usePickFolder'
 import { useSettingsStore } from '@/stores/settings'
@@ -50,6 +50,17 @@ watch(
   },
 )
 
+/**
+ * `useSettingsStore` — глобальный Pinia-стор (переживает уход с вкладки,
+ * К-14), а не эффект-скоуп этого компонента — таймер debounce живого
+ * примера, поставленный `store.requestPreview`, сам по себе не погашен
+ * размонтированием экрана (правка ревью TL-94, R6: без этого вызова
+ * `preview_name_template` улетает и после ухода со «Настроек»).
+ */
+onUnmounted(() => {
+  store.cancelPreview()
+})
+
 /** Пометка «сброшено к умолчанию» у конкретного поля (дизайн, п. 3) — не показывается вместе с общим баннером `wholeFileReset`, у которого пострадал сам факт чтения, а не отдельное значение. */
 function isFieldReset(field: SettingsField): boolean {
   return !store.wholeFileReset && store.resetFields.includes(field)
@@ -62,20 +73,57 @@ const FIELD_RESET_BADGE_TEXT = 'Сброшено к значению по умо
 const folderPathText = computed(() => (store.settings ? getDestinationFolderPathText(store.settings.destinationFolder) : ''))
 const canResetFolder = computed(() => store.settings?.destinationFolder.kind === 'custom')
 const folderMissingWarningVisible = computed(() => store.settings !== undefined && !store.destinationFolderExists)
+/**
+ * Предупреждение о длине пути (Ф-11, порог 200) — считает скаляры Unicode
+ * (`[...path].length`), не единицы UTF-16 (`.length`): ядро (правило
+ * ревью TL-87, единое для всех пределов E5) считает так же, и путь с
+ * эмодзи/суррогатными парами не должен предупреждать раньше или позже,
+ * чем реальный предел.
+ */
 const folderLengthWarningVisible = computed(() => {
   const folder = store.settings?.destinationFolder
-  return folder !== undefined && folder.kind === 'custom' && folder.path.length > 200
+  return folder !== undefined && folder.kind === 'custom' && [...folder.path].length > 200
 })
 const folderErrorText = computed(() => (store.folderError ? getFolderSaveErrorText(store.folderError) : undefined))
 
+const pickFolderButtonEl = ref<HTMLButtonElement>()
+
+/**
+ * Отказ самого диалога (правка ревью TL-94): до регистрации плагина в
+ * Rust (TL-84) `open()` из `@tauri-apps/plugin-dialog` бросает исключение
+ * на собранном приложении — тот же путь воспроизводится тестом на
+ * замоканном `pickDestinationFolder`. Молчаливый провал здесь неотличим
+ * от «пользователь ничего не нажал», поэтому исключение показывается тем
+ * же способом, что и остальные ошибки поля (`role="alert"`).
+ */
+const folderDialogErrorVisible = ref(false)
+
 async function onPickFolder(): Promise<void> {
-  const path = await pickDestinationFolder()
+  let path: string | null
+  try {
+    path = await pickDestinationFolder()
+  } catch (err) {
+    console.error('pickDestinationFolder rejected', err)
+    folderDialogErrorVisible.value = true
+    return
+  }
+  folderDialogErrorVisible.value = false
   if (path === null) return
   await store.setDestinationFolder({ kind: 'custom', path })
 }
 
+/**
+ * После успешного сброса кнопка «Сбросить к «Загрузки»» пропадает из DOM
+ * (`v-if` на {@link canResetFolder}) — если на ней был фокус, он молча
+ * падает на `<body>`; фокус переносится на «Выбрать папку…» (правка
+ * ревью TL-94, «Фокус»).
+ */
 async function onResetFolder(): Promise<void> {
-  await store.setDestinationFolder({ kind: 'system' })
+  const ok = await store.setDestinationFolder({ kind: 'system' })
+  if (ok) {
+    await nextTick()
+    pickFolderButtonEl.value?.focus()
+  }
 }
 
 // --- Шаблон имени файла (Ф-12, С-7) -------------------------------------
@@ -111,6 +159,7 @@ watch(
 function onNameTemplateInput(event: Event): void {
   const value = (event.target as HTMLInputElement).value
   nameTemplateDraft.value = value
+  store.clearTemplateError()
   store.requestPreview(value)
 }
 
@@ -120,24 +169,75 @@ const canSaveTemplate = computed(
   () => store.settings !== undefined && nameTemplateDraft.value !== store.settings.nameTemplate && templateClientProblem.value === undefined,
 )
 
-/** Живой пример (дизайн, «Шаблон имени») — приоритет: ошибка последнего ответа `preview_name_template`, затем недоступность, затем успешный результат; пока ответа ещё не было — ничего не показывается. */
+/**
+ * Живой пример (дизайн, «Шаблон имени»). Приоритет (правка ревью TL-94,
+ * п. 1 — «причина запрета показывается раньше, чем «Пример недоступен.»»):
+ * 1. клиентская проверка формы — если она уже запретила «Сохранить»,
+ *    строка объясняет, чем именно плох черновик, не дожидаясь и не
+ *    заслоняясь ответом `preview_name_template` (который на тот же
+ *    невалидный текст обычно тоже приходит отказом, включая заглушку
+ *    `writeFailed` до TL-91 — без этого пункта такой отказ показал бы
+ *    нейтральное «Пример недоступен.» вместо настоящей причины);
+ * 2. ошибка последнего ответа предпросмотра;
+ * 3. нейтральная недоступность;
+ * 4. успешный результат — с оговоркой дизайна о расширении.
+ * Пока ни один пункт не применим (первый показ, черновик пуст и т.п.) —
+ * строка не рисуется вовсе.
+ */
 const previewLine = computed<string | undefined>(() => {
+  if (templateClientProblem.value) return getTemplateProblemText(templateClientProblem.value)
   if (store.previewProblem) return getTemplateProblemText(store.previewProblem)
   if (store.previewUnavailable) return PREVIEW_UNAVAILABLE_TEXT
-  if (store.previewResult !== undefined) return `Пример: «${store.previewResult}»`
+  if (store.previewResult !== undefined) {
+    return `Пример: «${store.previewResult}» (расширение добавит сам загрузчик по итоговому формату)`
+  }
   return undefined
 })
 
 const templateErrorText = computed(() => (store.templateError ? getTemplateSaveErrorText(store.templateError) : undefined))
 
+const templateInputEl = ref<HTMLInputElement>()
+
+/**
+ * После успешного сохранения кнопка «Сохранить» становится недоступной
+ * (черновик снова равен сохранённому значению) — если фокус был на ней
+ * (клик мышью), браузер молча роняет его на `<body>`; переносим на само
+ * поле (правка ревью TL-94, «Фокус»). Для `Enter` в поле это не более чем
+ * идемпотентный повторный `.focus()` — фокус и так остаётся на поле.
+ */
 async function onSaveTemplate(): Promise<void> {
   if (!canSaveTemplate.value) return
-  await store.setNameTemplate(nameTemplateDraft.value)
+  const ok = await store.setNameTemplate(nameTemplateDraft.value)
+  if (ok) {
+    await nextTick()
+    templateInputEl.value?.focus()
+  }
 }
 
+/**
+ * Правка ревью TL-94 (блокирующее решение 1). Наблюдатель за
+ * `store.settings?.nameTemplate` выше молчит, когда ответ `settings_set`
+ * возвращает то же примитивное значение, что было в сторе (умолчание уже
+ * совпадало с сохранённым) — ровно случай «Сбросить», когда сохранённое
+ * значение и так равно умолчанию. Черновик выставляется явно из ответа
+ * (`store.defaults.nameTemplate`, то же значение, что ушло в
+ * `settings_set`), а не через наблюдатель; живой пример запрашивается тем
+ * же немедленным путём, что и обычная синхронизация. Условие
+ * `previousSaved === target` — тот самый случай, когда наблюдатель не
+ * сработает сам: в обычном случае (значения различались) наблюдатель уже
+ * сделал то же самое, и второй, уже свой, запрос предпросмотра здесь не
+ * нужен (без него — двойной вызов `preview_name_template` на один и тот
+ * же черновик, «Экономия вызовов»).
+ */
 async function onResetTemplate(): Promise<void> {
   if (!store.defaults) return
-  await store.setNameTemplate(store.defaults.nameTemplate)
+  const target = store.defaults.nameTemplate
+  const previousSaved = store.settings?.nameTemplate
+  const ok = await store.setNameTemplate(target)
+  if (ok && previousSaved === target) {
+    nameTemplateDraft.value = target
+    store.requestPreview(target, { immediate: true })
+  }
 }
 
 // --- Число попыток (Ф-13, С-8) ------------------------------------------
@@ -155,6 +255,7 @@ const attemptsDraft = ref('')
  */
 function onAttemptsInput(event: Event): void {
   attemptsDraft.value = (event.target as HTMLInputElement).value
+  store.clearAttemptsError()
 }
 
 watch(
@@ -180,17 +281,31 @@ const canIncrementAttempts = computed(() => parsedAttemptsDraft.value === undefi
 function stepAttempts(delta: number): void {
   const base = parsedAttemptsDraft.value ?? store.settings?.maxAttempts ?? 1
   attemptsDraft.value = String(clampAttempts(base + delta))
+  store.clearAttemptsError()
 }
 
+const attemptsInputEl = ref<HTMLInputElement>()
+
+/** См. {@link onSaveTemplate} — тот же перенос фокуса на поле после того, как «Сохранить» стала недоступной. */
 async function onSaveAttempts(): Promise<void> {
   const parsed = parsedAttemptsDraft.value
   if (parsed === undefined) return
-  await store.setMaxAttempts(parsed)
+  const ok = await store.setMaxAttempts(parsed)
+  if (ok) {
+    await nextTick()
+    attemptsInputEl.value?.focus()
+  }
 }
 
+/** См. {@link onResetTemplate} (то же блокирующее решение 1, то же условие «наблюдатель не сработает сам»). Предпросмотра у числа попыток нет — только явная установка черновика. */
 async function onResetAttempts(): Promise<void> {
   if (!store.defaults) return
-  await store.setMaxAttempts(store.defaults.maxAttempts)
+  const target = store.defaults.maxAttempts
+  const previousSaved = store.settings?.maxAttempts
+  const ok = await store.setMaxAttempts(target)
+  if (ok && previousSaved === target) {
+    attemptsDraft.value = String(target)
+  }
 }
 </script>
 
@@ -255,8 +370,16 @@ async function onResetAttempts(): Promise<void> {
         >
           {{ folderErrorText }}
         </p>
+        <p
+          v-if="folderDialogErrorVisible"
+          class="settings-screen__error"
+          role="alert"
+        >
+          Не удалось открыть окно выбора папки.
+        </p>
         <div class="settings-screen__actions">
           <button
+            ref="pickFolderButtonEl"
             type="button"
             class="tap-target"
             :disabled="store.folderSaving"
@@ -290,11 +413,13 @@ async function onResetAttempts(): Promise<void> {
         <div class="settings-screen__actions">
           <input
             id="settings-template-input"
+            ref="templateInputEl"
             type="text"
             :value="nameTemplateDraft"
             aria-describedby="settings-template-help settings-template-error"
             :aria-invalid="templateErrorText !== undefined"
             @input="onNameTemplateInput"
+            @keydown.enter.prevent="onSaveTemplate"
           >
           <button
             type="button"
@@ -349,6 +474,7 @@ async function onResetAttempts(): Promise<void> {
         <div class="settings-screen__actions">
           <input
             id="settings-attempts-input"
+            ref="attemptsInputEl"
             type="number"
             min="1"
             max="20"
@@ -357,6 +483,7 @@ async function onResetAttempts(): Promise<void> {
             aria-describedby="settings-attempts-help settings-attempts-error"
             :aria-invalid="attemptsErrorText !== undefined"
             @input="onAttemptsInput"
+            @keydown.enter.prevent="onSaveAttempts"
           >
           <button
             type="button"

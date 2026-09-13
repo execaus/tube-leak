@@ -109,6 +109,30 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
+  /**
+   * Гасит отложенный `preview_name_template` (правка ревью TL-94, R6):
+   * `useSettingsStore` — глобальный Pinia-стор, он не разбирается
+   * автоматически при размонтировании `SettingsScreen.vue`, а
+   * `setTimeout`, поставленный там {@link requestPreview}, — переживает
+   * экран. Вызывается из `onUnmounted` экрана; заодно проворачивает
+   * поколение, чтобы уже улетевший, но ещё не разрешившийся вызов
+   * `dispatchPreview` не применил результат после ухода со экрана.
+   */
+  function cancelPreview(): void {
+    clearPreviewDebounce()
+    previewGeneration += 1
+  }
+
+  /** Сброс отказа сохранения шаблона по правке черновика (ревью TL-94, п. 8) — старая ошибка не должна переживать пользовательский ввод, который её уже отменяет. */
+  function clearTemplateError(): void {
+    templateError.value = undefined
+  }
+
+  /** То же для числа попыток — см. {@link clearTemplateError}. */
+  function clearAttemptsError(): void {
+    attemptsError.value = undefined
+  }
+
   async function dispatchPreview(myGeneration: number, template: string): Promise<void> {
     try {
       const preview = await invoke<TemplatePreview>(PREVIEW_NAME_TEMPLATE_COMMAND, { template })
@@ -228,6 +252,9 @@ export const useSettingsStore = defineStore('settings', () => {
     previewUnavailable,
     fetchSettings,
     requestPreview,
+    cancelPreview,
+    clearTemplateError,
+    clearAttemptsError,
     setDestinationFolder,
     setNameTemplate,
     setMaxAttempts,

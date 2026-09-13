@@ -849,7 +849,8 @@ For more information, please refer to <http://unlicense.org/>
 ## Прочие зависимости (Rust-крейты и npm-пакеты)
 
 Остальной код приложения (Rust-крейты `tauri`, `serde`, `thiserror`,
-`tokio` и npm-пакеты `vue`, `pinia`, `@tauri-apps/api` и их
+`tokio` и npm-пакеты `vue`, `pinia`, `@tauri-apps/api`,
+`@tauri-apps/plugin-dialog` (MIT OR Apache-2.0) и их
 транзитивные зависимости — см. `src-tauri/Cargo.toml` и
 `package.json`) распространяются под пермиссивными лицензиями
 (преимущественно MIT и/или Apache-2.0), которые не требуют включения

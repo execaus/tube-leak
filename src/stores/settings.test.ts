@@ -185,6 +185,61 @@ describe('requestPreview — race guard (mutation: applying any response makes t
   })
 })
 
+describe('cancelPreview (правка ревью TL-94, R6 — debounce timer переживает размонтирование экрана)', () => {
+  it('prevents a pending debounced preview_name_template from firing at all', async () => {
+    const store = useSettingsStore()
+
+    store.requestPreview('{title}')
+    store.cancelPreview()
+    await vi.advanceTimersByTimeAsync(400)
+
+    expect(invokeMock).not.toHaveBeenCalled()
+  })
+
+  it('makes an in-flight response of the cancelled request a no-op (мутация: убрать проворот поколения — тест краснеет)', async () => {
+    const store = useSettingsStore()
+    let resolveInFlight!: (v: { result: string }) => void
+    invokeMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveInFlight = resolve
+        }),
+    )
+
+    store.requestPreview('{id}', { immediate: true })
+    store.cancelPreview()
+    resolveInFlight({ result: 'stale' })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(store.previewResult).toBeUndefined()
+  })
+})
+
+describe('clearTemplateError / clearAttemptsError (правка ревью TL-94, п. 8)', () => {
+  it('clearTemplateError resets templateError without touching anything else', async () => {
+    const store = useSettingsStore()
+    invokeMock.mockRejectedValueOnce({ kind: 'invalidTemplate', problem: { kind: 'noVariables' }, message: 'diag' })
+    await store.setNameTemplate('plain')
+    expect(store.templateError).toBeDefined()
+
+    store.clearTemplateError()
+
+    expect(store.templateError).toBeUndefined()
+  })
+
+  it('clearAttemptsError resets attemptsError', async () => {
+    const store = useSettingsStore()
+    invokeMock.mockRejectedValueOnce({ kind: 'invalidValue', min: 1, max: 20, message: 'diag' })
+    await store.setMaxAttempts(0)
+    expect(store.attemptsError).toBeDefined()
+
+    store.clearAttemptsError()
+
+    expect(store.attemptsError).toBeUndefined()
+  })
+})
+
 describe('requestPreview — writeFailed (TL-91 stub) shows "unavailable", not a save failure (mutation guard)', () => {
   it('sets previewUnavailable, not previewProblem, on a writeFailed response', async () => {
     invokeMock.mockRejectedValueOnce({ kind: 'writeFailed', message: 'not implemented yet' })
