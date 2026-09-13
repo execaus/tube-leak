@@ -72,6 +72,18 @@
 //! именем. Повтор (автоматический и ручной) заказывает только незабранные
 //! потоки, а повтор после неудачной склейки не запускает yt-dlp вовсе.
 //!
+//! Строка `[info] … Downloading N format(s): a, b` — перечень форматов,
+//! которые yt-dlp **выбрал**. Заказанный формат, которого нет в метаданных,
+//! из него молча выпадает, а процесс выходит с кодом 0 и пустым stderr
+//! (фикстура `single-launch/one-format-missing.json`). Такой поток — класс
+//! `staleFormat`, тот же, что давал до TL-48 отдельный запуск на этот
+//! формат ([`missing_from_selection`]).
+//!
+//! Сторож продвижения на стыке потоков одного запуска заводится заново на
+//! первой строке, назвавшей файл очередного потока (`Destination` или
+//! `has already been downloaded`), — см. doc
+//! [`RetryPolicy::stream_started`].
+//!
 //! # Что видит диск, пока задача идёт
 //!
 //! Потоки качаются **в папку назначения**, под именами вида
@@ -1036,7 +1048,7 @@ pub async fn run_task(
     let mut emitter = Emitter::new(task, sink);
     let started = monotonic_now();
     let end = execute(task, launcher, ffmpeg, &mut emitter, destination).await;
-    let elapsed = started.elapsed();
+    let elapsed = monotonic_now().duration_since(started);
 
     // Подчистка и терминальное событие — в одном месте на все ветки:
     // «что осталось на диске» уезжает на провод фактом, а не догадкой по
@@ -1202,10 +1214,22 @@ async fn execute(
                 stream_file(&work, DownloadStream::Video),
                 stream_file(&work, DownloadStream::Audio),
             ) else {
-                // Оба потока объявлены скачанными, а файла нет: верить
-                // коду завершения больше, чем файловой системе, здесь
-                // не за что.
-                eprintln!("download: потоки скачаны, но файла одного из них нет на диске");
+                // Сюда ведёт одна ветка: запуск кончился кодом 0, формат
+                // в перечне выбранных yt-dlp назвал, а файла потока — нет
+                // (выпавший из перечня формат отсекается раньше классом
+                // `staleFormat`). Что стало с потоком, из вывода не узнать;
+                // склеивать нечего. Класс прежний и повторяемый: повтор
+                // спросит незабранный поток снова.
+                let unnamed: Vec<&str> = work
+                    .jobs
+                    .iter()
+                    .filter(|job| job.file.is_none())
+                    .map(|job| job.format_id.as_str())
+                    .collect();
+                eprintln!(
+                    "download: yt-dlp завершился успешно, но файлов потоков {unnamed:?} не \
+                     назвал — склеивать нечего"
+                );
                 return TaskEnd::Failed(DownloadFailure::MergeFailed {
                     details: no_details(),
                 });
@@ -1244,7 +1268,7 @@ async fn execute(
             // жизни такой задачи не бывает вовсе, и расширение берётся
             // фактическое — то, которое дал скачанному файлу yt-dlp.
             let Some(file) = work.jobs.first().and_then(|job| job.file.clone()) else {
-                eprintln!("download: поток скачан, но файла нет на диске");
+                eprintln!("download: yt-dlp завершился успешно, но файла потока не назвал");
                 return TaskEnd::Failed(DownloadFailure::YtDlpFailure {
                     reason: YtDlpFailureReason::Generic,
                     details: no_details(),
@@ -1400,6 +1424,11 @@ async fn download_attempt(
     // потому, что отказ одного формата не останавливает другой (замер в
     // шапке модуля): код выхода 1 ещё не значит, что не забрано ничего.
     let mut ended = vec![false; work.jobs.len()];
+    // Назван ли уже файл потока в этом запуске — начало потока заводит
+    // сторож заново только один раз (doc [`RetryPolicy::stream_started`]).
+    let mut named = vec![false; work.jobs.len()];
+    // Перечень форматов, которые yt-dlp выбрал, если он его напечатал.
+    let mut selected: Option<Vec<String>> = None;
     // Видел ли этот запуск хоть одну строку прогресса. От него зависит,
     // какой из двух сторожей держит срок, и он же решает, чем стал
     // истёкший срок: зависшей подготовкой или зависшим потоком.
@@ -1450,18 +1479,26 @@ async fn download_attempt(
                     // сторож — продвижения по ней нет.
                     eprintln!("download: строка прогресса не разобрана: {line}");
                 }
+                StdoutLine::SelectedFormats { format_ids } => {
+                    eprintln!("download: yt-dlp выбрал форматы {format_ids:?}");
+                    selected = Some(format_ids.iter().map(|id| (*id).to_owned()).collect());
+                }
                 StdoutLine::Destination { path } => {
-                    attribute_file(work, &pending, Path::new(path));
+                    let owners = attribute_file(work, &pending, Path::new(path));
+                    note_stream_start(policy, &mut named, &owners, now);
                 }
                 StdoutLine::AlreadyDownloaded { path } => {
-                    for index in attribute_file(work, &pending, Path::new(path)) {
+                    let owners = attribute_file(work, &pending, Path::new(path));
+                    note_stream_start(policy, &mut named, &owners, now);
+                    for index in owners {
                         eprintln!(
                             "download: поток {} уже был скачан целиком",
                             work.jobs[index].format_id
                         );
                         ended[index] = true;
                         // Поток, который качать не пришлось, не присылает
-                        // ни одной строки прогресса — включая `finished`.
+                        // ни одной строки `downloading`, а `finished` следом
+                        // бывает не при любых аргументах (замер TL-48).
                         // Закрывается он здесь, а не по концу процесса:
                         // процесс ещё качает соседний поток, и его процент
                         // иначе упирался бы в 99 до самого конца.
@@ -1551,6 +1588,30 @@ async fn download_attempt(
         }
     };
 
+    // Р-1 ревью TL-48: заказанный формат, которого yt-dlp не выбрал, не
+    // появится ни на каком повторе. До TL-48 отдельный запуск на него сразу
+    // давал `staleFormat`; здесь тот же класс выводится из перечня. Поверх
+    // успеха и поверх обрыва — но не поверх содержательного отказа: его
+    // класс точнее.
+    if selected.is_none() && matches!(verdict, AttemptRun::Completed) {
+        eprintln!(
+            "download: перечня выбранных форматов в выводе не было — выпадение формата \
+             проверить нечем"
+        );
+    }
+    let missing = missing_from_selection(work, &pending, selected.as_deref());
+    let verdict = match verdict {
+        AttemptRun::Completed if !missing.is_empty() => stale_format(
+            &missing,
+            DownloadErrorDetails {
+                stderr_tail: stderr_tail(&run.stderr),
+                exit_code: run.exit_code,
+            },
+        ),
+        AttemptRun::Interrupted(details) if !missing.is_empty() => stale_format(&missing, details),
+        other => other,
+    };
+
     settle_streams(
         work,
         &pending,
@@ -1558,6 +1619,59 @@ async fn download_attempt(
         matches!(verdict, AttemptRun::Completed),
     );
     verdict
+}
+
+/// Заказанные этой попыткой форматы, которых yt-dlp не выбрал (Р-1 ревью
+/// TL-48).
+///
+/// Решается только по перечню `[info] … Downloading N format(s): …`: нет
+/// перечня в выводе — нет и вывода о выборе, и поток идёт прежней веткой.
+/// Формат, названный в перечне, сюда не попадает, даже если файла его
+/// yt-dlp так и не назвал.
+fn missing_from_selection(
+    work: &TaskWork,
+    pending: &[usize],
+    selected: Option<&[String]>,
+) -> Vec<String> {
+    let Some(selected) = selected else {
+        return Vec::new();
+    };
+    pending
+        .iter()
+        .map(|&index| &work.jobs[index].format_id)
+        .filter(|format_id| !selected.contains(format_id))
+        .cloned()
+        .collect()
+}
+
+fn stale_format(missing: &[String], details: DownloadErrorDetails) -> AttemptRun {
+    eprintln!(
+        "download: yt-dlp не выбрал заказанные форматы {missing:?} — в метаданных ролика их \
+         больше нет"
+    );
+    AttemptRun::Failed(DownloadFailure::StaleFormat { details })
+}
+
+/// Сообщает сторожу о начале потоков, файл которых назван в этом запуске
+/// впервые (М-2 ревью TL-48).
+///
+/// Граница — именно первая строка, называющая файл потока: `Destination`
+/// или `has already been downloaded`. До TL-48 с неё начинался новый
+/// процесс с полным сроком. Повтор той же строки срок не продлевает, так
+/// что замерший процесс не может жить на собственных строках.
+///
+/// Строки постпроцессоров (`[FixupM4a]` и подобные) границей не считаются.
+/// Снято с ffmpeg в `PATH`: постпроцессор потока идёт после его `finished`
+/// и до `Destination` следующего, то есть живёт в сроке от последнего байта
+/// своего потока — ровно как до TL-48, когда он шёл в том же процессе перед
+/// выходом.
+fn note_stream_start(policy: &mut RetryPolicy, named: &mut [bool], owners: &[usize], now: Instant) {
+    for &index in owners {
+        if !named[index] {
+            named[index] = true;
+            policy.stream_started(now);
+        }
+    }
 }
 
 /// Приписывает файл, названный yt-dlp, тем заказанным в этой попытке
@@ -1596,23 +1710,23 @@ fn attribute_file(work: &mut TaskWork, pending: &[usize], path: &Path) -> Vec<us
 /// (`ended`: `finished` его формата или `has already been downloaded` с
 /// его именем). Одного кода мало в обе стороны: при коде 1 соседний
 /// поток мог быть забран целиком, а при коде 0 без названного файла
-/// склеивать нечего — такой поток остаётся незабранным, и повтор снова
-/// спросит его у yt-dlp, который назовёт файл строкой `has already been
-/// downloaded`, вместо вечного отказа склейки на пустом месте.
+/// склеивать нечего. Формат, выпавший из перечня выбранных, сюда уже не
+/// доходит — его отсёк [`missing_from_selection`]. Остаётся названный в
+/// перечне, но без файла: что с ним случилось, из вывода не узнать, поток
+/// остаётся незабранным, и повтор спросит его снова.
 fn settle_streams(work: &mut TaskWork, pending: &[usize], ended: &[bool], completed: bool) {
     for &index in pending {
         let job = &mut work.jobs[index];
         if job.file.is_some() && (completed || ended[index]) {
             job.done = true;
-            // Поток, который качать не пришлось, не присылает ни одной
-            // строки прогресса — включая `finished`. Без этой отметки
-            // повтор после неудачной склейки навсегда упирался бы в
-            // неполный процент.
+            // Поток, забранный кодом 0 без собственной строки `finished`,
+            // иначе так и остался бы в агрегаторе незакрытым, и повтор
+            // после неудачной склейки упирался бы в неполный процент.
             work.aggregator.mark_complete(&job.format_id);
         } else if completed {
             eprintln!(
-                "download: запуск завершился успешно, но файла потока {} yt-dlp не назвал — \
-                 поток не считается забранным",
+                "download: запуск завершился с кодом 0, формат {} yt-dlp выбрал, но файла \
+                 потока не назвал — поток не считается забранным, повтор спросит его снова",
                 job.format_id
             );
         }
@@ -1742,10 +1856,19 @@ impl Cleanup {
 /// поток мимо yt-dlp, и склейка отказывала бы на отсутствующем файле при
 /// каждом следующем повторе. С одним запуском на задачу (TL-48) это не
 /// экзотика: один поток бывает забран раньше, чем отказал соседний.
+///
+/// Вместе с отметкой забывается и то, что агрегатор насчитал по потоку
+/// (Р-2 ревью TL-48): байты, признак конца, показанный процент. Иначе
+/// повтор с нуля не давал бы сторожу продвижения, пока не перерастёт
+/// удалённый объём, и снимался бы на здоровой загрузке, а процент стоял бы
+/// на удалённом. Отдельная политика повторов на каждый запуск задачи
+/// (`execute`) при этом уже начинается с нуля — старого высокого уровня
+/// байт в ней нет.
 fn forget_streams(work: &mut TaskWork) {
     for job in &mut work.jobs {
         job.done = false;
         job.file = None;
+        work.aggregator.forget_stream(&job.format_id);
     }
 }
 

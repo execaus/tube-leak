@@ -295,6 +295,26 @@ impl RetryPolicy {
         self.attempt_running = true;
     }
 
+    /// Внутри идущей попытки начался очередной поток: сторож продвижения
+    /// отсчитывается заново.
+    ///
+    /// С TL-48 попытка — один процесс на оба потока, и между последним
+    /// байтом одного потока и первым байтом следующего лежат постпроцессор
+    /// первого и подключение к новому адресу. До TL-48 следующий поток был
+    /// новым процессом, и этот промежуток держал полный срок от его старта.
+    /// Без этого метода тот же промежуток доставался бы из остатка срока,
+    /// отсчитанного от последнего байта прошлого потока (правка М-2 ревью).
+    ///
+    /// Счётчик попыток не трогается: начало потока — не продвижение (С-6).
+    /// Сколько раз продлевать срок, решает вызывающий; оркестрация зовёт
+    /// метод не больше раза на поток задачи за попытку, поэтому замерший
+    /// процесс продлить себе жизнь этим не может.
+    pub fn stream_started(&mut self, now: Instant) {
+        if self.attempt_running {
+            self.last_progress_at = self.last_progress_at.max(now);
+        }
+    }
+
     /// Учесть суммарное число принятых байт задачи.
     ///
     /// Возвращает `true`, если это продвижение, — тогда счётчик попыток
@@ -574,6 +594,47 @@ mod tests {
     }
 
     #[test]
+    fn the_start_of_the_next_stream_rearms_the_watchdog_without_counting_as_progress() {
+        let base = t0();
+        let mut policy = RetryPolicy::new(base);
+        policy.attempt_started(base);
+        assert!(matches!(
+            policy.attempt_failed(),
+            RetryDecision::Retry { .. }
+        ));
+        assert!(
+            policy.stall_deadline().is_none(),
+            "между попытками сторожить нечего"
+        );
+        policy.stream_started(at(base, 3));
+        assert!(
+            policy.stall_deadline().is_none(),
+            "и начало потока вне попытки срока не заводит"
+        );
+
+        policy.attempt_started(at(base, 10));
+        assert_eq!(policy.stall_deadline(), Some(at(base, 30)));
+
+        // Первый поток ни байта не дал, следующий назван на 25-й секунде.
+        policy.stream_started(at(base, 25));
+        assert_eq!(
+            policy.stall_deadline(),
+            Some(at(base, 45)),
+            "у нового потока полный срок от его начала"
+        );
+        assert!(!policy.is_stalled(at(base, 44)));
+        assert_eq!(
+            policy.attempt().number,
+            2,
+            "начало потока — не продвижение: счётчик попыток после неудачи стоит"
+        );
+
+        // Момент из прошлого срок не укорачивает.
+        policy.stream_started(at(base, 20));
+        assert_eq!(policy.stall_deadline(), Some(at(base, 45)));
+    }
+
+    #[test]
     fn a_fresh_attempt_is_not_born_already_stalled() {
         // Между попытками проходит пауза, и до неё — двадцать секунд
         // тишины. Если бы сторож считал от последнего байта задачи,
@@ -618,8 +679,11 @@ mod tests {
             let now = at(base, index as u64 + 1);
 
             // Как считала бы наивная политика — по сырым байтам строки.
-            if sample.downloaded_bytes > naive_high_water {
-                naive_high_water = sample.downloaded_bytes;
+            let raw = sample
+                .downloaded_bytes
+                .expect("у снятой загрузки счётчик есть на каждой строке");
+            if raw > naive_high_water {
+                naive_high_water = raw;
                 naive_run = 0;
             } else {
                 naive_run += 1;
@@ -695,7 +759,12 @@ mod tests {
 
             aggregator.apply(sample);
             policy.observe(aggregator.received_bytes(), now);
-            naive.observe(sample.downloaded_bytes, now);
+            naive.observe(
+                sample
+                    .downloaded_bytes
+                    .expect("у снятой загрузки счётчик есть на каждой строке"),
+                now,
+            );
 
             if naive.is_stalled(now) && naive_stalled_at.is_none() {
                 naive_stalled_at = Some(index);
@@ -839,7 +908,11 @@ mod tests {
         fixtures::stdout(fixture)
             .lines()
             .filter_map(|line| match parse_line(line) {
-                StdoutLine::Progress(sample) => Some(sample.downloaded_bytes),
+                StdoutLine::Progress(sample) => Some(
+                    sample
+                        .downloaded_bytes
+                        .expect("у снятой загрузки счётчик есть на каждой строке"),
+                ),
                 _ => None,
             })
             .collect()

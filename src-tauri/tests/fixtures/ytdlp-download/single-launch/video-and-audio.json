@@ -1,0 +1,76 @@
+{
+  "_capture": {
+    "note": "Успешная загрузка двух потоков одним запуском -f 133,139: видео целиком, затем звук, у каждого своя строка Destination и свой finished; код 0.",
+    "reality": "live",
+    "method": "local-server",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "--progress-delta",
+      "0.3",
+      "--socket-timeout",
+      "10",
+      "-f",
+      "133,139",
+      "-P",
+      "home:<destination>",
+      "-o",
+      "Big Buck Bunny.f%(format_id)s.%(ext)s",
+      "--load-info-json",
+      "<infoJson>"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-09-13",
+    "select": "133,139",
+    "served": {
+      "133": {
+        "file": "v133.mp4",
+        "bytes": 894838
+      },
+      "139": {
+        "file": "a139.m4a",
+        "bytes": 323730
+      }
+    },
+    "title": "Big Buck Bunny",
+    "requests": [
+      {
+        "path": "/v133.mp4",
+        "range": null,
+        "status": 200
+      },
+      {
+        "path": "/a139.m4a",
+        "range": null,
+        "status": 200
+      }
+    ]
+  },
+  "exitCode": 0,
+  "stdout": "[info] aqz-KE-bpKQ: Downloading 2 format(s): 133, 139\n[download] Destination: <destination>/Big Buck Bunny.f133.mp4\n@tl-progress|downloading|1024|894838|NA|NA|NA|NA|NA|133\n@tl-progress|downloading|130048|894838|NA|399417.4505539889|1|NA|NA|133\n@tl-progress|downloading|261120|894838|NA|373241.73526140157|1|NA|NA|133\n@tl-progress|downloading|523264|894838|NA|366165.1981968094|1|NA|NA|133\n@tl-progress|downloading|882642|894838|NA|360755.3143344266|0|NA|NA|133\n@tl-progress|downloading|894838|894838|NA|358812.2673011012|0|NA|NA|133\n@tl-progress|finished|894838|894838|NA|356337.9294768077|NA|NA|NA|133\n[download] Destination: <destination>/Big Buck Bunny.f139.m4a\n@tl-progress|downloading|1024|323730|NA|NA|NA|NA|NA|139\n@tl-progress|downloading|130048|323730|NA|399976.2758487182|0|NA|NA|139\n@tl-progress|downloading|261120|323730|NA|373478.34628540993|0|NA|NA|139\n@tl-progress|finished|323730|323730|NA|361975.642063137|NA|NA|NA|139\n",
+  "stderr": "WARNING: aqz-KE-bpKQ: writing DASH m4a. Only some players support this container. Install ffmpeg to fix this automatically\n",
+  "lineTimesMs": [
+    523,
+    538,
+    538,
+    864,
+    1239,
+    1968,
+    2985,
+    3033,
+    3037,
+    3053,
+    3054,
+    3380,
+    3754,
+    3945
+  ],
+  "listingBefore": [],
+  "listingAfter": [
+    "Big Buck Bunny.f133.mp4",
+    "Big Buck Bunny.f139.m4a"
+  ]
+}

@@ -40,17 +40,22 @@
 //! # Что ещё приезжает в stdout
 //!
 //! Кроме строк прогресса, в том же потоке идут служебные строки yt-dlp.
-//! Разбираются три — те, что меняют смысл чисел вокруг:
+//! Разбираются четыре — те, что меняют смысл чисел вокруг:
 //!
+//! - `[info] <id>: Downloading N format(s): a, b` — какие форматы yt-dlp
+//!   **выбрал** к скачиванию (TL-48). Формат, которого нет в метаданных,
+//!   из этого перечня молча выпадает, а процесс выходит с кодом 0;
 //! - `[download] Destination: …` — с какого места начинается поток
 //!   очередного формата (и куда он пишется);
 //! - `[download] Resuming download at byte N` — попытка продолжает
 //!   частичный файл, и первый же `downloaded_bytes` будет не с нуля;
 //! - `[download] … has already been downloaded` — поток качать не
-//!   пришлось, **строк прогресса по нему не будет ни одной** (проверено
-//!   живьём: повторный запуск по готовому файлу печатает только её).
+//!   пришлось, **строк `downloading` по нему не будет ни одной**. Будет
+//!   ли следом `finished`, зависит от аргументов (замер TL-48 на вложенном
+//!   бинарнике): на argv приложения — да, с `downloaded_bytes` = `NA`; с
+//!   отдельным временным каталогом (`-P temp:…`) — нет.
 //!
-//! Всё остальное — [`StdoutLine::Other`]: `[youtube] …`, `[info] …`,
+//! Всё остальное — [`StdoutLine::Other`]: `[youtube] …`, прочие `[info] …`,
 //! `[hlsnative] …`, вывод постпроцессоров. Модуль их не классифицирует —
 //! классификация отказов это TL-43, и она смотрит на stderr и код выхода.
 //!
@@ -124,6 +129,15 @@ const MISSING: &str = "NA";
 /// Сколько значений стоит в шаблоне после маркера.
 const VALUE_COUNT: usize = 9;
 
+/// Конец строки `[download] <путь> has already been downloaded`.
+///
+/// Якорь — конец строки, а не первое вхождение: путь несёт название
+/// ролика, и фраза может стоять в нём самом (фикстура
+/// `single-launch/phrase-in-title.json`). Продолжения после фразы на пине
+/// 2026.08.19 не бывает ни в одной съёмке, поэтому строка с хвостом —
+/// не эта строка.
+const ALREADY_DOWNLOADED: &str = " has already been downloaded";
+
 /// Что за строка пришла в stdout.
 ///
 /// Заимствует у входной строки: разбор — чистая функция от неё, а
@@ -142,13 +156,21 @@ pub enum StdoutLine<'a> {
     /// поэтому решение (залогировать, засчитать отсутствие продвижения)
     /// принимает оркестрация, а не этот модуль.
     MalformedProgress(&'a str),
+    /// `[info] <id>: Downloading N format(s): a, b` — перечень форматов,
+    /// которые yt-dlp выбрал к скачиванию, в его порядке.
+    ///
+    /// Нужен ради одного вывода, которого иначе не сделать (TL-48): формат,
+    /// заказанный через запятую, но отсутствующий в метаданных, yt-dlp не
+    /// считает ошибкой — он пропадает из перечня, процесс выходит с кодом 0
+    /// (фикстура `single-launch/one-format-missing.json`).
+    SelectedFormats { format_ids: Vec<&'a str> },
     /// `[download] Destination: <путь>` — куда пишется очередной поток.
     Destination { path: &'a str },
     /// `[download] Resuming download at byte N` — попытка продолжает
     /// частичный файл (Ф-5, докачка штатным механизмом yt-dlp).
     Resuming { byte_offset: u64 },
     /// `[download] <путь> has already been downloaded` — файл на месте,
-    /// строк прогресса по этому потоку не будет.
+    /// строк `downloading` по этому потоку не будет.
     AlreadyDownloaded { path: &'a str },
     /// Всё остальное.
     Other,
@@ -186,7 +208,12 @@ pub struct ProgressSample {
     /// На этом стоит требование К-6 «процент не падает к нулю»: считать
     /// его заново по каждой попытке не нужно, достаточно не терять
     /// накопленное.
-    pub downloaded_bytes: u64,
+    ///
+    /// `None` бывает только у `finished`, и ровно в одном снятом случае:
+    /// файл уже лежал на диске, yt-dlp его не качал и шлёт `NA`
+    /// (фикстура `already-downloaded.json`). У `downloading` число
+    /// обязательно — строка без него отвергается целиком.
+    pub downloaded_bytes: Option<u64>,
     /// Точный полный размер потока, если yt-dlp его знает.
     ///
     /// У прямых потоков (`https`) известен с первой строки; у потоков
@@ -243,6 +270,13 @@ pub fn parse_line(line: &str) -> StdoutLine<'_> {
         };
     }
 
+    if let Some(rest) = line.strip_prefix("[info] ") {
+        return match selected_formats(rest) {
+            Some(format_ids) => StdoutLine::SelectedFormats { format_ids },
+            None => StdoutLine::Other,
+        };
+    }
+
     let Some(rest) = line.strip_prefix("[download] ") else {
         return StdoutLine::Other;
     };
@@ -256,16 +290,30 @@ pub fn parse_line(line: &str) -> StdoutLine<'_> {
             Err(_) => StdoutLine::Other,
         };
     }
-    // Хвост после «has already been downloaded» на пине 2026.08.19 пуст
-    // (проверено живьём и для одиночного потока, и для уже склеенного
-    // результата). Пустой остаток здесь не требуется: у yt-dlp
-    // встречается продолжение « and merged», и терять из-за него весь
-    // класс строки незачем — путь всё равно левее разделителя.
-    if let Some((path, _)) = rest.split_once(" has already been downloaded") {
+    if let Some(path) = rest.strip_suffix(ALREADY_DOWNLOADED) {
         return StdoutLine::AlreadyDownloaded { path };
     }
 
     StdoutLine::Other
+}
+
+/// Перечень из `<id>: Downloading N format(s): a, b`, если строка именно
+/// такая.
+///
+/// Форма сверяется целиком: число перед `format(s)` обязано совпасть с
+/// длиной перечня, а идентификатор — быть непустым и без пробелов.
+/// Прочие строки `[info]` (`Downloading subtitles`, запись метаданных)
+/// этой проверки не проходят и остаются [`StdoutLine::Other`].
+fn selected_formats(rest: &str) -> Option<Vec<&str>> {
+    let (_video_id, tail) = rest.split_once(": Downloading ")?;
+    let (count, list) = tail.split_once(" format(s): ")?;
+    let count: usize = count.parse().ok()?;
+    let format_ids: Vec<&str> = list.split(", ").collect();
+    let well_formed = format_ids.len() == count
+        && format_ids
+            .iter()
+            .all(|id| !id.is_empty() && !id.contains(char::is_whitespace));
+    well_formed.then_some(format_ids)
 }
 
 /// Разобрать хвост строки прогресса — всё, что после маркера.
@@ -300,11 +348,18 @@ fn parse_progress(values: &str) -> Option<ProgressSample> {
         _ => return None,
     };
     let format_id = optional_field(format_id)?;
+    // `NA` у принятых байт — не порча, а факт: так yt-dlp закрывает поток,
+    // который не качал (doc `downloaded_bytes`). Но только в `finished`:
+    // строка хода загрузки без числа принятого ничего не сообщает.
+    let downloaded_bytes = match status {
+        SampleStatus::Downloading => Some(read_number(downloaded)?),
+        SampleStatus::Finished => optional_number(downloaded)?,
+    };
 
     Some(ProgressSample {
         status,
         format_id: format_id.to_owned(),
-        downloaded_bytes: read_number(downloaded)?,
+        downloaded_bytes,
         total_bytes: optional_number(total)?,
         total_bytes_estimate: optional_number(estimate)?,
         speed_bytes_per_sec: optional_number(speed)?,
@@ -348,13 +403,22 @@ fn read_number(field: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::download::fixtures::{self, PROGRESS_FIXTURES};
+    use crate::download::fixtures::{self, PROGRESS_FIXTURES, SINGLE_LAUNCH_FIXTURES};
 
     /// Разобрать весь снятый stdout фикстуры построчно.
     fn lines(name: &str) -> Vec<StdoutLine<'static>> {
+        parse_all(fixtures::stdout(name))
+    }
+
+    /// То же для фикстуры одного запуска (TL-48).
+    fn launch_lines(name: &str) -> Vec<StdoutLine<'static>> {
+        parse_all(fixtures::single_launch(name).stdout)
+    }
+
+    fn parse_all(stdout: String) -> Vec<StdoutLine<'static>> {
         // Фикстура живёт до конца теста: содержимое утекает намеренно,
         // иначе заимствующий `StdoutLine` не пережил бы возврат.
-        let stdout: &'static str = Box::leak(fixtures::stdout(name).into_boxed_str());
+        let stdout: &'static str = Box::leak(stdout.into_boxed_str());
         stdout.lines().map(parse_line).collect()
     }
 
@@ -419,14 +483,52 @@ mod tests {
             },
             "каталог фикстур и список PROGRESS_FIXTURES разошлись"
         );
+
+        // Набор одного запуска (TL-48) — те же две привязки: он снят тем
+        // же вложенным бинарником и тем же шаблоном.
+        for name in SINGLE_LAUNCH_FIXTURES {
+            let capture = fixtures::single_launch(name).capture;
+            assert_eq!(
+                capture.yt_dlp_version, pinned,
+                "single-launch/{name}: пин сменили — переснимите по README"
+            );
+            assert_eq!(
+                capture.progress_template, PROGRESS_TEMPLATE,
+                "single-launch/{name}: шаблон сменили — переснимите по README"
+            );
+            assert!(
+                capture.argv.iter().any(|arg| arg == "<progressTemplate>"),
+                "single-launch/{name}: в argv нет плейсхолдера шаблона"
+            );
+        }
+        assert_eq!(
+            fixtures::single_launch_files_on_disk(),
+            {
+                let mut declared: Vec<String> = SINGLE_LAUNCH_FIXTURES
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect();
+                declared.sort();
+                declared
+            },
+            "каталог single-launch и список SINGLE_LAUNCH_FIXTURES разошлись"
+        );
     }
 
     #[test]
     fn every_marked_line_of_every_fixture_parses() {
         // Сторож обратной стороны предыдущего теста: версия сошлась, а
         // строка не разобралась — значит разбор разошёлся с выводом.
-        for name in PROGRESS_FIXTURES {
-            let malformed: Vec<&str> = lines(name)
+        let every = PROGRESS_FIXTURES
+            .iter()
+            .map(|name| (*name, lines(name)))
+            .chain(
+                SINGLE_LAUNCH_FIXTURES
+                    .iter()
+                    .map(|name| (*name, launch_lines(name))),
+            );
+        for (name, parsed) in every {
+            let malformed: Vec<&str> = parsed
                 .into_iter()
                 .filter_map(|line| match line {
                     StdoutLine::MalformedProgress(raw) => Some(raw),
@@ -448,7 +550,7 @@ mod tests {
         let first = &samples[0];
         assert_eq!(first.status, SampleStatus::Downloading);
         assert_eq!(first.format_id, "133");
-        assert_eq!(first.downloaded_bytes, 1024);
+        assert_eq!(first.downloaded_bytes, Some(1024));
         assert_eq!(first.total_bytes, Some(9_323_483));
         assert_eq!(first.total_bytes_estimate, None);
         assert_eq!(first.speed_bytes_per_sec, Some(288_932));
@@ -557,7 +659,8 @@ mod tests {
         let stopped_at = interrupted
             .last()
             .expect("оборванная попытка что-то успела")
-            .downloaded_bytes;
+            .downloaded_bytes
+            .expect("у downloading счётчик есть всегда");
         assert_eq!(stopped_at, 995_883);
 
         let continued = lines("resume-continued.json");
@@ -568,34 +671,118 @@ mod tests {
             "вторая попытка объявляет, с какого байта продолжает"
         );
 
-        let first = &samples("resume-continued.json")[0];
+        let first = samples("resume-continued.json")[0]
+            .downloaded_bytes
+            .expect("у downloading счётчик есть всегда");
         assert!(
-            first.downloaded_bytes > stopped_at,
+            first > stopped_at,
             "первая же строка продолженной попытки считает накопленное \
-             ({} против {stopped_at})",
-            first.downloaded_bytes
+             ({first} против {stopped_at})"
         );
     }
 
     #[test]
-    fn a_stream_that_was_already_on_disk_reports_nothing_at_all() {
-        // Случай, из-за которого «нет строк прогресса» не равно «ничего не
-        // происходит»: поток может быть уже готов, и тогда о нём не
-        // приедет ни одной строки, включая finished.
+    fn a_stream_that_was_already_on_disk_reports_a_finish_without_bytes() {
+        // Поток может быть уже готов, и тогда о ходе его загрузки не
+        // приедет ни одной строки. На argv приложения yt-dlp всё же
+        // закрывает его строкой `finished` — но с `NA` вместо принятых
+        // байт (М-1 ревью TL-48). Прочитать её как порчу значило бы
+        // писать в лог «не разобрана» на каждом повторе.
         let lines = lines("already-downloaded.json");
 
         assert!(
-            !lines
-                .iter()
-                .any(|line| matches!(line, StdoutLine::Progress(_))),
-            "по готовому файлу строк прогресса не бывает"
+            lines.iter().any(|line| matches!(
+                line,
+                StdoutLine::AlreadyDownloaded { path }
+                    if *path == "<destination>/Big Buck Bunny.f140.m4a"
+            )),
+            "сообщение о том, что качать нечего, — есть: {lines:?}"
         );
-        assert!(
-            lines.iter().any(
-                |line| matches!(line, StdoutLine::AlreadyDownloaded { path } if *path == "e.m4a")
-            ),
-            "но сообщение о том, что качать нечего, — есть"
+        let progress: Vec<&ProgressSample> = lines
+            .iter()
+            .filter_map(|line| match line {
+                StdoutLine::Progress(sample) => Some(sample),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            progress,
+            [&ProgressSample {
+                status: SampleStatus::Finished,
+                format_id: "140".to_owned(),
+                downloaded_bytes: None,
+                total_bytes: Some(323_730),
+                total_bytes_estimate: None,
+                speed_bytes_per_sec: None,
+                eta_secs: None,
+                fragment_index: None,
+                fragment_count: None,
+            }],
+            "ни одной строки downloading, одна finished без байт с размером файла"
         );
+    }
+
+    #[test]
+    fn the_phrase_of_an_already_downloaded_line_inside_the_title_does_not_cut_the_path() {
+        // М-3 ревью TL-48: название ролика само несёт фразу, и обрезание
+        // по первому вхождению отдало бы путь «…/Big Buck Bunny» — файл,
+        // который не принадлежит ни одному потоку.
+        let paths: Vec<&str> = launch_lines("phrase-in-title.json")
+            .into_iter()
+            .filter_map(|line| match line {
+                StdoutLine::AlreadyDownloaded { path } => Some(path),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            paths,
+            ["<destination>/Big Buck Bunny has already been downloaded.f139.m4a"]
+        );
+        assert_eq!(
+            parse_line("[download] x.m4a has already been downloaded and merged"),
+            StdoutLine::Other,
+            "строка с продолжением после фразы — не эта строка"
+        );
+    }
+
+    #[test]
+    fn the_list_of_selected_formats_is_read_exactly_as_yt_dlp_prints_it() {
+        // Живые строки из двух съёмок одного запуска и из старой фикстуры
+        // с объединением потоков.
+        let selected = |lines: Vec<StdoutLine<'static>>| -> Vec<Vec<&'static str>> {
+            lines
+                .into_iter()
+                .filter_map(|line| match line {
+                    StdoutLine::SelectedFormats { format_ids } => Some(format_ids),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            selected(launch_lines("video-and-audio.json")),
+            [vec!["133", "139"]]
+        );
+        assert_eq!(
+            selected(launch_lines("one-format-missing.json")),
+            [vec!["133"]],
+            "формат, которого нет в метаданных, из перечня пропадает"
+        );
+        assert_eq!(selected(lines("video-and-audio.json")), [vec!["133+139"]]);
+
+        for other in [
+            // число не совпадает с перечнем
+            "[info] aqz-KE-bpKQ: Downloading 2 format(s): 133",
+            // не число
+            "[info] aqz-KE-bpKQ: Downloading two format(s): 133, 139",
+            // пустой идентификатор
+            "[info] aqz-KE-bpKQ: Downloading 2 format(s): 133, ",
+            // другая строка [info]
+            "[info] aqz-KE-bpKQ: Downloading subtitles: en",
+        ] {
+            assert_eq!(parse_line(other), StdoutLine::Other, "строка: {other:?}");
+        }
     }
 
     #[test]
@@ -617,7 +804,6 @@ mod tests {
         // проваливаться в разбор по совпадению префикса.
         for line in [
             "[youtube] aqz-KE-bpKQ: Downloading webpage",
-            "[info] aqz-KE-bpKQ: Downloading 1 format(s): 133+139",
             "[hlsnative] Total fragments: 123",
             "[Merger] Merging formats into \"./a.mp4\"",
             "[FixupM4a] Correcting container of \"./e.m4a\"",
@@ -639,6 +825,15 @@ mod tests {
         // пользователю замерший процент вместо отказа.
         let live = "@tl-progress|downloading|1024|9323483|NA|288931.53689875547|32|NA|NA|133";
         assert!(matches!(parse_line(live), StdoutLine::Progress(_)));
+        // `NA` вместо принятых байт у `finished` — снятый факт, а не порча.
+        let finished_without_bytes = "@tl-progress|finished|NA|323730|NA|NA|NA|NA|NA|140";
+        assert!(matches!(
+            parse_line(finished_without_bytes),
+            StdoutLine::Progress(ProgressSample {
+                downloaded_bytes: None,
+                ..
+            })
+        ));
 
         for broken in [
             // полем меньше
@@ -647,8 +842,10 @@ mod tests {
             "@tl-progress|downloading|1024|9323483|NA|288931.5|32|NA|NA|133|extra",
             // незнакомый статус
             "@tl-progress|paused|1024|9323483|NA|288931.5|32|NA|NA|133",
-            // обязательное число не читается
+            // у downloading принятые байты обязательны
             "@tl-progress|downloading|NA|9323483|NA|288931.5|32|NA|NA|133",
+            // а у finished `NA` можно, нечитаемое число — нельзя
+            "@tl-progress|finished|12x|9323483|NA|NA|NA|NA|NA|133",
             // идентификатора формата нет
             "@tl-progress|downloading|1024|9323483|NA|288931.5|32|NA|NA|NA",
             // отрицательная скорость

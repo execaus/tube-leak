@@ -49,6 +49,73 @@ pub const OUTCOME_FIXTURES: &[&str] = &[
     "stalled-killed-by-watchdog.json",
 ];
 
+/// Все фикстуры одного запуска с селектором через запятую (TL-48).
+///
+/// Четвёртый набор и четвёртый конверт: stdout, stderr и код **одного и
+/// того же** запуска вместе, плюс листинг папки назначения до и после.
+/// Сняты вложенным yt-dlp с argv приложения против локального HTTP-сервера,
+/// без обращения к YouTube, — как именно, в README рядом с набором.
+pub const SINGLE_LAUNCH_FIXTURES: &[&str] = &[
+    "video-and-audio.json",
+    "video-only.json",
+    "video-already-downloaded.json",
+    "one-format-missing.json",
+    "video-404.json",
+    "phrase-in-title.json",
+];
+
+/// Чем в снятом выводе заменён абсолютный путь папки назначения съёмки.
+pub const DESTINATION_PLACEHOLDER: &str = "<destination>";
+
+/// Снятый запуск: конверт `single-launch/<имя>.json`.
+#[derive(Debug)]
+pub struct SingleLaunch {
+    pub capture: Capture,
+    /// Код завершения; `None` — процесс убит сигналом.
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    /// Что лежало в папке назначения до запуска.
+    pub listing_before: Vec<String>,
+    /// Что осталось после.
+    pub listing_after: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SingleLaunchEnvelope {
+    #[serde(rename = "_capture")]
+    capture: Capture,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    listing_before: Vec<String>,
+    listing_after: Vec<String>,
+}
+
+/// Снятый запуск одного `-f V,A`.
+pub fn single_launch(name: &str) -> SingleLaunch {
+    let path = single_launch_dir().join(name);
+    let raw = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("фикстура {} не читается: {err}", path.display()));
+    let envelope: SingleLaunchEnvelope = serde_json::from_str(&raw)
+        .unwrap_or_else(|err| panic!("фикстура {} — не тот конверт: {err}", path.display()));
+
+    SingleLaunch {
+        capture: envelope.capture,
+        exit_code: envelope.exit_code,
+        stdout: envelope.stdout,
+        stderr: envelope.stderr,
+        listing_before: envelope.listing_before,
+        listing_after: envelope.listing_after,
+    }
+}
+
+/// Имена файлов, реально лежащих в каталоге `single-launch`, по алфавиту.
+pub fn single_launch_files_on_disk() -> Vec<String> {
+    json_files_in(&single_launch_dir())
+}
+
 /// Обстоятельства съёмки — всё, что нужно, чтобы фикстуру можно было
 /// повторить и чтобы её нельзя было тихо оставить протухшей.
 #[derive(Debug, Deserialize)]
@@ -348,6 +415,10 @@ fn fixtures_root() -> PathBuf {
 
 fn progress_dir() -> PathBuf {
     fixtures_root().join("ytdlp-download").join("progress")
+}
+
+fn single_launch_dir() -> PathBuf {
+    fixtures_root().join("ytdlp-download").join("single-launch")
 }
 
 fn outcomes_dir() -> PathBuf {

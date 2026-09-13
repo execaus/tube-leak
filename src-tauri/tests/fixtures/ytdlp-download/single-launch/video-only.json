@@ -1,0 +1,65 @@
+{
+  "_capture": {
+    "note": "Повтор, заказывающий один видеопоток -f 133 (оба формата в метаданных есть): перечень [info] называет 133, одна загрузка, код 0.",
+    "reality": "live",
+    "method": "local-server",
+    "argv": [
+      "--no-playlist",
+      "--newline",
+      "--progress-template",
+      "<progressTemplate>",
+      "--progress-delta",
+      "0.3",
+      "--socket-timeout",
+      "10",
+      "-f",
+      "133",
+      "-P",
+      "home:<destination>",
+      "-o",
+      "Big Buck Bunny.f%(format_id)s.%(ext)s",
+      "--load-info-json",
+      "<infoJson>"
+    ],
+    "progressTemplate": "download:@tl-progress|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s",
+    "ytDlpVersion": "2026.08.19",
+    "capturedAt": "2026-09-13",
+    "select": "133",
+    "served": {
+      "133": {
+        "file": "v133.mp4",
+        "bytes": 894838
+      },
+      "139": {
+        "file": "a139.m4a",
+        "bytes": 323730
+      }
+    },
+    "title": "Big Buck Bunny",
+    "requests": [
+      {
+        "path": "/v133.mp4",
+        "range": null,
+        "status": 200
+      }
+    ]
+  },
+  "exitCode": 0,
+  "stdout": "[info] aqz-KE-bpKQ: Downloading 1 format(s): 133\n[download] Destination: <destination>/Big Buck Bunny.f133.mp4\n@tl-progress|downloading|1024|894838|NA|NA|NA|NA|NA|133\n@tl-progress|downloading|130048|894838|NA|408785.1626129954|1|NA|NA|133\n@tl-progress|downloading|261120|894838|NA|379762.9709273538|1|NA|NA|133\n@tl-progress|downloading|523264|894838|NA|359367.4102081822|1|NA|NA|133\n@tl-progress|downloading|864382|894838|NA|357540.6595674263|0|NA|NA|133\n@tl-progress|downloading|894838|894838|NA|356632.0991996065|0|NA|NA|133\n@tl-progress|finished|894838|894838|NA|354564.159718799|NA|NA|NA|133\n",
+  "stderr": "",
+  "lineTimesMs": [
+    467,
+    481,
+    482,
+    802,
+    1170,
+    1938,
+    2900,
+    2991,
+    2993
+  ],
+  "listingBefore": [],
+  "listingAfter": [
+    "Big Buck Bunny.f133.mp4"
+  ]
+}

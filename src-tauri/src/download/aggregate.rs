@@ -133,6 +133,27 @@ impl StreamState {
                 .is_some_and(|total| total > 0 && self.received_bytes >= total)
     }
 
+    /// Сколько байт потока идёт в числитель процента.
+    ///
+    /// Закрытый поток идёт своим полным размером, даже если принятых байт
+    /// по нему нет: файл, который yt-dlp нашёл на диске и не качал, закрыт
+    /// строкой `finished` с `NA` вместо байт (фикстура
+    /// `single-launch/video-already-downloaded.json`). Без этого на таком
+    /// повторе полоса стояла бы около нуля, пока качается звук, и прыгала
+    /// бы к сотне на его конце.
+    ///
+    /// В сумму для сторожа продвижения
+    /// ([`ProgressAggregator::received_bytes`]) это не попадает: там
+    /// считаются только принятые байты, и закрытие потока продвижением не
+    /// является.
+    fn counted_bytes(&self) -> u64 {
+        if self.finished {
+            self.received_bytes.max(self.total_bytes.unwrap_or(0))
+        } else {
+            self.received_bytes
+        }
+    }
+
     /// Доля этого потока, если её есть из чего вывести.
     ///
     /// Порядок источников — от точного к грубому; `None` означает «поток
@@ -229,7 +250,13 @@ impl ProgressAggregator {
         // Байты не убывают: продолженная попытка считает вместе с
         // накопленным, а попытка, начавшая файл заново, всё равно не
         // повод показывать пользователю откат к нулю (К-6).
-        state.received_bytes = state.received_bytes.max(sample.downloaded_bytes);
+        //
+        // `None` приходит только в `finished` по файлу, который yt-dlp не
+        // качал (doc `ProgressSample::downloaded_bytes`): принятого этой
+        // строкой нет, и накопленное остаётся как было.
+        if let Some(downloaded) = sample.downloaded_bytes {
+            state.received_bytes = state.received_bytes.max(downloaded);
+        }
         if let Some(total) = sample.exact_total_bytes() {
             state.total_bytes = Some(total);
         }
@@ -263,14 +290,16 @@ impl ProgressAggregator {
 
     /// Закрыть поток, который качать не пришлось.
     ///
-    /// Нужно ровно для одного случая: yt-dlp печатает
+    /// Нужно для одного случая: yt-dlp печатает
     /// `[download] … has already been downloaded`
     /// ([`crate::download::progress::StdoutLine::AlreadyDownloaded`]) и
-    /// **не присылает по такому потоку ни одной строки прогресса, включая
-    /// `finished`**. Без этого метода задача, у которой один поток уже
-    /// лежал на диске (повтор после неудачной склейки — С-11), навсегда
-    /// упиралась бы в 99 %: правило «сто процентов только когда закрыты
-    /// все потоки» ждало бы строки, которой не будет.
+    /// **не присылает по такому потоку ни одной строки `downloading`**.
+    /// Строка `finished` следом приходит не всегда: на argv приложения —
+    /// да (с `NA` вместо байт), с отдельным временным каталогом — нет
+    /// (замер TL-48). Без этого метода задача, у которой один поток уже
+    /// лежал на диске (повтор после неудачной склейки — С-11), в худшем
+    /// случае навсегда упиралась бы в 99 %: правило «сто процентов только
+    /// когда закрыты все потоки» ждало бы строки, которой не будет.
     ///
     /// Строка `AlreadyDownloaded` несёт путь, а не `format_id`, — сопоставить
     /// их может только тот, кто задавал `-o` (TL-44), поэтому решение
@@ -285,6 +314,41 @@ impl ProgressAggregator {
             return false;
         };
         state.finished = true;
+        self.update_percent();
+        true
+    }
+
+    /// Забыть всё, что принято по потоку: его файлы удалены.
+    ///
+    /// Зовёт оркестрация после подчистки, удалившей частичное
+    /// (`forget_streams` в [`crate::download::orchestrate`]). Байты потока,
+    /// его размер, фрагменты и признак конца сбрасываются, а показанный
+    /// процент пересчитывается заново — мимо храповика.
+    ///
+    /// Оба правила раздела «Откат назад» стоят на том, что байты на диске
+    /// не исчезают. Здесь они исчезли, и держать прежние числа значило бы
+    /// соврать дважды (правка Р-2 ревью TL-48): процент на экране стоял бы
+    /// на удалённом, а сумма байт задачи — вход сторожа продвижения — не
+    /// росла бы, пока повтор с нуля не перерастёт прежний объём. Сторож
+    /// снимал бы здоровую загрузку, и после восьми попыток пользователь
+    /// получал бы «соединение потеряно».
+    ///
+    /// Возвращает `false`, если такого потока у задачи нет.
+    pub fn forget_stream(&mut self, format_id: &str) -> bool {
+        let Some(stream) = self.stream_of(format_id) else {
+            return false;
+        };
+        let Some(state) = self.state_mut(stream) else {
+            return false;
+        };
+        *state = StreamState::new(format_id.to_owned());
+
+        if self.current == Some(stream) {
+            self.current = None;
+        }
+        self.speed_bytes_per_sec = None;
+        self.eta_secs = None;
+        self.shown_percent = None;
         self.update_percent();
         true
     }
@@ -400,7 +464,7 @@ impl ProgressAggregator {
         let states = self.states();
         let received: u64 = states
             .iter()
-            .fold(0, |sum, state| sum.saturating_add(state.received_bytes));
+            .fold(0, |sum, state| sum.saturating_add(state.counted_bytes()));
         let exact: u64 = states
             .iter()
             .filter_map(|state| state.total_bytes)
@@ -421,7 +485,7 @@ impl ProgressAggregator {
             // выдать сотню раньше времени.
             let received_unknown: u64 = unknown
                 .iter()
-                .fold(0, |sum, state| sum.saturating_add(state.received_bytes));
+                .fold(0, |sum, state| sum.saturating_add(state.counted_bytes()));
             let residual = estimate.saturating_sub(exact).max(received_unknown);
             let denominator = exact.saturating_add(residual);
             (denominator > 0).then(|| ratio(received, denominator))?
@@ -515,7 +579,7 @@ mod tests {
         ProgressSample {
             status: SampleStatus::Downloading,
             format_id: format_id.to_owned(),
-            downloaded_bytes: downloaded,
+            downloaded_bytes: Some(downloaded),
             total_bytes: total,
             total_bytes_estimate: None,
             speed_bytes_per_sec: Some(1_000_000),
@@ -529,7 +593,7 @@ mod tests {
         ProgressSample {
             status: SampleStatus::Finished,
             format_id: format_id.to_owned(),
-            downloaded_bytes: total,
+            downloaded_bytes: Some(total),
             total_bytes: Some(total),
             total_bytes_estimate: None,
             speed_bytes_per_sec: Some(500_000),
@@ -902,6 +966,98 @@ mod tests {
     }
 
     #[test]
+    fn a_forgotten_stream_starts_again_from_zero_bytes_and_zero_percent() {
+        // Р-2 ревью TL-48: подчистка удалила файлы, и повтор качает с
+        // нуля. Первый же байт повтора обязан быть продвижением, а процент
+        // — не стоять на удалённом.
+        let mut aggregator = ProgressAggregator::new(
+            &streams(Some("133"), Some("139")),
+            known(9_323_483 + 3_871_021),
+        )
+        .expect("потоки");
+        aggregator.apply(&finished("133", 9_323_483));
+        assert_eq!(aggregator.percent().map(DownloadPercent::value), Some(70));
+
+        assert!(aggregator.forget_stream("133"));
+        assert!(aggregator.forget_stream("139"));
+        assert_eq!(aggregator.received_bytes(), 0);
+        assert!(!aggregator.is_complete());
+        assert_eq!(
+            aggregator.percent().map(DownloadPercent::value),
+            Some(0),
+            "удалённое не держится на экране храповиком"
+        );
+        assert_eq!(
+            aggregator.apply(&sample("133", 1024, Some(9_323_483))),
+            SampleOutcome::Applied { advanced: true },
+            "первый байт повтора с нуля — продвижение"
+        );
+        assert!(
+            !aggregator.forget_stream("251"),
+            "чужой поток не забывается"
+        );
+    }
+
+    #[test]
+    fn a_stream_found_on_disk_weighs_its_full_size_in_the_percent() {
+        // Снятый повтор: видео уже на диске (`finished` с `NA`), звук
+        // качается. Процент на звуке — от 73 (894 838 из 1 218 568), а не
+        // от нуля; сторожу при этом не достаётся ни одного «принятого» байта.
+        let mut aggregator =
+            ProgressAggregator::new(&streams(Some("133"), Some("139")), known(894_838 + 323_730))
+                .expect("потоки");
+        let lines: Vec<ProgressSample> = fixtures::single_launch("video-already-downloaded.json")
+            .stdout
+            .lines()
+            .filter_map(|line| match parse_line(line) {
+                StdoutLine::Progress(sample) => Some(sample),
+                _ => None,
+            })
+            .collect();
+        let (found, audio) = lines.split_first().expect("строки прогресса есть");
+        assert_eq!(
+            (found.format_id.as_str(), found.downloaded_bytes),
+            ("133", None)
+        );
+
+        aggregator.apply(found);
+        assert_eq!(aggregator.percent().map(DownloadPercent::value), Some(73));
+        assert_eq!(
+            aggregator.received_bytes(),
+            0,
+            "закрытие найденного на диске — не принятые байты"
+        );
+
+        let shown: Vec<u8> = audio
+            .iter()
+            .filter_map(|sample| {
+                aggregator.apply(sample);
+                aggregator.percent().map(DownloadPercent::value)
+            })
+            .collect();
+        assert!(shown.iter().all(|percent| *percent >= 73), "{shown:?}");
+        assert_eq!(shown.last().copied(), Some(100));
+    }
+
+    #[test]
+    fn a_finish_without_bytes_closes_the_stream() {
+        // Живая строка `finished|NA|…` из `already-downloaded.json`:
+        // принятого нет, но поток закрыт и его размер известен.
+        let mut aggregator =
+            ProgressAggregator::new(&streams(None, Some("140")), QualitySize::Unknown)
+                .expect("поток");
+        let lines = samples("already-downloaded.json");
+        assert_eq!(lines.len(), 1, "в фикстуре одна строка прогресса");
+
+        assert_eq!(
+            aggregator.apply(&lines[0]),
+            SampleOutcome::Applied { advanced: false }
+        );
+        assert!(aggregator.is_complete());
+        assert_eq!(aggregator.percent().map(DownloadPercent::value), Some(100));
+    }
+
+    #[test]
     fn a_line_about_a_format_nobody_asked_for_is_reported_not_absorbed() {
         let mut aggregator =
             ProgressAggregator::new(&streams(Some("133"), Some("139")), QualitySize::Unknown)
@@ -1036,7 +1192,7 @@ mod tests {
         let blind = ProgressSample {
             status: SampleStatus::Downloading,
             format_id: "602".to_owned(),
-            downloaded_bytes: 4096,
+            downloaded_bytes: Some(4096),
             total_bytes: None,
             total_bytes_estimate: Some(1_000_000),
             speed_bytes_per_sec: Some(1024),
