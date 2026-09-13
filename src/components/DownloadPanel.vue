@@ -469,7 +469,15 @@ const showDetailsToggle = computed(() => {
 .download-panel__step:not(:last-child)::after {
   content: '→';
   margin-left: 0.4rem;
-  color: var(--color-text-faint);
+  /*
+   * Отдельный токен, а не `--color-text-faint` (ревью TL-22, Б-2): у
+   * стрелки-разделителя был свой оттенок (`#aaa`), чуть светлее, чем у
+   * плейсхолдера превью (`#999`) — совпадение по смыслу («едва заметно»),
+   * а не по значению. `--color-text-faint` держит светлое значение `#999`
+   * ради VideoThumbnail; сюда нужен именно `#aaa`, иначе светлая тема
+   * меняется на пиксель.
+   */
+  color: var(--color-text-decorative);
 }
 
 .download-panel__bar {
