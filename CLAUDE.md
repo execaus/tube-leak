@@ -207,7 +207,7 @@ cd src-tauri && TUBE_LEAK_UPDATE_TS_BINDINGS=1 cargo test --locked types::bindin
 
 **Про архитектуру (вопрос владельца, закрыт).** Встраивать yt-dlp и ffmpeg библиотеками не будем: линковка ffmpeg распространит GPL на наш код, встраивание yt-dlp сломает обновление отдельным контуром (E6) и лишит изоляции падений.
 
-**Окружение.** `cargo` не в PATH: `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"`. Перед полной сборкой смотреть `df -h`. В свежем worktree тесты требуют заглушек: `node scripts/ci/stub-binaries.mjs`, затем `TUBE_LEAK_ALLOW_STUB_YTDLP=1 cargo test`.
+**Окружение.** `cargo` не в PATH: `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"`. Перед полной сборкой смотреть `df -h`. В свежем worktree тесты требуют заглушек: `node scripts/ci/stub-binaries.mjs`, затем `TUBE_LEAK_ALLOW_STUB_YTDLP=1 cargo test`. После мержа ветки, меняющей `package-lock.json`, в основной копии сначала `npm ci`, потом локальный прогон: иначе `main` краснеет на неразрешённом импорте, и это выглядит как дефект кода (так было с TL-94, `@tauri-apps/plugin-dialog`).
 
 **Типы границы генерируются, не пишутся руками (TL-51).** Объявляются в `src-tauri/src/types.rs` **выше** маркера `mod bindings;` — ниже их не видит ни один сторож. Зеркало лежит в `src/types/generated/` и коммитится; перегенерация — `TUBE_LEAK_UPDATE_TS_BINDINGS=1 cargo test`, обычный `cargo test` сверяет и падает при расхождении. Руками сгенерированное не править. На стороне TS списки вариантов объявляются литералом с `satisfies Record<Kind, true>`, а исчерпывающие `switch` закрываются `assertNever` — голого `switch` без `default` недостаточно, когда возвращаемый тип и так допускает `undefined`.
 
