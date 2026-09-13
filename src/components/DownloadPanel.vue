@@ -21,7 +21,7 @@ import type { DownloadPlan, DownloadProgress } from '@/types/generated/download'
 import { assertNever } from '@/utils/assertNever'
 import { formatEtaSecs } from '@/utils/formatEtaSecs'
 import { formatSpeed } from '@/utils/formatSpeed'
-import { getCancelledText, getFailedPartialDataNote } from '@/utils/downloadOutcomeTexts'
+import { getCancelledText, getFailedPartialDataNote, getFolderDisplayText } from '@/utils/downloadOutcomeTexts'
 import { getDownloadErrorText } from '@/utils/downloadErrorTexts'
 
 const props = defineProps<{
@@ -345,8 +345,8 @@ const showDetailsToggle = computed(() => {
         <p class="download-panel__terminal-title">
           ✓ Готово
         </p>
-        <p class="download-panel__row">
-          «{{ progress.fileName }}» сохранён в папке «Загрузки».
+        <p class="download-panel__row download-panel__row--wrap">
+          «{{ progress.fileName }}» сохранён в папке {{ getFolderDisplayText(progress.folderDisplay) }}.
         </p>
         <div class="download-panel__actions">
           <button
@@ -505,6 +505,25 @@ const showDetailsToggle = computed(() => {
   gap: 0.4rem;
   margin: 0.35rem 0 0;
   color: var(--color-text-secondary);
+}
+
+/*
+ * Модификатор для строк, которые могут содержать длинный путь без
+ * пробелов (TL-95, Done: `folderDisplay` с кастомной папкой). Путь не
+ * сокращается (см. `getFolderDisplayText`), поэтому раскладку защищает
+ * только CSS: `display: block` вместо строкового флекса (тут нет иконки
+ * рядом с текстом, гнать его во флекс-строку незачем) и
+ * `overflow-wrap: anywhere`, чтобы длинная последовательность без
+ * пробелов переносилась посимвольно, а не раздвигала панель. Решение
+ * дизайном не покрыто (документ молчит про перенос длинного пути в
+ * панели, в отличие от пути в настройках/истории — там про сокращение
+ * сказано явно, про перенос нет), поэтому выбран самый предсказуемый
+ * вариант, а не многоточие с `title`, которое прятало бы факт вместо
+ * того, чтобы его показывать.
+ */
+.download-panel__row--wrap {
+  display: block;
+  overflow-wrap: anywhere;
 }
 
 .download-panel__stall {

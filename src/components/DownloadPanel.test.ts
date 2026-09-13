@@ -387,6 +387,20 @@ describe('DownloadPanel — Готово', () => {
     await wrapper.find('button').trigger('click')
     expect(wrapper.emitted('hide')).toHaveLength(1)
   })
+
+  it('names the real custom folder in full, unquoted, when folderDisplay is not the system Downloads (Ф-15, TL-95)', () => {
+    const path = '/Users/исполнитель/Movies/Мой длинный путь с пробелами и юникодом/YouTube Downloads'
+    const wrapper = mount(DownloadPanel, {
+      props: {
+        displayTitle: TITLE,
+        plan: 'videoAndAudio',
+        progress: { phase: 'done', fileName: 'x.mp4', folderDisplay: { kind: 'custom', path } },
+      },
+    })
+
+    expect(wrapper.text()).toContain(`сохранён в папке ${path}.`)
+    expect(wrapper.text()).not.toContain('«Загрузки»')
+  })
 })
 
 describe('DownloadPanel — Ошибки: 9 классов (Ф-10, требование п.1 и п.2)', () => {
