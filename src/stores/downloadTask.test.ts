@@ -59,7 +59,7 @@ afterEach(() => {
 })
 
 describe('useDownloadTaskStore — start (постановка в хвост очереди, Ф-2 E4)', () => {
-  it('invokes start_download and optimistically appends the task, building the display title from title+quality (TL-75)', async () => {
+  it('invokes start_download and optimistically appends the task to the queue (Ф-2 E4)', async () => {
     invokeMock.mockResolvedValueOnce(started)
     const store = useDownloadTaskStore()
 
@@ -69,13 +69,6 @@ describe('useDownloadTaskStore — start (постановка в хвост о�
     expect(store.tasks).toStrictEqual([
       { taskId: 'task-1', title: 'Как приручить дракона', quality: request.quality, plan: 'videoAndAudio', phase: 'queued' },
     ])
-    expect(store.task).toStrictEqual({
-      taskId: 'task-1',
-      plan: 'videoAndAudio',
-      displayTitle: '«Как приручить дракона» — 1080p',
-    })
-    expect(store.progress).toStrictEqual({ phase: 'queued' })
-    expect(store.isActive).toBe(true) // тот же критерий, что в E3: задача есть и не терминальна.
   })
 
   it('subscribes to download://progress before invoking the command', async () => {
@@ -113,8 +106,9 @@ describe('useDownloadTaskStore — start (постановка в хвост о�
 
     await store.start(request)
 
-    expect(store.progress).toStrictEqual({ phase: 'fetching' })
-    expect(store.isActive).toBe(true)
+    expect(store.tasks).toStrictEqual([
+      { taskId: 'task-9', title: request.title, quality: request.quality, plan: 'singleStream', phase: 'fetching' },
+    ])
   })
 
   it('ignores a second concurrent start() call while the first is still in flight (double-click window)', async () => {
@@ -308,10 +302,10 @@ describe('useDownloadTaskStore — события прогресса, ключу
     await store.start(request)
 
     emitProgress({ taskId: 'other-task', phase: 'downloading', state: 'running', percent: 5 })
-    expect(store.progress).toStrictEqual({ phase: 'queued' })
+    expect(store.tasks[0]).toMatchObject({ phase: 'queued' })
 
     emitProgress({ taskId: 'task-1', phase: 'downloading', state: 'running', percent: 5 })
-    expect(store.progress).toStrictEqual({ phase: 'downloading', state: 'running', percent: 5 })
+    expect(store.tasks[0]).toMatchObject({ phase: 'downloading', state: 'running', percent: 5 })
   })
 
   it('keeps receiving events after a failed phase — retry resumes the same stream (TL-45 п.3, unchanged by E4)', async () => {
@@ -329,7 +323,7 @@ describe('useDownloadTaskStore — события прогресса, ключу
         partialData: 'kept',
       },
     })
-    expect(store.progress?.phase).toBe('failed')
+    expect(store.tasks[0]?.phase).toBe('failed')
 
     invokeMock.mockResolvedValueOnce(undefined)
     await store.retry('task-1')
@@ -337,57 +331,20 @@ describe('useDownloadTaskStore — события прогресса, ключу
 
     // Поток не отписан и не отфильтрован по факту отказа.
     emitProgress({ taskId: 'task-1', phase: 'downloading', state: 'running', percent: 10 })
-    expect(store.progress).toStrictEqual({ phase: 'downloading', state: 'running', percent: 10 })
+    expect(store.tasks[0]).toMatchObject({ phase: 'downloading', state: 'running', percent: 10 })
   })
 })
 
-describe('useDownloadTaskStore — task/progress/isActive: обратная совместимость на первой задаче списка', () => {
-  it('is active right after start(), even while the sole task is still "queued" (тот же критерий, что был в E3 до появления списка)', async () => {
-    invokeMock.mockResolvedValueOnce(started)
-    const store = useDownloadTaskStore()
-    await store.start(request)
-
-    expect(store.isActive).toBe(true)
-    expect(store.progress).toStrictEqual({ phase: 'queued' })
-  })
-
-  it('is not active once the task reaches a terminal phase', async () => {
+describe('useDownloadTaskStore — терминальный переход задачи сохраняет её данные в списке', () => {
+  it('a done event merges its terminal fields (fileName/folderDisplay) into the task in `tasks`, replacing the earlier downloading shape', async () => {
     invokeMock.mockResolvedValueOnce({ taskId: 'task-1', phase: 'downloading', plan: 'videoAndAudio' })
     const store = useDownloadTaskStore()
     await store.start(request)
-    expect(store.isActive).toBe(true)
+    expect(store.tasks[0]?.phase).toBe('downloading')
 
     emitProgress({ taskId: 'task-1', phase: 'done', fileName: 'video.mp4', folderDisplay: { kind: 'systemDownloads' } })
-    expect(store.isActive).toBe(false)
-    // `progress`/`task` продолжают показывать терминальную задачу — тот
-    // же приём, что и в E3 (панель рисует Done/Failed/Cancelled тем же
-    // `progress`); терминальность решает только `isActive`.
-    expect(store.progress).toStrictEqual({ phase: 'done', fileName: 'video.mp4', folderDisplay: { kind: 'systemDownloads' } })
-  })
 
-  it('is not active when no task exists', () => {
-    const store = useDownloadTaskStore()
-    expect(store.isActive).toBe(false)
-  })
-
-  it('known limitation (documented for TL-76): reflects the first task in list order, not necessarily the one actually running — a terminal task earlier in the list still wins', async () => {
-    const store = useDownloadTaskStore()
-    invokeMock.mockResolvedValueOnce({ tasks: [], awaitingContinue: false })
-    await store.initialize()
-    emitQueueChanged({
-      awaitingContinue: false,
-      tasks: [
-        { taskId: 'a', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } },
-        { taskId: 'b', title: 'B', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'downloading', state: 'running' },
-      ],
-    })
-
-    // Обратная совместимость (doc `useDownloadTaskStore`, «Обратная
-    // совместимость») намеренно не «умная»: `useExitConfirmation.ts`
-    // сегодня рассчитан на однозадачный случай, и полноценный срез всей
-    // очереди для диалога выхода — TL-76 (issue #83), не эта задача.
-    expect(store.task?.taskId).toBe('a')
-    expect(store.isActive).toBe(false)
+    expect(store.tasks[0]).toMatchObject({ phase: 'done', fileName: 'video.mp4', folderDisplay: { kind: 'systemDownloads' } })
   })
 })
 
