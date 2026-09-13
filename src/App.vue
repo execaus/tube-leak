@@ -176,8 +176,14 @@ const {
   stay: onExitStay,
   exitAnyway: onExitAnyway,
 } = useExitConfirmation()
-const { tasks: queueTasks, awaitingContinue, pauseReason, softStallSeconds, commandError: downloadCommandError } =
-  storeToRefs(downloadTaskStore)
+const {
+  tasks: queueTasks,
+  awaitingContinue,
+  pauseReason,
+  softStallSeconds,
+  commandError: downloadCommandError,
+  outcomeAnnouncement,
+} = storeToRefs(downloadTaskStore)
 
 function onDownloadRequested(payload: {
   url: string
@@ -424,6 +430,57 @@ watch(showQueueStatusRow, (visible, wasVisible) => {
     headingElFor(activeTab.value)?.focus()
   })
 })
+
+/**
+ * Живая зона исходов на «Истории»/«Настройках» (TL-98, issue #105) —
+ * терминальный исход задачи, которая была активной, и отказ команды
+ * постановки: строка статуса (`.queue-status-announcer` выше) молчит о
+ * них, потому что зеркалит только *текущее* состояние очереди и уже
+ * поменялась/пропала к тому моменту, когда пользователь мог бы это
+ * услышать (doc `showQueueStatusRow`, «на Истории/Настройках»).
+ *
+ * # Почему не читает `outcomeAnnouncement` напрямую в шаблоне
+ *
+ * **Молчание на «Главном» — решается здесь, не в сторе, и на записи, не
+ * на чтении.** Стор ничего не знает про вкладки (домен) и порождает факт
+ * при любом исходе независимо от того, что сейчас видно; здесь этот факт
+ * просто отбрасывается сразу, если `activeTab === 'main'` в момент
+ * прихода события — тот же приём, что Б-3 у `queueStatusText`/
+ * `showQueueStatusRow` (правки ревью TL-92, третий раунд), но с гейтом на
+ * **записи**, а не на каждом чтении/рендере: гейт на чтении (например,
+ * `computed(() => activeTab.value === 'main' ? '' : outcomeAnnouncement.value?.text)`)
+ * пересчитывался бы при каждом переключении вкладки и показал бы задним
+ * числом исход, случившийся, пока пользователь был на «Главном» и уже
+ * видел его через `DownloadPanel`/`DownloadCommandErrorBlock`, — при
+ * возврате с «Главного» на «Историю» текст просто появился бы снова, хотя
+ * никакого нового события не было.
+ *
+ * # Переозвучка одинакового текста подряд
+ *
+ * Скринридер не обязан заново озвучить `aria-live`-зону, если её
+ * текстовое содержимое не изменилось буквально (тот же исход у двух
+ * разных задач с одинаковым названием подряд — обычный случай, не край).
+ * `:key="outcomeAnnouncementKey"` на самом узле — при каждом новом
+ * объявлении ключ меняется, и Vue пересоздаёт `<p>` целиком (удаляет
+ * старый узел, вставляет новый с уже готовым текстом), а не переиспользует
+ * прежний элемент с обновлённым `textContent`. Для дерева доступности это
+ * не правка текста уже известного узла, а появление нового — не зависит
+ * от того, успевает ли конкретный AT заметить промежуточное пустое
+ * состояние при обычной мутации текста (приём «пересоздать узел», а не
+ * «очистить и переписать текст», не измерялся живым скринридером в этом
+ * проекте — предпочтён как не зависящий от гонки между двумя правками
+ * одного узла, doc-класс `App.tabs.test.ts`, «живая зона исходов»,
+ * проверяет ровно замену DOM-узла, а не предположение о поведении AT).
+ */
+const outcomeAnnouncementText = ref('')
+const outcomeAnnouncementKey = ref(0)
+
+watch(outcomeAnnouncement, (announcement) => {
+  if (!announcement) return
+  if (activeTab.value === 'main') return
+  outcomeAnnouncementText.value = announcement.text
+  outcomeAnnouncementKey.value += 1
+})
 </script>
 
 <template>
@@ -529,6 +586,25 @@ watch(showQueueStatusRow, (visible, wasVisible) => {
       aria-live="polite"
     >
       {{ showQueueStatusRow ? queueStatusText : '' }}
+    </p>
+
+    <!--
+      Живая зона исходов (TL-98, issue #105, doc-комментарий
+      `outcomeAnnouncementText` в `<script setup>`) — постоянный узел,
+      как и `.queue-status-announcer` выше (не `v-if`, по той же причине:
+      скринридер должен знать о зоне заранее, до первого текста в ней).
+      Собственный узел, не переиспользование `.queue-status-announcer`:
+      та зона зеркалит текущее состояние и вправе перезаписываться сколь
+      угодно часто, а это — разовое событие, которое обязано пережить
+      следующую же смену текста статусной строки (issue #105, «commit,
+      затем pump»).
+    -->
+    <p
+      :key="outcomeAnnouncementKey"
+      class="visually-hidden queue-outcome-announcer"
+      aria-live="polite"
+    >
+      {{ outcomeAnnouncementText }}
     </p>
 
     <!--

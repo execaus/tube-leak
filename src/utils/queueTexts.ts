@@ -133,3 +133,29 @@ export function getStatusRowWaitingText(waitingCount: number): string {
   const verb = pluralizeRu(waitingCount, 'ждёт', 'ждут', 'ждут')
   return `Очередь приостановлена — ${waitingCount} ${noun} ${verb}`
 }
+
+/**
+ * Текст объявления терминального исхода задачи, которая была активной
+ * (TL-98, issue #105) — для отдельной живой зоны исходов на «Истории»/
+ * «Настройках» (не для постоянной живой зоны строки состояния, Н-3/Б-3
+ * TL-92: та зеркалит *текущее* состояние и намеренно молчит, как только
+ * задача становится следующей/строка состояния меняется, — исход же
+ * обязан быть услышан ровно один раз, даже после того, как строка уже
+ * переключилась на следующую задачу).
+ *
+ * Только `done`/`failed` — `cancelled` не входит в решение ведущего
+ * issue #105: отмена доступна только с «Главного» (кнопка внутри
+ * `QueueSection`, скрытой на других вкладках), и о ней уже сообщает
+ * `DownloadPanel` (`role="status"`) в момент, когда пользователь и так
+ * смотрит на «Главный».
+ */
+export type QueueTaskOutcomePhase = 'done' | 'failed'
+
+const QUEUE_TASK_OUTCOME_LABELS: Record<QueueTaskOutcomePhase, string> = {
+  done: 'готово',
+  failed: 'не удалось',
+}
+
+export function getQueueOutcomeAnnouncementText(displayTitle: string, phase: QueueTaskOutcomePhase): string {
+  return `${displayTitle} — ${QUEUE_TASK_OUTCOME_LABELS[phase]}`
+}

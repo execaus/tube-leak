@@ -813,6 +813,275 @@ describe('App — живая зона строки статуса (TL-92, пра
   })
 })
 
+/**
+ * TL-98 (issue #105) — живая зона исходов на «Истории»/«Настройках»:
+ * терминальный исход (Done/Failed) задачи, которая была активной, и
+ * отказ команды постановки (`start_download`). Отдельная зона от
+ * `.queue-status-announcer` (Н-3/Б-3, TL-92) — та зеркалит только
+ * *текущий* текст строки статуса и не годится для разового события,
+ * которое обязано пережить следующую же смену этого текста.
+ *
+ * Запись в зону синхронна с приходом события (`watch(outcomeAnnouncement,
+ * …)` в `App.vue` пишет текст и меняет `:key` в одном вызове), поэтому
+ * каждой проверке хватает одного `await wrapper.vm.$nextTick()`. Тест
+ * переозвучки (ниже) прицельно сравнивает DOM-узел зоны до/после второго
+ * одинакового по тексту исхода — без пересоздания узла мутация «убрать
+ * `:key`» осталась бы незамеченной: итоговый текст совпадает и без него.
+ */
+describe('App — живая зона исходов (TL-98, issue 105)', () => {
+  const oneActiveTaskSnapshot: QueueSnapshot = {
+    tasks: [
+      {
+        taskId: 't1',
+        title: 'Ролик A',
+        quality: { kind: 'audioOnly' },
+        plan: 'singleStream',
+        phase: 'downloading',
+        state: 'running',
+        percent: 90,
+      },
+    ],
+    awaitingContinue: false,
+  }
+
+  it('announces a Failed outcome for the task that was active, on «История»', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () => Promise.resolve(oneActiveTaskSnapshot),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    emitQueueChanged({
+      tasks: [
+        {
+          taskId: 't1',
+          title: 'Ролик A',
+          quality: { kind: 'audioOnly' },
+          plan: 'singleStream',
+          phase: 'failed',
+          error: { kind: 'connectionLost', message: 'diag', retryable: true, partialData: 'kept' },
+        },
+      ],
+      awaitingContinue: false,
+    })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — Только аудио — не удалось')
+  })
+
+  it('announces a Done outcome for the task that was active, on «Настройки»', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () => Promise.resolve(oneActiveTaskSnapshot),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'Настройки').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    emitQueueChanged({
+      tasks: [
+        {
+          taskId: 't1',
+          title: 'Ролик A',
+          quality: { kind: 'audioOnly' },
+          plan: 'singleStream',
+          phase: 'done',
+          fileName: 'a.mp3',
+          folderDisplay: { kind: 'systemDownloads' },
+        },
+      ],
+      awaitingContinue: false,
+    })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — Только аудио — готово')
+  })
+
+  it('announces a start_download (posting command) rejection that resolves only after the user already left «Главный»', async () => {
+    const wrapper = await mountReady()
+    await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
+
+    let rejectStart: (err: unknown) => void = () => {}
+    invokeMock.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectStart = reject
+        }),
+    )
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await wrapper.vm.$nextTick()
+
+    // Ушли с «Главного» до того, как команда постановки разрешилась —
+    // баннер `DownloadCommandErrorBlock` (role="alert") появится в
+    // скрытой секции и сам по себе останется неозвученным.
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    rejectStart({ kind: 'invalidUrl', message: 'CORE-DIAGNOSTIC-NOT-SCREEN-TEXT' })
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('Ссылка не распознана')
+  })
+
+  it('never populates the outcome zone while on «Главный» — DownloadPanel/role="status" already announces it there live (mutation guard)', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () => Promise.resolve(oneActiveTaskSnapshot),
+    })
+    const wrapper = await mountReady()
+    expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('true')
+
+    emitQueueChanged({
+      tasks: [
+        {
+          taskId: 't1',
+          title: 'Ролик A',
+          quality: { kind: 'audioOnly' },
+          plan: 'singleStream',
+          phase: 'failed',
+          error: { kind: 'connectionLost', message: 'diag', retryable: true, partialData: 'kept' },
+        },
+      ],
+      awaitingContinue: false,
+    })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('')
+
+    // Возврат на «Историю» не показывает задним числом исход, случившийся,
+    // пока пользователь был на «Главном» (doc `outcomeAnnouncementText`,
+    // п. 1 — иначе это было бы дублем уже увиденного на «Главном»).
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('')
+  })
+
+  it('keeps the first task’s outcome text through a second queue://changed that starts the next task in the same tick (commit, then pump — mutation guard)', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () =>
+        Promise.resolve({
+          tasks: [
+            { ...oneActiveTaskSnapshot.tasks[0]! },
+            { taskId: 't2', title: 'Ролик B', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' },
+          ],
+          awaitingContinue: false,
+        } satisfies QueueSnapshot),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    // commit — t1 завершилась.
+    emitQueueChanged({
+      tasks: [
+        { taskId: 't1', title: 'Ролик A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } },
+        { taskId: 't2', title: 'Ролик B', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' },
+      ],
+      awaitingContinue: false,
+    })
+    // pump — t2 стартовала, тем же тиком, без ожидания между событиями.
+    emitQueueChanged({
+      tasks: [
+        { taskId: 't1', title: 'Ролик A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } },
+        { taskId: 't2', title: 'Ролик B', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'fetching' },
+      ],
+      awaitingContinue: false,
+    })
+
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — Только аудио — готово')
+  })
+
+  it('re-announces an identical outcome text for two different tasks finishing one after another — the DOM node itself is recreated, not just its text (mutation guard for the `:key` remount)', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () =>
+        Promise.resolve({
+          tasks: [
+            { taskId: 't1', title: 'Ролик', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'downloading', state: 'running' },
+            { taskId: 't2', title: 'Ролик', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' },
+          ],
+          awaitingContinue: false,
+        } satisfies QueueSnapshot),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    emitQueueChanged({
+      tasks: [
+        { taskId: 't1', title: 'Ролик', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } },
+        { taskId: 't2', title: 'Ролик', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'downloading', state: 'running' },
+      ],
+      awaitingContinue: false,
+    })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик» — Только аудио — готово')
+    const firstAnnouncerNode = wrapper.get('.queue-outcome-announcer').element
+
+    // Второй ролик с тем же названием тоже завершается — тот же итоговый
+    // текст, но это новое событие и оно обязано прозвучать снова.
+    emitQueueChanged({
+      tasks: [
+        { taskId: 't1', title: 'Ролик', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } },
+        { taskId: 't2', title: 'Ролик', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'b.mp3', folderDisplay: { kind: 'systemDownloads' } },
+      ],
+      awaitingContinue: false,
+    })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик» — Только аудио — готово')
+    // Мутация «убрать `:key`» не тронула бы этот текст (тот же и без
+    // ключа), но узел остался бы прежним — для дерева доступности это не
+    // новое сообщение, а неозвученная правка уже известного текста.
+    expect(wrapper.get('.queue-outcome-announcer').element).not.toBe(firstAnnouncerNode)
+  })
+
+  it('does not double-announce when both download://progress and the following queue://changed commit report the same Done transition', async () => {
+    // Активная задача через `start()` (клик «Скачать»), не через снимок
+    // очереди: только так подписан слушатель `download://progress`
+    // (doc {@link ensureProgressListening} в `downloadTask.ts`) — без него
+    // `emitProgress` ниже был бы холостым, и тест доказывал бы не то, что
+    // заявлен.
+    const wrapper = await mountReady()
+    await probeAndSelect(wrapper, 'https://youtu.be/a', resultA)
+    invokeMock.mockImplementationOnce(() => Promise.resolve(started))
+    await wrapper.findAll('button').find((b) => b.text() === 'Скачать')?.trigger('click')
+    await flushPromises()
+
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    emitProgress({ taskId: 'task-1', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — Только аудио — готово')
+    const announcerNode = wrapper.get('.queue-outcome-announcer').element
+
+    emitQueueChanged({
+      tasks: [
+        { taskId: 'task-1', title: 'Ролик A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } },
+      ],
+      awaitingContinue: false,
+    })
+    await wrapper.vm.$nextTick()
+    // Если бы снимок породил второе объявление того же исхода, узел был
+    // бы пересоздан (`:key`, doc выше, «Переозвучка») — он не пересоздан,
+    // потому что второго события не было: тот же самый DOM-узел.
+    expect(wrapper.get('.queue-outcome-announcer').element).toBe(announcerNode)
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — Только аудио — готово')
+  })
+})
+
 describe('App — К-14: переключение вкладок не теряет состояние (TL-92)', () => {
   it('typed link + probed card on «Главный» survive a trip to «История» and back — ProbeSection is not unmounted', async () => {
     const wrapper = await mountReady()
