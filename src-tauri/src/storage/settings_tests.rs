@@ -973,6 +973,31 @@ fn a_verbatim_path_without_a_plain_twin_keeps_its_prefix() {
     }
 }
 
+/// М-4 ревью TL-91: входы, которых `canonicalize` не выдаёт, могут сменить
+/// смысл при снятии префикса. Таблица закрепляет **текущее** поведение, а не
+/// желаемое: правка функции, меняющая его, обязана пройти через этот тест и
+/// doc [`without_verbatim_prefix`].
+///
+/// - `\\?\C:\a/b` — под `\\?\` `/` не разделитель, а знак имени; без
+///   префикса Win32 читает его как разделитель, `a/b` становится `a\b`.
+/// - `\\?\UNC\server` без share — снимается в `\\server`, у которого нет
+///   share: это уже не путь к папке.
+/// - `\\?\UNC\` — снимается в голое `\\`.
+#[test]
+fn verbatim_inputs_canonicalize_never_produces_may_change_meaning() {
+    for (input, output) in [
+        (r"\\?\C:\a/b", r"C:\a/b"),
+        (r"\\?\UNC\server", r"\\server"),
+        (r"\\?\UNC\", r"\\"),
+    ] {
+        assert_eq!(
+            without_verbatim_prefix(input.to_owned(), true),
+            output,
+            "{input}"
+        );
+    }
+}
+
 #[test]
 fn off_windows_a_canonical_path_is_left_as_is() {
     for path in [r"\\?\C:\x", r"\\?\UNC\server\share", "/Users/me/Movies"] {

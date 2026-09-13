@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
 use tempfile::{tempdir, TempDir};
@@ -24,6 +24,24 @@ struct Scene {
     data: TempDir,
     downloads: TempDir,
     state: Arc<SettingsState>,
+    log: LogSink,
+}
+
+/// Сток лога для `get_in`, запоминающий строки (приём `commands::history`).
+#[derive(Clone, Default)]
+struct LogSink {
+    lines: Arc<Mutex<Vec<String>>>,
+}
+
+impl LogSink {
+    fn sink(&self) -> impl Fn(&str) + Clone + Send + 'static {
+        let lines = Arc::clone(&self.lines);
+        move |line: &str| lines.lock().expect("мьютекс").push(line.to_owned())
+    }
+
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.lines.lock().expect("мьютекс"))
+    }
 }
 
 /// Сцена с `settings.json`, если он задан, — файл кладётся до открытия.
@@ -38,6 +56,7 @@ fn scene_with(file: Option<&str>) -> Scene {
         data,
         downloads,
         state,
+        log: LogSink::default(),
     }
 }
 
@@ -56,7 +75,7 @@ impl Scene {
     }
 
     async fn get(&self) -> SettingsView {
-        get_in(Arc::clone(&self.state), self.downloads()).await
+        get_in(Arc::clone(&self.state), self.downloads(), self.log.sink()).await
     }
 
     async fn set(&self, patch: SettingsPatch) -> Result<SettingsView, SettingsCommandError> {
@@ -107,6 +126,11 @@ async fn a_fresh_data_dir_reads_defaults_and_creates_nothing() {
         0,
         "чтение создало файл"
     );
+    assert_eq!(
+        scene.log.take(),
+        Vec::<String>::new(),
+        "умолчания из открытого хранилища — не откат"
+    );
 }
 
 /// `destinationFolderExists` — проверка на каждый запрос, у системной и у
@@ -118,12 +142,14 @@ async fn destination_folder_exists_is_checked_on_every_get() {
 
     assert!(scene.get().await.destination_folder_exists);
     assert!(
-        !get_in(state(), || None).await.destination_folder_exists,
+        !get_in(state(), || None, scene.log.sink())
+            .await
+            .destination_folder_exists,
         "ОС не дала «Загрузки» — папки нет"
     );
     let gone = scene.data.path().join("нет такой");
     assert!(
-        !get_in(state(), move || Some(gone))
+        !get_in(state(), move || Some(gone), scene.log.sink())
             .await
             .destination_folder_exists,
         "системная «Загрузки» не существует"
@@ -358,10 +384,22 @@ async fn without_a_store_get_answers_defaults_and_set_answers_write_failed() {
         "нет домашнего каталога".to_owned()
     )));
 
-    let view = get_in(Arc::clone(&state), || None).await;
+    let log = LogSink::default();
+    let view = get_in(Arc::clone(&state), || None, log.sink()).await;
     assert_eq!(view.settings, defaults());
     assert!(view.reset_fields.is_empty());
     assert!(!view.whole_file_reset);
+    let lines = log.take();
+    assert_eq!(
+        lines.len(),
+        1,
+        "откат на умолчания не залогирован: {lines:?}"
+    );
+    assert!(
+        lines[0].contains("умолчания") && lines[0].contains("нет домашнего каталога"),
+        "{}",
+        lines[0]
+    );
 
     let refused = set_in(
         state,
@@ -377,6 +415,20 @@ async fn without_a_store_get_answers_defaults_and_set_answers_write_failed() {
         "{}",
         refused.message
     );
+}
+
+/// М-2 ревью: состояние не подключено (`setup` его не положил) — тот же
+/// откат на умолчания, и та же строка лога с причиной.
+#[tokio::test]
+async fn an_unconnected_state_answers_defaults_and_logs_why() {
+    let log = LogSink::default();
+    let view = get_in(unconnected(), || None, log.sink()).await;
+    assert_eq!(view.settings, defaults());
+    assert!(view.reset_fields.is_empty());
+    assert!(!view.whole_file_reset);
+    let lines = log.take();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("не подключено"), "{}", lines[0]);
 }
 
 /// Паника в блокирующем пуле — типизированный отказ, промис `invoke` не
@@ -527,13 +579,17 @@ async fn checking_the_folder_on_get_does_not_block_the_runtime() {
     let (neighbour, wait) = rendezvous();
     let downloads = scene.downloads.path().to_path_buf();
 
-    let view = get_in(Arc::clone(&scene.state), move || {
-        assert!(
-            wait(),
-            "резолв «Загрузок» при чтении выполнялся на потоке рантайма"
-        );
-        Some(downloads)
-    })
+    let view = get_in(
+        Arc::clone(&scene.state),
+        move || {
+            assert!(
+                wait(),
+                "резолв «Загрузок» при чтении выполнялся на потоке рантайма"
+            );
+            Some(downloads)
+        },
+        scene.log.sink(),
+    )
     .await;
     assert!(
         view.destination_folder_exists,
@@ -553,8 +609,11 @@ async fn checking_the_folder_on_get_does_not_block_the_runtime() {
 /// Первый вызов процесса мог сделать и другой тест, поэтому его исход не
 /// проверяется: после него флаг взят наверняка. Остальные тесты флага не
 /// трогают (`open_isolated`, `open_with`).
-#[test]
-fn a_second_open_in_the_process_touches_no_disk_and_has_no_store() {
+///
+/// М-2 ревью: `settings_get` на таком состоянии отвечает умолчаниями и
+/// пишет в лог, что хранилище уже открыто.
+#[tokio::test]
+async fn a_second_open_in_the_process_touches_no_disk_and_has_no_store() {
     let first = tempdir().expect("каталог первого открытия");
     let second = tempdir().expect("каталог второго открытия");
     let garbage = second.path().join(SETTINGS_FILE_NAME);
@@ -576,6 +635,13 @@ fn a_second_open_in_the_process_touches_no_disk_and_has_no_store() {
         fs::read(&garbage).expect("мусор на месте"),
         "не JSON".as_bytes()
     );
+
+    let log = LogSink::default();
+    let view = get_in(Arc::new(again), || None, log.sink()).await;
+    assert_eq!(view.settings, defaults());
+    let lines = log.take();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("уже открыто"), "{}", lines[0]);
 
     // Мимо состояния — тем же флагом.
     let bypass = SettingsStore::open(second.path());
