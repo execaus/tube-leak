@@ -88,6 +88,7 @@ mod probe;
 mod queue;
 mod sidecar;
 mod single_instance;
+mod storage;
 mod types;
 mod ytdlp;
 
