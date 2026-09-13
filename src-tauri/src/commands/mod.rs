@@ -10,6 +10,8 @@ mod probe;
 mod queue;
 mod settings;
 mod sidecar;
+#[cfg(test)]
+mod source_guard;
 mod update;
 mod ytdlp;
 
@@ -19,7 +21,7 @@ pub use history::{
 };
 pub use probe::{cancel_probe, probe_url};
 pub use queue::{dismiss_queue_task, queue_state, resume_queue};
-pub use settings::{preview_name_template, settings_get, settings_set};
+pub use settings::{preview_name_template, settings_get, settings_set, SettingsState};
 // Образец предпросмотра — для тестов шаблона имени (TL-86): пример дизайна
 // проверяется на тех же константах, что возьмёт команда, а не на копии.
 #[cfg(test)]

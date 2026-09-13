@@ -69,7 +69,7 @@
 //! |---|---|
 //! | отказ открытия (`HistoryOpenError::reason()`) | `HistoryUnavailableError { reason }` у `history_page`, `unavailable { reason }` у остальных |
 //! | каталог данных не определяется | то же, `reason: noAccess` |
-//! | отказ чтения страницы или записи после открытия | `HistoryUnavailableError` / `unavailable` с `reason: noAccess` — см. ниже |
+//! | отказ чтения страницы или записи после открытия | `HistoryUnavailableError` / `unavailable` с `reason: storageFailed` — см. ниже |
 //! | `HistoryDeleteError::UnknownRecord` | `unknownRecord` |
 //! | `HistoryDeleteError::Storage`, отказ `clear` | `writeFailed` |
 //! | записи с таким `id` нет (`get` → `None`) | `unknownRecord` у `show_in_folder` |
@@ -78,14 +78,13 @@
 //! | `RevealError::FolderMissing` | `folderMissing` |
 //! | `RevealError::LauncherFailed` | `launcherFailed { exitCode, stderrTail }` |
 //! | `RevealError::Rejected` | `launcherFailed` без деталей, причина в `message` |
-//! | паника в блокирующем пуле | `HistoryUnavailableError` (`noAccess`) / `writeFailed` / `launcherFailed` без деталей |
+//! | паника в блокирующем пуле | `HistoryUnavailableError` (`storageFailed`) у `history_page` / `writeFailed` / `launcherFailed` без деталей |
 //!
-//! **Отказ чтения после открытия.** У `history_page` и `show_in_folder` нет
-//! класса «база отказала на чтении»: причины `HistoryUnavailableReason` —
-//! только про открытие. Ближайший честный класс — «история стала
-//! недоступна», причина `noAccess`; подробности уходят в `message` и лог.
-//! Текст экрана для `noAccess` в этом редком случае неточен — названо в
-//! отчёте TL-90, контракт не менялся.
+//! **Отказ чтения после открытия** — причина `storageFailed` (TL-91), в трёх
+//! местах: отказ чтения страницы, прерванное чтение страницы (`JoinError`) и
+//! отказ чтения записи в `show_in_folder`. До TL-91 здесь стояла `noAccess`,
+//! и экран говорил «нет прав», когда права были, а отказала база. Отказ
+//! открытия по-прежнему несёт свою причину (`HistoryOpenError::reason()`).
 //!
 //! **Паника не доходит до `invoke`.** Паника внутри асинхронной команды
 //! Tauri оставила бы промис висеть навсегда (doc `commands::settings`),
@@ -288,7 +287,7 @@ where
     .unwrap_or_else(|join| {
         join_log(&format!("history_page: чтение прервалось: {join}"));
         Err(HistoryUnavailableError {
-            reason: HistoryUnavailableReason::NoAccess,
+            reason: HistoryUnavailableReason::StorageFailed,
             message: format!("история: чтение прервалось — {join}"),
         })
     })
@@ -424,12 +423,15 @@ fn launcher_failed_without_details() -> ShowInFolderErrorKind {
 }
 
 /// Класс отказа базы на чтении после открытия — в причину недоступности.
-/// Отдельной причины в контракте нет (doc модуля); матч исчерпывающий,
-/// чтобы новый класс хранилища не проехал сюда молча.
+///
+/// Всё — `storageFailed` (doc модуля): `noAccess` и `diskFull` хранилища здесь
+/// не про права и место пользователя, а про базу, которая отказала на уже
+/// открытом соединении. Матч исчерпывающий, чтобы новый класс хранилища не
+/// проехал сюда молча.
 fn read_failure_reason(failure: StorageFailure) -> HistoryUnavailableReason {
     match failure {
         StorageFailure::NoAccess | StorageFailure::DiskFull | StorageFailure::Other => {
-            HistoryUnavailableReason::NoAccess
+            HistoryUnavailableReason::StorageFailed
         }
     }
 }

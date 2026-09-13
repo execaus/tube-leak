@@ -799,6 +799,11 @@ fn run_generated_pairs(seed: u64, pairs: u64) -> GenerationStats {
                     TemplateProblem::NoVariables => {
                         assert!(!source.contains('{'), "{}: {problem:?}", where_());
                     }
+                    // Предел длины проверяет хранилище настроек до разбора
+                    // (TL-87), сам разбор длину не ограничивает.
+                    TemplateProblem::TooLong { .. } => {
+                        panic!("{}: разбор вернул {problem:?}", where_());
+                    }
                 }
                 continue;
             }

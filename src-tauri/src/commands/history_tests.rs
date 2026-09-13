@@ -309,7 +309,8 @@ async fn entries_carry_the_folder_display_by_the_resolved_downloads() {
 }
 
 /// Паника в блокирующем пуле — типизированный отказ, промис `invoke` не
-/// повисает.
+/// повисает. Причина — `storageFailed` (TL-91, место 2 из 3): база уже
+/// открыта, прервалось чтение, а не права.
 #[tokio::test]
 async fn a_panicking_read_is_a_typed_refusal() {
     let scene = scene();
@@ -322,7 +323,88 @@ async fn a_panicking_read_is_a_typed_refusal() {
     )
     .await
     .expect_err("паника — отказ");
-    assert_eq!(refused.reason, HistoryUnavailableReason::NoAccess);
+    assert_eq!(refused.reason, HistoryUnavailableReason::StorageFailed);
+}
+
+/// Убирает таблицу истории вторым соединением: открытое хранилище после
+/// этого отказывает на любом чтении — живой отказ базы после открытия.
+fn drop_history_table(data: &Path) {
+    Connection::open(data.join(HISTORY_FILE_NAME))
+        .expect("второе соединение")
+        .execute_batch("DROP TABLE history")
+        .expect("таблица убрана");
+}
+
+/// TL-91, место 1 из 3: отказ базы на чтении страницы после открытия —
+/// `storageFailed` при любом классе хранилища, и подменённом, и живом.
+#[tokio::test]
+async fn a_page_read_failure_after_open_is_storage_failed() {
+    let scene = scene();
+    insert_with_file(&scene.state, scene.downloads.path(), 1);
+
+    for failure in [
+        StorageFailure::NoAccess,
+        StorageFailure::DiskFull,
+        StorageFailure::Other,
+    ] {
+        let refused = page_in(
+            Arc::clone(&scene.state),
+            None,
+            || None,
+            move |_, _| {
+                Err(HistoryStorageError {
+                    failure,
+                    detail: "подменённый отказ".to_owned(),
+                })
+            },
+            log_to_stderr,
+        )
+        .await
+        .expect_err("чтение отказало");
+        assert_eq!(
+            refused.reason,
+            HistoryUnavailableReason::StorageFailed,
+            "{failure:?}"
+        );
+    }
+
+    drop_history_table(scene.data.path());
+    let refused = page_in(
+        Arc::clone(&scene.state),
+        None,
+        || None,
+        HistoryStore::page,
+        log_to_stderr,
+    )
+    .await
+    .expect_err("таблицы нет");
+    assert_eq!(refused.reason, HistoryUnavailableReason::StorageFailed);
+    assert!(refused.message.contains("history"), "{}", refused.message);
+}
+
+/// TL-91, место 3 из 3: запись для «Показать в папке» не читается из уже
+/// открытой базы — `unavailable { storageFailed }`, и показ не запускается.
+#[tokio::test]
+async fn a_record_read_failure_in_show_in_folder_is_storage_failed() {
+    let scene = scene();
+    let id = insert_with_file(&scene.state, scene.downloads.path(), 1);
+    drop_history_table(scene.data.path());
+    let recorder = Recorder::default();
+
+    let refused = show_in(
+        Arc::clone(&scene.state),
+        id,
+        recorder.reveal_on(TargetOs::MacOs),
+    )
+    .await
+    .expect_err("запись не читается");
+    assert_eq!(
+        refused.kind,
+        ShowInFolderErrorKind::Unavailable {
+            reason: HistoryUnavailableReason::StorageFailed
+        }
+    );
+    assert!(recorder.calls().is_empty(), "{:?}", recorder.calls());
 }
 
 // ---------------------------------------------------------------------------
@@ -979,17 +1061,6 @@ fn a_second_open_in_the_process_touches_no_disk_and_is_unavailable() {
     );
 }
 
-/// Сколько раз в строке кода встречается токен `HistoryStore::open` — с
-/// вызовом или ссылкой на функцию, но не `open_isolated` и прочие имена.
-fn open_tokens(code: &str) -> usize {
-    const TOKEN: &str = "HistoryStore::open";
-    code.match_indices(TOKEN)
-        .filter(|(at, _)| {
-            !code[at + TOKEN.len()..].starts_with(|c: char| c == '_' || c.is_alphanumeric())
-        })
-        .count()
-}
-
 /// Сторож по исходникам: токен `HistoryStore::open` в продакшен-коде стоит
 /// ровно в одном месте — в `HistoryState::open`.
 ///
@@ -1011,76 +1082,31 @@ fn open_tokens(code: &str) -> usize {
 /// обобщённый вызов `T::open` с `T = HistoryStore`; имя, собранное макросом;
 /// вызов в хвосте строки после блочного комментария и токен внутри
 /// строкового литерала (там он дал бы ложную тревогу, а не пропуск).
+///
+/// Сканер общий с настройками (`commands::source_guard`, TL-91); номер
+/// строки единственного токена берётся из самого `history.rs`, чтобы сторож
+/// сверял место, а не только количество.
 #[test]
 fn the_store_is_opened_in_exactly_one_production_place() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut calls = Vec::new();
-    let mut aliases = Vec::new();
-    let mut stack = vec![src.clone()];
-    let mut scanned = 0;
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).expect("каталог обходится") {
-            let path = entry.expect("элемент").path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            if !name.ends_with(".rs") || name.ends_with("_tests.rs") {
-                continue;
-            }
-            scanned += 1;
-            let text = fs::read_to_string(&path).expect("исходник читается");
-            for (number, line) in text.lines().enumerate() {
-                let code = line.trim_start();
-                if code.starts_with("//") {
-                    continue;
-                }
-                let place = format!(
-                    "{}:{}",
-                    path.strip_prefix(&src).expect("под src").display(),
-                    number + 1
-                );
-                calls.extend((0..open_tokens(code)).map(|_| place.clone()));
-                let type_alias = code.split_whitespace().any(|word| word == "type")
-                    && code.split_once('=').is_some_and(|(_, rhs)| {
-                        let rhs = rhs.trim().trim_end_matches(';').trim_end();
-                        rhs == "HistoryStore" || rhs.ends_with("::HistoryStore")
-                    });
-                if code.contains("HistoryStore as ") || type_alias {
-                    aliases.push(place);
-                }
-            }
-        }
-    }
-    assert!(scanned > 20, "сторож не увидел исходников: {scanned}");
+    let places = crate::commands::source_guard::production_places("HistoryStore");
+    assert!(
+        places.scanned > 20,
+        "сторож не увидел исходников: {}",
+        places.scanned
+    );
     assert_eq!(
-        aliases,
+        places.aliases,
         Vec::<String>::new(),
         "переименованный импорт или псевдоним типа HistoryStore"
     );
+    let line = crate::commands::source_guard::first_line_in_impl(
+        include_str!("history.rs"),
+        "impl HistoryState",
+        "HistoryStore::open",
+    );
     assert_eq!(
-        calls,
-        vec!["commands/history.rs".to_owned() + ":" + &open_call_line().to_string()],
+        places.calls,
+        vec![format!("commands/history.rs:{line}")],
         "HistoryStore::open стоит не ровно в HistoryState::open"
     );
-}
-
-/// Номер строки единственного токена — из самого `history.rs`, чтобы сторож
-/// сверял место, а не только количество: первая строка кода с токеном после
-/// `impl HistoryState` (комментарии пропускаются так же, как в стороже).
-fn open_call_line() -> usize {
-    let text = include_str!("history.rs");
-    let mut in_impl = false;
-    for (number, line) in text.lines().enumerate() {
-        let code = line.trim_start();
-        in_impl |= code.starts_with("impl HistoryState");
-        if in_impl && !code.starts_with("//") && open_tokens(code) > 0 {
-            return number + 1;
-        }
-    }
-    panic!("токена HistoryStore::open внутри impl HistoryState нет");
 }

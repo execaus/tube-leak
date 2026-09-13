@@ -930,6 +930,56 @@ fn a_folder_behind_a_closed_parent_is_no_access() {
     );
 }
 
+/// Windows: `canonicalize` отдаёт `\\?\…`, в файл и на экран уходит обычная
+/// запись пути (добавка к TL-91). ОС — параметром, ветка Windows проверяется
+/// на любой машине.
+#[test]
+fn the_windows_verbatim_prefix_is_removed_when_the_path_means_the_same() {
+    for (verbatim, plain) in [
+        (r"\\?\C:\Users\me\Видео", r"C:\Users\me\Видео"),
+        (r"\\?\d:\", r"d:\"),
+        (r"\\?\C:\папка.с.точками\a b", r"C:\папка.с.точками\a b"),
+        (r"\\?\UNC\server\share\папка", r"\\server\share\папка"),
+        (r"\\?\UNC\server\share", r"\\server\share"),
+    ] {
+        assert_eq!(
+            without_verbatim_prefix(verbatim.to_owned(), true),
+            plain,
+            "{verbatim}"
+        );
+    }
+}
+
+/// Префикс остаётся, если без него путь значил бы другое (Win32 срезает
+/// точку и пробел на конце компонента, имя устройства становится
+/// устройством) или у формы нет обычной записи. Путь без префикса не
+/// меняется.
+#[test]
+fn a_verbatim_path_without_a_plain_twin_keeps_its_prefix() {
+    for kept in [
+        r"\\?\C:\папка.\x",
+        r"\\?\C:\a \x",
+        r"\\?\C:\CON",
+        r"\\?\C:\x\nul.txt",
+        r"\\?\UNC\server\COM1\x",
+        r"\\?\Volume{0b1c2d3e-0000-0000-0000-000000000000}\x",
+        r"\\?\GLOBALROOT\Device\HarddiskVolume1\x",
+        r"\\?\C:",
+        r"\\?\",
+        r"C:\уже\обычный",
+        r"\\server\share",
+    ] {
+        assert_eq!(without_verbatim_prefix(kept.to_owned(), true), kept);
+    }
+}
+
+#[test]
+fn off_windows_a_canonical_path_is_left_as_is() {
+    for path in [r"\\?\C:\x", r"\\?\UNC\server\share", "/Users/me/Movies"] {
+        assert_eq!(without_verbatim_prefix(path.to_owned(), false), path);
+    }
+}
+
 #[test]
 fn destination_existence_is_checked_on_request_not_on_read() {
     let dir = tempdir().expect("временный каталог");
