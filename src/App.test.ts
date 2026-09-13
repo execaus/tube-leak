@@ -123,11 +123,19 @@ const warmupFailedError: YtDlpPrepareError = {
  * от экрана подготовки/sidecar (см. doc `App.vue`), и без дефолта здесь
  * каждый тест этого файла (не про очередь) был бы обязан его мокать —
  * вечно висящий промис держит очередь в нейтральном «списка ещё нет».
+ *
+ * `history_page` (эпик E5, TL-93) — тем же приёмом: `HistoryScreen`
+ * рендерится безусловно под вкладкой «История» (`v-show`, К-14) и вызывает
+ * `useHistoryStore().initialize()` в своём `onMounted`, который срабатывает
+ * сразу при монтаже `App.vue`, а не только когда пользователь переключится
+ * на «Историю» — без дефолта здесь этот файл (не про историю) был бы обязан
+ * мокать и её.
  */
 function routeInvoke(handlers: Record<string, () => Promise<unknown>>) {
   const withDefaults: Record<string, () => Promise<unknown>> = {
     ytdlp_update_state: () => new Promise<unknown>(() => {}),
     queue_state: () => new Promise<unknown>(() => {}),
+    history_page: () => new Promise<unknown>(() => {}),
     ...handlers,
   }
   invokeMock.mockImplementation((command: string) => {
@@ -524,8 +532,9 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
 
     // prepare_ytdlp, ytdlp_update_state (TL-59, блок обновления — висит
     // вечно, см. doc `routeInvoke`), queue_state (эпик E4, TL-75 — тоже
-    // висит вечно), check_sidecar × 2.
-    expect(invokeMock).toHaveBeenCalledTimes(5)
+    // висит вечно), history_page (эпик E5, TL-93 — тоже висит вечно),
+    // check_sidecar × 2.
+    expect(invokeMock).toHaveBeenCalledTimes(6)
     expect(invokeMock.mock.calls.filter(([cmd]) => cmd === 'prepare_ytdlp')).toHaveLength(1)
     expect(buttonLabels(wrapper)).toStrictEqual(['Проверить сейчас'])
   })

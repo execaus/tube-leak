@@ -31,6 +31,7 @@ import { storeToRefs } from 'pinia'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 
 import ExitConfirmDialog from '@/components/ExitConfirmDialog.vue'
+import HistoryScreen from '@/components/HistoryScreen.vue'
 import ProbeSection from '@/components/ProbeSection.vue'
 import QueueSection from '@/components/QueueSection.vue'
 import SidecarStatusRow from '@/components/SidecarStatusRow.vue'
@@ -684,9 +685,9 @@ watch(showQueueStatusRow, (visible, wasVisible) => {
     </section>
 
     <!--
-      Плейсхолдер экрана истории (TL-93 заменит содержимое своим
-      компонентом на этом же месте) — не зависит от готовности sidecar
-      (дизайн «Навигация»).
+      Экран истории (TL-93, Ф-4…Ф-6, Ф-8, С-1…С-4, С-10) — заголовок и его
+      фокус-цель остаются здесь (К-14), содержимое ниже целиком несёт
+      `HistoryScreen`; не зависит от готовности sidecar (дизайн «Навигация»).
     -->
     <section
       v-show="activeTab === 'history'"
@@ -700,7 +701,7 @@ watch(showQueueStatusRow, (visible, wasVisible) => {
       >
         История
       </h2>
-      <p>Здесь появится история завершённых загрузок.</p>
+      <HistoryScreen />
     </section>
 
     <!--

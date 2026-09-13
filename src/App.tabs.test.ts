@@ -108,6 +108,11 @@ function routeInvoke(handlersByCommand: Record<string, () => Promise<unknown>>) 
     // Снимок очереди — дефолт «пусто», явно переданный обработчик той же
     // команды имеет приоритет (тот же приём, что `App.download.test.ts`).
     queue_state: () => Promise.resolve(EMPTY_QUEUE_SNAPSHOT),
+    // Первая страница истории (эпик E5, TL-93): `HistoryScreen` рендерится
+    // безусловно под вкладкой «История» (`v-show`, К-14) и запрашивает её
+    // сразу при монтаже `App.vue`, независимо от активной вкладки — дефолт
+    // «пусто», явно переданный обработчик той же команды имеет приоритет.
+    history_page: () => Promise.resolve({ entries: [], notices: [] }),
     ...handlersByCommand,
   }
   invokeMock.mockImplementation((command: string) => {
@@ -237,7 +242,7 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
     await wrapper.vm.$nextTick()
 
     expect(tabPanel(wrapper, 'tabpanel-history').isVisible()).toBe(true)
-    expect(wrapper.text()).toContain('Здесь появится история завершённых загрузок.')
+    expect(wrapper.text()).toContain('История пуста. Здесь появятся ролики после первой завершённой загрузки.')
 
     resolvePrepare(preparedWarm)
     await flushPromises()
@@ -255,7 +260,7 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
     expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('false')
     expect(tabPanel(wrapper, 'tabpanel-history').isVisible()).toBe(true)
     expect(tabPanel(wrapper, 'tabpanel-main').isVisible()).toBe(false)
-    expect(wrapper.text()).toContain('Здесь появится история завершённых загрузок.')
+    expect(wrapper.text()).toContain('История пуста. Здесь появятся ролики после первой завершённой загрузки.')
 
     const heading = tabPanel(wrapper, 'tabpanel-history').get('h2')
     expect(document.activeElement).toBe(heading.element)
@@ -843,6 +848,57 @@ describe('App — К-14: переключение вкладок не теряе
     // порвалась и не пересоздавалась при переключении вкладок.
     const queueStateCallsAfter = invokeMock.mock.calls.filter(([cmd]) => cmd === 'queue_state').length
     expect(queueStateCallsAfter).toBe(queueStateCallsBefore)
+  })
+
+  it('a page loaded via «Показать ещё» on «История» (TL-93) survives a trip to «Главный» and back — HistoryScreen is not unmounted', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      history_page: () =>
+        Promise.resolve({
+          entries: [{ id: '1', videoId: 'a', url: 'u', title: 'A', quality: { kind: 'audioOnly' }, fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' }, sizeBytes: 1, finishedAtUnixSecs: 1, fileStatus: { kind: 'present' } }],
+          nextCursor: { finishedAtUnixSecs: 1, id: '1' },
+          notices: [],
+        }),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    invokeMock.mockImplementationOnce((command: string) => {
+      if (command === 'history_page') {
+        return Promise.resolve({
+          entries: [{ id: '2', videoId: 'b', url: 'u', title: 'B', quality: { kind: 'audioOnly' }, fileName: 'b.mp3', folderDisplay: { kind: 'systemDownloads' }, sizeBytes: 1, finishedAtUnixSecs: 0, fileStatus: { kind: 'present' } }],
+          notices: [],
+        })
+      }
+      throw new Error(`unexpected invoke: ${command}`)
+    })
+    await wrapper.findAll('button').find((b) => b.text() === 'Показать ещё')?.trigger('click')
+    await flushPromises()
+    expect(wrapper.findAll('.history-screen__entry')).toHaveLength(2)
+
+    const historyPageCallsBefore = invokeMock.mock.calls.filter(([cmd]) => cmd === 'history_page').length
+
+    await tabButton(wrapper, 'Главный').trigger('click')
+    await wrapper.vm.$nextTick()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.findAll('.history-screen__entry')).toHaveLength(2)
+
+    // `history_page` не запрашивается повторно только оттого, что
+    // пользователь ушёл и вернулся: `v-show` держит `HistoryScreen`
+    // смонтированным всегда, `onMounted` срабатывает один раз при монтаже
+    // `App.vue` (doc `activeTab` в `App.vue`, doc-класс `useHistoryStore`).
+    // Мутация «`v-show` → `v-if` на секции «Истории»» размонтировала бы
+    // `HistoryScreen` при уходе и вызвала бы `onMounted` заново при
+    // возврате — этот счётчик вырос бы, и подгруженная вторая страница
+    // (id «2») пропала бы вместе с ним, потому что настоящий
+    // `history_page` (мок задан лишь единожды через `mockImplementationOnce`
+    // выше) на повторный вызов ответил бы `unexpected invoke`.
+    const historyPageCallsAfter = invokeMock.mock.calls.filter(([cmd]) => cmd === 'history_page').length
+    expect(historyPageCallsAfter).toBe(historyPageCallsBefore)
   })
 })
 
