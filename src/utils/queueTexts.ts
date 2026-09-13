@@ -68,3 +68,56 @@ export function getResumeBannerText(waitingCount: number): string {
  */
 export const YT_DLP_UPDATE_PAUSE_TEXT =
   'Между загрузками устанавливается обновлённый yt-dlp — обычно занимает меньше минуты'
+
+/**
+ * Три фазы, которые вообще могут принадлежать «активной задаче» строки
+ * состояния (TL-92, дизайн E5 «Навигация»): не `queued` (ждёт, ещё не
+ * активна) и не терминальная (`done`/`failed`/`cancelled` — задача уже не
+ * «происходит»). Подписи — буквально те же три, что рисует степпер
+ * `DownloadPanel` (дизайн: «‹название фазы, как в степпере DownloadPanel›»),
+ * скопированы сюда как строки, а не импортированы оттуда: у степпера это
+ * приватный литерал разметки конкретного компонента, не экспортируемый
+ * util — заводить экспорт ради трёх строк в одном другом месте означало
+ * бы новую публичную поверхность `DownloadPanel.vue` ради строки статуса.
+ */
+export type ActiveQueueTaskPhase = 'fetching' | 'downloading' | 'merging'
+
+const ACTIVE_PHASE_LABELS: Record<ActiveQueueTaskPhase, string> = {
+  fetching: 'Подготовка',
+  downloading: 'Скачивание',
+  merging: 'Склейка',
+}
+
+/**
+ * Текст компактной строки состояния очереди для активной задачи (дизайн
+ * «Навигация»): «‹displayTitle› · ‹фаза› · ‹процент, если есть›». Процент
+ * дописывается только для `downloading` и только когда он вообще известен
+ * (то же правило надёжности числа, что и у самой панели, — `merging`/
+ * `fetching` его не показывают никогда, даже если он случайно определён).
+ */
+export function getActiveQueueStatusText(
+  displayTitle: string,
+  phase: ActiveQueueTaskPhase,
+  percent?: number,
+): string {
+  const parts = [displayTitle, ACTIVE_PHASE_LABELS[phase]]
+  if (phase === 'downloading' && percent !== undefined) {
+    parts.push(`${Math.round(percent)} %`)
+  }
+  return parts.join(' · ')
+}
+
+/**
+ * Текст строки состояния, когда активной задачи ещё нет, а очередь
+ * восстановлена после перезапуска и ждёт «Продолжить» (дизайн
+ * «Навигация»: «Очередь приостановлена — N задач ждут», та же грамматика
+ * согласования числительного/глагола, что у {@link getResumeBannerText}) —
+ * короче баннера очереди: без «после перезапуска» и без второго
+ * предложения про сетевые обращения, эта строка живёт в шапке, а не в
+ * самой секции очереди.
+ */
+export function getStatusRowWaitingText(waitingCount: number): string {
+  const noun = pluralizeRu(waitingCount, 'задача', 'задачи', 'задач')
+  const verb = pluralizeRu(waitingCount, 'ждёт', 'ждут', 'ждут')
+  return `Очередь приостановлена — ${waitingCount} ${noun} ${verb}`
+}

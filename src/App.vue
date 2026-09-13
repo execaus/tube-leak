@@ -28,7 +28,7 @@
  * не требует четвёртой раскладки только ради доли секунды ожидания.
  */
 import { storeToRefs } from 'pinia'
-import { computed, onMounted } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 
 import ExitConfirmDialog from '@/components/ExitConfirmDialog.vue'
 import ProbeSection from '@/components/ProbeSection.vue'
@@ -42,8 +42,19 @@ import { useSidecarCheck } from '@/composables/useSidecarCheck'
 import { useYtDlpPrepare } from '@/composables/useYtDlpPrepare'
 import { useYtDlpUpdate } from '@/composables/useYtDlpUpdate'
 import { useDownloadTaskStore } from '@/stores/downloadTask'
+import type { DownloadPhase } from '@/types/generated/download'
 import type { QualitySize, QualityStreams } from '@/types/generated/probe'
 import type { SelectedQuality } from '@/types/generated/queue'
+import { assertNever } from '@/utils/assertNever'
+import { isTerminalQueuePhase } from '@/utils/queueTaskPhase'
+import { toDownloadProgress } from '@/utils/queueTaskProgress'
+import { formatTaskDisplayTitle } from '@/utils/queueTaskTitle'
+import {
+  type ActiveQueueTaskPhase,
+  getActiveQueueStatusText,
+  getStatusRowWaitingText,
+  YT_DLP_UPDATE_PAUSE_TEXT,
+} from '@/utils/queueTexts'
 
 // Версия приложения известна локально и не зависит от sidecar (дизайн E1,
 // «Компоновка»). Держим в синхроне с `package.json` вручную — единственное
@@ -181,6 +192,161 @@ function onDownloadRequested(payload: {
     quality: payload.quality,
   })
 }
+
+/**
+ * Навигация «Главный/История/Настройки» (Ф-16, TL-92, дизайн E5
+ * «Навигация») — локальный `ref`, без `vue-router` (запрещён требованием
+ * буквально). Три ветки одного `v-show` в шаблоне ниже, а не `v-if`:
+ * `ProbeSection` держит собственное состояние поля ссылки и разбора
+ * (`useLinkProbe`, эпик E2) в своём `<script setup>`, и `v-if` снёс бы
+ * его при каждом уходе на «Историю»/«Настройки» и создал заново с нуля —
+ * ровно то разрушение состояния, которого нет права быть по критерию
+ * К-14 «без потери состояния». Сам стор очереди (`downloadTaskStore`) и
+ * его подписки на события живут на верхнем уровне этого `<script setup>`
+ * независимо от того, что сейчас показано — переключение вкладки их не
+ * касается вовсе, `v-show`/`v-if` здесь ничего не меняет.
+ */
+type TabId = 'main' | 'history' | 'settings'
+
+const TABS: { id: TabId; label: string }[] = [
+  { id: 'main', label: 'Главный' },
+  { id: 'history', label: 'История' },
+  { id: 'settings', label: 'Настройки' },
+]
+
+const activeTab = ref<TabId>('main')
+
+const mainHeadingEl = ref<HTMLHeadingElement | null>(null)
+const historyHeadingEl = ref<HTMLHeadingElement | null>(null)
+const settingsHeadingEl = ref<HTMLHeadingElement | null>(null)
+
+function headingElFor(tab: TabId): HTMLHeadingElement | null {
+  switch (tab) {
+    case 'main':
+      return mainHeadingEl.value
+    case 'history':
+      return historyHeadingEl.value
+    case 'settings':
+      return settingsHeadingEl.value
+    default:
+      return assertNever(tab)
+  }
+}
+
+/**
+ * Переключение вкладки — клик по кнопке, стрелки/Home/End в `tablist`
+ * ниже и кнопка «На главный» строки состояния все идут через одну и ту
+ * же функцию (дизайн «Навигация», «Фокус при переключении экрана»):
+ * `aria-selected`/видимость панелей меняются синхронно с `activeTab`,
+ * а сразу после — фокус программно переводится на `<h2 tabindex="-1">`
+ * в начале новой панели (у «Главного» — уже существующий `<h1>`, тоже с
+ * `tabindex="-1"` теперь). Повторный вызов `.focus()` на уже
+ * сфокусированном элементе (пользователь и так на нём) — обычное
+ * поведение DOM, не требует отдельной проверки здесь.
+ */
+async function selectTab(tab: TabId): Promise<void> {
+  activeTab.value = tab
+  await nextTick()
+  headingElFor(tab)?.focus()
+}
+
+/**
+ * Клавиатура `tablist` (дизайн «Навигация», практика ARIA tabs): стрелки
+ * циклически двигают выбор, Home/End — к первой/последней вкладке.
+ * Активация — сразу по нажатию (не раздельные «фокус» и «активация»):
+ * дизайн явно требует уводить фокус с кнопки-вкладки в панель при любом
+ * переключении, так что отдельного шага подтверждения (Enter/Space) не
+ * остаётся, и удерживать фокус на самой вкладке между нажатиями стрелок
+ * незачем.
+ */
+function handleTablistKeydown(event: KeyboardEvent): void {
+  const ids = TABS.map((t) => t.id)
+  const currentIndex = ids.indexOf(activeTab.value)
+  let nextIndex: number
+  switch (event.key) {
+    case 'ArrowRight':
+    case 'ArrowDown':
+      nextIndex = (currentIndex + 1) % ids.length
+      break
+    case 'ArrowLeft':
+    case 'ArrowUp':
+      nextIndex = (currentIndex - 1 + ids.length) % ids.length
+      break
+    case 'Home':
+      nextIndex = 0
+      break
+    case 'End':
+      nextIndex = ids.length - 1
+      break
+    default:
+      return
+  }
+  event.preventDefault()
+  void selectTab(ids[nextIndex]!)
+}
+
+/**
+ * Три фазы, которые могут принадлежать активной задаче строки состояния
+ * (не `queued` — она ещё ждёт, не терминальная — она уже не «происходит»,
+ * см. doc {@link ActiveQueueTaskPhase} в `queueTexts.ts`). `assertNever`
+ * в `default` держит границу с контрактом (`DownloadPhase`, TL-51/TL-70):
+ * восьмая фаза не даёт этой функции тихо остаться в `undefined`, а роняет
+ * `npm run type-check` на этой строке.
+ */
+function toActiveQueueTaskPhase(phase: DownloadPhase): ActiveQueueTaskPhase | undefined {
+  switch (phase) {
+    case 'fetching':
+      return 'fetching'
+    case 'downloading':
+      return 'downloading'
+    case 'merging':
+      return 'merging'
+    case 'queued':
+    case 'done':
+    case 'failed':
+    case 'cancelled':
+      return undefined
+    default:
+      return assertNever(phase)
+  }
+}
+
+/**
+ * Текст строки состояния (дизайн «Навигация»): активная задача — по
+ * приоритету первая, пауза на обновление yt-dlp — вторая, восстановленная
+ * после перезапуска очередь — третья; иначе строки нет вовсе. Читает
+ * только уже существующий полный срез очереди (`tasks`/`awaitingContinue`/
+ * `pauseReason` — не временные геттеры `task`/`progress`/`isActive`,
+ * помеченные к удалению в #86/#89, doc-комментарий `useDownloadTaskStore`,
+ * «Обратная совместимость»), никакого нового опроса не заводит.
+ */
+const activeQueueStatusText = computed<string | undefined>(() => {
+  for (const t of queueTasks.value) {
+    const phase = toActiveQueueTaskPhase(t.phase)
+    if (phase === undefined) continue
+    const progress = toDownloadProgress(t)
+    const percent = progress.phase === 'downloading' ? progress.percent : undefined
+    return getActiveQueueStatusText(formatTaskDisplayTitle(t.title, t.quality), phase, percent)
+  }
+  return undefined
+})
+
+const queueStatusText = computed<string | undefined>(() => {
+  if (activeQueueStatusText.value !== undefined) return activeQueueStatusText.value
+  if (pauseReason.value === 'ytDlpUpdate') return YT_DLP_UPDATE_PAUSE_TEXT
+  if (awaitingContinue.value) {
+    const waitingCount = queueTasks.value.filter((t) => !isTerminalQueuePhase(t.phase)).length
+    if (waitingCount > 0) return getStatusRowWaitingText(waitingCount)
+  }
+  return undefined
+})
+
+/**
+ * Видна только на «Истории»/«Настройках» (дизайн: на «Главном» её роль и
+ * так играет полная секция «Очередь загрузок» — своя строка там была бы
+ * вторым источником того же самого).
+ */
+const showQueueStatusRow = computed(() => activeTab.value !== 'main' && queueStatusText.value !== undefined)
 </script>
 
 <template>
@@ -195,7 +361,18 @@ function onDownloadRequested(payload: {
 
   <main class="screen">
     <header>
-      <h1>tube-leak</h1>
+      <!--
+        `tabindex="-1"` (TL-92, дизайн E5 «Фокус при переключении экрана»):
+        цель программного фокуса при возврате на «Главный» с «Истории»/
+        «Настроек» — заголовок не входит в обычный порядок обхода Tab,
+        доступен только через `selectTab('main')`.
+      -->
+      <h1
+        ref="mainHeadingEl"
+        tabindex="-1"
+      >
+        tube-leak
+      </h1>
       <!--
         Версия — известна локально, sidecar не нужен, дизайн E1 держит её
         видимой к t ≤ 3 с независимо от того, идёт ли ещё 40-секундная
@@ -207,111 +384,222 @@ function onDownloadRequested(payload: {
       </p>
     </header>
 
-    <YtDlpPrepareScreen
-      v-if="showPrepareScreen"
-      :stage="stage!"
-      :percent="percent"
-      :eta-secs="etaSecs"
-    />
-
-    <YtDlpPrepareError
-      v-else-if="showPrepareError"
-      :error="prepareError!"
-      @retry="runPrepareAndCheckSidecar"
-    />
-
-    <template v-else>
-      <section
-        aria-live="polite"
-        :aria-busy="isLoading"
+    <!--
+      Панель вкладок (Ф-16, TL-92, дизайн E5 «Навигация») — самый верхний
+      уровень разметки, рендерится безусловно: «Главный» ниже показывает
+      ровно то же самое, что показывал бы без вкладок вообще (экран
+      подготовки yt-dlp, его ошибку либо обычное содержимое E1–E4, без
+      изменений внутри), а «История»/«Настройки» не зависят от готовности
+      sidecar вовсе.
+    -->
+    <div
+      class="tabs"
+      role="tablist"
+      aria-label="Разделы приложения"
+      @keydown="handleTablistKeydown"
+    >
+      <button
+        v-for="tab in TABS"
+        :id="`tab-${tab.id}`"
+        :key="tab.id"
+        type="button"
+        role="tab"
+        class="tabs__tab tap-target"
+        :aria-selected="activeTab === tab.id"
+        :aria-controls="`tabpanel-${tab.id}`"
+        :tabindex="activeTab === tab.id ? 0 : -1"
+        @click="selectTab(tab.id)"
       >
-        <SidecarStatusRow
-          fallback-name="yt-dlp"
-          :result="report?.ytDlp"
-        />
-        <SidecarStatusRow
-          fallback-name="ffmpeg"
-          :result="report?.ffmpeg"
-        />
-      </section>
+        {{ tab.label }}
+      </button>
+    </div>
 
-      <footer
-        v-if="showRetry"
-        class="screen__footer"
+    <hr class="screen__divider">
+
+    <!--
+      Компактная строка состояния очереди (дизайн «Навигация») — видна
+      только на «Истории»/«Настройках», пока где-то реально идёт или ждёт
+      загрузка: на «Главном» её роль и так играет полная секция «Очередь
+      загрузок» ниже. Кнопка «На главный» просто переключает вкладку, не
+      эмитит никаких команд.
+    -->
+    <p
+      v-if="showQueueStatusRow"
+      class="queue-status-row"
+      aria-live="polite"
+    >
+      <span class="queue-status-row__text">{{ queueStatusText }}</span>
+      <button
+        type="button"
+        class="tap-target"
+        @click="selectTab('main')"
       >
-        <button
-          type="button"
-          class="tap-target"
-          :disabled="isLoading"
-          @click="check"
+        На главный
+      </button>
+    </p>
+
+    <hr
+      v-if="showQueueStatusRow"
+      class="screen__divider"
+    >
+
+    <!--
+      `v-show`, не `v-if`, на всех трёх панелях (doc-комментарий `activeTab`
+      в `<script setup>`, К-14): переключение вкладки не должно
+      размонтировать `ProbeSection`/`QueueSection` и терять их состояние.
+    -->
+    <section
+      v-show="activeTab === 'main'"
+      id="tabpanel-main"
+      role="tabpanel"
+      aria-labelledby="tab-main"
+    >
+      <YtDlpPrepareScreen
+        v-if="showPrepareScreen"
+        :stage="stage!"
+        :percent="percent"
+        :eta-secs="etaSecs"
+      />
+
+      <YtDlpPrepareError
+        v-else-if="showPrepareError"
+        :error="prepareError!"
+        @retry="runPrepareAndCheckSidecar"
+      />
+
+      <template v-else>
+        <section
+          aria-live="polite"
+          :aria-busy="isLoading"
         >
-          {{ isLoading ? 'Проверяем…' : 'Повторить проверку' }}
-        </button>
-      </footer>
+          <SidecarStatusRow
+            fallback-name="yt-dlp"
+            :result="report?.ytDlp"
+          />
+          <SidecarStatusRow
+            fallback-name="ffmpeg"
+            :result="report?.ffmpeg"
+          />
+        </section>
 
-      <!--
-        Блок «Обновление yt-dlp» (Ф-10, TL-59/TL-60, дизайн E6) — между
-        строками SidecarStatusRow и разделителем перед полем ссылки
-        (дизайн, «Где живёт блок»). Кнопка «Вернуться к …» и инлайн-
-        подтверждение рисуются самим блоком по снимку контура; вызов
-        самой команды отката (Р-3) — здесь, тем же приёмом, что «Проверить
-        сейчас»/`checkYtDlpUpdateNow`.
-      -->
-      <YtDlpUpdateBlock
-        :snapshot="ytDlpUpdateSnapshot"
-        :active-version="report?.ytDlp.version"
-        @check="checkYtDlpUpdateNow"
-        @rollback="rollBackYtDlpUpdate"
-      />
+        <footer
+          v-if="showRetry"
+          class="screen__footer"
+        >
+          <button
+            type="button"
+            class="tap-target"
+            :disabled="isLoading"
+            @click="check"
+          >
+            {{ isLoading ? 'Проверяем…' : 'Повторить проверку' }}
+          </button>
+        </footer>
 
-      <!--
-        Разделитель — единственное, что явно отделяет «служебную» часть
-        экрана (E1, про инструменты) от «рабочей» (про конкретный ролик,
-        E2), чтобы ошибка ffmpeg выше не путалась с состоянием разбора
-        ниже (дизайн E2, «Где живёт поле ссылки»).
-      -->
-      <hr class="screen__divider">
+        <!--
+          Блок «Обновление yt-dlp» (Ф-10, TL-59/TL-60, дизайн E6) — между
+          строками SidecarStatusRow и разделителем перед полем ссылки
+          (дизайн, «Где живёт блок»). Кнопка «Вернуться к …» и инлайн-
+          подтверждение рисуются самим блоком по снимку контура; вызов
+          самой команды отката (Р-3) — здесь, тем же приёмом, что «Проверить
+          сейчас»/`checkYtDlpUpdateNow`.
+        -->
+        <YtDlpUpdateBlock
+          :snapshot="ytDlpUpdateSnapshot"
+          :active-version="report?.ytDlp.version"
+          @check="checkYtDlpUpdateNow"
+          @rollback="rollBackYtDlpUpdate"
+        />
 
-      <ProbeSection
-        :yt-dlp-state="ytDlpState"
-        @download="onDownloadRequested"
-      />
-
-      <!--
-        Секция «Очередь загрузок» (дизайн E4) — рендерится тогда и только
-        тогда, когда есть хоть одна задача **или** есть отказ команды
-        управления загрузкой/очередью, который ещё не скрыт (ревью TL-45,
-        «Достижимый путь к молчаливому отказу», унаследовано TL-75): отказ
-        `start_download`/`dismiss_queue_task` и т.п. возможен и без
-        существующей задачи в списке. Пока ни того, ни другого нет, макет
-        не резервирует под секцию пустое место (дизайн E3, «Где живёт
-        задача экрана», унаследовано дизайном E4). Условие продублировано
-        здесь (а не только внутри `QueueSection`) ради разделителя —
-        `<hr>` не должен появляться перед пустой секцией.
-
-        Без собственного aria-live на разделителе секции (ревью TL-45,
-        «Заметки»): `DownloadCommandErrorBlock` несёт role="alert",
-        `DownloadPanel` — свою единственную живую зону для нетерминальных
-        фаз и role="status" для терминальных, `QueueWaitingRow` — свою.
-      -->
-      <template v-if="queueTasks.length > 0 || downloadCommandError">
+        <!--
+          Разделитель — единственное, что явно отделяет «служебную» часть
+          экрана (E1, про инструменты) от «рабочей» (про конкретный ролик,
+          E2), чтобы ошибка ffmpeg выше не путалась с состоянием разбора
+          ниже (дизайн E2, «Где живёт поле ссылки»).
+        -->
         <hr class="screen__divider">
 
-        <QueueSection
-          :tasks="queueTasks"
-          :awaiting-continue="awaitingContinue"
-          :pause-reason="pauseReason"
-          :command-error="downloadCommandError"
-          :soft-stall-seconds="softStallSeconds"
-          @cancel="downloadTaskStore.cancel"
-          @retry="downloadTaskStore.retry"
-          @hide="downloadTaskStore.hide"
-          @hide-all-terminal="downloadTaskStore.hideAllTerminal"
-          @resume="downloadTaskStore.resume"
-          @dismiss-command-error="downloadTaskStore.dismissCommandError"
+        <ProbeSection
+          :yt-dlp-state="ytDlpState"
+          @download="onDownloadRequested"
         />
+
+        <!--
+          Секция «Очередь загрузок» (дизайн E4) — рендерится тогда и только
+          тогда, когда есть хоть одна задача **или** есть отказ команды
+          управления загрузкой/очередью, который ещё не скрыт (ревью TL-45,
+          «Достижимый путь к молчаливому отказу», унаследовано TL-75): отказ
+          `start_download`/`dismiss_queue_task` и т.п. возможен и без
+          существующей задачи в списке. Пока ни того, ни другого нет, макет
+          не резервирует под секцию пустое место (дизайн E3, «Где живёт
+          задача экрана», унаследовано дизайном E4). Условие продублировано
+          здесь (а не только внутри `QueueSection`) ради разделителя —
+          `<hr>` не должен появляться перед пустой секцией.
+
+          Без собственного aria-live на разделителе секции (ревью TL-45,
+          «Заметки»): `DownloadCommandErrorBlock` несёт role="alert",
+          `DownloadPanel` — свою единственную живую зону для нетерминальных
+          фаз и role="status" для терминальных, `QueueWaitingRow` — свою.
+        -->
+        <template v-if="queueTasks.length > 0 || downloadCommandError">
+          <hr class="screen__divider">
+
+          <QueueSection
+            :tasks="queueTasks"
+            :awaiting-continue="awaitingContinue"
+            :pause-reason="pauseReason"
+            :command-error="downloadCommandError"
+            :soft-stall-seconds="softStallSeconds"
+            @cancel="downloadTaskStore.cancel"
+            @retry="downloadTaskStore.retry"
+            @hide="downloadTaskStore.hide"
+            @hide-all-terminal="downloadTaskStore.hideAllTerminal"
+            @resume="downloadTaskStore.resume"
+            @dismiss-command-error="downloadTaskStore.dismissCommandError"
+          />
+        </template>
       </template>
-    </template>
+    </section>
+
+    <!--
+      Плейсхолдер экрана истории (TL-93 заменит содержимое своим
+      компонентом на этом же месте) — не зависит от готовности sidecar
+      (дизайн «Навигация»).
+    -->
+    <section
+      v-show="activeTab === 'history'"
+      id="tabpanel-history"
+      role="tabpanel"
+      aria-labelledby="tab-history"
+    >
+      <h2
+        ref="historyHeadingEl"
+        tabindex="-1"
+      >
+        История
+      </h2>
+      <p>Здесь появится история завершённых загрузок.</p>
+    </section>
+
+    <!--
+      Плейсхолдер экрана настроек (TL-94 заменит содержимое своим
+      компонентом на этом же месте) — не зависит от готовности sidecar
+      (дизайн «Навигация»).
+    -->
+    <section
+      v-show="activeTab === 'settings'"
+      id="tabpanel-settings"
+      role="tabpanel"
+      aria-labelledby="tab-settings"
+    >
+      <h2
+        ref="settingsHeadingEl"
+        tabindex="-1"
+      >
+        Настройки
+      </h2>
+      <p>Здесь появятся папка назначения, шаблон имени и число попыток.</p>
+    </section>
   </main>
 </template>
 
@@ -357,6 +645,61 @@ function onDownloadRequested(payload: {
 }
 
 .tap-target:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/*
+ * Панель вкладок (TL-92) — выбранная вкладка отмечена нижней границей
+ * акцентом: не текст, а декоративная граница элемента управления (тот же
+ * разрешённый случай использования `--color-accent`, что и обводка
+ * фокуса/левая граница активной задачи, см. doc-комментарий
+ * `src/style.css`, «Акцент — один и тот же оттенок в обеих темах»).
+ */
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin-top: 1rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.tabs__tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  margin-bottom: -1px;
+  color: var(--color-text-secondary);
+}
+
+.tabs__tab[aria-selected='true'] {
+  border-bottom-color: var(--color-accent);
+  color: var(--color-text-strong);
+  font-weight: 600;
+}
+
+.queue-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin: 0;
+  color: var(--color-text-secondary);
+}
+
+.queue-status-row__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*
+ * Заголовки-цели программного фокуса при переключении вкладки (дизайн
+ * «Фокус при переключении экрана») — та же рамка, что у `.tap-target`,
+ * чтобы фокус был заметен независимо от того, что именно его получило.
+ */
+h1:focus-visible,
+h2:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }

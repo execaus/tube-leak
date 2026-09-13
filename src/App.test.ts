@@ -144,9 +144,17 @@ function routeInvoke(handlers: Record<string, () => Promise<unknown>>) {
  * только эту одну подпись и молчит про любую другую постороннюю кнопку.
  * `toStrictEqual` на полном списке возвращает исходную силу: посторонняя
  * кнопка меняет список и ассерт падает.
+ *
+ * `role="tab"` исключены (TL-92): панель вкладок «Главный/История/
+ * Настройки» рендерится безусловно поверх всего экрана (дизайн E5
+ * «Навигация») и не относится к тому, что проверяет этот файл, — набор
+ * вкладок свой собственный тест (`App.tabs.test.ts`).
  */
 function buttonLabels(wrapper: ReturnType<typeof mount>): string[] {
-  return wrapper.findAll('button').map((b) => b.text())
+  return wrapper
+    .findAll('button')
+    .filter((b) => b.attributes('role') !== 'tab')
+    .map((b) => b.text())
 }
 
 beforeEach(() => {
