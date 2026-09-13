@@ -10,8 +10,9 @@
 //!   Поэтому все три ветки проверяются тестами на macOS;
 //! - [`reveal_with`] — три случая Ф-8 поверх плана: `stat` файла и папки,
 //!   затем запуск через [`Launcher`]. В тестах запускатель подменяется. В
-//!   продакшене работает [`SystemLauncher`], а [`reveal`] собирает всё для
-//!   текущей ОС.
+//!   продакшене работает [`SystemLauncher`]. [`reveal_with_path`] ищет
+//!   утилиты Linux в переданном `PATH`, а [`reveal`] собирает всё для
+//!   текущей ОС и `PATH` процесса.
 //!
 //! Команда Tauri `show_in_folder` — TL-90. Она строит путь через
 //! `HistoryRecord::file_path()`, зовёт [`reveal`] в блокирующем пуле
@@ -23,8 +24,12 @@
 //! | ОС | файл есть | файла нет, папка есть |
 //! |---|---|---|
 //! | macOS | `/usr/bin/open -R -- <файл>` | `/usr/bin/open -R -- <папка>` |
-//! | Windows | `explorer.exe /select,"<файл>"` (сырая строка) | `explorer.exe "<папка>"` |
-//! | Linux | D-Bus `ShowItems([file://…])`, при отказе `xdg-open <папка>` | `xdg-open <папка>` |
+//! | Windows | `explorer.exe /select,"<файл>"` (сырая строка) | `explorer.exe /select,"<папка>"` |
+//! | Linux | D-Bus `ShowItems([file://…])`, при отказе `<xdg-open> <папка>` | `<xdg-open> <папка>` |
+//!
+//! На Linux каждая утилита запускается по абсолютному пути, найденному в
+//! абсолютных каталогах `PATH` ([`find_executable`]); `<xdg-open>` в таблице
+//! — такой путь. По имени запускается только `explorer.exe`.
 //!
 //! ## macOS: `--` работает, папка показывается через `-R`
 //!
@@ -82,6 +87,23 @@
 //! `\\сервер\…`. Ведущего дефиса опасаться нечего: путь начинается с буквы
 //! диска или `\\` и стоит внутри кавычек после `/select,`.
 //!
+//! Папку Windows тоже **показывает** (`/select,"<папка>"`), как macOS
+//! (`-R`), а не открывает. Без ключа explorer применяет к аргументу действие
+//! по умолчанию. Если между `stat` папки и запуском на её месте окажется
+//! файл, `explorer.exe "<путь>"` запустит его, а С-2 это запрещает. С
+//! `/select,` explorer только выделяет элемент в родительской папке, что бы
+//! там ни лежало. Цена та же, что на macOS: открывается родитель, в папку
+//! назначения нужен ещё один двойной щелчок. Корень диска уходит как
+//! `/select,X:\`.
+//!
+//! `explorer.exe` запускается по имени. Путь ищет сам `Command` (std 1.98,
+//! `library/std/src/sys/process/windows.rs`, `search_paths`) в таком
+//! порядке: каталог приложения → System32 → каталог Windows → `PATH`.
+//! Первым шагом был бы `PATH` потомка, но только если его задали через
+//! `Command::env`; мы его не задаём. Текущий каталог не просматривается.
+//! Сам explorer лежит в каталоге Windows. Порядок взят из исходника std, а
+//! не из прогона.
+//!
 //! **Не измерено** (Р-6 E1: машин под Windows в проекте нет). Первое —
 //! поведение explorer в таблице выше; это сведения из отчётов, а не прогон.
 //! Второе — код возврата: explorer, передав запрос уже работающему
@@ -91,18 +113,26 @@
 //!
 //! ## Linux: D-Bus, затем `xdg-open` на папку
 //!
-//! Признак «есть D-Bus» (Р-8) — исполняемый `dbus-send` или `gdbus` в
-//! абсолютном каталоге из `PATH` ([`find_dbus_tool`]). Шину и сеть он не
-//! трогает. Порядок такой:
+//! Все три утилиты — `dbus-send`, `gdbus`, `xdg-open` — ищет одна функция
+//! ([`find_executable`], набор — [`LinuxTools`]): исполняемый файл в
+//! **абсолютном** каталоге из `PATH`. Пустой или относительный элемент
+//! `PATH` пропускается. libc (`execvp`) считает пустой элемент текущим
+//! каталогом, поэтому запуск по имени подхватил бы `xdg-open`, лежащий
+//! рядом с процессом. Найденная утилита запускается по абсолютному пути.
+//! Если `xdg-open` не найден, план содержит [`PlanStep::NotFound`]: ничего не
+//! запускается, а исход — отказ `NotStarted(NotFound)`.
 //!
-//! 1. если инструмент найден — `ShowItems` через него, по абсолютному пути
-//!    из `PATH`. Приоритет у `dbus-send`: пакет `dbus` есть почти везде,
-//!    `gdbus` лежит в `libglib2.0-bin`, который ставят не всегда. Второй
-//!    инструмент после отказа первого не пробуется: отказ `ServiceUnknown`
-//!    (нет `FileManager1`) у обоих одинаков, и это только удвоило бы
-//!    ожидание;
+//! Признак «есть D-Bus» (Р-8) — найденный `dbus-send` или `gdbus`. Шину и
+//! сеть поиск не трогает. Порядок такой:
+//!
+//! 1. если инструмент найден — `ShowItems` через него. Приоритет у
+//!    `dbus-send`: пакет `dbus` есть почти везде, `gdbus` лежит в
+//!    `libglib2.0-bin`, который ставят не всегда. Второй инструмент после
+//!    отказа первого не пробуется: отказ `ServiceUnknown` (нет
+//!    `FileManager1`) у обоих одинаков, и это только удвоило бы ожидание;
 //! 2. если инструмента нет или вызов не удался — `xdg-open <папка>`, без
-//!    выделения.
+//!    выделения. Если нет и `xdg-open`, отказ говорит о нём: нечем открыть
+//!    папку, и это полезнее ответа шины.
 //!
 //! `dbus-send` зовётся с `--print-reply`, иначе он не ждёт ответа и
 //! возвращает 0, даже если метод не существует
@@ -142,9 +172,23 @@
 //! Реестр E1 (`sidecar::ChildRegistry`) здесь **не нужен и вреден**. Он
 //! существует, чтобы работа sidecar не пережила приложение. Процесс показа
 //! — наоборот, окно пользователя, и выход из приложения не должен его
-//! закрывать (Ф-8). Сиротой в вредном смысле ничего не остаётся:
+//! закрывать (Ф-8). Что остаётся после запуска:
 //!
-//! - убитый по потолку процесс дожидается `wait()` сразу;
+//! - убитый процесс дожидается `wait()` сразу. Убивается **прямой
+//!   потомок** (`Child::kill` — `SIGKILL` на его pid), а не группа
+//!   процессов. По потолку убиваются только `open`, `dbus-send` и `gdbus`.
+//!   Своих процессов они не порождают: Finder поднимает launchd, файловый
+//!   менеджер — шина. Поэтому после них не остаётся ничего. Этот вывод верен
+//!   только для таких утилит. Внук, которого породила бы утилита, пережил бы
+//!   убийство и остался бы сиротой у init/launchd. По отказу ожидания
+//!   (`WaitFailed`) убивается утилита любого рода, в том числе `xdg-open`, и
+//!   её обработчик тоже переживёт убийство;
+//! - внук, унаследовавший пайп stderr, держит его открытым до своего выхода.
+//!   Запуск из-за этого не виснет: `finish` ждёт конца потока не дольше
+//!   `DRAIN_GRACE`. Но поток чтения `os-reveal-stderr` живёт, пока жив внук,
+//!   а в хвост попадает только прочитанное к этому моменту. После выхода
+//!   приложения конец чтения закрывается, и внук на записи в stderr получит
+//!   `SIGPIPE`;
 //! - отпущенный дожидается в отдельном потоке, так что зомби за время
 //!   жизни приложения не копятся. После выхода приложения его подбирает
 //!   init/launchd — ровно так, как должно быть для окна пользователя;
@@ -169,9 +213,11 @@ use crate::sidecar::stderr_tail;
 
 /// Абсолютный путь `open` на macOS (Ф-8).
 pub const MACOS_OPEN: &str = "/usr/bin/open";
-/// `explorer.exe` по имени: `Command` ищет его в каталоге Windows.
+/// `explorer.exe` по имени. Порядок поиска у `Command` — в doc модуля,
+/// «Windows».
 pub const WINDOWS_EXPLORER: &str = "explorer.exe";
-/// `xdg-open` по имени, из `PATH`.
+/// Имя `xdg-open`. Запускается не по имени, а по пути из
+/// [`find_executable`].
 pub const XDG_OPEN: &str = "xdg-open";
 
 const FM1_NAME: &str = "org.freedesktop.FileManager1";
@@ -252,6 +298,25 @@ pub struct DbusTool {
     pub program: PathBuf,
 }
 
+/// Утилиты Linux, найденные в `PATH` одной функцией ([`find_executable`]).
+/// На macOS и Windows не нужны: там набор пустой.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinuxTools {
+    pub dbus: Option<DbusTool>,
+    /// Абсолютный путь `xdg-open`.
+    pub xdg_open: Option<PathBuf>,
+}
+
+impl LinuxTools {
+    /// Ищет утилиты в абсолютных каталогах `path_var`.
+    pub fn find(path_var: Option<&OsStr>) -> Self {
+        Self {
+            dbus: find_dbus_tool(path_var),
+            xdg_open: find_executable(XDG_OPEN, path_var),
+        }
+    }
+}
+
 /// Какая утилита запускается. От этого зависят судьба кода возврата,
 /// stderr и поведение по истечении потолка (doc модуля, «Потолок»).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,12 +368,22 @@ pub struct RevealCommand {
     pub kind: LauncherKind,
 }
 
-/// План показа: команда и, на Linux, запасная команда на её отказ.
+/// Шаг плана.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanStep {
+    /// Запустить команду.
+    Run(RevealCommand),
+    /// Утилиты с этим именем нет в абсолютных каталогах `PATH`. Ничего не
+    /// запускается; исход шага — отказ `NotStarted(NotFound)`.
+    NotFound(&'static str),
+}
+
+/// План показа: шаг и, на Linux, запасной шаг на его отказ.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevealPlan {
-    pub first: RevealCommand,
-    /// Запускается, только если `first` отказал.
-    pub fallback: Option<RevealCommand>,
+    pub first: PlanStep,
+    /// Исполняется, только если `first` отказал.
+    pub fallback: Option<PlanStep>,
 }
 
 /// Почему путь не годится для показа. Проверка идёт до диска и процессов.
@@ -334,18 +409,18 @@ pub enum PathRejection {
 /// Строит план показа `path` на `os`. Чистая функция.
 ///
 /// Для [`RevealTarget::SelectFile`] `path` — файл, для
-/// [`RevealTarget::OpenFolder`] — папка. `dbus` учитывается только на
-/// Linux и только при выделении файла.
+/// [`RevealTarget::OpenFolder`] — папка. `tools` учитываются только на
+/// Linux; D-Bus — только при выделении файла.
 ///
 /// ```text
-/// build_plan(MacOs, SelectFile, "/Users/u/-rf.mp4", None)
+/// build_plan(MacOs, SelectFile, "/Users/u/-rf.mp4", &LinuxTools::default())
 ///   → /usr/bin/open ["-R", "--", "/Users/u/-rf.mp4"]
 /// ```
 pub fn build_plan(
     os: TargetOs,
     target: RevealTarget,
     path: &Path,
-    dbus: Option<&DbusTool>,
+    tools: &LinuxTools,
 ) -> Result<RevealPlan, PathRejection> {
     match os {
         TargetOs::MacOs => {
@@ -354,34 +429,34 @@ pub fn build_plan(
             // приложение (doc модуля, «macOS»).
             let args = vec!["-R".into(), "--".into(), path.to_os_string()];
             Ok(RevealPlan {
-                first: RevealCommand {
+                first: PlanStep::Run(RevealCommand {
                     program: MACOS_OPEN.into(),
                     args: CommandArgs::Argv(args),
                     kind: LauncherKind::Finder,
-                },
+                }),
                 fallback: None,
             })
         }
         TargetOs::Windows => {
             let path = windows_path(path)?;
-            let line = match target {
-                RevealTarget::SelectFile => format!("/select,{}", explorer_quoted(&path)),
-                RevealTarget::OpenFolder => explorer_quoted(&path),
-            };
+            // Папка тоже через `/select,`: без ключа explorer применил бы к
+            // пути действие по умолчанию (doc модуля, «Windows»).
+            let line = format!("/select,{}", explorer_quoted(&path));
             Ok(RevealPlan {
-                first: RevealCommand {
+                first: PlanStep::Run(RevealCommand {
                     program: WINDOWS_EXPLORER.into(),
                     args: CommandArgs::WindowsCommandLine(line),
                     kind: LauncherKind::Explorer,
-                },
+                }),
                 fallback: None,
             })
         }
         TargetOs::Linux => {
             let path = unix_absolute(path)?;
+            let xdg_open = tools.xdg_open.as_deref();
             match target {
                 RevealTarget::OpenFolder => Ok(RevealPlan {
-                    first: xdg_open(path),
+                    first: xdg_open_step(xdg_open, path),
                     fallback: None,
                 }),
                 RevealTarget::SelectFile => {
@@ -389,14 +464,17 @@ pub fn build_plan(
                         .parent()
                         .ok_or(PathRejection::NoParent)?
                         .as_os_str();
-                    let open_folder = xdg_open(folder);
-                    match dbus {
+                    let open_folder = xdg_open_step(xdg_open, folder);
+                    match &tools.dbus {
                         None => Ok(RevealPlan {
                             first: open_folder,
                             fallback: None,
                         }),
                         Some(tool) => Ok(RevealPlan {
-                            first: dbus_show_items(tool, &file_uri(Path::new(path))?),
+                            first: PlanStep::Run(dbus_show_items(
+                                tool,
+                                &file_uri(Path::new(path))?,
+                            )),
                             fallback: Some(open_folder),
                         }),
                     }
@@ -446,20 +524,25 @@ const fn hex_digit(nibble: u8) -> char {
     digit as char
 }
 
-/// Ищет `dbus-send`, затем `gdbus` в `PATH` (признак «есть D-Bus», Р-8).
-///
-/// Только абсолютные каталоги `PATH`: пустой или относительный элемент
-/// значит «текущий каталог», а оттуда программу не берём. Проверяется
-/// файл с правом исполнения, шина не трогается.
+/// Ищет `dbus-send`, затем `gdbus` через [`find_executable`] (признак «есть
+/// D-Bus», Р-8). Шина не трогается.
 pub fn find_dbus_tool(path_var: Option<&OsStr>) -> Option<DbusTool> {
-    let path_var = path_var?;
     DbusFlavor::PREFERENCE.into_iter().find_map(|flavor| {
-        std::env::split_paths(path_var)
-            .filter(|dir| dir.is_absolute())
-            .map(|dir| dir.join(flavor.program_name()))
-            .find(|candidate| is_executable_file(candidate))
-            .map(|program| DbusTool { flavor, program })
+        find_executable(flavor.program_name(), path_var).map(|program| DbusTool { flavor, program })
     })
+}
+
+/// Первый исполняемый файл `name` в **абсолютных** каталогах `path_var`.
+///
+/// Пустой или относительный элемент `PATH` пропускается. libc считает
+/// пустой элемент текущим каталогом, а оттуда программу не берём. Этой
+/// функцией ищутся все утилиты Linux, и найденный путь уходит в запуск как
+/// есть.
+pub fn find_executable(name: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(path_var?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
 }
 
 #[cfg(unix)]
@@ -544,13 +627,18 @@ fn explorer_quoted(path: &str) -> String {
     format!("\"{trimmed}\"")
 }
 
-fn xdg_open(folder: &OsStr) -> RevealCommand {
-    RevealCommand {
-        program: XDG_OPEN.into(),
-        // Без `--`: xdg-utils 1.1.3 его не понимает (doc модуля, «Linux»).
-        // Путь абсолютный и начинается с `/`.
-        args: CommandArgs::Argv(vec![folder.to_os_string()]),
-        kind: LauncherKind::XdgOpen,
+/// `xdg-open <папка>` по найденному пути. Не нашёлся — шаг-отказ, а не
+/// запуск по имени (doc модуля, «Linux»).
+fn xdg_open_step(xdg_open: Option<&Path>, folder: &OsStr) -> PlanStep {
+    match xdg_open {
+        Some(program) => PlanStep::Run(RevealCommand {
+            program: program.as_os_str().to_os_string(),
+            // Без `--`: xdg-utils 1.1.3 его не понимает (doc модуля, «Linux»).
+            // Путь абсолютный и начинается с `/`.
+            args: CommandArgs::Argv(vec![folder.to_os_string()]),
+            kind: LauncherKind::XdgOpen,
+        }),
+        None => PlanStep::NotFound(XDG_OPEN),
     }
 }
 
@@ -700,6 +788,19 @@ pub struct SystemLauncher {
 
 impl Launcher for SystemLauncher {
     fn launch(&self, command: &RevealCommand) -> Result<(), LauncherFailure> {
+        self.launch_prepared(command, |_| {})
+    }
+}
+
+impl SystemLauncher {
+    /// Запуск, в котором `prepare` правит `Command` перед `spawn`. Продакшен
+    /// ничего не правит. Тесты задают **потомку** `PATH` и текущий каталог,
+    /// не трогая их у своего процесса: параллельные тесты не гоняются.
+    fn launch_prepared(
+        &self,
+        command: &RevealCommand,
+        prepare: impl FnOnce(&mut Command),
+    ) -> Result<(), LauncherFailure> {
         let fail = |cause, exit_code, stderr_tail| LauncherFailure {
             program: program_label(&command.program),
             cause,
@@ -726,6 +827,7 @@ impl Launcher for SystemLauncher {
             }
         }
 
+        prepare(&mut process);
         let kind = command.kind;
         process
             .stdin(Stdio::null())
@@ -867,6 +969,17 @@ impl StderrDrain {
 /// возникает: там путь уже абсолютный. На Windows он возможен для пути с
 /// `"` или не в Юникоде. Показать такой путь нечем, это отказ механизма
 /// показа, а не отсутствие файла.
+///
+/// **Отказ `stat` любого рода — это отсутствие.** `EACCES` на папке или на
+/// любом её родителе, `EIO`, `ETIMEDOUT` отключённого сетевого тома
+/// классифицируются так же, как «нет на месте», — это `FileMissing` или
+/// `FolderMissing`. Так же считает статус файла в истории
+/// (`storage::history`, `file_status`), и экран не может показать запись
+/// «на месте», которую показ назовёт пропавшей, или наоборот. Если файл
+/// недоступен, а папка доступна (например, у папки нет права поиска, а у
+/// родителя есть), получается `FileMissing`, и папка открывается. Если
+/// недоступна и папка, получается `FolderMissing`. Причина отказа `stat`
+/// наружу не передаётся.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RevealError {
     /// Файла нет, папка есть и **открыта** без выделения.
@@ -886,15 +999,30 @@ pub enum RevealError {
 /// Блокирующая: `stat` (сетевой том может задуматься) и ожидание утилиты до
 /// потолка. TL-90 зовёт её через `spawn_blocking`.
 pub fn reveal(file: &Path) -> Result<(), RevealError> {
-    let os = TargetOs::current();
-    let dbus = match os {
-        TargetOs::Linux => find_dbus_tool(std::env::var_os("PATH").as_deref()),
-        TargetOs::MacOs | TargetOs::Windows => None,
-    };
-    reveal_with(os, file, dbus.as_ref(), &SystemLauncher::default())
+    reveal_with_path(
+        TargetOs::current(),
+        file,
+        std::env::var_os("PATH").as_deref(),
+        &SystemLauncher::default(),
+    )
 }
 
-/// Три случая Ф-8 с заданными ОС, инструментом D-Bus и запускателем.
+/// [`reveal_with`], где утилиты Linux ищутся в `path_var`
+/// ([`LinuxTools::find`]). На macOS и Windows `path_var` не читается.
+pub fn reveal_with_path(
+    os: TargetOs,
+    file: &Path,
+    path_var: Option<&OsStr>,
+    launcher: &impl Launcher,
+) -> Result<(), RevealError> {
+    let tools = match os {
+        TargetOs::Linux => LinuxTools::find(path_var),
+        TargetOs::MacOs | TargetOs::Windows => LinuxTools::default(),
+    };
+    reveal_with(os, file, &tools, launcher)
+}
+
+/// Три случая Ф-8 с заданными ОС, утилитами Linux и запускателем.
 ///
 /// - файл есть — показать его выделенным; `Ok(())`;
 /// - файла нет, папка есть — показать папку и **затем** вернуть
@@ -904,17 +1032,21 @@ pub fn reveal(file: &Path) -> Result<(), RevealError> {
 /// - нет и папки — [`RevealError::FolderMissing`], без запуска.
 ///
 /// Оба плана строятся до обращения к диску: негодный путь отклоняется, не
-/// тронув ни ФС, ни процессов. «Файл есть» значит обычный файл, как у
-/// статуса файла в истории (`is_file`): каталог на месте файла — не файл.
+/// тронув ни ФС, ни процессов. «Файл есть» значит, что `stat` удался и это
+/// обычный файл, как у статуса файла в истории (`is_file`): каталог на месте
+/// файла — не файл. Отказ `stat` любого рода (`EACCES` на папке или
+/// родителе, `EIO`, `ETIMEDOUT` на сетевом томе) — отсутствие того, что
+/// проверялось: `FileMissing` или `FolderMissing` (подробно — у
+/// [`RevealError`]).
 pub fn reveal_with(
     os: TargetOs,
     file: &Path,
-    dbus: Option<&DbusTool>,
+    tools: &LinuxTools,
     launcher: &impl Launcher,
 ) -> Result<(), RevealError> {
-    let select = build_plan(os, RevealTarget::SelectFile, file, dbus)?;
+    let select = build_plan(os, RevealTarget::SelectFile, file, tools)?;
     let folder = file.parent().ok_or(PathRejection::NoParent)?;
-    let open_folder = build_plan(os, RevealTarget::OpenFolder, folder, dbus)?;
+    let open_folder = build_plan(os, RevealTarget::OpenFolder, folder, tools)?;
 
     if std::fs::metadata(file).is_ok_and(|meta| meta.is_file()) {
         run_plan(&select, launcher).map_err(RevealError::LauncherFailed)
@@ -926,12 +1058,24 @@ pub fn reveal_with(
     }
 }
 
-/// Первая команда, при её отказе — запасная. Отказ — последний.
+/// Первый шаг, при его отказе — запасной. Отказ — последний.
 fn run_plan(plan: &RevealPlan, launcher: &impl Launcher) -> Result<(), LauncherFailure> {
-    match (launcher.launch(&plan.first), &plan.fallback) {
+    match (run_step(&plan.first, launcher), &plan.fallback) {
         (Ok(()), _) => Ok(()),
         (Err(failure), None) => Err(failure),
-        (Err(_), Some(fallback)) => launcher.launch(fallback),
+        (Err(_), Some(fallback)) => run_step(fallback, launcher),
+    }
+}
+
+fn run_step(step: &PlanStep, launcher: &impl Launcher) -> Result<(), LauncherFailure> {
+    match step {
+        PlanStep::Run(command) => launcher.launch(command),
+        PlanStep::NotFound(program) => Err(LauncherFailure {
+            program: (*program).to_string(),
+            cause: LaunchCause::NotStarted(io::ErrorKind::NotFound),
+            exit_code: None,
+            stderr_tail: None,
+        }),
     }
 }
 

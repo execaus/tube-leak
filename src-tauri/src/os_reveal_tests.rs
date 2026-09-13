@@ -49,6 +49,51 @@ fn gdbus() -> DbusTool {
     }
 }
 
+const XDG_OPEN_PATH: &str = "/usr/bin/xdg-open";
+
+fn run(step: &PlanStep) -> &RevealCommand {
+    match step {
+        PlanStep::Run(command) => command,
+        PlanStep::NotFound(program) => {
+            panic!("ожидался запуск, а не отказ «{program} не найден»")
+        }
+    }
+}
+
+fn no_tools() -> LinuxTools {
+    LinuxTools::default()
+}
+
+fn xdg_only() -> LinuxTools {
+    LinuxTools {
+        dbus: None,
+        xdg_open: Some(PathBuf::from(XDG_OPEN_PATH)),
+    }
+}
+
+fn with_dbus_send() -> LinuxTools {
+    LinuxTools {
+        dbus: Some(dbus_send()),
+        ..xdg_only()
+    }
+}
+
+fn with_gdbus() -> LinuxTools {
+    LinuxTools {
+        dbus: Some(gdbus()),
+        ..xdg_only()
+    }
+}
+
+fn xdg_open_not_found() -> LauncherFailure {
+    LauncherFailure {
+        program: "xdg-open".into(),
+        cause: LaunchCause::NotStarted(io::ErrorKind::NotFound),
+        exit_code: None,
+        stderr_tail: None,
+    }
+}
+
 /// Путь Unix и его URI. Эталон — Python 3.9 `urllib.parse.quote_from_bytes(
 /// путь, safe="/")`: безопасны латиница, цифры, `_.-~` и `/`. Команда:
 ///
@@ -99,26 +144,35 @@ fn macos_reveals_file_and_folder_with_open_r_double_dash() {
             TargetOs::MacOs,
             RevealTarget::SelectFile,
             Path::new(&path),
-            None,
+            &no_tools(),
         )
         .unwrap_or_else(|err| panic!("{path:?}: {err}"));
         assert_eq!(
-            plan.first.program,
+            run(&plan.first).program,
             OsString::from("/usr/bin/open"),
             "{path:?}"
         );
-        assert_eq!(argv(&plan.first), strings(&["-R", "--", &path]), "{path:?}");
-        assert_eq!(plan.first.kind, LauncherKind::Finder);
+        assert_eq!(
+            argv(run(&plan.first)),
+            strings(&["-R", "--", &path]),
+            "{path:?}"
+        );
+        assert_eq!(run(&plan.first).kind, LauncherKind::Finder);
         assert_eq!(plan.fallback, None);
 
         // Папка — тоже `-R`, не `open <папка>` (пакет `.app` запустился бы).
         let folder = Path::new(&path)
             .parent()
             .expect("у пути таблицы есть папка");
-        let plan = build_plan(TargetOs::MacOs, RevealTarget::OpenFolder, folder, None)
-            .unwrap_or_else(|err| panic!("{folder:?}: {err}"));
+        let plan = build_plan(
+            TargetOs::MacOs,
+            RevealTarget::OpenFolder,
+            folder,
+            &no_tools(),
+        )
+        .unwrap_or_else(|err| panic!("{folder:?}: {err}"));
         assert_eq!(
-            argv(&plan.first),
+            argv(run(&plan.first)),
             vec![
                 OsString::from("-R"),
                 OsString::from("--"),
@@ -140,10 +194,10 @@ fn macos_puts_double_dash_immediately_before_a_leading_dash_path() {
             TargetOs::MacOs,
             RevealTarget::SelectFile,
             Path::new(path),
-            None,
+            &no_tools(),
         )
         .expect("абсолютный путь годится");
-        let args = argv(&plan.first);
+        let args = argv(run(&plan.first));
         let at = args
             .iter()
             .position(|arg| arg == OsStr::new(path))
@@ -173,7 +227,7 @@ fn unix_branches_reject_relative_paths_so_a_dash_cannot_lead() {
                 " /x.mp4",
             ] {
                 assert_eq!(
-                    build_plan(os, target, Path::new(path), Some(&dbus_send())),
+                    build_plan(os, target, Path::new(path), &with_dbus_send()),
                     Err(PathRejection::NotAbsolute),
                     "{os:?} {target:?} {path:?}",
                 );
@@ -234,35 +288,42 @@ fn windows_select_line_quotes_the_whole_path_after_the_comma() {
             TargetOs::Windows,
             RevealTarget::SelectFile,
             Path::new(&path),
-            None,
+            &no_tools(),
         )
         .unwrap_or_else(|err| panic!("{path:?}: {err}"));
-        assert_eq!(plan.first.program, OsString::from("explorer.exe"));
-        assert_eq!(plan.first.kind, LauncherKind::Explorer);
+        assert_eq!(run(&plan.first).program, OsString::from("explorer.exe"));
+        assert_eq!(run(&plan.first).kind, LauncherKind::Explorer);
         assert_eq!(plan.fallback, None);
-        assert_eq!(windows_line(&plan.first), expected, "{path:?}");
+        assert_eq!(windows_line(run(&plan.first)), expected, "{path:?}");
     }
 }
 
+/// Папка тоже через `/select,` (ревью TL-88): без ключа explorer применил бы
+/// к пути действие по умолчанию, а на месте папки к запуску мог оказаться
+/// файл (С-2).
 #[test]
-fn windows_folder_line_never_puts_a_backslash_before_the_closing_quote() {
+fn windows_folder_is_selected_and_never_puts_a_backslash_before_the_closing_quote() {
     for (folder, expected) in [
-        (r"C:\Users\u\Downloads", r#""C:\Users\u\Downloads""#),
-        (r"C:\Users\u\My Downloads\", r#""C:\Users\u\My Downloads""#),
-        (r"C:\Users\u\a,b\\", r#""C:\Users\u\a,b""#),
-        (r"C:\", r"C:\"),
-        (r"d:/", r"d:\"),
-        (r"\\?\C:\", r"C:\"),
-        (r"\\srv\share\", r#""\\srv\share""#),
+        (r"C:\Users\u\Downloads", r#"/select,"C:\Users\u\Downloads""#),
+        (
+            r"C:\Users\u\My Downloads\",
+            r#"/select,"C:\Users\u\My Downloads""#,
+        ),
+        (r"C:\Users\u\a,b\\", r#"/select,"C:\Users\u\a,b""#),
+        (r"C:\Users\u\-x", r#"/select,"C:\Users\u\-x""#),
+        (r"C:\", r"/select,C:\"),
+        (r"d:/", r"/select,d:\"),
+        (r"\\?\C:\", r"/select,C:\"),
+        (r"\\srv\share\", r#"/select,"\\srv\share""#),
     ] {
         let plan = build_plan(
             TargetOs::Windows,
             RevealTarget::OpenFolder,
             Path::new(folder),
-            None,
+            &no_tools(),
         )
         .unwrap_or_else(|err| panic!("{folder:?}: {err}"));
-        assert_eq!(windows_line(&plan.first), expected, "{folder:?}");
+        assert_eq!(windows_line(run(&plan.first)), expected, "{folder:?}");
     }
 }
 
@@ -278,11 +339,12 @@ fn windows_lines_are_unambiguous_under_both_quote_readings() {
         .map(|p| (RevealTarget::OpenFolder, p))
         .chain(files.iter().map(|p| (RevealTarget::SelectFile, p)))
         .map(|(target, path)| {
-            let plan = build_plan(TargetOs::Windows, target, Path::new(path), None)
+            let plan = build_plan(TargetOs::Windows, target, Path::new(path), &no_tools())
                 .unwrap_or_else(|err| panic!("{path:?}: {err}"));
-            windows_line(&plan.first).to_string()
+            windows_line(run(&plan.first)).to_string()
         });
     for line in lines {
+        assert!(line.starts_with("/select,"), "без /select, в {line:?}");
         assert!(!line.contains("\\\""), "`\\\"` в {line:?}");
         let quotes = line.matches('"').count();
         assert!(quotes == 0 || quotes == 2, "кавычек {quotes} в {line:?}");
@@ -309,7 +371,7 @@ fn windows_rejects_paths_it_cannot_quote_or_that_are_not_absolute() {
     ] {
         for target in [RevealTarget::SelectFile, RevealTarget::OpenFolder] {
             assert_eq!(
-                build_plan(TargetOs::Windows, target, Path::new(path), None),
+                build_plan(TargetOs::Windows, target, Path::new(path), &no_tools()),
                 Err(rejection),
                 "{path:?} {target:?}",
             );
@@ -323,7 +385,12 @@ fn windows_rejects_non_unicode_paths() {
     use std::os::unix::ffi::OsStrExt;
     let path = Path::new(OsStr::from_bytes(b"C:\\a\xff.mp4"));
     assert_eq!(
-        build_plan(TargetOs::Windows, RevealTarget::SelectFile, path, None),
+        build_plan(
+            TargetOs::Windows,
+            RevealTarget::SelectFile,
+            path,
+            &no_tools()
+        ),
         Err(PathRejection::NotUnicode),
     );
 }
@@ -342,12 +409,15 @@ fn linux_without_dbus_opens_the_parent_folder_with_xdg_open() {
             TargetOs::Linux,
             RevealTarget::SelectFile,
             Path::new(&path),
-            None,
+            &xdg_only(),
         )
         .unwrap_or_else(|err| panic!("{path:?}: {err}"));
-        assert_eq!(plan.first.program, OsString::from("xdg-open"));
-        assert_eq!(plan.first.kind, LauncherKind::XdgOpen);
-        assert_eq!(argv(&plan.first), vec![folder.as_os_str().to_os_string()]);
+        assert_eq!(run(&plan.first).program, OsString::from(XDG_OPEN_PATH));
+        assert_eq!(run(&plan.first).kind, LauncherKind::XdgOpen);
+        assert_eq!(
+            argv(run(&plan.first)),
+            vec![folder.as_os_str().to_os_string()]
+        );
         assert_eq!(plan.fallback, None);
     }
 }
@@ -359,12 +429,52 @@ fn linux_folder_is_opened_with_xdg_open_even_when_dbus_is_there() {
         TargetOs::Linux,
         RevealTarget::OpenFolder,
         folder,
-        Some(&dbus_send()),
+        &with_dbus_send(),
     )
     .expect("абсолютная папка годится");
-    assert_eq!(plan.first.program, OsString::from("xdg-open"));
-    assert_eq!(argv(&plan.first), strings(&["/home/u/-dir, with space"]));
+    assert_eq!(run(&plan.first).program, OsString::from(XDG_OPEN_PATH));
+    assert_eq!(
+        argv(run(&plan.first)),
+        strings(&["/home/u/-dir, with space"])
+    );
     assert_eq!(plan.fallback, None);
+}
+
+/// Ревью TL-88: `xdg-open` не нашёлся в абсолютных каталогах `PATH` — в
+/// плане отказ, а не запуск по имени.
+#[test]
+fn linux_without_xdg_open_plans_not_found_instead_of_a_bare_name() {
+    let file = Path::new("/home/u/clip.mp4");
+    let folder = Path::new("/home/u");
+    let not_found = PlanStep::NotFound("xdg-open");
+
+    for (target, path) in [
+        (RevealTarget::OpenFolder, folder),
+        (RevealTarget::SelectFile, file),
+    ] {
+        assert_eq!(
+            build_plan(TargetOs::Linux, target, path, &no_tools()),
+            Ok(RevealPlan {
+                first: not_found.clone(),
+                fallback: None,
+            }),
+            "{target:?}",
+        );
+    }
+
+    let dbus_without_xdg = LinuxTools {
+        dbus: Some(dbus_send()),
+        xdg_open: None,
+    };
+    let plan = build_plan(
+        TargetOs::Linux,
+        RevealTarget::SelectFile,
+        file,
+        &dbus_without_xdg,
+    )
+    .expect("абсолютный путь годится");
+    assert_eq!(run(&plan.first).kind, LauncherKind::DbusShowItems);
+    assert_eq!(plan.fallback, Some(not_found));
 }
 
 #[test]
@@ -377,14 +487,17 @@ fn linux_with_dbus_send_calls_show_items_then_falls_back_to_xdg_open() {
             TargetOs::Linux,
             RevealTarget::SelectFile,
             Path::new(&path),
-            Some(&dbus_send()),
+            &with_dbus_send(),
         )
         .unwrap_or_else(|err| panic!("{path:?}: {err}"));
 
-        assert_eq!(plan.first.program, OsString::from("/usr/bin/dbus-send"));
-        assert_eq!(plan.first.kind, LauncherKind::DbusShowItems);
         assert_eq!(
-            argv(&plan.first),
+            run(&plan.first).program,
+            OsString::from("/usr/bin/dbus-send")
+        );
+        assert_eq!(run(&plan.first).kind, LauncherKind::DbusShowItems);
+        assert_eq!(
+            argv(run(&plan.first)),
             strings(&[
                 "--session",
                 "--print-reply",
@@ -400,8 +513,11 @@ fn linux_with_dbus_send_calls_show_items_then_falls_back_to_xdg_open() {
         );
 
         let fallback = plan.fallback.expect("у D-Bus есть запасной путь");
-        assert_eq!(fallback.program, OsString::from("xdg-open"));
-        assert_eq!(argv(&fallback), vec![folder.as_os_str().to_os_string()]);
+        assert_eq!(run(&fallback).program, OsString::from(XDG_OPEN_PATH));
+        assert_eq!(
+            argv(run(&fallback)),
+            vec![folder.as_os_str().to_os_string()]
+        );
     }
 }
 
@@ -412,12 +528,12 @@ fn linux_with_gdbus_passes_gvariant_text() {
             TargetOs::Linux,
             RevealTarget::SelectFile,
             Path::new(&path),
-            Some(&gdbus()),
+            &with_gdbus(),
         )
         .unwrap_or_else(|err| panic!("{path:?}: {err}"));
-        assert_eq!(plan.first.program, OsString::from("/usr/bin/gdbus"));
+        assert_eq!(run(&plan.first).program, OsString::from("/usr/bin/gdbus"));
         assert_eq!(
-            argv(&plan.first),
+            argv(run(&plan.first)),
             strings(&[
                 "call",
                 "--session",
@@ -452,7 +568,7 @@ fn linux_root_file_has_no_parent_to_fall_back_to() {
             TargetOs::Linux,
             RevealTarget::SelectFile,
             Path::new("/"),
-            None
+            &no_tools()
         ),
         Err(PathRejection::NoParent),
     );
@@ -580,10 +696,10 @@ fn very_long_path_reaches_argv_and_uri_whole() {
         TargetOs::MacOs,
         RevealTarget::SelectFile,
         Path::new(&path),
-        None,
+        &no_tools(),
     )
     .expect("длинный путь годится");
-    assert_eq!(argv(&mac.first)[2], OsString::from(&path));
+    assert_eq!(argv(run(&mac.first))[2], OsString::from(&path));
 
     let uri = file_uri(Path::new(&path)).expect("длинный путь годится");
     assert_eq!(decode_uri_path(&uri), path.as_bytes());
@@ -661,6 +777,36 @@ fn find_dbus_tool_ignores_relative_path_entries() {
 
     let path_var = std::env::join_paths([relative.as_path(), Path::new("")]).expect("PATH");
     assert_eq!(find_dbus_tool(Some(&path_var)), None);
+
+    put_file(dir.path(), "xdg-open", 0o755);
+    assert_eq!(LinuxTools::find(Some(&path_var)), LinuxTools::default());
+}
+
+/// `xdg-open` ищется той же функцией, что и инструменты D-Bus: пустой и
+/// относительный элементы пропускаются, найденное — абсолютный путь.
+#[cfg(unix)]
+#[test]
+fn xdg_open_is_found_only_in_absolute_path_entries() {
+    let skipped = tempfile::tempdir().expect("временный каталог");
+    let found = tempfile::tempdir().expect("временный каталог");
+    put_file(skipped.path(), "xdg-open", 0o644);
+    put_file(found.path(), "xdg-open", 0o755);
+
+    let path_var = std::env::join_paths([
+        Path::new(""),
+        Path::new("relative"),
+        skipped.path(),
+        found.path(),
+    ])
+    .expect("PATH");
+    assert_eq!(
+        LinuxTools::find(Some(&path_var)),
+        LinuxTools {
+            dbus: None,
+            xdg_open: Some(found.path().join("xdg-open")),
+        },
+    );
+    assert_eq!(LinuxTools::find(None), LinuxTools::default());
 }
 
 // ---------------------------------------------------------------------------
@@ -730,16 +876,20 @@ fn file_present_is_revealed_selected() {
     let scene = scene(true, true);
     let launcher = Recording::default();
     assert_eq!(
-        reveal_with(TargetOs::MacOs, &scene.file, None, &launcher),
+        reveal_with(TargetOs::MacOs, &scene.file, &no_tools(), &launcher),
         Ok(())
     );
     assert_eq!(
         launcher.calls(),
-        vec![
-            build_plan(TargetOs::MacOs, RevealTarget::SelectFile, &scene.file, None)
-                .expect("план")
-                .first
-        ],
+        vec![run(&build_plan(
+            TargetOs::MacOs,
+            RevealTarget::SelectFile,
+            &scene.file,
+            &no_tools()
+        )
+        .expect("план")
+        .first)
+        .clone()],
     );
 }
 
@@ -749,7 +899,7 @@ fn file_missing_folder_present_opens_folder_then_reports_file_missing() {
         let scene = scene(false, true);
         let launcher = Recording::default();
         assert_eq!(
-            reveal_with(os, &scene.file, Some(&dbus_send()), &launcher),
+            reveal_with(os, &scene.file, &with_dbus_send(), &launcher),
             Err(RevealError::FileMissing),
             "{os:?}",
         );
@@ -773,7 +923,7 @@ fn folder_missing_launches_nothing() {
         let scene = scene(false, false);
         let launcher = Recording::default();
         assert_eq!(
-            reveal_with(os, &scene.file, Some(&dbus_send()), &launcher),
+            reveal_with(os, &scene.file, &with_dbus_send(), &launcher),
             Err(RevealError::FolderMissing),
             "{os:?}",
         );
@@ -787,7 +937,7 @@ fn directory_in_place_of_the_file_counts_as_missing_file() {
     fs::create_dir(&scene.file).expect("каталог вместо файла");
     let launcher = Recording::default();
     assert_eq!(
-        reveal_with(TargetOs::MacOs, &scene.file, None, &launcher),
+        reveal_with(TargetOs::MacOs, &scene.file, &no_tools(), &launcher),
         Err(RevealError::FileMissing),
     );
     assert_eq!(launcher.calls().len(), 1);
@@ -798,7 +948,7 @@ fn failed_folder_open_is_a_launcher_failure_not_file_missing() {
     let scene = scene(false, true);
     let launcher = Recording::answering([Err(failure(1))]);
     assert_eq!(
-        reveal_with(TargetOs::MacOs, &scene.file, None, &launcher),
+        reveal_with(TargetOs::MacOs, &scene.file, &no_tools(), &launcher),
         Err(RevealError::LauncherFailed(failure(1))),
     );
 }
@@ -808,7 +958,7 @@ fn failed_select_is_a_launcher_failure() {
     let scene = scene(true, true);
     let launcher = Recording::answering([Err(failure(2))]);
     assert_eq!(
-        reveal_with(TargetOs::MacOs, &scene.file, None, &launcher),
+        reveal_with(TargetOs::MacOs, &scene.file, &no_tools(), &launcher),
         Err(RevealError::LauncherFailed(failure(2))),
     );
 }
@@ -818,7 +968,7 @@ fn linux_dbus_failure_falls_back_to_xdg_open_and_succeeds() {
     let scene = scene(true, true);
     let launcher = Recording::answering([Err(failure(1)), Ok(())]);
     assert_eq!(
-        reveal_with(TargetOs::Linux, &scene.file, Some(&dbus_send()), &launcher),
+        reveal_with(TargetOs::Linux, &scene.file, &with_dbus_send(), &launcher),
         Ok(()),
     );
     let kinds: Vec<_> = launcher.calls().iter().map(|call| call.kind).collect();
@@ -830,7 +980,7 @@ fn linux_dbus_success_does_not_open_a_second_window() {
     let scene = scene(true, true);
     let launcher = Recording::default();
     assert_eq!(
-        reveal_with(TargetOs::Linux, &scene.file, Some(&gdbus()), &launcher),
+        reveal_with(TargetOs::Linux, &scene.file, &with_gdbus(), &launcher),
         Ok(()),
     );
     let kinds: Vec<_> = launcher.calls().iter().map(|call| call.kind).collect();
@@ -842,16 +992,103 @@ fn linux_both_attempts_failing_reports_the_last_failure() {
     let scene = scene(true, true);
     let launcher = Recording::answering([Err(failure(1)), Err(failure(3))]);
     assert_eq!(
-        reveal_with(TargetOs::Linux, &scene.file, Some(&dbus_send()), &launcher),
+        reveal_with(TargetOs::Linux, &scene.file, &with_dbus_send(), &launcher),
         Err(RevealError::LauncherFailed(failure(3))),
     );
+}
+
+/// Ревью TL-88: нет `xdg-open` — отказ `NotStarted(NotFound)` без запуска.
+#[test]
+fn linux_missing_xdg_open_fails_without_launching_anything() {
+    let present = scene(true, true);
+    let launcher = Recording::default();
+    assert_eq!(
+        reveal_with(TargetOs::Linux, &present.file, &no_tools(), &launcher),
+        Err(RevealError::LauncherFailed(xdg_open_not_found())),
+    );
+    assert_eq!(launcher.calls(), Vec::new());
+
+    // Файла нет: `FileMissing` обещал бы открытую папку.
+    let gone = scene(false, true);
+    let launcher = Recording::default();
+    assert_eq!(
+        reveal_with(TargetOs::Linux, &gone.file, &no_tools(), &launcher),
+        Err(RevealError::LauncherFailed(xdg_open_not_found())),
+    );
+    assert_eq!(launcher.calls(), Vec::new());
+
+    // Нет и папки — это важнее: ничего не запускалось бы и так.
+    let nothing = scene(false, false);
+    assert_eq!(
+        reveal_with(
+            TargetOs::Linux,
+            &nothing.file,
+            &no_tools(),
+            &Recording::default()
+        ),
+        Err(RevealError::FolderMissing),
+    );
+
+    // D-Bus отказал, запасной `xdg-open` не найден: запуск один, отказ — о
+    // нём.
+    let launcher = Recording::answering([Err(failure(1))]);
+    let dbus_without_xdg = LinuxTools {
+        dbus: Some(dbus_send()),
+        xdg_open: None,
+    };
+    assert_eq!(
+        reveal_with(TargetOs::Linux, &present.file, &dbus_without_xdg, &launcher),
+        Err(RevealError::LauncherFailed(xdg_open_not_found())),
+    );
+    let kinds: Vec<_> = launcher.calls().iter().map(|call| call.kind).collect();
+    assert_eq!(kinds, [LauncherKind::DbusShowItems]);
+}
+
+/// Doc `RevealError`: отказ `stat` любого рода — отсутствие. Воспроизводим
+/// `EACCES` правами каталога. `EIO` и `ETIMEDOUT` без сетевого тома не
+/// воспроизвести; они проходят той же веткой `is_ok_and`.
+#[cfg(unix)]
+#[test]
+fn denied_stat_counts_as_absence() {
+    use std::os::unix::fs::PermissionsExt;
+    let chmod = |dir: &Path, mode: u32| {
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode)).expect("chmod каталога");
+    };
+
+    // У папки нет права поиска: файл в ней есть, но его `stat` — EACCES.
+    let locked = scene(true, true);
+    chmod(&locked.folder, 0o000);
+    let launcher = Recording::default();
+    let result = reveal_with(TargetOs::MacOs, &locked.file, &no_tools(), &launcher);
+    chmod(&locked.folder, 0o755);
+    assert_eq!(result, Err(RevealError::FileMissing));
+    assert_eq!(launcher.calls().len(), 1, "папка должна открыться");
+
+    // У родителя папки нет права поиска: отказ и файлу, и папке.
+    let hidden = scene(true, true);
+    let parent = hidden
+        .folder
+        .parent()
+        .expect("у папки сцены есть родитель")
+        .to_path_buf();
+    chmod(&parent, 0o000);
+    let launcher = Recording::default();
+    let result = reveal_with(TargetOs::MacOs, &hidden.file, &no_tools(), &launcher);
+    chmod(&parent, 0o700);
+    assert_eq!(result, Err(RevealError::FolderMissing));
+    assert_eq!(launcher.calls(), Vec::new());
 }
 
 #[test]
 fn rejected_path_touches_neither_disk_nor_processes() {
     let launcher = Recording::default();
     assert_eq!(
-        reveal_with(TargetOs::MacOs, Path::new("-rf.mp4"), None, &launcher),
+        reveal_with(
+            TargetOs::MacOs,
+            Path::new("-rf.mp4"),
+            &no_tools(),
+            &launcher
+        ),
         Err(RevealError::Rejected(PathRejection::NotAbsolute)),
     );
     assert_eq!(launcher.calls(), Vec::new());
@@ -1028,10 +1265,10 @@ mod system {
             TargetOs::MacOs,
             RevealTarget::SelectFile,
             Path::new(&hostile),
-            None,
+            &no_tools(),
         )
         .expect("абсолютный путь годится");
-        let mut launched = plan.first.clone();
+        let mut launched = run(&plan.first).clone();
         launched.program = tool.into_os_string();
 
         assert_eq!(patient().launch(&launched), Ok(()));
@@ -1090,6 +1327,97 @@ mod system {
         let _ = std::process::Command::new("kill")
             .args(["-9", pid])
             .status();
+    }
+
+    /// Запускатель, который задаёт **потомку** `PATH` и текущий каталог.
+    /// Потомок видит их так, как видел бы процесс приложения, запущенный из
+    /// этого каталога с этим `PATH`. Свои `PATH` и cwd тест не трогает, так
+    /// что гонок с параллельными тестами нет.
+    struct ChildEnv<'a> {
+        path_var: &'a OsStr,
+        cwd: &'a Path,
+    }
+
+    impl Launcher for ChildEnv<'_> {
+        fn launch(&self, command: &RevealCommand) -> Result<(), LauncherFailure> {
+            patient().launch_prepared(command, |process| {
+                process.env("PATH", self.path_var).current_dir(self.cwd);
+            })
+        }
+    }
+
+    /// Ревью TL-88: libc при запуске по имени считает пустой элемент `PATH`
+    /// текущим каталогом. `xdg-open`, подложенный в текущий каталог, не
+    /// должен запуститься.
+    #[test]
+    fn xdg_open_in_the_current_directory_is_not_run_via_an_empty_path_entry() {
+        let cwd = tempfile::tempdir().expect("временный каталог");
+        let marker = cwd.path().join("ran");
+        script(
+            cwd.path(),
+            "xdg-open",
+            &format!("echo ran > '{}'", marker.display()),
+        );
+        let scene = scene(true, true);
+
+        for path_var in ["/nonexistent:", ":/nonexistent"] {
+            let path_var = OsStr::new(path_var);
+            let launcher = ChildEnv {
+                path_var,
+                cwd: cwd.path(),
+            };
+            let result = reveal_with_path(TargetOs::Linux, &scene.file, Some(path_var), &launcher);
+            assert!(
+                !marker.exists(),
+                "PATH={path_var:?}: запустился xdg-open из текущего каталога"
+            );
+            assert_eq!(
+                result,
+                Err(RevealError::LauncherFailed(xdg_open_not_found())),
+                "PATH={path_var:?}",
+            );
+        }
+    }
+
+    /// Найденный `xdg-open` запускается по абсолютному пути, даже если
+    /// пустой элемент `PATH` стоит раньше и в текущем каталоге лежит
+    /// одноимённый скрипт.
+    #[test]
+    fn xdg_open_found_in_path_runs_by_absolute_path() {
+        let cwd = tempfile::tempdir().expect("временный каталог");
+        let decoy = cwd.path().join("decoy-ran");
+        script(
+            cwd.path(),
+            "xdg-open",
+            &format!("echo ran > '{}'", decoy.display()),
+        );
+        let bin = tempfile::tempdir().expect("временный каталог");
+        let out = bin.path().join("argv.txt");
+        let tool = script(
+            bin.path(),
+            "xdg-open",
+            &format!(
+                "printf '[%s]' \"$0\" \"$@\" > '{}'\necho >> '{}'",
+                out.display(),
+                out.display()
+            ),
+        );
+        let scene = scene(true, true);
+        let path_var = std::env::join_paths([Path::new(""), bin.path()]).expect("PATH");
+        let launcher = ChildEnv {
+            path_var: &path_var,
+            cwd: cwd.path(),
+        };
+
+        assert_eq!(
+            reveal_with_path(TargetOs::Linux, &scene.file, Some(&path_var), &launcher),
+            Ok(()),
+        );
+        assert_eq!(
+            wait_for_file(&out),
+            format!("[{}][{}]\n", tool.display(), scene.folder.display()),
+        );
+        assert!(!decoy.exists(), "запустился xdg-open из текущего каталога");
     }
 
     #[cfg(not(windows))]
