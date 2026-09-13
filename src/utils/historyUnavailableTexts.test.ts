@@ -31,6 +31,9 @@ describe('getHistoryUnavailableText — storageFailed (TL-91)', () => {
   it('names a read failure of an opened base, distinct from the other reasons', () => {
     const text = getHistoryUnavailableText('storageFailed')
     expect(text).toContain('не удалось прочитать базу данных')
+    // Отказ одного ответа, а не сеанса (контракт StorageFailed): текст не обещает недоступность до перезапуска.
+    expect(text).not.toContain('в этом сеансе')
+    expect(text).not.toContain('перезапустите')
     for (const other of ['newerVersion', 'noAccess', 'migrationFailed'] as const) {
       expect(text).not.toBe(getHistoryUnavailableText(other))
     }
