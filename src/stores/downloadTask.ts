@@ -13,14 +13,12 @@ import type {
   StartDownloadRequest,
 } from '@/types/generated/download'
 import type { QueuePauseReason, QueueSnapshot, QueueTask } from '@/types/generated/queue'
-import {
-  getDownloadCommandErrorText,
-  NON_CONTRACTUAL_COMMAND_ERROR_TEXT,
-} from '@/utils/downloadCommandErrorTexts'
+import { assertNever } from '@/utils/assertNever'
+import { resolveDownloadCommandErrorText } from '@/utils/downloadCommandErrorTexts'
 import { knownKindsOf } from '@/utils/knownKinds'
 import { getQueueOutcomeAnnouncementText, type QueueTaskOutcomePhase } from '@/utils/queueTexts'
 import { toDownloadProgress } from '@/utils/queueTaskProgress'
-import { formatTaskDisplayTitle } from '@/utils/queueTaskTitle'
+import { formatTaskDisplayTitle, quoteTaskTitle } from '@/utils/queueTaskTitle'
 
 const START_DOWNLOAD_COMMAND = 'start_download'
 const CANCEL_DOWNLOAD_COMMAND = 'cancel_download'
@@ -108,8 +106,48 @@ function toDownloadCommandFailure(err: unknown): DownloadCommandFailure {
   return { message: 'Команда управления загрузкой отклонена по нераспознанной причине.' }
 }
 
+/**
+ * Исчерпывающий `switch` по {@link DownloadPhase}, не сравнение строк
+ * (правки ревью TL-98, Н-6): восьмая фаза контракта роняет
+ * `npm run type-check` прямо на вызове {@link assertNever} в `default`,
+ * а не молча проходит мимо белого списка (тот же класс дефекта, что
+ * TL-18 — новый класс ошибки yt-dlp, тихо прошедший мимо списка строк).
+ */
 function isTerminalPhase(phase: DownloadPhase): boolean {
-  return phase === 'done' || phase === 'failed' || phase === 'cancelled'
+  switch (phase) {
+    case 'queued':
+    case 'fetching':
+    case 'downloading':
+    case 'merging':
+      return false
+    case 'done':
+    case 'failed':
+    case 'cancelled':
+      return true
+    default:
+      return assertNever(phase)
+  }
+}
+
+/**
+ * Фаза `next.phase`, если она вообще терминальна ({@link QueueTaskOutcomePhase}) —
+ * `undefined` иначе. Тот же приём исчерпывающего `switch` (Н-6), что и
+ * {@link isTerminalPhase} выше: план и здесь не сравнением строк.
+ */
+function toQueueTaskOutcomePhase(phase: DownloadPhase): QueueTaskOutcomePhase | undefined {
+  switch (phase) {
+    case 'queued':
+    case 'fetching':
+    case 'downloading':
+    case 'merging':
+      return undefined
+    case 'done':
+    case 'failed':
+    case 'cancelled':
+      return phase
+    default:
+      return assertNever(phase)
+  }
 }
 
 /**
@@ -129,31 +167,41 @@ export interface QueueOutcomeAnnouncement {
 
 /**
  * Текст исхода для перехода конкретной задачи из нетерминальной фазы в
- * `done`/`failed` — `undefined`, если это не такой переход (задача уже
- * была терминальна, либо новая фаза сама не терминальна).
+ * `done`/`failed`/`cancelled` (С-3, правки ревью, второй раунд — отмена
+ * добавлена к исходному done/failed) — `undefined`, если это не такой
+ * переход (задача уже была терминальна, либо новая фаза сама не
+ * терминальна).
  *
  * Вызывается из двух разных мест ({@link handleProgressEvent} и
  * {@link applySnapshot}), потому что неизвестно заранее, каким именно
- * каналом ядро донесёт конкретный переход в done/failed — точечным
- * `download://progress` по активной задаче или полным снимком
- * `queue://changed` (issue #105 явно описывает случай, когда снимок на
- * Done приходит **дважды подряд**, `commit` и `pump`). Дублирования нет:
- * какой бы канал ни доставил переход первым, он же и меняет
- * `tasks.value`, поэтому второй канал увидит фазу уже терминальной и
- * не даст второго текста для того же события.
+ * каналом ядро донесёт конкретный переход — точечным `download://progress`
+ * по активной задаче или полным снимком `queue://changed` (issue 105
+ * явно описывает случай, когда снимок на Done приходит **дважды
+ * подряд**, `commit` и `pump`). Дублирования нет: какой бы канал ни
+ * доставил переход первым, он же и меняет `tasks.value`, поэтому второй
+ * канал увидит фазу уже терминальной и не даст второго текста для того
+ * же события.
+ *
+ * Название — {@link quoteTaskTitle}, без качества (Н-7, правки ревью,
+ * второй раунд): не {@link formatTaskDisplayTitle}, который несёт своё
+ * тире перед качеством — «‹название› — 1080p — готово» читалось бы двумя
+ * тире подряд, а качество для исхода не нужно.
  */
 function outcomeTextForTransition(previousPhase: DownloadPhase, next: QueueTask): string | undefined {
   if (isTerminalPhase(previousPhase)) return undefined
-  const phase = next.phase
-  if (phase !== 'done' && phase !== 'failed') return undefined
-  const outcomePhase: QueueTaskOutcomePhase = phase
-  return getQueueOutcomeAnnouncementText(formatTaskDisplayTitle(next.title, next.quality), outcomePhase)
+  const outcomePhase = toQueueTaskOutcomePhase(next.phase)
+  if (outcomePhase === undefined) return undefined
+  return getQueueOutcomeAnnouncementText(quoteTaskTitle(next.title), outcomePhase)
 }
 
-/** Текст отказа команды постановки (`start_download`) — тот же текст, что уже показан в `DownloadCommandErrorBlock` (не заводим второй). */
+/**
+ * Текст отказа команды постановки (`start_download`) — тот же текст, что
+ * уже показан в `DownloadCommandErrorBlock` (правки ревью TL-98, Н-5:
+ * общая {@link resolveDownloadCommandErrorText}, не своя копия условия
+ * «неконтрактный отказ — контрактный»).
+ */
 function commandFailureAnnouncementText(failure: DownloadCommandFailure): string {
-  const text = failure.kind === undefined ? NON_CONTRACTUAL_COMMAND_ERROR_TEXT : getDownloadCommandErrorText(failure)
-  return text.title
+  return resolveDownloadCommandErrorText(failure).title
 }
 
 /**

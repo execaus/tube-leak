@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   getActiveQueueStatusText,
+  getQueueOutcomeAnnouncementText,
   getResumeBannerText,
   getStatusRowWaitingText,
   getWaitingStatusText,
@@ -111,6 +112,20 @@ describe('getActiveQueueStatusText (TL-92, строка состояния оч�
     expect(getActiveQueueStatusText('«Ролик A» — 1080p', 'downloading')).toBe(
       '«Ролик A» — 1080p · Скачивание',
     )
+  })
+})
+
+describe('getQueueOutcomeAnnouncementText (TL-98, живая зона исходов, правки ревью Н-7/С-3)', () => {
+  it('done: quoted title — outcome word, no quality, one dash (Н-7)', () => {
+    expect(getQueueOutcomeAnnouncementText('«Ролик A»', 'done')).toBe('«Ролик A» — готово')
+  })
+
+  it('failed: same shape', () => {
+    expect(getQueueOutcomeAnnouncementText('«Ролик A»', 'failed')).toBe('«Ролик A» — не удалось')
+  })
+
+  it('cancelled: same shape (С-3, second round — cancellation is announced too)', () => {
+    expect(getQueueOutcomeAnnouncementText('«Ролик A»', 'cancelled')).toBe('«Ролик A» — отменено')
   })
 })
 

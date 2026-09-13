@@ -129,3 +129,25 @@ export const NON_CONTRACTUAL_COMMAND_ERROR_TEXT: DownloadCommandErrorText = {
   title: 'Не удалось выполнить команду',
   explanation: 'Не удалось разобрать причину отказа. Попробуйте ещё раз.',
 }
+
+/**
+ * Форма отказа, достаточная, чтобы выбрать текст (правки ревью TL-98,
+ * Н-5) — не полный {@link import('@/stores/downloadTask').DownloadCommandFailure}:
+ * импорт оттуда сюда завёл бы цикл (`downloadTask.ts` уже импортирует из
+ * этого файла). Обе стороны (семь контрактных классов и неконтрактный
+ * отказ) совпадают ровно по полю `kind`, которое здесь и используется —
+ * `message`/`existing` конкретного варианта резолверу не нужны.
+ */
+export type CommandFailureTextInput = DownloadCommandErrorKind | { kind?: undefined }
+
+/**
+ * Одна точка выбора текста отказа команды постановки — до этой правки
+ * один и тот же тернарник (`kind === undefined ? NON_CONTRACTUAL_… :
+ * getDownloadCommandErrorText(…)`) был скопирован дословно в
+ * `DownloadCommandErrorBlock.vue` (для баннера на экране) и в
+ * `downloadTask.ts` (для текста живой зоны исходов, TL-98) — оба места
+ * теперь зовут эту функцию, а не держат свою копию условия.
+ */
+export function resolveDownloadCommandErrorText(failure: CommandFailureTextInput): DownloadCommandErrorText {
+  return failure.kind === undefined ? NON_CONTRACTUAL_COMMAND_ERROR_TEXT : getDownloadCommandErrorText(failure)
+}

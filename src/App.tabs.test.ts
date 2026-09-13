@@ -814,19 +814,33 @@ describe('App — живая зона строки статуса (TL-92, пра
 })
 
 /**
- * TL-98 (issue #105) — живая зона исходов на «Истории»/«Настройках»:
- * терминальный исход (Done/Failed) задачи, которая была активной, и
- * отказ команды постановки (`start_download`). Отдельная зона от
- * `.queue-status-announcer` (Н-3/Б-3, TL-92) — та зеркалит только
- * *текущий* текст строки статуса и не годится для разового события,
- * которое обязано пережить следующую же смену этого текста.
+ * TL-98 (issue 105) — живая зона исходов на «Истории»/«Настройках»:
+ * терминальный исход (Done/Failed/Cancelled — Cancelled с правок ревью,
+ * второй раунд, С-3) задачи, которая была активной, и отказ команды
+ * постановки (`start_download`). Отдельная зона от `.queue-status-announcer`
+ * (Н-3/Б-3, TL-92) — та зеркалит только *текущий* текст строки статуса и
+ * не годится для разового события, которое обязано пережить следующую же
+ * смену этого текста.
  *
  * Запись в зону синхронна с приходом события (`watch(outcomeAnnouncement,
- * …)` в `App.vue` пишет текст и меняет `:key` в одном вызове), поэтому
- * каждой проверке хватает одного `await wrapper.vm.$nextTick()`. Тест
- * переозвучки (ниже) прицельно сравнивает DOM-узел зоны до/после второго
- * одинакового по тексту исхода — без пересоздания узла мутация «убрать
- * `:key`» осталась бы незамеченной: итоговый текст совпадает и без него.
+ * …)` в `App.vue` пишет текст и `:key` в одном вызове), поэтому каждой
+ * проверке хватает одного `await wrapper.vm.$nextTick()`.
+ *
+ * # Б-1 (правки ревью, второй раунд) — контейнер с `aria-live` постоянный
+ *
+ * `.queue-outcome-announcer` (сам элемент с `aria-live`) не пересоздаётся
+ * ни разу, сколько бы объявлений ни пришло — пересоздаётся только его
+ * дочерний `.queue-outcome-announcer__text`. Первая версия (первый раунд)
+ * держала `:key` на самом узле с `aria-live`, и весь узел удалялся и
+ * вставлялся заново с уже готовым текстом — такую живую зону, вставленную
+ * в DOM уже с содержимым, скринридеры обычно не озвучивают (ровно то, из-
+ * за чего Н-3 TL-92 когда-то завело постоянный контейнер для строки
+ * статуса). Тест ниже целится именно в это различие: контейнер — тот же
+ * объект на протяжении нескольких объявлений, дочерний узел — новый при
+ * каждом. Мутация «вернуть `:key` на контейнер» красит именно этот тест
+ * (контейнер начинает пересоздаваться); мутация «убрать `:key` совсем»
+ * красит тест повтора одинакового текста (дочерний узел перестаёт
+ * пересоздаваться, хотя текст тот же).
  */
 describe('App — живая зона исходов (TL-98, issue 105)', () => {
   const oneActiveTaskSnapshot: QueueSnapshot = {
@@ -844,7 +858,7 @@ describe('App — живая зона исходов (TL-98, issue 105)', () => 
     awaitingContinue: false,
   }
 
-  it('announces a Failed outcome for the task that was active, on «История»', async () => {
+  it('announces a Failed outcome for the task that was active, on «История», without the quality suffix (Н-7)', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
       check_sidecar: () => Promise.resolve(okReport),
@@ -869,10 +883,10 @@ describe('App — живая зона исходов (TL-98, issue 105)', () => 
     })
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — Только аудио — не удалось')
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — не удалось')
   })
 
-  it('announces a Done outcome for the task that was active, on «Настройки»', async () => {
+  it('announces a Done outcome for the task that was active, on «Настройки», without the quality suffix (Н-7)', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
       check_sidecar: () => Promise.resolve(okReport),
@@ -898,7 +912,35 @@ describe('App — живая зона исходов (TL-98, issue 105)', () => 
     })
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — Только аудио — готово')
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — готово')
+  })
+
+  it('announces a Cancelled outcome for the task that was active, on «История» (С-3, правки ревью, второй раунд — отмена в ядре асинхронна, пользователь мог уже уйти с «Главного»)', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () => Promise.resolve(oneActiveTaskSnapshot),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    emitQueueChanged({
+      tasks: [
+        {
+          taskId: 't1',
+          title: 'Ролик A',
+          quality: { kind: 'audioOnly' },
+          plan: 'singleStream',
+          phase: 'cancelled',
+          partialData: 'removed',
+        },
+      ],
+      awaitingContinue: false,
+    })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — отменено')
   })
 
   it('announces a start_download (posting command) rejection that resolves only after the user already left «Главный»', async () => {
@@ -962,6 +1004,38 @@ describe('App — живая зона исходов (TL-98, issue 105)', () => 
     expect(wrapper.get('.queue-outcome-announcer').text()).toBe('')
   })
 
+  it('clears the outcome text when the user returns to «Главный», so the screen reader’s virtual cursor cannot land on a stale outcome out of context (Н-1, правки ревью, второй раунд)', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () => Promise.resolve(oneActiveTaskSnapshot),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    emitQueueChanged({
+      tasks: [
+        {
+          taskId: 't1',
+          title: 'Ролик A',
+          quality: { kind: 'audioOnly' },
+          plan: 'singleStream',
+          phase: 'failed',
+          error: { kind: 'connectionLost', message: 'diag', retryable: true, partialData: 'kept' },
+        },
+      ],
+      awaitingContinue: false,
+    })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — не удалось')
+
+    await tabButton(wrapper, 'Главный').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('')
+  })
+
   it('keeps the first task’s outcome text through a second queue://changed that starts the next task in the same tick (commit, then pump — mutation guard)', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
@@ -998,10 +1072,10 @@ describe('App — живая зона исходов (TL-98, issue 105)', () => 
 
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — Только аудио — готово')
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — готово')
   })
 
-  it('re-announces an identical outcome text for two different tasks finishing one after another — the DOM node itself is recreated, not just its text (mutation guard for the `:key` remount)', async () => {
+  it('the aria-live container is never replaced across several announcements — only its child text node is recreated per announcement (Б-1, правки ревью, второй раунд)', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
       check_sidecar: () => Promise.resolve(okReport),
@@ -1015,8 +1089,16 @@ describe('App — живая зона исходов (TL-98, issue 105)', () => 
         } satisfies QueueSnapshot),
     })
     const wrapper = await mountReady()
+
+    // Контейнер существует в DOM с монтирования, до первого объявления и
+    // до переключения вкладки (Б-1: живая зона должна быть известна AT
+    // заранее, а не появляться вместе с первым текстом).
+    const containerAtMount = wrapper.get('.queue-outcome-announcer').element
+    expect(containerAtMount.getAttribute('aria-live')).toBe('polite')
+
     await tabButton(wrapper, 'История').trigger('click')
     await wrapper.vm.$nextTick()
+    expect(wrapper.get('.queue-outcome-announcer').element).toBe(containerAtMount)
 
     emitQueueChanged({
       tasks: [
@@ -1026,8 +1108,11 @@ describe('App — живая зона исходов (TL-98, issue 105)', () => 
       awaitingContinue: false,
     })
     await wrapper.vm.$nextTick()
-    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик» — Только аудио — готово')
-    const firstAnnouncerNode = wrapper.get('.queue-outcome-announcer').element
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик» — готово')
+    // Мутация «перенести `:key` обратно на контейнер» красит эту проверку:
+    // контейнер пересоздался бы вместе с первым объявлением.
+    expect(wrapper.get('.queue-outcome-announcer').element).toBe(containerAtMount)
+    const firstChildNode = wrapper.get('.queue-outcome-announcer__text').element
 
     // Второй ролик с тем же названием тоже завершается — тот же итоговый
     // текст, но это новое событие и оно обязано прозвучать снова.
@@ -1040,11 +1125,14 @@ describe('App — живая зона исходов (TL-98, issue 105)', () => 
     })
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик» — Только аудио — готово')
-    // Мутация «убрать `:key`» не тронула бы этот текст (тот же и без
-    // ключа), но узел остался бы прежним — для дерева доступности это не
-    // новое сообщение, а неозвученная правка уже известного текста.
-    expect(wrapper.get('.queue-outcome-announcer').element).not.toBe(firstAnnouncerNode)
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик» — готово')
+    // Контейнер с `aria-live` — тот же объект, что и до второго объявления.
+    expect(wrapper.get('.queue-outcome-announcer').element).toBe(containerAtMount)
+    // Мутация «убрать `:key`» красит эту проверку: без пересоздания
+    // дочернего узла итоговый текст совпадает и без него, но для AT это
+    // была бы неозвученная правка уже известного узла, а не новое
+    // сообщение.
+    expect(wrapper.get('.queue-outcome-announcer__text').element).not.toBe(firstChildNode)
   })
 
   it('does not double-announce when both download://progress and the following queue://changed commit report the same Done transition', async () => {
@@ -1064,8 +1152,8 @@ describe('App — живая зона исходов (TL-98, issue 105)', () => 
 
     emitProgress({ taskId: 'task-1', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } })
     await wrapper.vm.$nextTick()
-    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — Только аудио — готово')
-    const announcerNode = wrapper.get('.queue-outcome-announcer').element
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — готово')
+    const announcerTextNode = wrapper.get('.queue-outcome-announcer__text').element
 
     emitQueueChanged({
       tasks: [
@@ -1074,11 +1162,56 @@ describe('App — живая зона исходов (TL-98, issue 105)', () => 
       awaitingContinue: false,
     })
     await wrapper.vm.$nextTick()
-    // Если бы снимок породил второе объявление того же исхода, узел был
-    // бы пересоздан (`:key`, doc выше, «Переозвучка») — он не пересоздан,
-    // потому что второго события не было: тот же самый DOM-узел.
-    expect(wrapper.get('.queue-outcome-announcer').element).toBe(announcerNode)
-    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — Только аудио — готово')
+    // Если бы снимок породил второе объявление того же исхода, дочерний
+    // узел был бы пересоздан (`:key`, doc выше, «Переозвучка») — он не
+    // пересоздан, потому что второго события не было: тот же самый
+    // DOM-узел.
+    expect(wrapper.get('.queue-outcome-announcer__text').element).toBe(announcerTextNode)
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — готово')
+  })
+
+  it('race: an outcome event and a click on «Главный» land in the same tick — the gate reads the tab at watch-flush time, so it is dropped (doc `outcomeAnnouncementText`, «Почему не читает outcomeAnnouncement напрямую»)', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () => Promise.resolve(oneActiveTaskSnapshot),
+    })
+    const wrapper = await mountReady()
+    await tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    emitQueueChanged({
+      tasks: [
+        { taskId: 't1', title: 'Ролик A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'failed', error: { kind: 'connectionLost', message: 'diag', retryable: true, partialData: 'kept' } },
+      ],
+      awaitingContinue: false,
+    })
+    // Не ждём между событием и кликом — оба попадают в один и тот же тик,
+    // до флаша watch'а по умолчанию (`flush: 'pre'`).
+    void tabButton(wrapper, 'Главный').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('')
+  })
+
+  it('race: an outcome event fires while still on «Главный», but a click to «История» lands in the same tick — announced (doc `outcomeAnnouncementText`, «Почему не читает outcomeAnnouncement напрямую»)', async () => {
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(okReport),
+      queue_state: () => Promise.resolve(oneActiveTaskSnapshot),
+    })
+    const wrapper = await mountReady()
+
+    emitQueueChanged({
+      tasks: [
+        { taskId: 't1', title: 'Ролик A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'failed', error: { kind: 'connectionLost', message: 'diag', retryable: true, partialData: 'kept' } },
+      ],
+      awaitingContinue: false,
+    })
+    void tabButton(wrapper, 'История').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.queue-outcome-announcer').text()).toBe('«Ролик A» — не удалось')
   })
 })
 
