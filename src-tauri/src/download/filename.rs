@@ -622,7 +622,7 @@ fn truncated(value: &str, max_bytes: usize) -> &str {
 /// Сравнивается сегмент до первой точки и без краевых пробелов: и
 /// `CON.mp4`, и `CON.обзор.mp4`, и `CON .mp4` для Windows — то же
 /// устройство, что и `CON`.
-fn is_reserved_device_name(stem: &str) -> bool {
+pub(crate) fn is_reserved_device_name(stem: &str) -> bool {
     let head = stem
         .split('.')
         .next()

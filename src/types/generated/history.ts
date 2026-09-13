@@ -172,12 +172,16 @@ notices: Array<HistoryNotice>, };
 export type HistoryUnavailableError = { reason: HistoryUnavailableReason, message: string, };
 
 /**
- * Почему история недоступна в этом сеансе (Ф-1 б, в, д).
+ * Почему история недоступна (Ф-1 б, в, д).
+ *
+ * `newerVersion`, `noAccess` и `migrationFailed` — отказ открытия, история
+ * недоступна на весь сеанс. `storageFailed` — отказ базы на чтении уже после
+ * открытия: недоступен этот ответ, следующий запрос может пройти.
  *
  * `corrupted` сюда не входит: порча базы не лишает сеанс истории, ядро
  * заводит новую (см. [`HistoryNotice::BaseRecreated`]).
  */
-export type HistoryUnavailableReason = "newerVersion" | "noAccess" | "migrationFailed";
+export type HistoryUnavailableReason = "newerVersion" | "noAccess" | "migrationFailed" | "storageFailed";
 
 /**
  * Почему последняя запись в историю не сохранилась (Ф-3).

@@ -1998,15 +1998,14 @@ pub struct QueueSnapshot {
 // Контракт экрана истории, экрана настроек и папки в `Done` (дизайн E5,
 // раздел «Данные для API»). Реализация — TL-85 (хранилище истории), TL-86
 // (шаблон имени), TL-87 (хранилище настроек), TL-88 (показ в папке), TL-89
-// (оркестрация), TL-90 и TL-91 (тела команд). Здесь только типы; сигнатуры
-// команд с заглушечными телами — `crate::commands::history` и
-// `crate::commands::settings`. Зеркало — `src/types/generated/history.ts` и
-// `settings.ts`; `FolderDisplay` лежит в `download.ts` рядом с `Done`.
+// (оркестрация), TL-90 и TL-91 (тела команд). Здесь только типы; команды —
+// `crate::commands::history` и `crate::commands::settings`. Зеркало —
+// `src/types/generated/history.ts` и `settings.ts`; `FolderDisplay` лежит в
+// `download.ts` рядом с `Done`.
 //
-// Глушители `#[allow(dead_code)]` в секции стоят по той же причине, что
-// стояли в секциях E2, E3, E4 и E6: контракт опережает реализацию, и
-// конструировать большую часть типов пока некому. Снимает их задача,
-// которая первой конструирует тип.
+// Глушители `#[allow(dead_code)]` секции сняты TL-91: после команд истории
+// (TL-90) и настроек типы конструирует продакшен-код. Оставшиеся точечные
+// стоят на том, что ждёт записи Done (TL-89), и названы у самих элементов.
 //
 // # Семь команд
 //
@@ -2084,7 +2083,6 @@ pub enum FolderDisplay {
     /// Своя папка пользователя. `path` — абсолютный путь целиком, без
     /// сокращений: путь — факт, который пользователь проверяет глазами
     /// (дизайн E5, пункты 3 и 4).
-    #[allow(dead_code)]
     Custom { path: String },
 }
 
@@ -2092,7 +2090,6 @@ pub enum FolderDisplay {
 ///
 /// Вычисляется при каждом запросе страницы и в базе не хранится:
 /// единственный источник — диск в момент запроса.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
 #[serde(
@@ -2116,7 +2113,6 @@ pub enum HistoryFileStatus {
 /// «Показать в папке» принимает `id`, и путь ядро строит из собственной
 /// копии записи (Ф-8). Фронтенду путь нужен только как текст, и этот текст —
 /// [`Self::folder_display`].
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
@@ -2197,7 +2193,6 @@ pub struct HistoryCursor {
 ///   [`HistoryPage::next_cursor`], а не по неполной странице.
 ///
 /// В TS-зеркало константа не попадает — и не должна.
-#[allow(dead_code)]
 pub const HISTORY_PAGE_SIZE: usize = 30;
 
 /// Почему последняя запись в историю не сохранилась (Ф-3).
@@ -2206,7 +2201,6 @@ pub const HISTORY_PAGE_SIZE: usize = 30;
 /// дизайна за вычетом «база недоступна»: при недоступной базе
 /// `history_page` отвечает отказом [`HistoryUnavailableError`], и страница
 /// с этой пометкой не приходит вовсе.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
@@ -2230,7 +2224,6 @@ pub enum HistoryWriteFailure {
 /// нет. Запрос следующей страницы (с курсором) пометок не выдаёт и не гасит:
 /// «Показать ещё», нажатое до обновления первой страницы, пометку не съест.
 /// Как ядро это держит, решает TL-90 вместе с хранилищем (TL-85).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
 #[serde(
@@ -2275,11 +2268,14 @@ pub struct HistoryPage {
     pub notices: Vec<HistoryNotice>,
 }
 
-/// Почему история недоступна в этом сеансе (Ф-1 б, в, д).
+/// Почему история недоступна (Ф-1 б, в, д).
+///
+/// `newerVersion`, `noAccess` и `migrationFailed` — отказ открытия, история
+/// недоступна на весь сеанс. `storageFailed` — отказ базы на чтении уже после
+/// открытия: недоступен этот ответ, следующий запрос может пройти.
 ///
 /// `corrupted` сюда не входит: порча базы не лишает сеанс истории, ядро
 /// заводит новую (см. [`HistoryNotice::BaseRecreated`]).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
@@ -2292,13 +2288,16 @@ pub enum HistoryUnavailableReason {
     /// Миграция схемы отказала. Транзакция откатила её, база осталась на
     /// прежней версии.
     MigrationFailed,
+    /// База открылась, но отказала на чтении уже после открытия: страница
+    /// истории, запись для «Показать в папке» или прерванное чтение.
+    /// Подробности — в `message` и в логе ядра, на экран они не попадают.
+    StorageFailed,
 }
 
 /// Отказ `history_page`: истории в этом сеансе нет.
 ///
 /// `message` — диагностика для лога, как у [`DownloadCommandError`]:
 /// экран рисуется по `reason`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
@@ -2309,7 +2308,6 @@ pub struct HistoryUnavailableError {
 
 /// Почему отклонена команда над записями истории (`delete_history_record`,
 /// `clear_history`).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
 #[serde(
@@ -2346,7 +2344,6 @@ pub struct HistoryCommandError {
 /// Оба поля необязательны. Программа, которая не запустилась вовсе
 /// (`xdg-open` не установлен), не даёт ни кода, ни stderr; её причина — в
 /// `message`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
@@ -2366,7 +2363,6 @@ pub struct LauncherFailureDetails {
 /// объяснить, почему файл не выделен (дизайн E5, пункт 2, таблица трёх
 /// случаев). Отказ здесь означает «не выделено», а не «ничего не
 /// произошло».
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
 #[serde(
@@ -2420,17 +2416,26 @@ pub struct ShowInFolderError {
 ///    к диску: относительный разрешился бы от рабочего каталога процесса, а
 ///    у приложения, запущенного из Finder, это `/`;
 /// 2. путь канонизируется (`std::fs::canonicalize`): `..` и символические
-///    ссылки разрешаются, и в файл настроек пишется **канонический** путь.
-///    Его же возвращает [`SettingsView::settings`], и его же показывает
-///    экран: пользователь видит, куда на самом деле лягут файлы;
+///    ссылки разрешаются, и в файл настроек пишется **канонический на момент
+///    сохранения** путь. Его же возвращает [`SettingsView::settings`], и его
+///    же показывает экран: пользователь видит, куда на самом деле лягут
+///    файлы;
 /// 3. канонический путь — папка.
 ///
 /// Любой отказ — `notADirectory` с причиной [`FolderProblem`], файл настроек
 /// не меняется. Проверки на запись нет (Ф-11).
 ///
-/// На Windows `canonicalize` возвращает путь с префиксом `\\?\`. Показывать
-/// его пользователю и сравнивать в таком виде с системной «Загрузками»
-/// нельзя. Как снять префикс без новых зависимостей, решает TL-91.
+/// **Канонический — на момент сохранения, не на момент ответа.** Чтение
+/// файла настроек путь не канонизирует: это обращение к диску на старте
+/// (Н-3), а символическая ссылка могла появиться на пути уже после
+/// сохранения. Такой путь по-прежнему абсолютный и без `..` — правило
+/// чтения (`storage::settings`).
+///
+/// На Windows `canonicalize` возвращает путь с префиксом `\\?\`. Ядро снимает
+/// его при сохранении (`\\?\C:\…` → `C:\…`, `\\?\UNC\сервер\…` →
+/// `\\сервер\…`), и в ответах префикса нет. Путь, который без префикса
+/// значил бы другое (компонент с точкой или пробелом на конце, имя
+/// устройства), остаётся как есть.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
 #[serde(
@@ -2441,7 +2446,7 @@ pub struct ShowInFolderError {
 pub enum DestinationFolder {
     System,
     /// Путь, выбранный системным диалогом. В ответах ядра — всегда
-    /// абсолютный и канонический (правило выше).
+    /// абсолютный и канонический на момент сохранения (правило выше).
     Custom {
         path: String,
     },
@@ -2470,7 +2475,6 @@ pub struct Settings {
 ///
 /// Значения на проводе совпадают с ключами [`Settings`] и [`SettingsPatch`]
 /// (сторож в тестах ниже).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
@@ -2538,7 +2542,8 @@ pub enum SettingsPatch {
     /// типизированный отказ. С `u32` число `-1` или `5000000000` отклонил бы
     /// уже разбор аргументов, и Tauri вернул бы промису **строку** вместо
     /// [`SettingsCommandError`] — класса у такого отказа нет. С `i64` всё вне
-    /// 1…20 — `invalidValue { min: 1, max: 20 }` (проверка — TL-91).
+    /// 1…20 — `invalidValue { min: 1, max: 20 }` (проверка —
+    /// `storage::settings`, перевод — `commands::settings`).
     ///
     /// Разбор аргументов по-прежнему отклоняет строкой всё, что не целое в
     /// пределах `i64`: не-число (в том числе `"8"`), пустую строку, `null`,
@@ -2562,10 +2567,18 @@ pub enum SettingsPatch {
 /// Unicode (`char` Rust), а не в байтах и не в единицах UTF-16. Интерфейс
 /// печатает его как есть («символ 8») и не режет им строку.
 ///
-/// Набор вариантов — белый список TL-86 на момент контракта. Если
-/// валидатору понадобится новый класс, он добавляется сюда, и зеркало
-/// перегенерируется.
-#[allow(dead_code)]
+/// Набор вариантов — белый список TL-86 плюс предел длины TL-87
+/// (`tooLong`). Если валидатору понадобится новый класс, он добавляется сюда,
+/// и зеркало перегенерируется.
+///
+/// **`unclosedBrace` — `{` без `}` до следующей `{`**, а не только до конца
+/// строки: имя переменной кончается на первой скобке любого вида. Поэтому
+/// `{{title}}` — это `unclosedBrace` в позиции 1, а не переменная с именем
+/// `{title`.
+///
+/// **`tooLong` проверяется первым**, до разбора: работа на непроверенном
+/// вводе ограничена, и у слишком длинного шаблона синтаксис не смотрится
+/// вовсе. `max` — предел в символах Unicode (тех же, что у `position`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
 #[serde(
@@ -2577,7 +2590,8 @@ pub enum TemplateProblem {
     /// `{имя}` не из белого списка. `name` — текст между скобками как есть,
     /// в том числе пустой (`{}`).
     UnknownVariable { position: u32, name: String },
-    /// `{` без закрывающей `}`. Позиция — открывающей скобки.
+    /// `{` без закрывающей `}` до конца строки или до следующей `{`
+    /// (`{{title}}` — позиция 1). Позиция — открывающей скобки.
     UnclosedBrace { position: u32 },
     /// `}` без открывающей `{`. Белый список, а не чёрный: одиночная скобка
     /// не становится литералом по умолчанию.
@@ -2586,6 +2600,8 @@ pub enum TemplateProblem {
     /// одни литералы (`видео`). Решение С-9. Проверяется после синтаксиса:
     /// `{channel}` — это `unknownVariable`, а не `noVariables`.
     NoVariables,
+    /// Шаблон длиннее `max` символов Unicode. Проверяется до разбора.
+    TooLong { max: u32 },
 }
 
 /// Почему папка из патча не принята (Ф-11). Это `<причина>` в тексте
@@ -2594,7 +2610,6 @@ pub enum TemplateProblem {
 /// Строка на проводе, как у [`HistoryWriteFailure`]: данных у причин нет,
 /// подробности ОС едут в `message`. Порядок проверок — в doc
 /// [`DestinationFolder`].
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
@@ -2616,9 +2631,8 @@ pub enum FolderProblem {
 ///
 /// Предпросмотр делит тип с сохранением, как и требует дизайн («тот же
 /// `invalidTemplate`»). Из четырёх классов он возвращает только
-/// `invalidTemplate`. Исключение до TL-91 — заглушки обеих команд, см.
-/// [`SettingsCommandErrorKind::WriteFailed`].
-#[allow(dead_code)]
+/// `invalidTemplate` — с той же проблемой, что `settings_set` на том же
+/// шаблоне, включая `tooLong`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
 #[serde(
@@ -2641,11 +2655,9 @@ pub enum SettingsCommandErrorKind {
     /// временный файл и переименование может отказать, а значения в памяти
     /// остаются прежними.
     ///
-    /// **До TL-91 этим классом отвечают заглушки обеих команд**
-    /// (`crate::commands::settings`): ничего не сохранено, предпросмотр не
-    /// построен. Из четырёх классов только этот не утверждает ложного о
-    /// введённом значении. Отличить заглушку можно лишь по `message`, и
-    /// интерфейс этого делать не должен.
+    /// Тем же классом отвечает `settings_set`, когда хранилища настроек в
+    /// этом сеансе нет (каталог данных не определился) или сохранение
+    /// прервалось: в обоих случаях файл не записан.
     WriteFailed,
 }
 
@@ -2672,15 +2684,16 @@ pub struct SettingsCommandError {
 /// - id ролика — `dQw4w9WgXcQ` (`PREVIEW_SAMPLE_VIDEO_ID`);
 /// - качество — стандартная ступень 1080 (`PREVIEW_SAMPLE_QUALITY`),
 ///   `{quality}` даёт `1080p`;
-/// - дата — **сегодняшняя по локальному времени на момент запроса**, как
-///   того требует дизайн. Это единственная непостоянная часть образца.
+/// - дата — **сегодняшняя по UTC на момент запроса** (`clock::today_utc`,
+///   та же функция, что даёт `{date}` в имени настоящего файла). Это
+///   единственная непостоянная часть образца. Цена: около полуночи дата
+///   может быть вчерашней или завтрашней относительно местной.
 ///
 /// `result` — основа имени после того же конвейера, что у настоящего файла
 /// (подстановка, затем санитизация E3), **без расширения** и без суффикса
 /// коллизии « (N)»: расширение даёт фактический контейнер, а суффикс — папка
 /// в момент финализации, и предпросмотр не смотрит ни на то, ни на другое.
 /// Файл не пишется, папка назначения не требуется.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
@@ -4678,11 +4691,13 @@ mod tests {
             NewerVersion => "newerVersion",
             NoAccess => "noAccess",
             MigrationFailed => "migrationFailed",
+            StorageFailed => "storageFailed",
         );
 
-        // Три, а не четыре Ф-17: `corrupted` не делает историю недоступной
-        // — ядро заводит новую базу, и это `HistoryNotice::BaseRecreated`.
-        assert_eq!(reasons.len(), 3);
+        // Из четырёх Ф-17 `corrupted` не делает историю недоступной — ядро
+        // заводит новую базу, и это `HistoryNotice::BaseRecreated`. Сверх
+        // Ф-17 — `storageFailed`: отказ базы после открытия (TL-91).
+        assert_eq!(reasons.len(), 4);
 
         for (reason, expected) in reasons {
             assert_eq!(
@@ -5069,11 +5084,12 @@ mod tests {
                 => json!({ "kind": "strayClosingBrace", "position": 1 }),
             // У шаблона без переменных указать некуда — и ключа позиции нет.
             NoVariables => json!({ "kind": "noVariables" }),
+            TooLong { max: 200 } => json!({ "kind": "tooLong", "max": 200 }),
         );
 
         // Пустой основы имени среди проблем нет: при загрузке это запасное
         // имя из id (Ф-12), а не отказ.
-        assert_eq!(problems.len(), 4);
+        assert_eq!(problems.len(), 5);
 
         for (problem, expected) in problems {
             assert_eq!(

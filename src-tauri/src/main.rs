@@ -100,7 +100,7 @@ use commands::{
     delete_history_record, dismiss_queue_task, history_page, prepare_ytdlp, preview_name_template,
     probe_url, queue_state, resume_queue, retry_download, roll_back_ytdlp, settings_get,
     settings_set, show_in_folder, start_download, start_ytdlp_preparation,
-    start_ytdlp_update_schedule, ytdlp_update_state, HistoryState, PreparationLock,
+    start_ytdlp_update_schedule, ytdlp_update_state, HistoryState, PreparationLock, SettingsState,
 };
 use probe::ProbeSession;
 use sidecar::ChildRegistry;
@@ -220,6 +220,14 @@ fn main() {
             // Отказ открытия не мешает старту (Н-4): он хранится в состоянии,
             // и экран истории называет причину.
             let data_dir = app.path().app_data_dir().map_err(|err| err.to_string());
+            // Настройки (E5) — тот же приём и те же причины: `settings.json`
+            // лежит в каталоге данных, открывается **ровно один раз** за
+            // процесс (второй `SettingsStore::open` отклоняется процессным
+            // флагом, doc `commands::settings`), чтение не отказывает, а
+            // отсутствие каталога данных не мешает старту (Н-4): команды
+            // отвечают умолчаниями и `writeFailed` на сохранение. Команды
+            // настроек и оркестрация (TL-89) берут это состояние.
+            app.manage(Arc::new(SettingsState::open(data_dir.clone())));
             app.manage(Arc::new(HistoryState::open(data_dir)));
 
             start_ytdlp_preparation(app.handle());

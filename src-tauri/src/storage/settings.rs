@@ -1,10 +1,10 @@
 //! Настройки пользователя на диске: формат, чтение со сбросом по полю,
 //! атомарная запись одного поля (TL-87; Ф-9, Ф-10, Ф-11, Ф-13 эпика E5).
 //!
-//! Команд Tauri здесь нет — их тела подставит TL-91. Чтение настроек при
-//! старте задачи тоже не здесь, его делает оркестрация (TL-89) через
-//! [`SettingsStore::current`]. Обе задачи обращаются только к API этого
-//! модуля.
+//! Команд Tauri здесь нет — тонкий слой над модулем `crate::commands::settings`
+//! (TL-91). Чтение настроек при старте задачи тоже не здесь, его делает
+//! оркестрация (TL-89) через [`SettingsStore::current`]. Обе задачи
+//! обращаются только к API этого модуля.
 //!
 //! Типы здесь свои, и сведение к контракту делают потребители — прецедент
 //! истории (TL-85). Из `crate::types` приходят как есть только значения, у
@@ -106,7 +106,12 @@
 //!
 //! Двух писателей не бывает: приложение одно на пользователя (TL-20), а
 //! хранилище открывается один раз за процесс и живёт в состоянии Tauri
-//! (`manage`, TL-91).
+//! (`manage`, TL-91). «Один раз» держит процессный флаг в
+//! [`SettingsStore::open`], а не договорённость: второе открытие отклоняется
+//! до диска. Два открытых хранилища — это две копии настроек в памяти, и
+//! сохранение через одно молча затёрло бы в файле сохранённое через другое;
+//! а второе открытие испорченного файла не нашло бы его на месте, потому что
+//! первое уже отложило его под `.broken-`.
 //!
 //! # Замки
 //!
@@ -126,6 +131,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde_json::{Map, Value};
@@ -250,6 +256,7 @@ impl Settings {
     }
 
     /// Предел попыток на задачу, всегда в [`MIN_ATTEMPTS`]…[`MAX_ATTEMPTS_LIMIT`].
+    #[allow(dead_code)] // потребитель — оркестрация (TL-89)
     pub fn max_attempts(&self) -> u32 {
         self.max_attempts
     }
@@ -257,6 +264,7 @@ impl Settings {
     /// Основа имени файла по сохранённому шаблону (Ф-12) — для оркестрации
     /// (TL-89), чтобы ей не импортировать модуль шаблона. Отказов нет:
     /// шаблон проверен при чтении или сохранении.
+    #[allow(dead_code)] // потребитель — оркестрация (TL-89)
     pub fn file_stem(&self, ctx: &TemplateContext<'_>) -> String {
         self.name_template.file_stem(ctx)
     }
@@ -354,8 +362,8 @@ pub enum SettingsSetError {
     InvalidTemplate(TemplateProblem),
     /// Шаблон длиннее [`NAME_TEMPLATE_MAX_CHARS`]. Проверяется до разбора.
     ///
-    /// В контракте класса для этого нет (`TemplateProblem` не знает длины) —
-    /// сведение решает TL-91.
+    /// В контракте — `invalidTemplate { problem: tooLong { max } }`, перевод
+    /// делает `commands::settings`.
     #[error("шаблон имени длиной {found} символов, предел {max}")]
     TemplateTooLong { found: usize, max: usize },
     /// Число попыток вне пределов (Ф-13).
@@ -381,8 +389,10 @@ pub struct FolderCheckError {
 /// в JSON и показать без потерь нельзя, а папкой, которую нельзя назвать,
 /// пользоваться нельзя (класс «прочие отказы» контракта).
 ///
-/// На Windows `canonicalize` даёт путь с префиксом `\\?\`; снимать ли его,
-/// контракт оставил TL-91, и здесь он не снимается.
+/// На Windows `canonicalize` даёт путь с префиксом `\\?\`. Он снимается
+/// здесь, до сохранения ([`without_verbatim_prefix`]): такой путь нельзя
+/// показывать пользователю и сравнивать с системной «Загрузками». Хранит
+/// значение домен, поэтому и снимает он, а не команда.
 ///
 /// # Errors
 ///
@@ -421,13 +431,77 @@ pub fn check_folder(path: &str) -> Result<FolderPath, FolderCheckError> {
     canonical
         .into_os_string()
         .into_string()
-        .map(FolderPath)
+        .map(|text| FolderPath(without_verbatim_prefix(text, cfg!(windows))))
         .map_err(|raw| {
             fail(
                 FolderProblem::NoAccess,
                 format!("путь {} не в UTF-8", PathBuf::from(raw).display()),
             )
         })
+}
+
+/// Путь после `canonicalize` в той форме, в какой его пишет пользователь
+/// Windows: `\\?\C:\…` → `C:\…`, `\\?\UNC\сервер\шара\…` → `\\сервер\шара\…`.
+///
+/// Функция строковая, а ОС — параметром (`windows`): так обе ветки
+/// проверяются тестом на любой машине. Вне Windows путь не меняется.
+///
+/// Префикс снимается, только когда путь без него значит **то же самое**.
+/// `\\?\` отключает разбор пути Win32, и без префикса Windows отрезает у
+/// компонента точки и пробелы на конце и превращает имя устройства (`CON`,
+/// `CON.txt`) в устройство. Папка с таким компонентом могла появиться
+/// только через `\\?\`, и её путь остаётся с префиксом: показать его
+/// некрасиво, но подменить им другую папку нельзя. С префиксом остаются и
+/// формы, у которых нет Win32-записи (`\\?\Volume{…}\`, `\\?\GLOBALROOT\`).
+///
+/// **Обещание «то же самое» дано только для входов, которые выдаёт
+/// `canonicalize`**, — других здесь в продакшене нет (`check_folder`).
+/// Строка, которой `canonicalize` не выдаёт, при снятии префикса может
+/// сменить смысл, и функция её не отклоняет. Закреплено тестом-таблицей
+/// `verbatim_inputs_canonicalize_never_produces_may_change_meaning`:
+///
+/// - `\\?\C:\a/b` → `C:\a/b`: под `\\?\` `/` — знак имени, без префикса —
+///   разделитель;
+/// - `\\?\UNC\server` (без share) → `\\server`;
+/// - `\\?\UNC\` → `\\`.
+///
+/// Длина не проверяется: файловые функции std сами возвращают префикс
+/// длинному абсолютному пути перед вызовом ОС.
+fn without_verbatim_prefix(path: String, windows: bool) -> String {
+    const VERBATIM: &str = r"\\?\";
+    const VERBATIM_UNC: &str = r"\\?\UNC\";
+
+    if !windows {
+        return path;
+    }
+    let (plain, rest) = if let Some(rest) = path.strip_prefix(VERBATIM_UNC) {
+        (format!(r"\\{rest}"), rest)
+    } else if let Some(rest) = path.strip_prefix(VERBATIM) {
+        let mut head = rest.chars();
+        let drive = matches!(
+            (head.next(), head.next(), head.next()),
+            (Some(letter), Some(':'), Some('\\')) if letter.is_ascii_alphabetic()
+        );
+        if !drive {
+            return path;
+        }
+        (rest.to_owned(), rest)
+    } else {
+        return path;
+    };
+
+    let same_meaning = rest
+        .split('\\')
+        .filter(|component| !component.is_empty())
+        .all(|component| {
+            !component.ends_with(['.', ' '])
+                && !crate::download::filename::is_reserved_device_name(component)
+        });
+    if same_meaning {
+        plain
+    } else {
+        path
+    }
 }
 
 /// Переименование на последнем шаге записи. Шов для теста атомарности:
@@ -439,6 +513,21 @@ type LabelFn = fn() -> String;
 
 fn unix_secs_label() -> String {
     crate::clock::now_unix_secs().to_string()
+}
+
+/// Открывалось ли хранилище настроек в этом процессе ([`SettingsStore::open`]).
+static OPENED_IN_PROCESS: AtomicBool = AtomicBool::new(false);
+
+/// Почему хранилище настроек не открыто.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SettingsOpenError {
+    /// Хранилище в этом процессе уже открывалось. Повторное открытие
+    /// отклонено до любого обращения к диску.
+    #[error(
+        "настройки: хранилище уже открыто в этом процессе — повторное открытие отклонено, \
+         диск не тронут"
+    )]
+    AlreadyOpen,
 }
 
 /// Хранилище настроек. Открывается один раз за процесс.
@@ -470,10 +559,37 @@ struct State {
 }
 
 impl SettingsStore {
-    /// Читает `settings.json` из каталога данных приложения. Не отказывает:
-    /// таблица исходов — в шапке модуля. Файлов не создаёт; отложить
-    /// испорченный файл и убрать огрызок временного — может.
-    pub fn open(data_dir: &Path) -> Self {
+    /// Читает `settings.json` из каталога данных приложения. Чтение не
+    /// отказывает: таблица исходов — в шапке модуля. Файлов не создаёт;
+    /// отложить испорченный файл и убрать огрызок временного — может.
+    ///
+    /// **Ровно один раз за процесс** (шапка модуля, «Запись»). Первый вызов
+    /// забирает процессный флаг; второй и последующие отвечают
+    /// [`SettingsOpenError::AlreadyOpen`], не читая, не откладывая и не
+    /// удаляя ничего. Приём и цена — те же, что у `HistoryStore::open`:
+    /// лишний вызов в продакшене забрал бы флаг первым, и настройки на сеанс
+    /// стали бы недоступны у настоящего владельца. Место единственного вызова
+    /// пинает сторож по исходникам в `commands::settings`.
+    ///
+    /// # Errors
+    ///
+    /// [`SettingsOpenError::AlreadyOpen`] — хранилище в процессе уже
+    /// открывалось.
+    pub fn open(data_dir: &Path) -> Result<Self, SettingsOpenError> {
+        if OPENED_IN_PROCESS.swap(true, Ordering::SeqCst) {
+            return Err(SettingsOpenError::AlreadyOpen);
+        }
+        Ok(Self::open_with(
+            data_dir,
+            |from, to| fs::rename(from, to),
+            unix_secs_label,
+        ))
+    }
+
+    /// [`Self::open`] без процессного флага — только для тестов: открытий за
+    /// тестовый процесс много, и порядок их не задан.
+    #[cfg(test)]
+    pub(crate) fn open_isolated(data_dir: &Path) -> Self {
         Self::open_with(data_dir, |from, to| fs::rename(from, to), unix_secs_label)
     }
 
@@ -492,11 +608,6 @@ impl SettingsStore {
         }
     }
 
-    /// Путь к файлу настроек.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// Путь к временному файлу записи — только для тестов хранилища.
     #[cfg(test)]
     pub fn temp_path(&self) -> &Path {
@@ -505,6 +616,7 @@ impl SettingsStore {
 
     /// Текущие настройки — дешёвая копия из памяти, диск не трогается. Её
     /// снимает оркестрация при старте каждой задачи (Р-4, Ф-14).
+    #[allow(dead_code)] // потребитель — оркестрация (TL-89)
     pub fn current(&self) -> Settings {
         self.lock().settings.clone()
     }
@@ -626,14 +738,28 @@ fn accept_patch(patch: &SettingsPatch) -> Result<Accepted, SettingsSetError> {
 /// Шаблон из патча: сначала длина (работа на непроверенном вводе
 /// ограничена), затем белый список.
 fn accept_template(text: &str) -> Result<NameTemplate, SettingsSetError> {
+    check_template_length(text)?;
+    NameTemplate::parse(text).map_err(SettingsSetError::InvalidTemplate)
+}
+
+/// Предел длины шаблона на непроверенном вводе — одна проверка для
+/// сохранения и для предпросмотра (`commands::settings`): иначе предпросмотр
+/// показал бы пример по шаблону, который сохранение отклонит.
+///
+/// # Errors
+///
+/// [`SettingsSetError::TemplateTooLong`], если символов Unicode больше
+/// [`NAME_TEMPLATE_MAX_CHARS`].
+pub fn check_template_length(text: &str) -> Result<(), SettingsSetError> {
     let found = text.chars().count();
-    if !template_length_ok(found) {
-        return Err(SettingsSetError::TemplateTooLong {
+    if template_length_ok(found) {
+        Ok(())
+    } else {
+        Err(SettingsSetError::TemplateTooLong {
             found,
             max: NAME_TEMPLATE_MAX_CHARS,
-        });
+        })
     }
-    NameTemplate::parse(text).map_err(SettingsSetError::InvalidTemplate)
 }
 
 /// Предел длины шаблона — одно место для чтения и сохранения.
