@@ -5,8 +5,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DownloadProgressEvent, DownloadStarted } from '@/types/generated/download'
 import type { ProbeResult } from '@/types/generated/probe'
 import type { QueueSnapshot } from '@/types/generated/queue'
+import type { Settings, SettingsView } from '@/types/generated/settings'
 import type { SidecarCheckReport } from '@/types/generated/sidecar'
 import type { YtDlpPrepared } from '@/types/generated/ytdlp'
+
+/** Настройки по умолчанию (Ф-10) — для тестов, которым содержимое экрана «Настройки» безразлично. */
+const DEFAULT_SETTINGS: Settings = { destinationFolder: { kind: 'system' }, nameTemplate: '{title}', maxAttempts: 8 }
+const DEFAULT_SETTINGS_VIEW: SettingsView = {
+  settings: DEFAULT_SETTINGS,
+  defaults: DEFAULT_SETTINGS,
+  resetFields: [],
+  wholeFileReset: false,
+  destinationFolderExists: true,
+}
 
 /**
  * TL-92 (issue execaus/tube-leak#95, дизайн E5 «Навигация»): панель вкладок
@@ -113,6 +124,11 @@ function routeInvoke(handlersByCommand: Record<string, () => Promise<unknown>>) 
     // сразу при монтаже `App.vue`, независимо от активной вкладки — дефолт
     // «пусто», явно переданный обработчик той же команды имеет приоритет.
     history_page: () => Promise.resolve({ entries: [], notices: [] }),
+    // Настройки (эпик E5, TL-94): `SettingsScreen` рендерится безусловно
+    // под вкладкой «Настройки» (`v-show`, К-14) и запрашивает их сразу при
+    // монтаже `App.vue`, независимо от активной вкладки — тот же приём,
+    // что и у `history_page` выше.
+    settings_get: () => Promise.resolve(DEFAULT_SETTINGS_VIEW),
     ...handlersByCommand,
   }
   invokeMock.mockImplementation((command: string) => {
@@ -266,15 +282,19 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
     expect(document.activeElement).toBe(heading.element)
   })
 
-  it('clicking «Настройки» switches to its panel/placeholder and moves focus to its heading', async () => {
+  it('clicking «Настройки» switches to its panel and moves focus to its heading', async () => {
     const wrapper = await mountReady()
 
     await tabButton(wrapper, 'Настройки').trigger('click')
     await wrapper.vm.$nextTick()
+    await flushPromises()
 
     expect(tabButton(wrapper, 'Настройки').attributes('aria-selected')).toBe('true')
     expect(tabPanel(wrapper, 'tabpanel-settings').isVisible()).toBe(true)
-    expect(wrapper.text()).toContain('Здесь появятся папка назначения, шаблон имени и число попыток.')
+    // TL-94: содержимое экрана настроек — `SettingsScreen`, не плейсхолдер TL-92.
+    expect(wrapper.text()).toContain('Папка назначения')
+    expect(wrapper.text()).toContain('Шаблон имени файла')
+    expect(wrapper.text()).toContain('Число попыток')
 
     const heading = tabPanel(wrapper, 'tabpanel-settings').get('h2')
     expect(document.activeElement).toBe(heading.element)

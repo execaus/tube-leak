@@ -34,6 +34,7 @@ import ExitConfirmDialog from '@/components/ExitConfirmDialog.vue'
 import HistoryScreen from '@/components/HistoryScreen.vue'
 import ProbeSection from '@/components/ProbeSection.vue'
 import QueueSection from '@/components/QueueSection.vue'
+import SettingsScreen from '@/components/SettingsScreen.vue'
 import SidecarStatusRow from '@/components/SidecarStatusRow.vue'
 import YtDlpPrepareError from '@/components/YtDlpPrepareError.vue'
 import YtDlpPrepareScreen from '@/components/YtDlpPrepareScreen.vue'
@@ -716,9 +717,9 @@ watch(showQueueStatusRow, (visible, wasVisible) => {
     </section>
 
     <!--
-      Плейсхолдер экрана настроек (TL-94 заменит содержимое своим
-      компонентом на этом же месте) — не зависит от готовности sidecar
-      (дизайн «Навигация»).
+      Экран настроек (TL-94, Ф-9…Ф-13, С-5…С-9) — заголовок и его
+      фокус-цель остаются здесь (К-14), содержимое ниже целиком несёт
+      `SettingsScreen`; не зависит от готовности sidecar (дизайн «Навигация»).
     -->
     <section
       v-show="activeTab === 'settings'"
@@ -732,7 +733,7 @@ watch(showQueueStatusRow, (visible, wasVisible) => {
       >
         Настройки
       </h2>
-      <p>Здесь появятся папка назначения, шаблон имени и число попыток.</p>
+      <SettingsScreen :active="activeTab === 'settings'" />
     </section>
   </main>
 </template>
