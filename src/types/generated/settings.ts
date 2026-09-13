@@ -15,10 +15,40 @@
  * машину или смена системной папки молча оставляли бы старый путь.
  *
  * Тип ходит в обе стороны: уходит в [`SettingsPatch::DestinationFolder`].
- * Путь `custom` — непроверенный ввод; ядро проверяет его при сохранении
- * (`notADirectory`, Ф-11).
+ *
+ * # Правило пути `custom` (Ф-11)
+ *
+ * Путь из патча — непроверенный ввод, форма его не ограничивает: пустой и
+ * относительный путь разбираются и доходят до команды. Проверяет ядро при
+ * сохранении, по порядку:
+ *
+ * 1. путь **абсолютный**. Относительный и пустой отклоняются до обращения
+ *    к диску: относительный разрешился бы от рабочего каталога процесса, а
+ *    у приложения, запущенного из Finder, это `/`;
+ * 2. путь канонизируется (`std::fs::canonicalize`): `..` и символические
+ *    ссылки разрешаются, и в файл настроек пишется **канонический** путь.
+ *    Его же возвращает [`SettingsView::settings`], и его же показывает
+ *    экран: пользователь видит, куда на самом деле лягут файлы;
+ * 3. канонический путь — папка.
+ *
+ * Любой отказ — `notADirectory` с причиной [`FolderProblem`], файл настроек
+ * не меняется. Проверки на запись нет (Ф-11).
+ *
+ * На Windows `canonicalize` возвращает путь с префиксом `\\?\`. Показывать
+ * его пользователю и сравнивать в таком виде с системной «Загрузками»
+ * нельзя. Как снять префикс без новых зависимостей, решает TL-91.
  */
 export type DestinationFolder = { "kind": "system" } | { "kind": "custom", path: string, };
+
+/**
+ * Почему папка из патча не принята (Ф-11). Это `<причина>` в тексте
+ * дизайна «Эта папка недоступна: <причина> — выберите другую».
+ *
+ * Строка на проводе, как у [`HistoryWriteFailure`]: данных у причин нет,
+ * подробности ОС едут в `message`. Порядок проверок — в doc
+ * [`DestinationFolder`].
+ */
+export type FolderProblem = "notAbsolute" | "notFound" | "notADirectory" | "noAccess";
 
 /**
  * Настройки пользователя — ровно три поля (Ф-10, Р-5).
@@ -48,16 +78,17 @@ maxAttempts: number, };
  *
  * `message` — диагностика для лога; решение принимается по `kind`.
  */
-export type SettingsCommandError = { message: string, } & ({ "kind": "notADirectory" } | { "kind": "invalidTemplate", problem: TemplateProblem, } | { "kind": "invalidValue", min: number, max: number, } | { "kind": "writeFailed" });
+export type SettingsCommandError = { message: string, } & ({ "kind": "notADirectory", problem: FolderProblem, } | { "kind": "invalidTemplate", problem: TemplateProblem, } | { "kind": "invalidValue", min: number, max: number, } | { "kind": "writeFailed" });
 
 /**
  * Почему отклонены `settings_set` или `preview_name_template`.
  *
  * Предпросмотр делит тип с сохранением, как и требует дизайн («тот же
  * `invalidTemplate`»). Из четырёх классов он возвращает только
- * `invalidTemplate`.
+ * `invalidTemplate`. Исключение до TL-91 — заглушки обеих команд, см.
+ * [`SettingsCommandErrorKind::WriteFailed`].
  */
-export type SettingsCommandErrorKind = { "kind": "notADirectory" } | { "kind": "invalidTemplate", problem: TemplateProblem, } | { "kind": "invalidValue", min: number, max: number, } | { "kind": "writeFailed" };
+export type SettingsCommandErrorKind = { "kind": "notADirectory", problem: FolderProblem, } | { "kind": "invalidTemplate", problem: TemplateProblem, } | { "kind": "invalidValue", min: number, max: number, } | { "kind": "writeFailed" };
 
 /**
  * Имя одного поля настроек — для пометок «сброшено к умолчанию».
@@ -150,9 +181,13 @@ export type TemplatePreview = { result: string, };
  * Что именно не так с шаблоном имени (Ф-12, дизайн E5, пункт 3).
  *
  * Вместо `reason: String` дизайна — перечисление, см. пункт 3 шапки
- * секции. Позиция лежит внутри вариантов, а не рядом: у пустого результата
- * указать некуда, и «пустой результат в символе 8» не должен быть
- * выразим.
+ * секции. Позиция лежит внутри вариантов, а не рядом: у шаблона без
+ * переменных указать некуда, и «нет переменных в символе 8» не должно быть
+ * выразимо.
+ *
+ * Пустая основа имени — не проблема шаблона: при загрузке она получает
+ * запасное имя из id, как в E3 (Ф-12), а шаблон без единой переменной
+ * недопустим всегда (`noVariables`, С-9), иначе все файлы получают одно имя.
  *
  * **`position` — номер символа для показа, с единицы**, в символах
  * Unicode (`char` Rust), а не в байтах и не в единицах UTF-16. Интерфейс
@@ -162,4 +197,4 @@ export type TemplatePreview = { result: string, };
  * валидатору понадобится новый класс, он добавляется сюда, и зеркало
  * перегенерируется.
  */
-export type TemplateProblem = { "kind": "unknownVariable", position: number, name: string, } | { "kind": "unclosedBrace", position: number, } | { "kind": "strayClosingBrace", position: number, } | { "kind": "emptyResult" };
+export type TemplateProblem = { "kind": "unknownVariable", position: number, name: string, } | { "kind": "unclosedBrace", position: number, } | { "kind": "strayClosingBrace", position: number, } | { "kind": "noVariables" };

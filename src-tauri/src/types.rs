@@ -2038,8 +2038,8 @@ pub struct QueueSnapshot {
 //    «системная или своя» по-прежнему принимается в Rust один раз.
 // 2. **Отдельного `HistoryAvailability` нет.** Три его состояния уже
 //    выражены ответом `history_page`: `Err(HistoryUnavailableError)` —
-//    недоступна, `Ok` с [`HistoryNotice::BaseRecreated`] — пересоздана, `Ok`
-//    без него — в порядке. Отдельный тип стал бы вторым источником истины
+//    недоступна, `Ok` с [`HistoryNotice::BaseRecreated`] в `notices` —
+//    пересоздана, `Ok` без неё — в порядке. Отдельный тип стал бы вторым источником истины
 //    о том же факте.
 // 3. **Причины — перечисления, а не `reason: String`**
 //    ([`TemplateProblem`], [`HistoryWriteFailure`]). Свободная строка —
@@ -2122,7 +2122,17 @@ pub enum HistoryFileStatus {
 #[serde(rename_all = "camelCase")]
 pub struct HistoryEntry {
     /// Идентификатор записи. Для фронтенда непрозрачен: уходит обратно в
-    /// `delete_history_record` и `show_in_folder`, но не разбирается.
+    /// `delete_history_record`, `show_in_folder` и в [`HistoryCursor`], но не
+    /// разбирается и не сравнивается. Сравнение определяет ядро, и оно
+    /// **числовое**: за строкой стоит целый ключ базы, и `"10"` больше `"9"`,
+    /// хотя как строка меньше.
+    ///
+    /// **Уникален навсегда и никогда не переиспользуется**, в том числе после
+    /// удаления записи и очистки истории. Это требование к схеме TL-85:
+    /// `INTEGER PRIMARY KEY AUTOINCREMENT`, а не голый `INTEGER PRIMARY KEY`,
+    /// который после удаления строки с наибольшим ключом выдаёт тот же ключ
+    /// заново. Иначе `id` и курсор в руках открытого экрана указали бы на
+    /// чужую запись, и «Удалить» стёрло бы не ту строку.
     pub id: String,
     /// Канонический id ролика (TL-72) — то же значение, по которому очередь
     /// сравнивает дубли.
@@ -2152,11 +2162,20 @@ pub struct HistoryEntry {
 ///
 /// Пара (время завершения, id), а не смещение: список растёт сверху, и
 /// смещение пропускало бы или повторяло строку, если между двумя «Показать
-/// ещё» завершилась загрузка (дизайн E5, пункт 2). `id` разводит записи
-/// одной секунды.
+/// ещё» завершилась загрузка (дизайн E5, пункт 2).
+///
+/// **Порядок строгий:** записи идут по убыванию пары `(finishedAt, id)`.
+/// Сначала сравнивается время, при равенстве — `id` в числовом сравнении
+/// ядра (см. [`HistoryEntry::id`]). Следующая страница — записи строго
+/// меньше курсора в этом порядке. Пара уникальна, потому что уникален `id`:
+/// на стыке страниц нет ни пропуска, ни повтора, даже если в одну секунду
+/// завершилось больше записей, чем помещается на страницу.
 ///
 /// Фронтенд значение не собирает: берёт [`HistoryPage::next_cursor`] и
-/// отдаёт как есть. Отсюда `Deserialize` — тип ходит в обе стороны.
+/// отдаёт как есть. Отсюда `Deserialize` — тип ходит в обе стороны. Курсор,
+/// которого ядро не выдавало (`id` не целое), — непроверенный ввод. Ответ на
+/// него — пустая последняя страница без `nextCursor`, а не паника и не отказ
+/// (реализация — TL-90).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
@@ -2205,10 +2224,12 @@ pub enum HistoryWriteFailure {
 /// пользователь должен узнать (дизайн E5, пункт 2).
 ///
 /// **«Выдано один раз» — свойство реализации, а не контракта.** Для
-/// контракта это просто необязательное поле ответа [`HistoryPage::notice`].
-/// Обещание ядра: пометка приходит в первом ответе `history_page` после
-/// события и больше не повторяется, показал её фронтенд или нет. Как ядро
-/// это держит, решает TL-90 вместе с хранилищем (TL-85).
+/// контракта это элемент обычного поля ответа [`HistoryPage::notices`].
+/// Обещание ядра: пометка приходит в первом ответе `history_page` **без
+/// курсора** после события и больше не повторяется, показал её фронтенд или
+/// нет. Запрос следующей страницы (с курсором) пометок не выдаёт и не гасит:
+/// «Показать ещё», нажатое до обновления первой страницы, пометку не съест.
+/// Как ядро это держит, решает TL-90 вместе с хранилищем (TL-85).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
@@ -2231,17 +2252,27 @@ pub enum HistoryNotice {
 #[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryPage {
-    /// Не больше [`HISTORY_PAGE_SIZE`] записей. Порядок задаёт ядро: время
-    /// завершения по убыванию, при равенстве — по `id`. UI не сортирует.
+    /// Не больше [`HISTORY_PAGE_SIZE`] записей, строго по убыванию пары
+    /// `(finishedAt, id)`. Порядок и сравнение `id` задаёт ядро (doc
+    /// [`HistoryCursor`]). UI не сортирует.
     pub entries: Vec<HistoryEntry>,
     /// Курсор следующей порции. Отсутствует, когда записей старше этих нет;
     /// по нему интерфейс и прячет «Показать ещё».
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<HistoryCursor>,
-    /// Однократная пометка ([`HistoryNotice`]). В подавляющем большинстве
-    /// ответов отсутствует.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub notice: Option<HistoryNotice>,
+    /// Однократные пометки ([`HistoryNotice`]). Пустой список — пометок нет,
+    /// и так выглядит подавляющее большинство ответов.
+    ///
+    /// Список, а не одно значение: события независимы и могут совпасть.
+    /// Например, база пересоздана при открытии (`baseRecreated`), и первая же
+    /// запись в новую не сохранилась (`lastWriteFailed`). Пользователь обязан
+    /// узнать об обоих, и ни одна пометка не вытесняет другую.
+    ///
+    /// Не больше одной пометки каждого вида, порядок не значим. У
+    /// `lastWriteFailed` — причина последнего отказа. Непустым список бывает
+    /// только в ответе без курсора, то есть на первой странице (doc
+    /// [`HistoryNotice`]).
+    pub notices: Vec<HistoryNotice>,
 }
 
 /// Почему история недоступна в этом сеансе (Ф-1 б, в, д).
@@ -2378,8 +2409,28 @@ pub struct ShowInFolderError {
 /// машину или смена системной папки молча оставляли бы старый путь.
 ///
 /// Тип ходит в обе стороны: уходит в [`SettingsPatch::DestinationFolder`].
-/// Путь `custom` — непроверенный ввод; ядро проверяет его при сохранении
-/// (`notADirectory`, Ф-11).
+///
+/// # Правило пути `custom` (Ф-11)
+///
+/// Путь из патча — непроверенный ввод, форма его не ограничивает: пустой и
+/// относительный путь разбираются и доходят до команды. Проверяет ядро при
+/// сохранении, по порядку:
+///
+/// 1. путь **абсолютный**. Относительный и пустой отклоняются до обращения
+///    к диску: относительный разрешился бы от рабочего каталога процесса, а
+///    у приложения, запущенного из Finder, это `/`;
+/// 2. путь канонизируется (`std::fs::canonicalize`): `..` и символические
+///    ссылки разрешаются, и в файл настроек пишется **канонический** путь.
+///    Его же возвращает [`SettingsView::settings`], и его же показывает
+///    экран: пользователь видит, куда на самом деле лягут файлы;
+/// 3. канонический путь — папка.
+///
+/// Любой отказ — `notADirectory` с причиной [`FolderProblem`], файл настроек
+/// не меняется. Проверки на запись нет (Ф-11).
+///
+/// На Windows `canonicalize` возвращает путь с префиксом `\\?\`. Показывать
+/// его пользователю и сравнивать в таком виде с системной «Загрузками»
+/// нельзя. Как снять префикс без новых зависимостей, решает TL-91.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
 #[serde(
@@ -2389,7 +2440,8 @@ pub struct ShowInFolderError {
 )]
 pub enum DestinationFolder {
     System,
-    /// Абсолютный путь, выбранный системным диалогом.
+    /// Путь, выбранный системным диалогом. В ответах ядра — всегда
+    /// абсолютный и канонический (правило выше).
     Custom {
         path: String,
     },
@@ -2479,15 +2531,32 @@ pub struct SettingsView {
 pub enum SettingsPatch {
     DestinationFolder(DestinationFolder),
     NameTemplate(String),
-    MaxAttempts(u32),
+    /// Число попыток. На входе `i64`, хотя хранится `u32`
+    /// ([`Settings::max_attempts`]).
+    ///
+    /// Широкий тип нужен, чтобы любое целое из UI дошло до команды и получило
+    /// типизированный отказ. С `u32` число `-1` или `5000000000` отклонил бы
+    /// уже разбор аргументов, и Tauri вернул бы промису **строку** вместо
+    /// [`SettingsCommandError`] — класса у такого отказа нет. С `i64` всё вне
+    /// 1…20 — `invalidValue { min: 1, max: 20 }` (проверка — TL-91).
+    ///
+    /// Разбор аргументов по-прежнему отклоняет строкой всё, что не целое в
+    /// пределах `i64`: не-число (в том числе `"8"`), пустую строку, `null`,
+    /// дробное (`1.5`) и целые за пределами `i64`. **UI обязан проверить
+    /// поле сам** и такое значение не отправлять (критерий TL-94).
+    MaxAttempts(i64),
 }
 
 /// Что именно не так с шаблоном имени (Ф-12, дизайн E5, пункт 3).
 ///
 /// Вместо `reason: String` дизайна — перечисление, см. пункт 3 шапки
-/// секции. Позиция лежит внутри вариантов, а не рядом: у пустого результата
-/// указать некуда, и «пустой результат в символе 8» не должен быть
-/// выразим.
+/// секции. Позиция лежит внутри вариантов, а не рядом: у шаблона без
+/// переменных указать некуда, и «нет переменных в символе 8» не должно быть
+/// выразимо.
+///
+/// Пустая основа имени — не проблема шаблона: при загрузке она получает
+/// запасное имя из id, как в E3 (Ф-12), а шаблон без единой переменной
+/// недопустим всегда (`noVariables`, С-9), иначе все файлы получают одно имя.
 ///
 /// **`position` — номер символа для показа, с единицы**, в символах
 /// Unicode (`char` Rust), а не в байтах и не в единицах UTF-16. Интерфейс
@@ -2513,16 +2582,42 @@ pub enum TemplateProblem {
     /// `}` без открывающей `{`. Белый список, а не чёрный: одиночная скобка
     /// не становится литералом по умолчанию.
     StrayClosingBrace { position: u32 },
-    /// На образце шаблон даёт пустую основу имени: пустая строка или
-    /// строка, от которой санитизация ничего не оставила.
-    EmptyResult,
+    /// В шаблоне нет ни одной переменной из белого списка: пустой шаблон или
+    /// одни литералы (`видео`). Решение С-9. Проверяется после синтаксиса:
+    /// `{channel}` — это `unknownVariable`, а не `noVariables`.
+    NoVariables,
+}
+
+/// Почему папка из патча не принята (Ф-11). Это `<причина>` в тексте
+/// дизайна «Эта папка недоступна: <причина> — выберите другую».
+///
+/// Строка на проводе, как у [`HistoryWriteFailure`]: данных у причин нет,
+/// подробности ОС едут в `message`. Порядок проверок — в doc
+/// [`DestinationFolder`].
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub enum FolderProblem {
+    /// Путь относительный или пустой. К диску ядро не обращалось.
+    NotAbsolute,
+    /// `canonicalize` ответил «не найдено»: нет самой папки или одного из
+    /// родителей, либо символическая ссылка ведёт в никуда.
+    NotFound,
+    /// Путь существует, но это не папка.
+    NotADirectory,
+    /// ОС отказала в доступе при разрешении пути или чтении метаданных.
+    /// Прочие отказы ввода-вывода при проверке — тоже сюда: папкой нельзя
+    /// пользоваться. Это не проверка на запись — её нет (Ф-11).
+    NoAccess,
 }
 
 /// Почему отклонены `settings_set` или `preview_name_template`.
 ///
 /// Предпросмотр делит тип с сохранением, как и требует дизайн («тот же
 /// `invalidTemplate`»). Из четырёх классов он возвращает только
-/// `invalidTemplate`.
+/// `invalidTemplate`. Исключение до TL-91 — заглушки обеих команд, см.
+/// [`SettingsCommandErrorKind::WriteFailed`].
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
@@ -2532,24 +2627,31 @@ pub enum TemplateProblem {
     rename_all_fields = "camelCase"
 )]
 pub enum SettingsCommandErrorKind {
-    /// Путь из диалога не является существующей папкой (Ф-11). Файл
-    /// настроек не изменён.
-    NotADirectory,
+    /// Папка из патча не принята (Ф-11). Причина — `problem`, правило
+    /// проверки — doc [`DestinationFolder`]. Имя класса — из Ф-17, хотя «не
+    /// папка» лишь одна из четырёх причин. Файл настроек не изменён.
+    NotADirectory { problem: FolderProblem },
     /// Шаблон имени не прошёл белый список (Ф-12).
     InvalidTemplate { problem: TemplateProblem },
-    /// Число попыток вне диапазона (Ф-13). Границы едут значением, чтобы
+    /// Число попыток вне 1…20 (Ф-13), включая отрицательные и `i64::MAX`
+    /// (doc [`SettingsPatch::MaxAttempts`]). Границы едут значением, чтобы
     /// текст «от 1 до 20» не был второй копией чисел ядра.
     InvalidValue { min: u32, max: u32 },
     /// Файл настроек не записался (Ф-9). Сверх перечня Ф-17: запись через
     /// временный файл и переименование может отказать, а значения в памяти
     /// остаются прежними.
+    ///
+    /// **До TL-91 этим классом отвечают заглушки обеих команд**
+    /// (`crate::commands::settings`): ничего не сохранено, предпросмотр не
+    /// построен. Из четырёх классов только этот не утверждает ложного о
+    /// введённом значении. Отличить заглушку можно лишь по `message`, и
+    /// интерфейс этого делать не должен.
     WriteFailed,
 }
 
 /// Отказ команды настроек в сериализуемом виде.
 ///
 /// `message` — диагностика для лога; решение принимается по `kind`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
@@ -4272,6 +4374,34 @@ mod tests {
     // Сравнение — со значением целиком, как в секциях выше: лишнее поле
     // обязано ронять равенство само по себе.
 
+    /// Образцы **каждого** варианта перечисления вместе с ожиданием для него.
+    ///
+    /// Сторожа `every_*` в секциях E2…E4 держат варианты массивом литералов:
+    /// новый вариант проходит мимо них, пока автор сам не вспомнит про
+    /// массив. Здесь один и тот же список порождает и образцы, и `match` без
+    /// `_` по типу. Вариант, которого нет в списке, — ошибка компиляции
+    /// E0004 в тесте, а попасть в список без образца и ожидания нельзя.
+    ///
+    /// Форма записи: `Вариант => ожидание` или `Вариант { поле: значение }
+    /// => ожидание`; для кортежного варианта поля пишутся номерами
+    /// (`MaxAttempts { 0: 8 }`). Несколько образцов одного варианта
+    /// допустимы.
+    macro_rules! every_variant {
+        ($ty:ident: $( $variant:ident $({ $($field:tt : $value:expr),+ $(,)? })? => $expected:expr ),+ $(,)?) => {{
+            #[allow(unreachable_patterns)]
+            fn exhaustive(value: &$ty) {
+                match value {
+                    $( $ty::$variant { .. } => {} )+
+                }
+            }
+            let all = [ $( ($ty::$variant $({ $($field: $value),+ })?, $expected) ),+ ];
+            for (value, _) in &all {
+                exhaustive(value);
+            }
+            all
+        }};
+    }
+
     #[test]
     fn serializes_done_with_the_file_name_and_the_system_downloads_folder() {
         assert_eq!(
@@ -4308,36 +4438,26 @@ mod tests {
 
     #[test]
     fn every_folder_display_variant_has_its_own_wire_value() {
-        let variants = [
-            (FolderDisplay::SystemDownloads, "systemDownloads"),
-            (
-                FolderDisplay::Custom {
-                    path: "/tmp/x".to_string(),
-                },
-                "custom",
-            ),
-        ];
+        let variants = every_variant!(FolderDisplay:
+            SystemDownloads => json!({ "kind": "systemDownloads" }),
+            Custom { path: "/tmp/x".to_string() } => json!({ "kind": "custom", "path": "/tmp/x" }),
+        );
 
-        // Ф-15: папка либо системная, либо своя — третьего не бывает.
+        // Ф-15: папка либо системная, либо своя — третьего не бывает. Имени
+        // системной папки на проводе нет: подпись выбирает UI.
         assert_eq!(variants.len(), 2);
 
         for (variant, expected) in variants {
             assert_eq!(
-                serde_json::to_value(variant).expect("serialization must not fail")["kind"],
-                json!(expected)
+                serde_json::to_value(variant).expect("serialization must not fail"),
+                expected
             );
         }
-        // Имени системной папки на проводе нет: подпись выбирает UI.
-        assert_eq!(
-            serde_json::to_value(FolderDisplay::SystemDownloads)
-                .expect("serialization must not fail"),
-            json!({ "kind": "systemDownloads" })
-        );
     }
 
     fn history_entry(file_status: HistoryFileStatus) -> HistoryEntry {
         HistoryEntry {
-            id: "h-42".to_string(),
+            id: "42".to_string(),
             video_id: "dQw4w9WgXcQ".to_string(),
             url: "https://youtu.be/dQw4w9WgXcQ?si=abc".to_string(),
             title: "Как приручить дракона".to_string(),
@@ -4361,7 +4481,7 @@ mod tests {
             serde_json::to_value(history_entry(HistoryFileStatus::Present))
                 .expect("serialization must not fail"),
             json!({
-                "id": "h-42",
+                "id": "42",
                 "videoId": "dQw4w9WgXcQ",
                 "url": "https://youtu.be/dQw4w9WgXcQ?si=abc",
                 "title": "Как приручить дракона",
@@ -4408,21 +4528,11 @@ mod tests {
 
     #[test]
     fn every_history_file_status_has_its_own_wire_shape() {
-        let statuses = [
-            (HistoryFileStatus::Present, json!({ "kind": "present" })),
-            (
-                HistoryFileStatus::Missing {
-                    folder_exists: true,
-                },
-                json!({ "kind": "missing", "folderExists": true }),
-            ),
-            (
-                HistoryFileStatus::Missing {
-                    folder_exists: false,
-                },
-                json!({ "kind": "missing", "folderExists": false }),
-            ),
-        ];
+        let statuses = every_variant!(HistoryFileStatus:
+            Present => json!({ "kind": "present" }),
+            Missing { folder_exists: true } => json!({ "kind": "missing", "folderExists": true }),
+            Missing { folder_exists: false } => json!({ "kind": "missing", "folderExists": false }),
+        );
 
         // Три строки таблицы дизайна (файл есть / нет, папка есть / нет
         // папки) — три формы на проводе.
@@ -4436,16 +4546,18 @@ mod tests {
         }
     }
 
+    /// Пометок нет — ключ `notices` всё равно на месте, пустым списком: у
+    /// поля нет второго способа сказать «нет».
     #[test]
-    fn serializes_the_last_page_without_a_cursor_and_without_a_notice() {
+    fn serializes_the_last_page_without_a_cursor_and_with_no_notices() {
         assert_eq!(
             serde_json::to_value(HistoryPage {
                 entries: Vec::new(),
                 next_cursor: None,
-                notice: None,
+                notices: Vec::new(),
             })
             .expect("serialization must not fail"),
-            json!({ "entries": [] })
+            json!({ "entries": [], "notices": [] })
         );
     }
 
@@ -4458,16 +4570,16 @@ mod tests {
                 })],
                 next_cursor: Some(HistoryCursor {
                     finished_at_unix_secs: 1_789_000_000,
-                    id: "h-42".to_string(),
+                    id: "42".to_string(),
                 }),
-                notice: Some(HistoryNotice::LastWriteFailed {
+                notices: vec![HistoryNotice::LastWriteFailed {
                     cause: HistoryWriteFailure::DiskFull,
-                }),
+                }],
             })
             .expect("serialization must not fail"),
             json!({
                 "entries": [{
-                    "id": "h-42",
+                    "id": "42",
                     "videoId": "dQw4w9WgXcQ",
                     "url": "https://youtu.be/dQw4w9WgXcQ?si=abc",
                     "title": "Как приручить дракона",
@@ -4478,8 +4590,34 @@ mod tests {
                     "finishedAtUnixSecs": 1_789_000_000_u64,
                     "fileStatus": { "kind": "missing", "folderExists": true },
                 }],
-                "nextCursor": { "finishedAtUnixSecs": 1_789_000_000_u64, "id": "h-42" },
-                "notice": { "kind": "lastWriteFailed", "cause": "diskFull" },
+                "nextCursor": { "finishedAtUnixSecs": 1_789_000_000_u64, "id": "42" },
+                "notices": [{ "kind": "lastWriteFailed", "cause": "diskFull" }],
+            })
+        );
+    }
+
+    /// Б-1: база пересоздана, и последняя запись не сохранена — обе пометки
+    /// доходят в одном ответе, ни одна не вытесняет другую.
+    #[test]
+    fn serializes_both_one_time_notices_in_one_page() {
+        assert_eq!(
+            serde_json::to_value(HistoryPage {
+                entries: Vec::new(),
+                next_cursor: None,
+                notices: vec![
+                    HistoryNotice::BaseRecreated,
+                    HistoryNotice::LastWriteFailed {
+                        cause: HistoryWriteFailure::NoAccess,
+                    },
+                ],
+            })
+            .expect("serialization must not fail"),
+            json!({
+                "entries": [],
+                "notices": [
+                    { "kind": "baseRecreated" },
+                    { "kind": "lastWriteFailed", "cause": "noAccess" },
+                ],
             })
         );
     }
@@ -4490,7 +4628,7 @@ mod tests {
     fn a_history_cursor_travels_back_unchanged() {
         let cursor = HistoryCursor {
             finished_at_unix_secs: 1_789_000_000,
-            id: "h-42".to_string(),
+            id: "42".to_string(),
         };
         let wire = serde_json::to_value(&cursor).expect("serialization must not fail");
         let back: HistoryCursor = serde_json::from_value(wire).expect("deserialization must work");
@@ -4499,15 +4637,11 @@ mod tests {
 
     #[test]
     fn every_history_notice_kind_has_its_own_wire_value() {
-        let notices = [
-            (HistoryNotice::BaseRecreated, "baseRecreated"),
-            (
-                HistoryNotice::LastWriteFailed {
-                    cause: HistoryWriteFailure::NoAccess,
-                },
-                "lastWriteFailed",
-            ),
-        ];
+        let notices = every_variant!(HistoryNotice:
+            BaseRecreated => json!({ "kind": "baseRecreated" }),
+            LastWriteFailed { cause: HistoryWriteFailure::NoAccess }
+                => json!({ "kind": "lastWriteFailed", "cause": "noAccess" }),
+        );
 
         // Два баннера дизайна: «файл истории был повреждён» и «последняя
         // запись не сохранена».
@@ -4515,24 +4649,19 @@ mod tests {
 
         for (notice, expected) in notices {
             assert_eq!(
-                serde_json::to_value(notice).expect("serialization must not fail")["kind"],
-                json!(expected)
+                serde_json::to_value(notice).expect("serialization must not fail"),
+                expected
             );
         }
-        assert_eq!(
-            serde_json::to_value(HistoryNotice::BaseRecreated)
-                .expect("serialization must not fail"),
-            json!({ "kind": "baseRecreated" })
-        );
     }
 
     #[test]
     fn every_history_write_failure_has_its_own_wire_value() {
-        let causes = [
-            (HistoryWriteFailure::DiskFull, "diskFull"),
-            (HistoryWriteFailure::NoAccess, "noAccess"),
-            (HistoryWriteFailure::StorageFailed, "storageFailed"),
-        ];
+        let causes = every_variant!(HistoryWriteFailure:
+            DiskFull => "diskFull",
+            NoAccess => "noAccess",
+            StorageFailed => "storageFailed",
+        );
         assert_eq!(causes.len(), 3);
 
         for (cause, expected) in causes {
@@ -4545,11 +4674,11 @@ mod tests {
 
     #[test]
     fn every_history_unavailable_reason_has_its_own_wire_value() {
-        let reasons = [
-            (HistoryUnavailableReason::NewerVersion, "newerVersion"),
-            (HistoryUnavailableReason::NoAccess, "noAccess"),
-            (HistoryUnavailableReason::MigrationFailed, "migrationFailed"),
-        ];
+        let reasons = every_variant!(HistoryUnavailableReason:
+            NewerVersion => "newerVersion",
+            NoAccess => "noAccess",
+            MigrationFailed => "migrationFailed",
+        );
 
         // Три, а не четыре Ф-17: `corrupted` не делает историю недоступной
         // — ядро заводит новую базу, и это `HistoryNotice::BaseRecreated`.
@@ -4577,16 +4706,11 @@ mod tests {
 
     #[test]
     fn every_history_command_error_kind_has_its_own_wire_value() {
-        let kinds = [
-            (HistoryCommandErrorKind::UnknownRecord, "unknownRecord"),
-            (HistoryCommandErrorKind::WriteFailed, "writeFailed"),
-            (
-                HistoryCommandErrorKind::Unavailable {
-                    reason: HistoryUnavailableReason::NoAccess,
-                },
-                "unavailable",
-            ),
-        ];
+        let kinds = every_variant!(HistoryCommandErrorKind:
+            UnknownRecord => "unknownRecord",
+            WriteFailed => "writeFailed",
+            Unavailable { reason: HistoryUnavailableReason::NoAccess } => "unavailable",
+        );
         assert_eq!(kinds.len(), 3);
 
         for (kind, expected) in kinds {
@@ -4618,35 +4742,24 @@ mod tests {
         assert_eq!(
             serde_json::to_value(HistoryCommandError {
                 kind: HistoryCommandErrorKind::UnknownRecord,
-                message: "записи h-7 нет".to_string(),
+                message: "записи 7 нет".to_string(),
             })
             .expect("serialization must not fail"),
-            json!({ "kind": "unknownRecord", "message": "записи h-7 нет" })
+            json!({ "kind": "unknownRecord", "message": "записи 7 нет" })
         );
     }
 
     #[test]
     fn every_show_in_folder_error_kind_has_its_own_wire_value() {
-        let kinds = [
-            (ShowInFolderErrorKind::FileMissing, "fileMissing"),
-            (ShowInFolderErrorKind::FolderMissing, "folderMissing"),
-            (
-                ShowInFolderErrorKind::LauncherFailed {
-                    details: LauncherFailureDetails {
-                        exit_code: None,
-                        stderr_tail: None,
-                    },
-                },
-                "launcherFailed",
-            ),
-            (ShowInFolderErrorKind::UnknownRecord, "unknownRecord"),
-            (
-                ShowInFolderErrorKind::Unavailable {
-                    reason: HistoryUnavailableReason::NoAccess,
-                },
-                "unavailable",
-            ),
-        ];
+        let kinds = every_variant!(ShowInFolderErrorKind:
+            FileMissing => "fileMissing",
+            FolderMissing => "folderMissing",
+            LauncherFailed {
+                details: LauncherFailureDetails { exit_code: None, stderr_tail: None },
+            } => "launcherFailed",
+            UnknownRecord => "unknownRecord",
+            Unavailable { reason: HistoryUnavailableReason::NoAccess } => "unavailable",
+        );
 
         // Три класса Ф-17 и два сверх него (doc варианта): запись могла
         // исчезнуть, а база — не открыться.
@@ -4744,15 +4857,11 @@ mod tests {
 
     #[test]
     fn every_destination_folder_travels_both_ways_unchanged() {
-        let folders = [
-            (DestinationFolder::System, json!({ "kind": "system" })),
-            (
-                DestinationFolder::Custom {
-                    path: "C:\\Users\\me\\Videos".to_string(),
-                },
-                json!({ "kind": "custom", "path": "C:\\Users\\me\\Videos" }),
-            ),
-        ];
+        let folders = every_variant!(DestinationFolder:
+            System => json!({ "kind": "system" }),
+            Custom { path: "C:\\Users\\me\\Videos".to_string() }
+                => json!({ "kind": "custom", "path": "C:\\Users\\me\\Videos" }),
+        );
         assert_eq!(folders.len(), 2);
 
         for (folder, wire) in folders {
@@ -4763,6 +4872,26 @@ mod tests {
             let back: DestinationFolder =
                 serde_json::from_value(wire).expect("deserialization must work");
             assert_eq!(back, folder);
+        }
+    }
+
+    /// П-2: форма пути не проверяет — пустой и относительный путь доходят до
+    /// команды, и отклонить их обязано ядро (`notAbsolute`, doc
+    /// [`DestinationFolder`]). Тест фиксирует, что проверку нельзя оставить
+    /// разбору.
+    #[test]
+    fn an_empty_or_relative_custom_path_reaches_the_command() {
+        for path in ["", "Movies/YouTube", "../..", "."] {
+            let wire = json!({ "destinationFolder": { "kind": "custom", "path": path } });
+            let patch: SettingsPatch =
+                serde_json::from_value(wire.clone()).expect("разбор путь не проверяет");
+            assert_eq!(
+                patch,
+                SettingsPatch::DestinationFolder(DestinationFolder::Custom {
+                    path: path.to_string(),
+                }),
+                "{wire}"
+            );
         }
     }
 
@@ -4784,39 +4913,41 @@ mod tests {
             .collect();
         from_settings.sort_unstable();
 
-        let mut from_fields: Vec<String> = [
-            SettingsField::DestinationFolder,
-            SettingsField::NameTemplate,
-            SettingsField::MaxAttempts,
-        ]
-        .into_iter()
-        .map(|field| {
-            serde_json::to_value(field)
-                .expect("serialization must not fail")
-                .as_str()
-                .expect("field must be a string")
-                .to_string()
-        })
-        .collect();
+        let fields = every_variant!(SettingsField:
+            DestinationFolder => "destinationFolder",
+            NameTemplate => "nameTemplate",
+            MaxAttempts => "maxAttempts",
+        );
+        let mut from_fields: Vec<String> = fields
+            .into_iter()
+            .map(|(field, expected)| {
+                let value = serde_json::to_value(field).expect("serialization must not fail");
+                assert_eq!(value, json!(expected));
+                expected.to_string()
+            })
+            .collect();
         from_fields.sort_unstable();
 
-        let mut from_patches: Vec<String> = [
-            SettingsPatch::DestinationFolder(DestinationFolder::System),
-            SettingsPatch::NameTemplate("{title}".to_string()),
-            SettingsPatch::MaxAttempts(8),
-        ]
-        .into_iter()
-        .map(|patch| {
-            let value = serde_json::to_value(patch).expect("serialization must not fail");
-            let object = value.as_object().expect("patch must be an object");
-            assert_eq!(
-                object.len(),
-                1,
-                "патч обязан нести ровно одно поле: {value}"
-            );
-            object.keys().next().expect("one key").clone()
-        })
-        .collect();
+        let patches = every_variant!(SettingsPatch:
+            DestinationFolder { 0: DestinationFolder::System } => "destinationFolder",
+            NameTemplate { 0: "{title}".to_string() } => "nameTemplate",
+            MaxAttempts { 0: 8 } => "maxAttempts",
+        );
+        let mut from_patches: Vec<String> = patches
+            .into_iter()
+            .map(|(patch, expected)| {
+                let value = serde_json::to_value(patch).expect("serialization must not fail");
+                let object = value.as_object().expect("patch must be an object");
+                assert_eq!(
+                    object.len(),
+                    1,
+                    "патч обязан нести ровно одно поле: {value}"
+                );
+                let key = object.keys().next().expect("one key").clone();
+                assert_eq!(key, expected);
+                key
+            })
+            .collect();
         from_patches.sort_unstable();
 
         // Ф-10 и Р-5: ровно три поля — папка, шаблон, попытки.
@@ -4879,30 +5010,69 @@ mod tests {
         }
     }
 
+    /// П-1: любое целое в пределах `i64` доходит до команды и получает класс
+    /// `invalidValue`, а не строку разбора. С прежним `u32` отрицательное и
+    /// огромное число отклонялись бы до команды.
+    #[test]
+    fn any_integer_max_attempts_reaches_the_command_and_gets_a_typed_rejection() {
+        for attempts in [0_i64, 21, -1, i64::MAX, i64::MIN] {
+            let wire = json!({ "maxAttempts": attempts });
+            let patch: SettingsPatch =
+                serde_json::from_value(wire.clone()).expect("целое i64 обязано разобраться");
+            assert_eq!(patch, SettingsPatch::MaxAttempts(attempts), "{wire}");
+
+            // Форма ответа, которую TL-91 обязан вернуть на это значение.
+            assert_eq!(
+                serde_json::to_value(SettingsCommandError {
+                    kind: SettingsCommandErrorKind::InvalidValue { min: 1, max: 20 },
+                    message: format!("maxAttempts = {attempts}"),
+                })
+                .expect("serialization must not fail"),
+                json!({
+                    "kind": "invalidValue",
+                    "min": 1,
+                    "max": 20,
+                    "message": format!("maxAttempts = {attempts}"),
+                })
+            );
+        }
+    }
+
+    /// Оборотная сторона П-1, записанная в doc [`SettingsPatch::MaxAttempts`]:
+    /// это разбор отклоняет строкой, и до команды оно не дойдёт. UI обязан
+    /// проверить поле сам (критерий TL-94).
+    #[test]
+    fn a_non_integer_max_attempts_is_rejected_by_argument_parsing() {
+        for rejected in [
+            json!({ "maxAttempts": "8" }),
+            json!({ "maxAttempts": "" }),
+            json!({ "maxAttempts": null }),
+            json!({ "maxAttempts": 1.5 }),
+            // `JSON.stringify(1e21)` — это `1e+21`, число с плавающей точкой.
+            json!({ "maxAttempts": 1e21 }),
+            json!({ "maxAttempts": u64::MAX }),
+        ] {
+            assert!(
+                serde_json::from_value::<SettingsPatch>(rejected.clone()).is_err(),
+                "не целое i64 обязано отклоняться разбором: {rejected}"
+            );
+        }
+    }
+
     #[test]
     fn every_template_problem_has_its_own_wire_shape() {
-        let problems = [
-            (
-                TemplateProblem::UnknownVariable {
-                    position: 8,
-                    name: "channel".to_string(),
-                },
-                json!({ "kind": "unknownVariable", "position": 8, "name": "channel" }),
-            ),
-            (
-                TemplateProblem::UnclosedBrace { position: 12 },
-                json!({ "kind": "unclosedBrace", "position": 12 }),
-            ),
-            (
-                TemplateProblem::StrayClosingBrace { position: 1 },
-                json!({ "kind": "strayClosingBrace", "position": 1 }),
-            ),
-            // У пустого результата указать некуда — и ключа позиции нет.
-            (
-                TemplateProblem::EmptyResult,
-                json!({ "kind": "emptyResult" }),
-            ),
-        ];
+        let problems = every_variant!(TemplateProblem:
+            UnknownVariable { position: 8, name: "channel".to_string() }
+                => json!({ "kind": "unknownVariable", "position": 8, "name": "channel" }),
+            UnclosedBrace { position: 12 } => json!({ "kind": "unclosedBrace", "position": 12 }),
+            StrayClosingBrace { position: 1 }
+                => json!({ "kind": "strayClosingBrace", "position": 1 }),
+            // У шаблона без переменных указать некуда — и ключа позиции нет.
+            NoVariables => json!({ "kind": "noVariables" }),
+        );
+
+        // Пустой основы имени среди проблем нет: при загрузке это запасное
+        // имя из id (Ф-12), а не отказ.
         assert_eq!(problems.len(), 4);
 
         for (problem, expected) in problems {
@@ -4914,21 +5084,31 @@ mod tests {
     }
 
     #[test]
+    fn every_folder_problem_has_its_own_wire_value() {
+        let problems = every_variant!(FolderProblem:
+            NotAbsolute => "notAbsolute",
+            NotFound => "notFound",
+            NotADirectory => "notADirectory",
+            NoAccess => "noAccess",
+        );
+        assert_eq!(problems.len(), 4);
+
+        for (problem, expected) in problems {
+            assert_eq!(
+                serde_json::to_value(problem).expect("serialization must not fail"),
+                json!(expected)
+            );
+        }
+    }
+
+    #[test]
     fn every_settings_command_error_kind_has_its_own_wire_value() {
-        let kinds = [
-            (SettingsCommandErrorKind::NotADirectory, "notADirectory"),
-            (
-                SettingsCommandErrorKind::InvalidTemplate {
-                    problem: TemplateProblem::EmptyResult,
-                },
-                "invalidTemplate",
-            ),
-            (
-                SettingsCommandErrorKind::InvalidValue { min: 1, max: 20 },
-                "invalidValue",
-            ),
-            (SettingsCommandErrorKind::WriteFailed, "writeFailed"),
-        ];
+        let kinds = every_variant!(SettingsCommandErrorKind:
+            NotADirectory { problem: FolderProblem::NotFound } => "notADirectory",
+            InvalidTemplate { problem: TemplateProblem::NoVariables } => "invalidTemplate",
+            InvalidValue { min: 1, max: 20 } => "invalidValue",
+            WriteFailed => "writeFailed",
+        );
 
         // Три класса Ф-17 и `writeFailed` сверх него (doc варианта).
         assert_eq!(kinds.len(), 4);
@@ -4939,6 +5119,26 @@ mod tests {
                 json!(expected)
             );
         }
+    }
+
+    /// П-2: причина отказа по папке лежит рядом с тегом строкой — текст
+    /// «Эта папка недоступна: <причина>» выбирает UI по ней.
+    #[test]
+    fn serializes_a_rejected_folder_with_its_problem_next_to_the_tag() {
+        assert_eq!(
+            serde_json::to_value(SettingsCommandError {
+                kind: SettingsCommandErrorKind::NotADirectory {
+                    problem: FolderProblem::NotAbsolute,
+                },
+                message: "путь \"Movies\" не абсолютный".to_string(),
+            })
+            .expect("serialization must not fail"),
+            json!({
+                "kind": "notADirectory",
+                "problem": "notAbsolute",
+                "message": "путь \"Movies\" не абсолютный",
+            })
+        );
     }
 
     /// Проблема шаблона — вложенный объект со своим тегом, а не поля рядом
@@ -4960,6 +5160,20 @@ mod tests {
                 "kind": "invalidTemplate",
                 "problem": { "kind": "unknownVariable", "position": 8, "name": "channel" },
                 "message": "неизвестная переменная channel",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(SettingsCommandError {
+                kind: SettingsCommandErrorKind::InvalidTemplate {
+                    problem: TemplateProblem::NoVariables,
+                },
+                message: "в шаблоне \"видео\" нет переменных".to_string(),
+            })
+            .expect("serialization must not fail"),
+            json!({
+                "kind": "invalidTemplate",
+                "problem": { "kind": "noVariables" },
+                "message": "в шаблоне \"видео\" нет переменных",
             })
         );
     }

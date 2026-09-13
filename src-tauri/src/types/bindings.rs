@@ -227,6 +227,7 @@ macro_rules! with_contract_types {
             SettingsView,
             SettingsPatch,
             TemplateProblem,
+            FolderProblem,
             SettingsCommandErrorKind,
             SettingsCommandError,
             TemplatePreview,
@@ -487,7 +488,7 @@ fn every_optional_field_of_the_contract_is_omitted_when_absent() {
     /// граница и заводилась. Меняется вместе с контрактом, одной строкой,
     /// и это осознанная просьба к автору нового поля посмотреть на
     /// сторожа.
-    const OPTIONAL_FIELDS: usize = 38;
+    const OPTIONAL_FIELDS: usize = 37;
 
     let mut checked = 0usize;
     let contract: Vec<&str> = contract_source().lines().collect();

@@ -36,7 +36,9 @@ pub async fn history_page(
     Ok(HistoryPage {
         entries: Vec::new(),
         next_cursor: None,
-        notice: None,
+        // Пометкам неоткуда взяться: базы ещё нет, пересоздавать и не
+        // сохранять в неё нечего.
+        notices: Vec::new(),
     })
 }
 
