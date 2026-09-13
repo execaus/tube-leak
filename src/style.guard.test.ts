@@ -311,6 +311,61 @@ import { describe, expect, it } from 'vitest'
  *    `.svg`/`.html`, разобранный как обычный элемент шаблона
  *    (`getStaticAttrValue(node, 'lang')` — для него нет отдельного поля
  *    `lang`, только атрибут).
+ *
+ * # Шестой раунд (TL-103, issue execaus/tube-leak#110) — ссылка на issue не hex
+ *
+ * Найдено при TL-98 (issue #105): заголовок теста `it('… issue #105 …', …)`
+ * краснел — трёхзначный номер issue после `#` синтаксически неотличим от
+ * 3-значного hex-цвета, а `findScriptColorLiteral` (пятый раунд и раньше)
+ * искал hex ГДЕ УГОДНО в составной строке скрипта без оглядки на контекст.
+ * Тот же класс ложного совпадения, что уже был решён для имён цветов в
+ * четвёртом раунде (Б-1: `Field`/`Window` — легитимные системные цвета и
+ * обычные слова) — решение ведущего распространяет ту же границу на hex, а
+ * не изобретает отдельную:
+ *
+ * 1. **Голый hex внутри составной строки скрипта ищется только в тех же
+ *    трёх контекстах, где уже ищутся голые имена (Б-1, «Четвёртый раунд»):**
+ *    ключ объекта, похожий на CSS-свойство, внутри стилевого объекта;
+ *    присваивание в цепочку `....style`/вызов `....setProperty(...)`;
+ *    выражение директивы `:style`, целиком являющееся строкой. Реализовано
+ *    без нового признака контекста — `findScriptColorLiteral` (вызывается,
+ *    когда `allowNames === false`) больше не вызывает `containsHexOrFunctionColor`,
+ *    только новый `containsFunctionColor` (вызовы цветовых функций, всегда,
+ *    без ограничения контекста — синтаксис `rgb(...)` не совпадает со
+ *    случайной прозой). Голый hex «где угодно» доступен только через
+ *    `findCssColorLiteral`/`containsHexOrFunctionColor` (новый
+ *    `containsHexColor` + `containsFunctionColor`), которые вызываются
+ *    именно и только в контекстах п. 1–3 (`allowNames === true`,
+ *    `checkWholeLiteral`) и для CSS-деклараций (п. 1 «Четвёртого раунда»,
+ *    где поверхность узкая заведомо). Симметрично применено и к статическим
+ *    частям шаблонных литералов с подстановкой (`checkFragmentLiteral`) —
+ *    тот же класс совпадения не более обоснован внутри `TemplateHead`, чем
+ *    внутри обычного строкового литерала.
+ * 2. **Значение ЦЕЛИКОМ равное hex по-прежнему нарушение** (`'#f00'`,
+ *    `'#105'`) — не затронуто, это честное ограничение из «Честного
+ *    компромисса» (раздел выше, п. 3 брифа третьего раунда): строковый
+ *    литерал не несёт контекста, отличающего id от цвета, когда ничего,
+ *    кроме самого hex, в строке нет. Обходной путь для такого id — не
+ *    писать его отдельным литералом (см. п. 3 ниже — заголовки тестов уже
+ *    решают эту проблему иначе).
+ * 3. **Первый аргумент `describe`/`it`/`test` не проверяется вовсе** —
+ *    новый, отдельный от Б-1 признак контекста, а не расширение грамматики:
+ *    заголовок теста — не CSS-значение и не значение вообще, это метаданные
+ *    для отчёта тестраннера, программе к разбору не предназначенные.
+ *    `isTestTitleCall`/`isEachTableCall`/`unwrapCalleeRootName` находят
+ *    вызов по имени корневого идентификатора цепочки (`describe`/`it`/
+ *    `test`), включая `.each(...)`/`.skip`/`.only`/`.concurrent` в любой
+ *    комбинации и глубине; `.each([...])` сам по себе — не заголовочный
+ *    вызов (его аргумент — таблица данных, которая по-прежнему
+ *    проверяется, если фикстура данных содержит настоящий код с цветом).
+ *    Остальные аргументы такого вызова (обычно функция теста) проверяются
+ *    как обычно — исключён только индекс 0.
+ *
+ * Вызовы цветовых функций (`rgb(`, `oklch(`, …) исключение не затрагивает
+ * нигде: они ищутся где угодно в любой строке независимо от контекста, как
+ * и раньше, — синтаксис вызова функции не совпадает со случайной прозой
+ * (единственный барьер для этого класса — точка перед именем функции,
+ * отличающая `theme.color('x')` от `color('x')`, см. выше).
  */
 
 const SRC_DIR = join(dirname(fileURLToPath(import.meta.url)))
@@ -441,24 +496,49 @@ function isWholeValueColor(rawValue: string): boolean {
 }
 
 /**
+ * Вызов цветовой функции ГДЕ УГОДНО в значении (после вырезания
+ * `var()`/`url()`) — не требует, чтобы значение было ЦЕЛИКОМ цветом.
+ * Единственный поиск «где угодно», применяемый БЕЗ оглядки на контекст (см.
+ * `findScriptColorLiteral` шестого раунда, doc-комментарий файла — «Шестой
+ * раунд»): вызов функции синтаксически однозначен сам по себе, в отличие от
+ * голого hex-фрагмента или имени, которые совпадают со случайной прозой
+ * (номер issue, идентификатор).
+ */
+function containsFunctionColor(rawValue: string): string | null {
+  const value = stripNonPaletteConstructs(rawValue)
+  const functionCall = value.match(COLOR_FUNCTION_CALL_RE)
+  return functionCall && functionCall[0] !== undefined ? functionCall[0] : null
+}
+
+/**
+ * hex ГДЕ УГОДНО в значении (после вырезания `var()`/`url()`) — не требует,
+ * чтобы значение было ЦЕЛИКОМ цветом. Используется только там, где строка
+ * синтаксически гарантированно CSS-значение (см. doc-комментарий файла —
+ * «Шестой раунд»): голый hex-фрагмент неотличим от номера issue (`#105`) без
+ * такого контекста.
+ */
+function containsHexColor(rawValue: string): string | null {
+  const value = stripNonPaletteConstructs(rawValue)
+  const hexRuns = value.match(HEX_RUN_RE)
+  if (!hexRuns) return null
+  const validHexRun = hexRuns.find((run) => VALID_HEX_DIGIT_COUNTS.has(run.length - 1))
+  return validHexRun ?? null
+}
+
+/**
  * hex или вызов цветовой функции ГДЕ УГОДНО в значении (после вырезания
  * `var()`/`url()`) — не требует, чтобы значение было ЦЕЛИКОМ цветом.
  * Именованные/системные цвета сюда намеренно не входят (см.
- * `findScriptColorLiteral` — там объяснено, почему).
+ * `findScriptColorLiteral` — там объяснено, почему). Используется только в
+ * контекстах, где строка синтаксически гарантированно CSS-значение
+ * (CSS-декларации, п. 1–3 «Четвёртого раунда» через `findCssColorLiteral`) —
+ * hex-часть здесь безопасна именно потому, что поверхность узкая, в отличие
+ * от произвольной строки TS (см. `containsHexColor`).
  */
 function containsHexOrFunctionColor(rawValue: string): string | null {
-  const value = stripNonPaletteConstructs(rawValue)
-
-  const hexRuns = value.match(HEX_RUN_RE)
-  if (hexRuns) {
-    const validHexRun = hexRuns.find((run) => VALID_HEX_DIGIT_COUNTS.has(run.length - 1))
-    if (validHexRun !== undefined) return validHexRun
-  }
-
-  const functionCall = value.match(COLOR_FUNCTION_CALL_RE)
-  if (functionCall && functionCall[0] !== undefined) return functionCall[0]
-
-  return null
+  const hexRun = containsHexColor(rawValue)
+  if (hexRun !== null) return hexRun
+  return containsFunctionColor(rawValue)
 }
 
 /**
@@ -481,8 +561,8 @@ function findCssColorLiteral(rawValue: string): string | null {
 /**
  * Проверка строкового литерала в скриптах/выражениях (п. 3): «целиком
  * цвет» — полной грамматикой (`isWholeValueColor`), «составное
- * CSS-подобное значение» — только по hex/функции
- * (`containsHexOrFunctionColor`), БЕЗ голых имён цветов.
+ * CSS-подобное значение» — только по вызову цветовой функции
+ * (`containsFunctionColor`), БЕЗ голых имён цветов и БЕЗ голого hex.
  *
  * Причина асимметрии с CSS-декларациями измерена, не предположена: первая
  * версия применяла ту же полную грамматику (включая системные цвета) к
@@ -495,10 +575,18 @@ function findCssColorLiteral(rawValue: string): string | null {
  * Отсюда сознательный выбор: составное совпадение по именам цветов ловится
  * только там, где поверхность узкая и предсказуемая (CSS-значение), а не
  * в произвольной строке TS.
+ *
+ * Шестой раунд (TL-103, issue execaus/tube-leak#110) распространил то же
+ * рассуждение на голый hex: `issue #105`/`см. #105` — трёхзначное число
+ * после `#`, случайно являющееся валидным hex, тот же класс совпадения, что
+ * и `Field`/`Window` для имён. Вызов цветовой функции (`rgb(`, `oklch(`, …)
+ * синтаксически однозначен сам по себе (случайная проза не порождает
+ * `rgb(...)`) и по-прежнему ищется где угодно в строке без ограничения по
+ * контексту — асимметрия только для hex и имён, не для функций.
  */
 function findScriptColorLiteral(text: string): string | null {
   if (isWholeValueColor(text)) return text.trim()
-  return containsHexOrFunctionColor(text)
+  return containsFunctionColor(text)
 }
 
 /**
@@ -519,16 +607,18 @@ function checkWholeLiteral(text: string, allowNames: boolean): string | null {
  * часть — это кусок значения, а не всё значение, и совпадение куска с
  * именем цвета целиком вне контекстов п. 1–3 не должно ложно сработать
  * (см. doc-комментарий файла, «Шаблонные литералы с подстановкой»).
- * Функции цвета и hex ищутся всегда, имена — только если `allowNames`.
+ * Функции цвета ищутся всегда; hex и имена — только если `allowNames`
+ * (шестой раунд симметрично распространил ограничение hex из
+ * `findScriptColorLiteral` и на статические части шаблонных литералов —
+ * тот же класс ложного совпадения, `#105` в статической части не более
+ * контекстно-обоснован, чем в обычном строковом литерале).
  */
 function checkFragmentLiteral(text: string, allowNames: boolean): string | null {
-  const hexOrFunction = containsHexOrFunctionColor(text)
-  if (hexOrFunction !== null) return hexOrFunction
+  const functionColor = containsFunctionColor(text)
+  if (functionColor !== null) return functionColor
   if (!allowNames) return null
 
-  const stripped = stripNonPaletteConstructs(text)
-  const namedColor = stripped.match(NAMED_OR_SYSTEM_COLOR_RE)
-  return namedColor && namedColor[0] !== undefined ? namedColor[0] : null
+  return findCssColorLiteral(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +662,57 @@ function isStylePropertyAccessChain(expr: ts.Expression): boolean {
 /** `x.style.setProperty(name, value)` — CSSOM API, синтаксически однозначен независимо от приёмника `x`. */
 function isSetPropertyCall(node: ts.CallExpression): boolean {
   return ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'setProperty'
+}
+
+// Имена функций объявления теста из vitest — единственный источник, чей
+// первый аргумент вообще не является CSS-значением или прозой, требующей
+// разбора: это заголовок теста (TL-103, issue execaus/tube-leak#110).
+const TEST_DEFINITION_NAMES = new Set(['describe', 'it', 'test'])
+
+/**
+ * Имя переменной в корне цепочки вызова/доступа к свойству: снимает
+ * `PropertyAccessExpression` (`.skip`, `.only`, …) и `CallExpression`
+ * (`.each([...])`) слой за слоем, пока не останется голый идентификатор.
+ * `null`, если цепочка не сводится к идентификатору (например, вызов
+ * результата другого вызова, не связанного с `describe`/`it`/`test`).
+ */
+function unwrapCalleeRootName(expr: ts.Expression): string | null {
+  let current: ts.Expression = expr
+  while (true) {
+    if (ts.isIdentifier(current)) return current.text
+    if (ts.isPropertyAccessExpression(current)) {
+      current = current.expression
+      continue
+    }
+    if (ts.isCallExpression(current)) {
+      current = current.expression
+      continue
+    }
+    return null
+  }
+}
+
+/**
+ * `describe.each([...])`/`it.each([...])` — вызов, порождающий функцию
+ * заголовка, а не сам вызов с заголовком: его единственный аргумент —
+ * таблица данных, а не название теста, и должен проверяться как обычно (в
+ * т. ч. если фикстура данных содержит настоящий код с цветом).
+ */
+function isEachTableCall(node: ts.CallExpression): boolean {
+  return ts.isPropertyAccessExpression(node.expression)
+    && node.expression.name.text === 'each'
+    && TEST_DEFINITION_NAMES.has(unwrapCalleeRootName(node.expression) ?? '')
+}
+
+/**
+ * Вызов `describe(...)`/`it(...)`/`test(...)` (включая `.each(...)`, `.skip`,
+ * `.only`, `.concurrent` в любой комбинации и глубине) с заголовком в первом
+ * аргументе. Не совпадает с самим `it.each([...])` (см. `isEachTableCall`) —
+ * тот вызов возвращает функцию заголовка, но заголовком не является.
+ */
+function isTestTitleCall(node: ts.CallExpression): boolean {
+  if (isEachTableCall(node)) return false
+  return TEST_DEFINITION_NAMES.has(unwrapCalleeRootName(node.expression) ?? '')
 }
 
 // ---------------------------------------------------------------------------
@@ -721,6 +862,21 @@ function collectColorLiterals(
     collectColorLiterals(node.expression, allowNames, objectStyleContext, label, violations)
     node.arguments.forEach((arg, index) => {
       collectColorLiterals(arg, index === 1 ? true : allowNames, objectStyleContext, label, violations)
+    })
+    return
+  }
+
+  // Заголовок теста (TL-103, issue execaus/tube-leak#110) — не CSS-значение
+  // и не подлежит проверке грамматикой цвета вовсе, каким бы ни было его
+  // содержимое (`it('… issue #105 …', …)` не должен путать номер issue с
+  // hex-цветом). Callee (`node.expression`, включая `.each([...])` — там
+  // проверяется таблица данных) и остальные аргументы (обычно функция теста)
+  // по-прежнему обходятся как всегда.
+  if (ts.isCallExpression(node) && isTestTitleCall(node)) {
+    collectColorLiterals(node.expression, allowNames, objectStyleContext, label, violations)
+    node.arguments.forEach((arg, index) => {
+      if (index === 0) return
+      collectColorLiterals(arg, allowNames, objectStyleContext, label, violations)
     })
     return
   }
@@ -1395,6 +1551,74 @@ describe('TL-96: <style lang="less"> падает как неподдержив�
     ].join('\n')
 
     expect(sfcViolations(source)).not.toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// TL-103 (issue execaus/tube-leak#110), шестой раунд — ссылка на issue не hex
+// ---------------------------------------------------------------------------
+
+describe('TL-103: заголовок describe/it/test не проверяется вовсе', () => {
+  it.each([
+    ['it с номером issue в прозе', () => scriptViolations("it('… issue #105 …', () => {})")],
+    ['describe с номером issue в начале строки', () => scriptViolations("describe('#110 заголовок', () => {})")],
+    [
+      'it с заголовком, ЦЕЛИКОМ совпадающим с hex (#105) — различает исключение заголовка от гейта hex по контексту',
+      () => scriptViolations("it('#105', () => {})"),
+    ],
+    ['test(...)', () => scriptViolations("test('#105 тоже не проверяется', () => {})")],
+    ['it.skip(...)', () => scriptViolations("it.skip('issue #105', () => {})")],
+    ['it.only(...)', () => scriptViolations("it.only('issue #105', () => {})")],
+    ['describe.skip(...)', () => scriptViolations("describe.skip('issue #105', () => {})")],
+    [
+      'it.each([...])(title, fn) — заголовок из .each не проверяется',
+      () => scriptViolations("it.each([[1]])('#105 случай %i', (n) => {})"),
+    ],
+    [
+      'шаблонная подпись с подстановкой в заголовке',
+      () => scriptViolations('it(`issue #${n}`, () => {})'),
+    ],
+  ])('не краснеет: %s', (_label, run) => {
+    expect(run()).toEqual([])
+  })
+
+  it('не краснеет: expect(x, "см. #105") — сообщение assertion, не заголовок теста, но hex вне CSS-контекста', () => {
+    // `expect` не входит в `TEST_DEFINITION_NAMES` — это доказывает, что
+    // зелёный цвет здесь получен именно ограничением поиска hex CSS-контекстом
+    // (см. `findScriptColorLiteral`), а не совпадением с исключением
+    // заголовка теста.
+    expect(scriptViolations("expect(x, 'см. #105')")).toEqual([])
+  })
+
+  it('таблица данных it.each([...]) по-прежнему проверяется (не заголовок)', () => {
+    // `.each([...])` сам по себе — не заголовочный вызов: его единственный
+    // аргумент — таблица данных, а не название теста, реальный цвет внутри
+    // неё обязан ловиться.
+    const violations = scriptViolations("it.each([['#ff0000']])('%s', (hex) => {})")
+    expect(violations).not.toEqual([])
+  })
+
+  it('функция-обработчик (второй аргумент it/describe) по-прежнему проверяется', () => {
+    const violations = scriptViolations("it('заголовок без цвета', () => { el.style.color = 'red' })")
+    expect(violations).not.toEqual([])
+  })
+})
+
+describe('TL-103: hex внутри составной строки скрипта — только в CSS-контексте', () => {
+  it.each([
+    ['ключ объекта похож на CSS-свойство (color) — модуль', () => moduleScriptViolations("const s = { color: '#105' }")],
+    ['ключ объекта похож на CSS-свойство (border) — модуль', () => moduleScriptViolations("const s = { border: '1px solid #fff' }")],
+    ['присваивание в .style.color', () => scriptViolations("el.style.color = '#f00'")],
+    ['setProperty с составным hex во втором аргументе', () => scriptViolations("el.style.setProperty('color', '#abc')")],
+    ['значение целиком равно hex', () => scriptViolations("const c = '#fff'")],
+    [':style-объект в шаблоне (background hex)', () => templateViolations('<div :style="{ background: \'#000\' }" />')],
+    ['вызов цветовой функции в любой строке (не hex)', () => scriptViolations("const s = '0 0 2px rgb(0,0,0)'")],
+  ])('краснеет: %s', (_label, run) => {
+    expect(run()).not.toEqual([])
+  })
+
+  it('не краснеет: составной hex вне CSS-контекста и вне заголовка теста', () => {
+    expect(scriptViolations("const message = 'см. issue #105 в отчёте'")).toEqual([])
   })
 })
 
