@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
-import { getResumeBannerText, getWaitingStatusText, YT_DLP_UPDATE_PAUSE_TEXT } from './queueTexts'
+import {
+  getActiveQueueStatusText,
+  getResumeBannerText,
+  getStatusRowWaitingText,
+  getWaitingStatusText,
+  STATUS_ROW_YT_DLP_UPDATE_PAUSE_TEXT,
+  YT_DLP_UPDATE_PAUSE_TEXT,
+} from './queueTexts'
 
 describe('getWaitingStatusText — обычный ход очереди (не awaitingContinue)', () => {
   it('zero ahead: "начнётся после текущей загрузки", без "и ещё N"', () => {
@@ -65,5 +72,58 @@ describe('YT_DLP_UPDATE_PAUSE_TEXT', () => {
   it('is a non-empty, self-contained explanation — not borrowed from YtDlpUpdateBlock', () => {
     expect(YT_DLP_UPDATE_PAUSE_TEXT.length).toBeGreaterThan(0)
     expect(YT_DLP_UPDATE_PAUSE_TEXT).toContain('yt-dlp')
+  })
+})
+
+describe('STATUS_ROW_YT_DLP_UPDATE_PAUSE_TEXT (TL-92, правки ревью, С-3)', () => {
+  it('is exactly the design copy, without the "usually under a minute" tail that the full queue section carries', () => {
+    expect(STATUS_ROW_YT_DLP_UPDATE_PAUSE_TEXT).toBe(
+      'Между загрузками устанавливается обновлённый yt-dlp',
+    )
+  })
+
+  it('is a different string object from the queue-section constant, not a re-export under a new name', () => {
+    expect(STATUS_ROW_YT_DLP_UPDATE_PAUSE_TEXT).not.toBe(YT_DLP_UPDATE_PAUSE_TEXT)
+    expect(YT_DLP_UPDATE_PAUSE_TEXT).toContain(STATUS_ROW_YT_DLP_UPDATE_PAUSE_TEXT)
+  })
+})
+
+describe('getActiveQueueStatusText (TL-92, строка состояния очереди)', () => {
+  it('fetching: title · phase label, no percent even if one was somehow passed', () => {
+    expect(getActiveQueueStatusText('«Ролик A» — 1080p', 'fetching', 42)).toBe(
+      '«Ролик A» — 1080p · Подготовка',
+    )
+  })
+
+  it('merging: title · phase label, no percent even if one was somehow passed', () => {
+    expect(getActiveQueueStatusText('«Ролик A» — 1080p', 'merging', 42)).toBe(
+      '«Ролик A» — 1080p · Склейка',
+    )
+  })
+
+  it('downloading with a known percent: title · phase label · rounded percent', () => {
+    expect(getActiveQueueStatusText('«Как приручить дракона» — 1080p', 'downloading', 61.7)).toBe(
+      '«Как приручить дракона» — 1080p · Скачивание · 62 %',
+    )
+  })
+
+  it('downloading without a known percent yet: no percent segment', () => {
+    expect(getActiveQueueStatusText('«Ролик A» — 1080p', 'downloading')).toBe(
+      '«Ролик A» — 1080p · Скачивание',
+    )
+  })
+})
+
+describe('getStatusRowWaitingText (TL-92, строка состояния — очередь приостановлена)', () => {
+  it('singular agreement for exactly one task', () => {
+    expect(getStatusRowWaitingText(1)).toBe('Очередь приостановлена — 1 задача ждёт')
+  })
+
+  it('few agreement for 2-4', () => {
+    expect(getStatusRowWaitingText(3)).toBe('Очередь приостановлена — 3 задачи ждут')
+  })
+
+  it('many agreement for 5+', () => {
+    expect(getStatusRowWaitingText(5)).toBe('Очередь приостановлена — 5 задач ждут')
   })
 })
