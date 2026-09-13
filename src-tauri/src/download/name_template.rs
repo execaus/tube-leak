@@ -297,6 +297,9 @@ pub struct TemplateDate {
 impl TemplateDate {
     /// Дата, если такая есть в григорианском календаре; год 1…9999, чтобы
     /// форма всегда была из четырёх цифр.
+    // Дату строят оркестрация (TL-89) и предпросмотр (TL-91); хранилище
+    // настроек (TL-87) её не строит.
+    #[allow(dead_code)]
     pub fn new(year: u16, month: u8, day: u8) -> Option<Self> {
         let days_in_month = match month {
             1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -334,6 +337,9 @@ fn is_leap_year(year: u16) -> bool {
 ///
 /// Те же, что у [`NameTemplate::parse`]. Пустого результата среди них нет:
 /// пустая основа получает запасное имя (Ф-12).
+// Сохранение (TL-87) зовёт `NameTemplate::parse` напрямую — ему нужен
+// разобранный шаблон, а не пример; эту функцию зовёт предпросмотр (TL-91).
+#[allow(dead_code)]
 pub fn validate_for_save(
     template: &str,
     sample: &TemplateContext<'_>,
