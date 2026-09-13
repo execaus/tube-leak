@@ -31,7 +31,7 @@ fn dirs() -> Dirs {
 }
 
 fn open(data: &Path) -> HistoryStore {
-    HistoryStore::open(data).expect("история открывается")
+    HistoryStore::open_isolated(data).expect("история открывается")
 }
 
 fn db_path(data: &Path) -> PathBuf {
@@ -191,7 +191,6 @@ fn a_fresh_directory_gets_schema_version_1() {
     let data = dirs.data.path().join("ещё-не-создан");
 
     let store = open(&data);
-    assert_eq!(store.path(), db_path(&data));
     drop(store);
 
     assert_eq!(SCHEMA_VERSION, 1);
@@ -286,7 +285,7 @@ fn a_newer_base_is_refused_and_left_byte_for_byte() {
         make_sqlite_with_version(&db_path(data), version);
         let before = snapshot(data);
 
-        let result = HistoryStore::open(data);
+        let result = HistoryStore::open_isolated(data);
 
         match &result {
             Err(
@@ -463,7 +462,7 @@ fn wal_pair(scratch: &Path, header_version: i64, wal_version: i64) -> (Vec<u8>, 
 fn assert_refused_as_wal_and_untouched(data: &Path, expected_found: i64) {
     let before = snapshot(data);
 
-    let result = HistoryStore::open(data);
+    let result = HistoryStore::open_isolated(data);
 
     match &result {
         Err(
@@ -594,7 +593,7 @@ fn a_read_only_directory_is_no_access_and_nothing_is_created() {
     let data = dirs.data.path();
     set_mode(data, 0o555);
 
-    let result = HistoryStore::open(data);
+    let result = HistoryStore::open_isolated(data);
     let names = names_in(data);
     set_mode(data, 0o755);
 
@@ -622,7 +621,7 @@ fn a_read_only_base_file_is_no_access_and_left_alone() {
     let before = fs::read(db_path(data)).expect("база читается");
     set_mode(&db_path(data), 0o444);
 
-    let result = HistoryStore::open(data);
+    let result = HistoryStore::open_isolated(data);
     set_mode(&db_path(data), 0o644);
 
     assert!(

@@ -84,10 +84,6 @@
 mod clock;
 mod commands;
 mod download;
-// Глушитель по той же причине, что у `storage::history`: домен опережает
-// потребителя. Снимает TL-90, когда команда `show_in_folder` позовёт
-// `os_reveal::reveal`.
-#[allow(dead_code)]
 mod os_reveal;
 mod probe;
 mod queue;
@@ -104,7 +100,7 @@ use commands::{
     delete_history_record, dismiss_queue_task, history_page, prepare_ytdlp, preview_name_template,
     probe_url, queue_state, resume_queue, retry_download, roll_back_ytdlp, settings_get,
     settings_set, show_in_folder, start_download, start_ytdlp_preparation,
-    start_ytdlp_update_schedule, ytdlp_update_state, PreparationLock,
+    start_ytdlp_update_schedule, ytdlp_update_state, HistoryState, PreparationLock,
 };
 use probe::ProbeSession;
 use sidecar::ChildRegistry;
@@ -193,10 +189,17 @@ fn main() {
             // Очередь загрузок (E4) поднимается первой из всего, что
             // делает `setup`, и поднимается здесь, а не в цепочке
             // `manage` выше: ей нужен каталог данных, а он резолвится
-            // только по `AppHandle`. Момент безопасен с обеих сторон —
-            // окон ещё нет, то есть команду очереди позвать некому, а
-            // замок единственности (TL-20) уже взят, то есть второго
-            // писателя снимка не бывает (Р-2, Р-6а).
+            // только по `AppHandle`. Окна из конфига к этому моменту уже
+            // построены: Tauri 2.11.5 создаёт их в собственном `setup` до
+            // вызова этого замыкания (`tauri/src/app.rs`, `fn setup`), так
+            // что довода «окон ещё нет» здесь нет. Команда, пришедшая до
+            // `manage`, получила бы отказ `invoke` «state not managed»
+            // (`tauri/src/state.rs`), а не состояние без восстановления. По
+            // устройству до возврата отсюда она и не приходит — замыкание
+            // выполняется на потоке цикла событий, через который webview
+            // получает и страницу, и IPC, — но это не проверялось. Замок
+            // единственности (TL-20) уже взят, то есть второго писателя
+            // снимка не бывает (Р-2, Р-6а).
             app.manage(Arc::new(queue::scheduler::QueueScheduler::new(
                 queue_store(app.handle()),
             )));
@@ -206,6 +209,18 @@ fn main() {
             // делается (Н-1).
             app.state::<Arc<queue::scheduler::QueueScheduler>>()
                 .restore();
+
+            // История загрузок (E5) открывается здесь **ровно один раз** за
+            // процесс и по той же причине, что очередь: нужен каталог
+            // данных, а замок единственности уже взят. Больше
+            // `HistoryState::open` не зовёт никто — команды истории и запись
+            // Done (TL-89) берут это состояние (doc `commands::history`).
+            // Второй вызов за процесс диска не тронул бы: хранилище
+            // отклоняет его процессным флагом (`HistoryStore::open`).
+            // Отказ открытия не мешает старту (Н-4): он хранится в состоянии,
+            // и экран истории называет причину.
+            let data_dir = app.path().app_data_dir().map_err(|err| err.to_string());
+            app.manage(Arc::new(HistoryState::open(data_dir)));
 
             start_ytdlp_preparation(app.handle());
             // Контур самообновления yt-dlp (E6) стартует здесь же и по

@@ -56,6 +56,9 @@
 //! | нет прав на каталог или файл, файл открывается только на чтение | [`HistoryOpenError::NoAccess`] |
 //!
 //! Строки проверяются сверху вниз: первые две — до любого вызова SQLite.
+//! Всё это — у первого вызова за процесс. Второй и последующие диск не
+//! трогают вовсе и отвечают [`HistoryOpenError::AlreadyOpen`] (doc
+//! [`HistoryStore::open`]).
 //!
 //! **Отложить, а не удалить.** Порча — это данные пользователя, которые,
 //! возможно, ещё читаются чужим инструментом. Отложенное имя никогда не
@@ -165,6 +168,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use rusqlite::ffi::ErrorCode;
@@ -245,7 +249,8 @@ CREATE INDEX history_newest_first ON history (finished_at_unix_secs DESC, id DES
 const MIGRATIONS: &[&str] = &[SCHEMA_V1];
 
 /// Версия схемы, которую знает эта сборка.
-#[allow(clippy::cast_possible_truncation)]
+// Вне тестов не читается: открытие сверяет версию по длине списка миграций.
+#[allow(clippy::cast_possible_truncation, dead_code)]
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
 
 /// Первая страница: новые сверху.
@@ -272,6 +277,8 @@ SELECT id, video_id, url, title, quality_kind, quality_height_px,
 FROM history
 WHERE id = ?1";
 
+// Запись Done — TL-89; до неё путь вставки зовут только тесты.
+#[allow(dead_code)]
 const INSERT_SQL: &str = "
 INSERT INTO history (video_id, url, title, quality_kind, quality_height_px,
                      file_name, folder, size_bytes, finished_at_unix_secs)
@@ -305,6 +312,8 @@ impl fmt::Display for RecordId {
 }
 
 /// Запись для вставки — данные Done-задачи на момент завершения (Ф-2, Р-2).
+// Строит оркестрация (TL-89); до неё — только тесты.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewHistoryRecord {
     /// Канонический id ролика (TL-72).
@@ -405,6 +414,13 @@ pub enum HistoryOpenError {
         to: u32,
         reason: String,
     },
+    /// Хранилище в этом процессе уже открывалось. Повторное открытие
+    /// отклонено до любого обращения к диску ([`HistoryStore::open`]).
+    #[error(
+        "история: хранилище уже открыто в этом процессе — повторное открытие отклонено, \
+         диск не тронут"
+    )]
+    AlreadyOpen,
 }
 
 fn newer_detail(found: i64, supported: u32, wal: bool) -> String {
@@ -423,6 +439,9 @@ impl HistoryOpenError {
             Self::NewerVersion { .. } => HistoryUnavailableReason::NewerVersion,
             Self::NoAccess { .. } => HistoryUnavailableReason::NoAccess,
             Self::MigrationFailed { .. } => HistoryUnavailableReason::MigrationFailed,
+            // Отдельной причины в контракте нет: для экрана это «история на
+            // сеанс недоступна», подробность — в `message`.
+            Self::AlreadyOpen => HistoryUnavailableReason::NoAccess,
         }
     }
 }
@@ -440,6 +459,7 @@ pub enum StorageFailure {
 
 impl StorageFailure {
     /// Причина отказа записи в форме контракта.
+    #[allow(dead_code)] // путь записи — TL-89
     pub fn as_write_failure(self) -> HistoryWriteFailure {
         match self {
             Self::DiskFull => HistoryWriteFailure::DiskFull,
@@ -459,6 +479,7 @@ pub struct HistoryStorageError {
 }
 
 /// Почему запись Done не вставлена.
+#[allow(dead_code)] // путь записи — TL-89
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HistoryWriteError {
     /// Запись не прошла проверку до базы: имя файла не одно имя, папка не
@@ -472,6 +493,7 @@ pub enum HistoryWriteError {
 
 impl HistoryWriteError {
     /// Причина для пометки `lastWriteFailed`.
+    #[allow(dead_code)] // путь записи — TL-89
     pub fn failure(&self) -> HistoryWriteFailure {
         match self {
             Self::InvalidRecord { .. } => HistoryWriteFailure::StorageFailed,
@@ -484,12 +506,42 @@ impl HistoryWriteError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HistoryDeleteError {
     /// Записи с таким id нет (или строка — не id, выданный ядром).
-    #[error("история: записи {id} нет")]
+    ///
+    /// `id` — непроверенный ввод, в тексте он через [`ShownId`].
+    #[error("история: записи {} нет", ShownId(.id))]
     UnknownRecord { id: String },
     /// База отказала.
     #[error(transparent)]
     Storage(#[from] HistoryStorageError),
 }
+
+/// Непроверенный `id` (записи или курсора) для строки лога и текста отказа.
+///
+/// Печатается в форме `{:?}` и не длиннее [`ShownId::MAX_CHARS`] знаков, с
+/// `…` при обрезке. Кавычки и экранирование — не косметика: перевод строки
+/// или возврат каретки внутри `id` иначе начал бы в логе новую строку,
+/// неотличимую от настоящей.
+pub(crate) struct ShownId<'a>(pub &'a str);
+
+impl ShownId<'_> {
+    /// Сколько знаков `id` показывается.
+    pub(crate) const MAX_CHARS: usize = 40;
+}
+
+impl fmt::Display for ShownId<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut chars = self.0.chars();
+        let shown: String = chars.by_ref().take(Self::MAX_CHARS).collect();
+        write!(f, "{shown:?}")?;
+        if chars.next().is_some() {
+            f.write_str("…")?;
+        }
+        Ok(())
+    }
+}
+
+/// Открывалось ли хранилище в этом процессе ([`HistoryStore::open`]).
+static OPENED_IN_PROCESS: AtomicBool = AtomicBool::new(false);
 
 /// Пометки, ждущие ответа без курсора.
 #[derive(Debug, Default)]
@@ -504,7 +556,6 @@ struct PendingNotices {
 /// под мьютексом, поэтому хранилище можно делить между потоками.
 #[derive(Debug)]
 pub struct HistoryStore {
-    path: PathBuf,
     conn: Mutex<Connection>,
     pending: Mutex<PendingNotices>,
 }
@@ -512,7 +563,31 @@ pub struct HistoryStore {
 impl HistoryStore {
     /// Открывает `history.sqlite` в каталоге данных приложения, создавая
     /// каталог и базу при необходимости. Доктрина отказов — в шапке модуля.
+    ///
+    /// **Ровно один раз за процесс.** Первый вызов забирает процессный
+    /// флаг — при любом исходе, в том числе при отказе. Второй и
+    /// последующие отвечают [`HistoryOpenError::AlreadyOpen`], не создавая
+    /// ни каталога, ни файла. Причина — ревью TL-85: замок единственности
+    /// приложения работает fail-open, а два открытия на испорченном файле
+    /// могли бы оставить одно соединение на уже отложенной копии.
+    ///
+    /// Флаг стоит здесь, а не в `commands::history::HistoryState::open`:
+    /// так его не обходит и вызов хранилища мимо состояния (мутация ревью
+    /// TL-90 через псевдоним типа). Цена: лишний вызов в продакшене не
+    /// ломает процесс, а забирает флаг первым, и история на сеанс
+    /// становится недоступна у того, кто пришёл вторым. Место единственного
+    /// вызова пинает сторож по исходникам в `commands::history`.
     pub fn open(data_dir: &Path) -> Result<Self, HistoryOpenError> {
+        if OPENED_IN_PROCESS.swap(true, Ordering::SeqCst) {
+            return Err(HistoryOpenError::AlreadyOpen);
+        }
+        Self::open_with(data_dir, MIGRATIONS)
+    }
+
+    /// [`Self::open`] без процессного флага — только для тестов: открытий
+    /// за тестовый процесс много, и порядок их не задан.
+    #[cfg(test)]
+    pub(crate) fn open_isolated(data_dir: &Path) -> Result<Self, HistoryOpenError> {
         Self::open_with(data_dir, MIGRATIONS)
     }
 
@@ -576,7 +651,6 @@ impl HistoryStore {
         migrate(&mut conn, &path, migrations)?;
 
         Ok(Self {
-            path,
             conn: Mutex::new(conn),
             pending: Mutex::new(PendingNotices {
                 base_recreated: recreated,
@@ -585,15 +659,11 @@ impl HistoryStore {
         })
     }
 
-    /// Путь к файлу базы.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// Вставляет запись Done одной транзакцией и возвращает её id.
     ///
     /// Отказ — любой, включая проверку записи — сам выставляет пометку
     /// [`HistoryNotice::LastWriteFailed`].
+    #[allow(dead_code)] // зовёт оркестрация в момент Done — TL-89
     pub fn insert(&self, record: &NewHistoryRecord) -> Result<RecordId, HistoryWriteError> {
         let result = self.try_insert(record);
         if let Err(err) = &result {
@@ -602,6 +672,7 @@ impl HistoryStore {
         result
     }
 
+    #[allow(dead_code)] // путь записи — TL-89
     fn try_insert(&self, record: &NewHistoryRecord) -> Result<RecordId, HistoryWriteError> {
         let row = ValidRow::check(record)?;
         let mut conn = self.connection();
@@ -615,6 +686,7 @@ impl HistoryStore {
 
     /// Запоминает, что запись Done не сохранилась по причине, случившейся
     /// до [`Self::insert`] (для TL-89). Последняя причина вытесняет прежнюю.
+    #[allow(dead_code)] // зовёт оркестрация — TL-89
     pub fn record_write_failure(&self, cause: HistoryWriteFailure) {
         self.pending_notices().last_write_failed = Some(cause);
     }
@@ -780,6 +852,7 @@ impl HistoryStore {
 }
 
 /// Проверенная запись, готовая к вставке.
+#[allow(dead_code)] // путь записи — TL-89
 struct ValidRow<'a> {
     record: &'a NewHistoryRecord,
     folder: &'a str,
@@ -788,6 +861,7 @@ struct ValidRow<'a> {
 }
 
 impl<'a> ValidRow<'a> {
+    #[allow(dead_code)] // путь записи — TL-89
     fn check(record: &'a NewHistoryRecord) -> Result<Self, HistoryWriteError> {
         let invalid = |reason| HistoryWriteError::InvalidRecord { reason };
         if !is_single_file_name(&record.file_name) {
@@ -813,6 +887,7 @@ impl<'a> ValidRow<'a> {
     }
 }
 
+#[allow(dead_code)] // путь записи — TL-89
 fn insert_row(tx: &Transaction<'_>, row: &ValidRow<'_>) -> rusqlite::Result<RecordId> {
     let record = row.record;
     tx.execute(
@@ -892,6 +967,7 @@ fn conversion_failure(column: usize, kind: Type, what: &'static str) -> rusqlite
     rusqlite::Error::FromSqlConversionFailure(column, kind, what.into())
 }
 
+#[allow(dead_code)] // путь записи — TL-89
 fn kind_to_column(kind: QualityKind) -> &'static str {
     match kind {
         QualityKind::Standard => "standard",
@@ -941,6 +1017,12 @@ fn file_status(folder: &Path, file_name: &str) -> HistoryFileStatus {
                 && fs::metadata(folder).is_ok_and(|meta| meta.is_dir()),
         }
     }
+}
+
+/// Мог ли ядро выдать этот курсор. `false` — [`HistoryStore::page`] ответит
+/// на него пустой страницей; команда (TL-90) пишет такой случай в лог.
+pub fn is_issued_cursor(cursor: &HistoryCursor) -> bool {
+    cursor_key(cursor).is_some()
 }
 
 fn cursor_key(cursor: &HistoryCursor) -> Option<(i64, i64)> {
