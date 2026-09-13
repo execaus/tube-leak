@@ -112,7 +112,7 @@ describe('getExitDialogText — диалог выхода для очереди 
   })
 
   it('терминальные фазы не должны встречаться на практике (диалог не показывается), но не падают', () => {
-    const done: DownloadProgress = { phase: 'done', fileName: 'x.mp4' }
+    const done: DownloadProgress = { phase: 'done', fileName: 'x.mp4', folderDisplay: { kind: 'systemDownloads' } }
     expect(() => getExitDialogText({ activeTask: activeTask(done), waitingCount: 0 })).not.toThrow()
   })
 })

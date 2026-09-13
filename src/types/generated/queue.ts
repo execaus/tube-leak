@@ -6,7 +6,7 @@
 //
 // Комментарии ниже — те же doc-комментарии, что стоят у типов в types.rs;
 // расходиться с ними этот файл не может по построению.
-import type { DownloadError, DownloadPlan, DownloadingState, PartialData } from "./download";
+import type { DownloadError, DownloadPlan, DownloadingState, FolderDisplay, PartialData } from "./download";
 import type { QualityKind } from "./probe";
 
 /**
@@ -107,18 +107,19 @@ quality: SelectedQuality,
  */
 plan: DownloadPlan, } & ({ "phase": "queued" } | { "phase": "fetching" } | { "phase": "downloading" } & DownloadingState | { "phase": "merging" } | { "phase": "done", 
 /**
- * Имя готового файла с фактическим расширением, без пути: папка
- * назначения одна и та же на всё приложение (Р-1), и подставлять
- * её в текст — дело UI.
- *
- * Известный долг: как только папка станет настройкой (E5), текст
- * «сохранён в папке „Загрузки“» на стороне UI протухнет —
- * показывать придётся ту папку, куда реально положили. Чинится
- * это в E5 добавлением сюда пути или имени папки; сейчас лишнее
- * поле означало бы величину, которая не может отличаться от
- * константы.
+ * Имя готового файла с фактическим расширением, без пути.
  */
-fileName: string, } | { "phase": "failed", error: DownloadError, } | { "phase": "cancelled", 
+fileName: string, 
+/**
+ * Папка, куда файл положен на самом деле (Ф-15, TL-83).
+ *
+ * Закрывает долг E3: пока папка была константой, текст «сохранён в
+ * папке „Загрузки“» был правдой. С папкой-настройкой (E5) он
+ * протухает, и показывать нужно ту папку, куда файл лёг.
+ * Объединение, а не строка: см. [`FolderDisplay`]. Поле
+ * обязательное: папка у готового файла есть всегда.
+ */
+folderDisplay: FolderDisplay, } | { "phase": "failed", error: DownloadError, } | { "phase": "cancelled", 
 /**
  * При отмене подчистка всегда полная, поэтому здесь бывает либо
  * `removed`, либо `nothingCreated` (отмена в `queued`) — разница

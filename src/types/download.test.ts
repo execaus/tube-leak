@@ -175,8 +175,9 @@ describe('DownloadProgressEvent — дословная форма из issue #41
       taskId: 'task-1',
       phase: 'done',
       fileName: 'Как приручить дракона.mp4',
+      folderDisplay: { kind: 'systemDownloads' },
     }
-    expect(event.fileName).toBe('Как приручить дракона.mp4')
+    expect(event.phase === 'done' && event.fileName).toBe('Как приручить дракона.mp4')
   })
 
   it('failed — класс ytDlpFailure с обязательным reason', () => {

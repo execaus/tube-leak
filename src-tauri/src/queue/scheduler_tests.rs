@@ -75,6 +75,7 @@ fn failed(kind: DownloadErrorKind) -> DownloadProgress {
 fn done() -> DownloadProgress {
     DownloadProgress::Done {
         file_name: "Big Buck Bunny.m4a".to_string(),
+        folder_display: crate::types::FolderDisplay::SystemDownloads,
     }
 }
 

@@ -136,7 +136,7 @@ describe('useExitConfirmation — состояние «только термин
     })
     const store = useDownloadTaskStore()
     await store.start(request)
-    emitProgress({ taskId: 'task-1', phase: 'done', fileName: 'x.mp4' })
+    emitProgress({ taskId: 'task-1', phase: 'done', fileName: 'x.mp4', folderDisplay: { kind: 'systemDownloads' } })
 
     const { result } = withSetup(() => useExitConfirmation(port))
     port.attempt()
@@ -170,7 +170,7 @@ describe('useExitConfirmation — состояние «только термин
     emitQueueChanged({
       awaitingContinue: false,
       tasks: [
-        { taskId: 'a', title: 'Ролик A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp4' },
+        { taskId: 'a', title: 'Ролик A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp4', folderDisplay: { kind: 'systemDownloads' } },
         {
           taskId: 'b',
           title: 'Ролик B',

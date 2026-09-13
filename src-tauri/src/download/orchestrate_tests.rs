@@ -827,7 +827,8 @@ async fn a_title_with_a_percent_and_a_dollar_reaches_a_file_inside_the_destinati
     assert_eq!(
         sink.last(),
         DownloadProgress::Done {
-            file_name: expected.clone()
+            file_name: expected.clone(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
         }
     );
     assert_eq!(dir_listing(&dir), [expected]);
@@ -965,7 +966,8 @@ async fn two_streams_go_through_merging_to_one_ready_file() {
     assert_eq!(
         sink.last(),
         DownloadProgress::Done {
-            file_name: "Big Buck Bunny.mp4".to_string()
+            file_name: "Big Buck Bunny.mp4".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
         }
     );
     assert_eq!(
@@ -1036,7 +1038,8 @@ async fn a_progressive_format_never_enters_merging() {
     assert_eq!(
         sink.last(),
         DownloadProgress::Done {
-            file_name: "Big Buck Bunny.mp4".to_string()
+            file_name: "Big Buck Bunny.mp4".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
         }
     );
     assert_eq!(dir_listing(dir.path()), ["Big Buck Bunny.mp4"]);
@@ -1063,7 +1066,8 @@ async fn audio_only_keeps_the_extension_the_stream_actually_has() {
     assert_eq!(
         sink.last(),
         DownloadProgress::Done {
-            file_name: "Big Buck Bunny.m4a".to_string()
+            file_name: "Big Buck Bunny.m4a".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
         }
     );
 
@@ -1102,7 +1106,8 @@ async fn a_second_copy_of_the_same_video_gets_a_suffix_and_leaves_the_first_alon
     assert_eq!(
         sink.last(),
         DownloadProgress::Done {
-            file_name: "Big Buck Bunny (2).mp4".to_string()
+            file_name: "Big Buck Bunny (2).mp4".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
         }
     );
     assert_eq!(
@@ -1371,7 +1376,8 @@ async fn an_interrupted_attempt_is_retried_and_the_percent_does_not_fall_to_zero
     assert_eq!(
         sink.last(),
         DownloadProgress::Done {
-            file_name: "Big Buck Bunny.mp4".to_string()
+            file_name: "Big Buck Bunny.mp4".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
         }
     );
     assert_eq!(launcher.calls().len(), 2, "ровно две попытки");
@@ -2190,7 +2196,8 @@ async fn a_title_carrying_the_already_downloaded_phrase_still_closes_its_stream(
     assert_eq!(
         sink.last(),
         DownloadProgress::Done {
-            file_name: format!("{TITLE}.mp4")
+            file_name: format!("{TITLE}.mp4"),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
         }
     );
     assert_eq!(
@@ -2529,7 +2536,8 @@ async fn a_retry_after_a_failed_merge_only_merges_again() {
     assert_eq!(
         sink.last(),
         DownloadProgress::Done {
-            file_name: "Big Buck Bunny.mp4".to_string()
+            file_name: "Big Buck Bunny.mp4".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
         }
     );
     assert_eq!(dir_listing(dir.path()), ["Big Buck Bunny.mp4"]);

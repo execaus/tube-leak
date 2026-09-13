@@ -204,6 +204,33 @@ macro_rules! with_contract_types {
             QueueTask,
             QueuePauseReason,
             QueueSnapshot,
+            // download.ts (E5): папка у `Done` и у записи истории
+            FolderDisplay,
+            // history.ts
+            HistoryFileStatus,
+            HistoryEntry,
+            HistoryCursor,
+            HistoryWriteFailure,
+            HistoryNotice,
+            HistoryPage,
+            HistoryUnavailableReason,
+            HistoryUnavailableError,
+            HistoryCommandErrorKind,
+            HistoryCommandError,
+            LauncherFailureDetails,
+            ShowInFolderErrorKind,
+            ShowInFolderError,
+            // settings.ts
+            DestinationFolder,
+            Settings,
+            SettingsField,
+            SettingsView,
+            SettingsPatch,
+            TemplateProblem,
+            FolderProblem,
+            SettingsCommandErrorKind,
+            SettingsCommandError,
+            TemplatePreview,
         ]
     };
 }
@@ -253,15 +280,19 @@ const HEADER: &str = "\
 
 /// Столько файлов зеркала производит генератор сейчас: по одному на
 /// модуль контракта — `sidecar`, `ytdlp`, `probe`, `download`, `update`,
-/// `queue`.
+/// `queue`, `history`, `settings`.
 ///
 /// Контур самообновления (E6) получил собственный файл, а не дописался в
 /// `ytdlp.ts`: тот про подготовку первого запуска, у которой с фоновым
 /// обновлением намеренно разные каналы событий и разные экраны. Очередь
 /// (E4) — по тому же правилу: её типы описывают список задач и его
 /// команды, а не ход одной загрузки, который остался в `download.ts`
-/// нетронутым (обещание дизайна E3, повторённое дизайном E4).
-const MIRROR_FILES: usize = 6;
+/// нетронутым (обещание дизайна E3, повторённое дизайном E4). История и
+/// настройки (E5) — два файла, а не один: у них разные экраны, разные
+/// команды и ни одного общего типа. Папка готового файла
+/// (`FolderDisplay`) при этом легла в `download.ts`, рядом с `Done`,
+/// которому она принадлежит первой; история импортирует её оттуда.
+const MIRROR_FILES: usize = 8;
 
 /// Эталон: что зеркало обязано содержать прямо сейчас.
 ///
@@ -457,7 +488,7 @@ fn every_optional_field_of_the_contract_is_omitted_when_absent() {
     /// граница и заводилась. Меняется вместе с контрактом, одной строкой,
     /// и это осознанная просьба к автору нового поля посмотреть на
     /// сторожа.
-    const OPTIONAL_FIELDS: usize = 34;
+    const OPTIONAL_FIELDS: usize = 37;
 
     let mut checked = 0usize;
     let contract: Vec<&str> = contract_source().lines().collect();
