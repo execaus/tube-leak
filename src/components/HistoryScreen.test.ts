@@ -238,6 +238,22 @@ describe('HistoryScreen — удаление и очистка (С-4)', () => {
     expect(invokeMock).toHaveBeenCalledWith('clear_history')
     expect(wrapper.text()).toContain('История пуста')
   })
+
+  it('a delete failure keeps the row and shows a dismissible command-error banner', async () => {
+    invokeMock.mockResolvedValueOnce({ entries: [entry({ id: '1' })], notices: [] } satisfies HistoryPage)
+    const wrapper = await mountScreen()
+
+    invokeMock.mockRejectedValueOnce({ kind: 'unknownRecord', message: 'diag' })
+    await wrapper.findAll('button').find((b) => b.text() === 'Удалить')?.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.findAll('.history-screen__entry')).toHaveLength(1)
+    const banner = wrapper.get('[role="alert"].history-screen__command-error')
+    expect(banner.text()).toContain('Запись не найдена')
+
+    await banner.get('button').trigger('click')
+    expect(wrapper.find('.history-screen__command-error').exists()).toBe(false)
+  })
 })
 
 describe('HistoryScreen — «Показать в папке» и его исходы (Ф-8)', () => {
