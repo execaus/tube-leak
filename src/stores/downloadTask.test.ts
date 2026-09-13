@@ -471,3 +471,123 @@ describe('useDownloadTaskStore — мягкий индикатор зависа�
     expect(store.softStallSeconds).toBeUndefined()
   })
 })
+
+/**
+ * TL-98 (issue 105), правки ревью, второй раунд, С-2 — уровень стора, не
+ * `App.vue`: `outcomeTextForTransition`/`findSnapshotOutcomeText` не
+ * зависят ни от одной вкладки и заслуживают собственных тестов, а не
+ * только косвенной проверки через смонтированное дерево `App.vue`.
+ */
+describe('useDownloadTaskStore — живая зона исходов outcomeAnnouncement (TL-98, issue 105, правки ревью С-2)', () => {
+  it('R1: reverse order — queue://changed reports Done first, then download://progress reports the same Done — one announcement, not two', async () => {
+    // `initialize()` перед `start()` — подписка на `queue://changed`
+    // нужна именно этому тесту (`emitQueueChanged` иначе холостой, doc
+    // `ensureQueueListening`); обычный порядок вызовов `App.vue` тот же.
+    invokeMock.mockResolvedValueOnce({ tasks: [], awaitingContinue: false } satisfies QueueSnapshot)
+    const store = useDownloadTaskStore()
+    await store.initialize()
+
+    invokeMock.mockResolvedValueOnce(started)
+    await store.start(request)
+
+    emitQueueChanged({
+      tasks: [
+        { taskId: 'task-1', title: request.title, quality: request.quality, plan: started.plan, phase: 'done', fileName: 'a.mp4', folderDisplay: { kind: 'systemDownloads' } },
+      ],
+      awaitingContinue: false,
+    })
+    expect(store.outcomeAnnouncement?.text).toBe(`«${request.title}» — готово`)
+    const firstId = store.outcomeAnnouncement?.id
+
+    // Ядро шлёт `download://progress` о том же переходе следующим — стор
+    // уже видит фазу терминальной по снимку выше, второго объявления нет.
+    emitProgress({ taskId: 'task-1', phase: 'done', fileName: 'a.mp4', folderDisplay: { kind: 'systemDownloads' } })
+
+    expect(store.outcomeAnnouncement?.id).toBe(firstId)
+  })
+
+  it('R2: restart (К-13) — queue_state already carries a done/failed task with no prior phase to compare against — silent', async () => {
+    invokeMock.mockResolvedValueOnce({
+      tasks: [
+        { taskId: 't1', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'done', fileName: 'a.mp3', folderDisplay: { kind: 'systemDownloads' } },
+        {
+          taskId: 't2',
+          title: 'B',
+          quality: { kind: 'audioOnly' },
+          plan: 'singleStream',
+          phase: 'failed',
+          error: { kind: 'connectionLost', message: 'diag', retryable: true, partialData: 'kept' },
+        },
+      ],
+      awaitingContinue: false,
+    } satisfies QueueSnapshot)
+    const store = useDownloadTaskStore()
+
+    await store.initialize()
+
+    expect(store.outcomeAnnouncement).toBeUndefined()
+  })
+
+  it('R3: a task disappears from the snapshot (hidden via dismiss_queue_task) — no comparison, no announcement', async () => {
+    invokeMock.mockResolvedValueOnce({
+      tasks: [{ taskId: 't1', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'downloading', state: 'running' }],
+      awaitingContinue: false,
+    } satisfies QueueSnapshot)
+    const store = useDownloadTaskStore()
+    await store.initialize()
+
+    emitQueueChanged({ tasks: [], awaitingContinue: false })
+
+    expect(store.outcomeAnnouncement).toBeUndefined()
+  })
+
+  it('R4: Failed → Retry (queued, fetching) → Failed again — the second outcome announces too, not just the first', async () => {
+    invokeMock.mockResolvedValueOnce({
+      tasks: [{ taskId: 't1', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'downloading', state: 'running' }],
+      awaitingContinue: false,
+    } satisfies QueueSnapshot)
+    const store = useDownloadTaskStore()
+    await store.initialize()
+
+    const failedTask = {
+      taskId: 't1',
+      title: 'A',
+      quality: { kind: 'audioOnly' as const },
+      plan: 'singleStream' as const,
+      phase: 'failed' as const,
+      error: { kind: 'connectionLost' as const, message: 'diag', retryable: true, partialData: 'kept' as const },
+    }
+    emitQueueChanged({ tasks: [failedTask], awaitingContinue: false })
+    const firstId = store.outcomeAnnouncement?.id
+    expect(store.outcomeAnnouncement?.text).toContain('не удалось')
+
+    emitQueueChanged({
+      tasks: [{ taskId: 't1', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'queued' }],
+      awaitingContinue: false,
+    })
+    emitQueueChanged({
+      tasks: [{ taskId: 't1', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'fetching' }],
+      awaitingContinue: false,
+    })
+    emitQueueChanged({ tasks: [failedTask], awaitingContinue: false })
+
+    expect(store.outcomeAnnouncement?.id).not.toBe(firstId)
+    expect(store.outcomeAnnouncement?.text).toContain('не удалось')
+  })
+
+  it('С-3: a Cancelled transition announces the same way as Done/Failed — core cancellation is async and can resolve after the user already navigated away', async () => {
+    invokeMock.mockResolvedValueOnce({
+      tasks: [{ taskId: 't1', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'downloading', state: 'running' }],
+      awaitingContinue: false,
+    } satisfies QueueSnapshot)
+    const store = useDownloadTaskStore()
+    await store.initialize()
+
+    emitQueueChanged({
+      tasks: [{ taskId: 't1', title: 'A', quality: { kind: 'audioOnly' }, plan: 'singleStream', phase: 'cancelled', partialData: 'removed' }],
+      awaitingContinue: false,
+    })
+
+    expect(store.outcomeAnnouncement?.text).toBe('«A» — отменено')
+  })
+})

@@ -13,9 +13,12 @@ import type {
   StartDownloadRequest,
 } from '@/types/generated/download'
 import type { QueuePauseReason, QueueSnapshot, QueueTask } from '@/types/generated/queue'
+import { assertNever } from '@/utils/assertNever'
+import { resolveDownloadCommandErrorText } from '@/utils/downloadCommandErrorTexts'
 import { knownKindsOf } from '@/utils/knownKinds'
+import { getQueueOutcomeAnnouncementText, type QueueTaskOutcomePhase } from '@/utils/queueTexts'
 import { toDownloadProgress } from '@/utils/queueTaskProgress'
-import { formatTaskDisplayTitle } from '@/utils/queueTaskTitle'
+import { formatTaskDisplayTitle, quoteTaskTitle } from '@/utils/queueTaskTitle'
 
 const START_DOWNLOAD_COMMAND = 'start_download'
 const CANCEL_DOWNLOAD_COMMAND = 'cancel_download'
@@ -103,8 +106,102 @@ function toDownloadCommandFailure(err: unknown): DownloadCommandFailure {
   return { message: 'Команда управления загрузкой отклонена по нераспознанной причине.' }
 }
 
+/**
+ * Исчерпывающий `switch` по {@link DownloadPhase}, не сравнение строк
+ * (правки ревью TL-98, Н-6): восьмая фаза контракта роняет
+ * `npm run type-check` прямо на вызове {@link assertNever} в `default`,
+ * а не молча проходит мимо белого списка (тот же класс дефекта, что
+ * TL-18 — новый класс ошибки yt-dlp, тихо прошедший мимо списка строк).
+ */
 function isTerminalPhase(phase: DownloadPhase): boolean {
-  return phase === 'done' || phase === 'failed' || phase === 'cancelled'
+  switch (phase) {
+    case 'queued':
+    case 'fetching':
+    case 'downloading':
+    case 'merging':
+      return false
+    case 'done':
+    case 'failed':
+    case 'cancelled':
+      return true
+    default:
+      return assertNever(phase)
+  }
+}
+
+/**
+ * Фаза `next.phase`, если она вообще терминальна ({@link QueueTaskOutcomePhase}) —
+ * `undefined` иначе. Тот же приём исчерпывающего `switch` (Н-6), что и
+ * {@link isTerminalPhase} выше: план и здесь не сравнением строк.
+ */
+function toQueueTaskOutcomePhase(phase: DownloadPhase): QueueTaskOutcomePhase | undefined {
+  switch (phase) {
+    case 'queued':
+    case 'fetching':
+    case 'downloading':
+    case 'merging':
+      return undefined
+    case 'done':
+    case 'failed':
+    case 'cancelled':
+      return phase
+    default:
+      return assertNever(phase)
+  }
+}
+
+/**
+ * Одно объявление живой зоны исходов (TL-98, issue #105) — терминальный
+ * исход задачи, которая была активной, либо отказ команды постановки
+ * (`start_download`). `id` — не для отображения, а чтобы `App.vue` мог
+ * отличить «новое» объявление от предыдущего по идентичности объекта, а
+ * не по совпадению текста: два одинаковых по смыслу исхода подряд (две
+ * разные задачи с одинаковым названием) обязаны объявиться оба (issue
+ * #105, критерий приёмки) — сравнение строк потеряло бы второе как
+ * «уже видели», сравнение по `id` — нет.
+ */
+export interface QueueOutcomeAnnouncement {
+  id: number
+  text: string
+}
+
+/**
+ * Текст исхода для перехода конкретной задачи из нетерминальной фазы в
+ * `done`/`failed`/`cancelled` (С-3, правки ревью, второй раунд — отмена
+ * добавлена к исходному done/failed) — `undefined`, если это не такой
+ * переход (задача уже была терминальна, либо новая фаза сама не
+ * терминальна).
+ *
+ * Вызывается из двух разных мест ({@link handleProgressEvent} и
+ * {@link applySnapshot}), потому что неизвестно заранее, каким именно
+ * каналом ядро донесёт конкретный переход — точечным `download://progress`
+ * по активной задаче или полным снимком `queue://changed` (issue 105
+ * явно описывает случай, когда снимок на Done приходит **дважды
+ * подряд**, `commit` и `pump`). Дублирования нет: какой бы канал ни
+ * доставил переход первым, он же и меняет `tasks.value`, поэтому второй
+ * канал увидит фазу уже терминальной и не даст второго текста для того
+ * же события.
+ *
+ * Название — {@link quoteTaskTitle}, без качества (Н-7, правки ревью,
+ * второй раунд): не {@link formatTaskDisplayTitle}, который несёт своё
+ * тире перед качеством — «‹название› — 1080p — готово» читалось бы двумя
+ * тире подряд, а качество для исхода не нужно.
+ */
+function outcomeTextForTransition(previousPhase: DownloadPhase, next: QueueTask): string | undefined {
+  if (isTerminalPhase(previousPhase)) return undefined
+  const outcomePhase = toQueueTaskOutcomePhase(next.phase)
+  if (outcomePhase === undefined) return undefined
+  return getQueueOutcomeAnnouncementText(quoteTaskTitle(next.title), outcomePhase)
+}
+
+/**
+ * Текст отказа команды постановки (`start_download`) — тот же текст, что
+ * уже показан в `DownloadCommandErrorBlock` (правки ревью TL-98, Н-5:
+ * общая {@link resolveDownloadCommandErrorText}, не своя копия условия
+ * «неконтрактный отказ — контрактный»).
+ */
+function commandFailureAnnouncementText(failure: DownloadCommandFailure): string {
+  return resolveDownloadCommandErrorText(failure).title
 }
 
 /**
@@ -212,6 +309,22 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
    */
   const softStallSeconds = ref<number>()
 
+  /**
+   * Живая зона исходов на «Истории»/«Настройках» (TL-98, issue #105) —
+   * последнее объявление, а не история всех: `App.vue` решает, показывать
+   * ли его (на «Главном» — нет, doc {@link QueueOutcomeAnnouncement}) и
+   * гарантирует настоящую переозвучку одинакового текста (см. doc-
+   * комментарий в `App.vue`, «Живая зона исходов»). Домен здесь только
+   * порождает факт («эта задача завершилась/этот отказ случился»), сам
+   * показ и его видимость по вкладке — забота экрана, не стора.
+   */
+  const outcomeAnnouncement = ref<QueueOutcomeAnnouncement>()
+  let nextOutcomeAnnouncementId = 1
+
+  function pushOutcomeAnnouncement(text: string): void {
+    outcomeAnnouncement.value = { id: nextOutcomeAnnouncementId++, text }
+  }
+
   let unlistenProgress: UnlistenFn | undefined
   let listeningProgress: Promise<void> | undefined
   let unlistenQueue: UnlistenFn | undefined
@@ -270,7 +383,9 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
       plan: current.plan,
       ...rest,
     } as QueueTask
+    const outcomeText = outcomeTextForTransition(current.phase, updated)
     tasks.value = tasks.value.map((t, i) => (i === index ? updated : t))
+    if (outcomeText !== undefined) pushOutcomeAnnouncement(outcomeText)
 
     if (rest.phase === 'downloading' && rest.state === 'running') {
       noteActivity()
@@ -297,10 +412,31 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
     return listeningProgress
   }
 
+  /**
+   * Исход по полному снимку (TL-98, issue #105) — берём первый переход
+   * нетерминальной фазы в done/failed среди задач, присутствующих в обоих
+   * списках (старом и новом): при штатной работе очереди (К-4, не больше
+   * одной активной задачи) он ровно один. Если этот же переход уже
+   * отражён предыдущим `download://progress` (doc {@link outcomeTextForTransition}),
+   * старая фаза здесь уже терминальна, и функция вернёт `undefined` —
+   * дублирующего объявления не будет.
+   */
+  function findSnapshotOutcomeText(previousTasks: QueueTask[], nextTasks: QueueTask[]): string | undefined {
+    for (const next of nextTasks) {
+      const previous = previousTasks.find((t) => t.taskId === next.taskId)
+      if (previous === undefined) continue
+      const outcomeText = outcomeTextForTransition(previous.phase, next)
+      if (outcomeText !== undefined) return outcomeText
+    }
+    return undefined
+  }
+
   function applySnapshot(snapshot: QueueSnapshot): void {
+    const outcomeText = findSnapshotOutcomeText(tasks.value, snapshot.tasks)
     tasks.value = snapshot.tasks
     awaitingContinue.value = snapshot.awaitingContinue
     pauseReason.value = snapshot.pauseReason
+    if (outcomeText !== undefined) pushOutcomeAnnouncement(outcomeText)
   }
 
   function ensureQueueListening(): Promise<void> {
@@ -418,7 +554,16 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
       clearStallTimer()
     } catch (err) {
       console.error('start_download rejected', err)
-      commandError.value = toDownloadCommandFailure(err)
+      const failure = toDownloadCommandFailure(err)
+      commandError.value = failure
+      // Отказ команды постановки (TL-98, issue #105) — единственная из
+      // пяти команд управления в этой живой зоне (doc-комментарий
+      // `commandFailureAnnouncementText`): она, в отличие от остальных
+      // четырёх, достижима с кнопки «Скачать» на «Главном», и отказ может
+      // разрешиться уже после того, как пользователь ушёл на «Историю»/
+      // «Настройки», не увидев `DownloadCommandErrorBlock` (`role="alert"`)
+      // в скрытой секции.
+      pushOutcomeAnnouncement(commandFailureAnnouncementText(failure))
     } finally {
       commandInFlight = false
     }
@@ -528,6 +673,7 @@ export const useDownloadTaskStore = defineStore('downloadTask', () => {
     progress,
     softStallSeconds,
     commandError,
+    outcomeAnnouncement,
     isActive,
     initialize,
     start,

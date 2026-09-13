@@ -17,3 +17,15 @@ import { qualityLabel } from './qualityLabel'
 export function formatTaskDisplayTitle(title: string, quality: SelectedQuality): string {
   return `«${title}» — ${qualityLabel(quality)}`
 }
+
+/**
+ * Название задачи в кавычках, без качества (правки ревью TL-98, Н-7) —
+ * для живой зоны исходов (`getQueueOutcomeAnnouncementText`): «‹название›
+ * — готово»/«— не удалось»/«— отменено» с одним тире, не двумя. Качество
+ * там не несёт новой информации (в отличие от заголовка панели/строки
+ * состояния, где рядом с фазой оно уместно), а два тире подряд
+ * (`formatTaskDisplayTitle` уже содержит своё) читаются вслух плохо.
+ */
+export function quoteTaskTitle(title: string): string {
+  return `«${title}»`
+}

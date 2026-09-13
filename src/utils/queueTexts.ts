@@ -133,3 +133,38 @@ export function getStatusRowWaitingText(waitingCount: number): string {
   const verb = pluralizeRu(waitingCount, 'ждёт', 'ждут', 'ждут')
   return `Очередь приостановлена — ${waitingCount} ${noun} ${verb}`
 }
+
+/**
+ * Текст объявления терминального исхода задачи, которая была активной
+ * (TL-98, issue 105) — для отдельной живой зоны исходов на «Истории»/
+ * «Настройках» (не для постоянной живой зоны строки состояния, Н-3/Б-3
+ * TL-92: та зеркалит *текущее* состояние и намеренно молчит, как только
+ * задача становится следующей/строка состояния меняется, — исход же
+ * обязан быть услышан ровно один раз, даже после того, как строка уже
+ * переключилась на следующую задачу).
+ *
+ * `cancelled` входит в список с правок ревью (С-3, второй раунд): отмена
+ * в ядре асинхронна (`cancel_download` только просит остановиться,
+ * подтверждение приходит отдельным переходом фазы), пользователь может
+ * нажать «Отменить» на «Главном» и сразу уйти — тогда `role="status"`
+ * `DownloadPanel`, на который рассчитывал первый раунд, уже никто не
+ * видит.
+ */
+export type QueueTaskOutcomePhase = 'done' | 'failed' | 'cancelled'
+
+const QUEUE_TASK_OUTCOME_LABELS: Record<QueueTaskOutcomePhase, string> = {
+  done: 'готово',
+  failed: 'не удалось',
+  cancelled: 'отменено',
+}
+
+/**
+ * `quotedTitle` — название в кавычках без качества
+ * ({@link import('./queueTaskTitle').quoteTaskTitle}, правки ревью Н-7),
+ * не {@link import('./queueTaskTitle').formatTaskDisplayTitle}: качество
+ * не несёт новой информации для исхода, а два тире подряд («… — 1080p —
+ * готово») читаются вслух плохо.
+ */
+export function getQueueOutcomeAnnouncementText(quotedTitle: string, phase: QueueTaskOutcomePhase): string {
+  return `${quotedTitle} — ${QUEUE_TASK_OUTCOME_LABELS[phase]}`
+}

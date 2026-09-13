@@ -16,10 +16,7 @@
 import { computed } from 'vue'
 
 import type { DownloadCommandFailure } from '@/stores/downloadTask'
-import {
-  getDownloadCommandErrorText,
-  NON_CONTRACTUAL_COMMAND_ERROR_TEXT,
-} from '@/utils/downloadCommandErrorTexts'
+import { resolveDownloadCommandErrorText } from '@/utils/downloadCommandErrorTexts'
 
 const props = defineProps<{
   error: DownloadCommandFailure
@@ -29,11 +26,12 @@ defineEmits<{
   hide: []
 }>()
 
-const text = computed(() =>
-  props.error.kind === undefined
-    ? NON_CONTRACTUAL_COMMAND_ERROR_TEXT
-    : getDownloadCommandErrorText(props.error),
-)
+/**
+ * Одна логика выбора текста, не своя копия тернарника (правки ревью
+ * TL-98, Н-5) — та же {@link resolveDownloadCommandErrorText}, что зовёт
+ * живая зона исходов в `downloadTask.ts` для этого же самого отказа.
+ */
+const text = computed(() => resolveDownloadCommandErrorText(props.error))
 </script>
 
 <template>
