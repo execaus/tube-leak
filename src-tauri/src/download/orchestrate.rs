@@ -1067,7 +1067,13 @@ pub async fn run_task(
                 task.id,
                 elapsed.as_millis()
             );
-            DownloadProgress::Done { file_name }
+            // Папка назначения сегодня всегда системная «Загрузки»: её резолвит
+            // воркер очереди (`commands::queue::run`). Настоящее решение по
+            // фактической папке из настроек подставит TL-89.
+            DownloadProgress::Done {
+                file_name,
+                folder_display: crate::types::FolderDisplay::SystemDownloads,
+            }
         }
         TaskEnd::Cancelled => {
             let partial_data = Cleanup::Remove.apply(destination, &work);

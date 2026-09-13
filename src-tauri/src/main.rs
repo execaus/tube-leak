@@ -94,10 +94,11 @@ mod ytdlp;
 use std::sync::Arc;
 
 use commands::{
-    cancel_download, cancel_probe, check_sidecar, check_ytdlp_update, dismiss_queue_task,
-    prepare_ytdlp, probe_url, queue_state, resume_queue, retry_download, roll_back_ytdlp,
-    start_download, start_ytdlp_preparation, start_ytdlp_update_schedule, ytdlp_update_state,
-    PreparationLock,
+    cancel_download, cancel_probe, check_sidecar, check_ytdlp_update, clear_history,
+    delete_history_record, dismiss_queue_task, history_page, prepare_ytdlp, preview_name_template,
+    probe_url, queue_state, resume_queue, retry_download, roll_back_ytdlp, settings_get,
+    settings_set, show_in_folder, start_download, start_ytdlp_preparation,
+    start_ytdlp_update_schedule, ytdlp_update_state, PreparationLock,
 };
 use probe::ProbeSession;
 use sidecar::ChildRegistry;
@@ -136,13 +137,20 @@ fn main() {
             cancel_probe,
             check_sidecar,
             check_ytdlp_update,
+            clear_history,
+            delete_history_record,
             dismiss_queue_task,
+            history_page,
             prepare_ytdlp,
+            preview_name_template,
             probe_url,
             queue_state,
             resume_queue,
             retry_download,
             roll_back_ytdlp,
+            settings_get,
+            settings_set,
+            show_in_folder,
             start_download,
             ytdlp_update_state
         ])

@@ -989,17 +989,16 @@ pub enum DownloadProgress {
     /// ffmpeg объединяет скачанные потоки. Без процента — см. doc типа.
     Merging,
     Done {
-        /// Имя готового файла с фактическим расширением, без пути: папка
-        /// назначения одна и та же на всё приложение (Р-1), и подставлять
-        /// её в текст — дело UI.
-        ///
-        /// Известный долг: как только папка станет настройкой (E5), текст
-        /// «сохранён в папке „Загрузки“» на стороне UI протухнет —
-        /// показывать придётся ту папку, куда реально положили. Чинится
-        /// это в E5 добавлением сюда пути или имени папки; сейчас лишнее
-        /// поле означало бы величину, которая не может отличаться от
-        /// константы.
+        /// Имя готового файла с фактическим расширением, без пути.
         file_name: String,
+        /// Папка, куда файл положен на самом деле (Ф-15, TL-83).
+        ///
+        /// Закрывает долг E3: пока папка была константой, текст «сохранён в
+        /// папке „Загрузки“» был правдой. С папкой-настройкой (E5) он
+        /// протухает, и показывать нужно ту папку, куда файл лёг.
+        /// Объединение, а не строка: см. [`FolderDisplay`]. Поле
+        /// обязательное: папка у готового файла есть всегда.
+        folder_display: FolderDisplay,
     },
     Failed {
         error: DownloadError,
@@ -1994,6 +1993,599 @@ pub struct QueueSnapshot {
     pub pause_reason: Option<QueuePauseReason>,
 }
 
+// ─────────────────── история и настройки (TL-83, эпик E5) ───────────────────
+//
+// Контракт экрана истории, экрана настроек и папки в `Done` (дизайн E5,
+// раздел «Данные для API»). Реализация — TL-85 (хранилище истории), TL-86
+// (шаблон имени), TL-87 (хранилище настроек), TL-88 (показ в папке), TL-89
+// (оркестрация), TL-90 и TL-91 (тела команд). Здесь только типы; сигнатуры
+// команд с заглушечными телами — `crate::commands::history` и
+// `crate::commands::settings`. Зеркало — `src/types/generated/history.ts` и
+// `settings.ts`; `FolderDisplay` лежит в `download.ts` рядом с `Done`.
+//
+// Глушители `#[allow(dead_code)]` в секции стоят по той же причине, что
+// стояли в секциях E2, E3, E4 и E6: контракт опережает реализацию, и
+// конструировать большую часть типов пока некому. Снимает их задача,
+// которая первой конструирует тип.
+//
+// # Семь команд
+//
+// - `history_page(cursor?) -> Result<HistoryPage, HistoryUnavailableError>`
+// - `delete_history_record(id) -> Result<(), HistoryCommandError>`
+// - `clear_history() -> Result<(), HistoryCommandError>`
+// - `show_in_folder(id) -> Result<(), ShowInFolderError>`
+// - `settings_get() -> SettingsView`
+// - `settings_set(patch) -> Result<SettingsView, SettingsCommandError>`
+// - `preview_name_template(template) -> Result<TemplatePreview, SettingsCommandError>`
+//
+// Новых событий нет: появление Done уже видно в `queue://changed`, а
+// настройки меняет только этот же клиент (дизайн, «События»). Разрешений в
+// `capabilities/main.json` команды приложения не требуют — пока у приложения
+// нет собственного ACL-манифеста (сторож `app_commands_stay_outside_the_acl`
+// в `tests/frontend_acl.rs`).
+//
+// # Где контракт отступил от буквы дизайна и почему
+//
+// Дизайн оставляет точные имена и формы контрактной задаче. Каждое отступление
+// ниже закрывает место, где буквальная форма нарушила бы инвариант проекта.
+//
+// 1. **`folderDisplay` — объединение, а не строка** ([`FolderDisplay`]).
+//    Строка «Загрузки» из ядра — это текст интерфейса в Rust (тексты живут
+//    на стороне UI, см. [`SelectedQuality`]). Кроме того, панель различает
+//    два случая оформлением: имя системной папки в кавычках, свой путь без
+//    них. Со строкой ей пришлось бы сравнивать значение с магической
+//    константой, которую не сторожит ни генератор, ни компилятор. Решение
+//    «системная или своя» по-прежнему принимается в Rust один раз.
+// 2. **Отдельного `HistoryAvailability` нет.** Три его состояния уже
+//    выражены ответом `history_page`: `Err(HistoryUnavailableError)` —
+//    недоступна, `Ok` с [`HistoryNotice::BaseRecreated`] — пересоздана, `Ok`
+//    без него — в порядке. Отдельный тип стал бы вторым источником истины
+//    о том же факте.
+// 3. **Причины — перечисления, а не `reason: String`**
+//    ([`TemplateProblem`], [`HistoryWriteFailure`]). Свободная строка —
+//    либо текст интерфейса из ядра, либо диагностика, просочившаяся на
+//    экран (Ф-17, Н-4 E2). Диагностика для лога едет в `message`, как у
+//    соседних отказов команд.
+// 4. **Классы сверх перечня Ф-17**, каждый — состояние, которое иначе
+//    нечем назвать: у `show_in_folder` — `unknownRecord` и `unavailable`
+//    (команда принимает `id`, записи может не быть, а базы — не открыться),
+//    у `settings_set` — `writeFailed` (запись файла настроек может
+//    отказать, Ф-9).
+// 5. **`SettingsView::defaults`.** Кнопка «Сбросить» у шаблона и у числа
+//    попыток иначе знала бы умолчания `{title}` и `8` только копией во
+//    фронтенде — вторым местом, где их пришлось бы калибровать.
+
+/// Какая папка назначения у готового файла — в той форме, в какой её
+/// называет интерфейс.
+///
+/// Объединение, а не строка: см. пункт 1 шапки секции. На проводе тег —
+/// поле `kind`.
+///
+/// Решение «это системная папка „Загрузки“» принимает ядро один раз для
+/// всех потребителей: для панели задачи ([`DownloadProgress::Done`]), для
+/// записи истории ([`HistoryEntry::folder_display`]) и для экрана настроек.
+/// Фронтенд не угадывает его по абсолютному пути, то есть не знает, как
+/// «Загрузки» устроены на macOS, Windows и Linux.
+///
+/// Решается по **фактической** папке, куда лёг файл, а не по настройке:
+/// своя папка, совпавшая с системной, показывается как системная. Как именно
+/// сравниваются пути, решает реализация (TL-89).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "download.ts", optional_fields))]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum FolderDisplay {
+    /// Системная папка «Загрузки». Имени папки в контракте нет: подпись
+    /// выбирает интерфейс.
+    SystemDownloads,
+    /// Своя папка пользователя. `path` — абсолютный путь целиком, без
+    /// сокращений: путь — факт, который пользователь проверяет глазами
+    /// (дизайн E5, пункты 3 и 4).
+    #[allow(dead_code)]
+    Custom { path: String },
+}
+
+/// Есть ли на диске файл записи истории (Ф-5).
+///
+/// Вычисляется при каждом запросе страницы и в базе не хранится:
+/// единственный источник — диск в момент запроса.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum HistoryFileStatus {
+    /// Файл на месте — «Показать в папке» откроет его с выделением.
+    Present,
+    /// Файла нет. `folderExists` разводит два текста и два набора действий
+    /// дизайна: папка есть — «Показать в папке» откроет её; папки нет —
+    /// кнопки нет вовсе.
+    Missing { folder_exists: bool },
+}
+
+/// Одна запись истории — то, что видит одна строка списка.
+///
+/// Состав — минимум из данных `Done` (Р-2): длительности, канала и превью
+/// здесь нет и не будет без отдельного решения. **Сырого пути папки нет**:
+/// «Показать в папке» принимает `id`, и путь ядро строит из собственной
+/// копии записи (Ф-8). Фронтенду путь нужен только как текст, и этот текст —
+/// [`Self::folder_display`].
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryEntry {
+    /// Идентификатор записи. Для фронтенда непрозрачен: уходит обратно в
+    /// `delete_history_record` и `show_in_folder`, но не разбирается.
+    pub id: String,
+    /// Канонический id ролика (TL-72) — то же значение, по которому очередь
+    /// сравнивает дубли.
+    pub video_id: String,
+    /// Ссылка в том виде, в каком её вставили. Показывается текстом, а не
+    /// активной ссылкой (граница продукта).
+    pub url: String,
+    /// Название ролика, как его показала карточка E2.
+    pub title: String,
+    /// Выбранный пункт лестницы — вторая половина заголовка
+    /// ««Название» — качество».
+    pub quality: SelectedQuality,
+    /// Имя готового файла с расширением, без пути.
+    pub file_name: String,
+    /// Папка на момент завершения — по тому же правилу, что у `Done`.
+    pub folder_display: FolderDisplay,
+    /// Размер файла в байтах, снятый с диска в момент записи (Ф-2).
+    pub size_bytes: u64,
+    /// Время завершения, Unix-секунды UTC. Относительное время
+    /// («3 часа назад») строит интерфейс.
+    pub finished_at_unix_secs: u64,
+    /// Файл на месте или нет — на момент этого запроса.
+    pub file_status: HistoryFileStatus,
+}
+
+/// Курсор постраничного чтения: последняя запись, которую уже показали.
+///
+/// Пара (время завершения, id), а не смещение: список растёт сверху, и
+/// смещение пропускало бы или повторяло строку, если между двумя «Показать
+/// ещё» завершилась загрузка (дизайн E5, пункт 2). `id` разводит записи
+/// одной секунды.
+///
+/// Фронтенд значение не собирает: берёт [`HistoryPage::next_cursor`] и
+/// отдаёт как есть. Отсюда `Deserialize` — тип ходит в обе стороны.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryCursor {
+    pub finished_at_unix_secs: u64,
+    pub id: String,
+}
+
+/// Сколько записей отдаёт одна страница `history_page`.
+///
+/// **Константа ядра, а не параметр запроса** — решение неясности дизайна
+/// («`limit` — стартовая точка калибровки, 30»). Причины:
+///
+/// - число калибруется на собранном приложении (Н-7), и калибровка правит
+///   одно место, а не два;
+/// - параметр был бы непроверенным вводом, который ядру пришлось бы
+///   зажимать, чтобы `limit: 1e9` не отменил постраничность (Н-3);
+/// - фронтенду число не нужно: конец списка он узнаёт по отсутствию
+///   [`HistoryPage::next_cursor`], а не по неполной странице.
+///
+/// В TS-зеркало константа не попадает — и не должна.
+#[allow(dead_code)]
+pub const HISTORY_PAGE_SIZE: usize = 30;
+
+/// Почему последняя запись в историю не сохранилась (Ф-3).
+///
+/// Перечисление, а не строка: см. пункт 3 шапки секции. Набор — кандидаты
+/// дизайна за вычетом «база недоступна»: при недоступной базе
+/// `history_page` отвечает отказом [`HistoryUnavailableError`], и страница
+/// с этой пометкой не приходит вовсе.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub enum HistoryWriteFailure {
+    /// На диске не хватило места.
+    DiskFull,
+    /// Нет прав на запись в каталог данных или в файл базы.
+    NoAccess,
+    /// База отказала по иной причине. Подробности — в логе ядра, на экран
+    /// они не попадают.
+    StorageFailed,
+}
+
+/// Однократная пометка на экране истории: случилось то, о чём
+/// пользователь должен узнать (дизайн E5, пункт 2).
+///
+/// **«Выдано один раз» — свойство реализации, а не контракта.** Для
+/// контракта это просто необязательное поле ответа [`HistoryPage::notice`].
+/// Обещание ядра: пометка приходит в первом ответе `history_page` после
+/// события и больше не повторяется, показал её фронтенд или нет. Как ядро
+/// это держит, решает TL-90 вместе с хранилищем (TL-85).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum HistoryNotice {
+    /// Файл базы был испорчен: он отложен рядом с меткой времени, начата
+    /// новая пустая история (Ф-1 г). История работает — это баннер над
+    /// списком, а не блокировка экрана.
+    BaseRecreated,
+    /// Загрузка завершилась, а строка истории не сохранилась.
+    LastWriteFailed { cause: HistoryWriteFailure },
+}
+
+/// Ответ `history_page`: одна порция истории, новые записи сверху.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryPage {
+    /// Не больше [`HISTORY_PAGE_SIZE`] записей. Порядок задаёт ядро: время
+    /// завершения по убыванию, при равенстве — по `id`. UI не сортирует.
+    pub entries: Vec<HistoryEntry>,
+    /// Курсор следующей порции. Отсутствует, когда записей старше этих нет;
+    /// по нему интерфейс и прячет «Показать ещё».
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<HistoryCursor>,
+    /// Однократная пометка ([`HistoryNotice`]). В подавляющем большинстве
+    /// ответов отсутствует.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice: Option<HistoryNotice>,
+}
+
+/// Почему история недоступна в этом сеансе (Ф-1 б, в, д).
+///
+/// `corrupted` сюда не входит: порча базы не лишает сеанс истории, ядро
+/// заводит новую (см. [`HistoryNotice::BaseRecreated`]).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub enum HistoryUnavailableReason {
+    /// База создана более новой версией приложения. Файл не тронут и
+    /// откроется на новой сборке (доктрина `ForeignVersion` TL-71).
+    NewerVersion,
+    /// Нет прав на каталог данных или на файл базы.
+    NoAccess,
+    /// Миграция схемы отказала. Транзакция откатила её, база осталась на
+    /// прежней версии.
+    MigrationFailed,
+}
+
+/// Отказ `history_page`: истории в этом сеансе нет.
+///
+/// `message` — диагностика для лога, как у [`DownloadCommandError`]:
+/// экран рисуется по `reason`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryUnavailableError {
+    pub reason: HistoryUnavailableReason,
+    pub message: String,
+}
+
+/// Почему отклонена команда над записями истории (`delete_history_record`,
+/// `clear_history`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum HistoryCommandErrorKind {
+    /// Записи с таким `id` нет (Ф-6). Типизированный отказ, а не паника.
+    UnknownRecord,
+    /// Диск отказал посреди операции. Транзакция откатилась, ничего не
+    /// удалено наполовину.
+    WriteFailed,
+    /// История стала недоступна между открытием экрана и нажатием.
+    Unavailable { reason: HistoryUnavailableReason },
+}
+
+/// Отказ команды над записями истории в сериализуемом виде.
+///
+/// `message` — диагностика для лога; решение принимается по `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryCommandError {
+    /// Разворачивается в поля объекта: `kind` лежит рядом с `message`.
+    #[serde(flatten)]
+    pub kind: HistoryCommandErrorKind,
+    pub message: String,
+}
+
+/// Подробности отказа системного файлового менеджера — для свёрнутого
+/// блока «Подробнее» (Ф-17).
+///
+/// Оба поля необязательны. Программа, которая не запустилась вовсе
+/// (`xdg-open` не установлен), не даёт ни кода, ни stderr; её причина — в
+/// `message`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct LauncherFailureDetails {
+    /// Код завершения программы показа, если она успела завершиться.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Хвост stderr программы показа, обрезанный по длине.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
+}
+
+/// Почему «Показать в папке» не выделило файл (Ф-8).
+///
+/// **У `fileMissing` есть побочный эффект.** Если папка на месте, ядро
+/// открывает её и **при этом** возвращает этот отказ: так интерфейс может
+/// объяснить, почему файл не выделен (дизайн E5, пункт 2, таблица трёх
+/// случаев). Отказ здесь означает «не выделено», а не «ничего не
+/// произошло».
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ShowInFolderErrorKind {
+    /// Файла нет, папка есть — папка открыта без выделения.
+    FileMissing,
+    /// Нет ни файла, ни папки — ничего не открыто.
+    FolderMissing,
+    /// Системный механизм показа не запустился или завершился с ошибкой.
+    LauncherFailed { details: LauncherFailureDetails },
+    /// Записи с таким `id` нет. Сверх перечня Ф-17: команда принимает `id`,
+    /// и запись могла исчезнуть между показом списка и нажатием.
+    UnknownRecord,
+    /// История недоступна в этом сеансе, записи не прочитать. Тоже сверх
+    /// перечня Ф-17, по той же причине.
+    Unavailable { reason: HistoryUnavailableReason },
+}
+
+/// Отказ `show_in_folder` в сериализуемом виде.
+///
+/// `message` — диагностика для лога; решение принимается по `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "history.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct ShowInFolderError {
+    /// Разворачивается в поля объекта: `kind` лежит рядом с `message`.
+    #[serde(flatten)]
+    pub kind: ShowInFolderErrorKind,
+    pub message: String,
+}
+
+/// Папка назначения в настройках (Ф-10).
+///
+/// `system` — системная «Загрузки», и это умолчание. Путь самой системной
+/// папки в настройки не записывается: иначе перенос профиля на другую
+/// машину или смена системной папки молча оставляли бы старый путь.
+///
+/// Тип ходит в обе стороны: уходит в [`SettingsPatch::DestinationFolder`].
+/// Путь `custom` — непроверенный ввод; ядро проверяет его при сохранении
+/// (`notADirectory`, Ф-11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum DestinationFolder {
+    System,
+    /// Абсолютный путь, выбранный системным диалогом.
+    Custom {
+        path: String,
+    },
+}
+
+/// Настройки пользователя — ровно три поля (Ф-10, Р-5).
+///
+/// Число полей закреплено сторожем
+/// `settings_fields_patch_keys_and_reset_marks_are_one_list` в тестах ниже.
+/// Он сверяет эти ключи с [`SettingsField`] и с [`SettingsPatch`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct Settings {
+    /// Куда класть готовые файлы. Умолчание — `system`.
+    pub destination_folder: DestinationFolder,
+    /// Шаблон основы имени файла из белого списка переменных `{title}`,
+    /// `{id}`, `{quality}`, `{date}` (Ф-12). Умолчание — `{title}`.
+    pub name_template: String,
+    /// Предел попыток на задачу, от 1 до 20 включительно. Умолчание — 8,
+    /// откалиброванное в E3 (`crate::download::retry::MAX_ATTEMPTS`).
+    pub max_attempts: u32,
+}
+
+/// Имя одного поля настроек — для пометок «сброшено к умолчанию».
+///
+/// Значения на проводе совпадают с ключами [`Settings`] и [`SettingsPatch`]
+/// (сторож в тестах ниже).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub enum SettingsField {
+    DestinationFolder,
+    NameTemplate,
+    MaxAttempts,
+}
+
+/// Ответ `settings_get` и успешный ответ `settings_set`.
+///
+/// **`resetFields` и `wholeFileReset` — просто поля ответа.** Как долго они
+/// живут, решает реализация (TL-87). Обещание дизайна: до первого успешного
+/// сохранения любого поля в этом сеансе. Отсюда следствие: в успешном ответе
+/// `settings_set` они всегда пусты и `false`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsView {
+    /// Действующие настройки — то, что прочитает следующая стартующая
+    /// задача (Ф-14).
+    pub settings: Settings,
+    /// Умолчания тех же трёх полей. Сверх дизайна, см. пункт 5 шапки
+    /// секции: по ним «Сбросить» отправляет значение, а интерфейс решает,
+    /// показывать ли кнопку.
+    pub defaults: Settings,
+    /// Поля, которые при чтении файла оказались недопустимыми и заменены
+    /// умолчанием (Ф-9). Порядок не значим, повторов нет.
+    pub reset_fields: Vec<SettingsField>,
+    /// Файл не прочитался целиком (не JSON, чужая версия формата). Тогда
+    /// все поля — умолчания, а `resetFields` пуст: пострадал сам факт
+    /// чтения, а не отдельные значения (дизайн E5, пункт 3).
+    pub whole_file_reset: bool,
+    /// Существует ли папка назначения прямо сейчас. Это одна дешёвая
+    /// проверка на момент запроса, фонового слежения нет (С-6, Н-3).
+    pub destination_folder_exists: bool,
+}
+
+/// Вход `settings_set`: **ровно одно** поле настроек.
+///
+/// Одно поле за раз — решение дизайна (пункт 3). У каждого поля своя кнопка
+/// «Сохранить», и объект целиком отправлял бы вместе с сохраняемым полем
+/// несохранённые черновики двух соседних.
+///
+/// Закреплено формой, а не договорённостью. Перечисление с внешним тегом на
+/// проводе выглядит как `{ "nameTemplate": "{title} [{quality}]" }`, то есть
+/// как [`Settings`], урезанный до одного ключа. Объект с двумя ключами
+/// `serde` отклоняет при разборе, до кода команды: сторож
+/// `a_settings_patch_carries_exactly_one_field`. Со стороны TS объединение
+/// одноключевых объектов лишний ключ не запрещает: проверка избыточных
+/// свойств у объединения без дискриминанта мягкая. Держит правило ядро.
+///
+/// Сброс поля — то же сохранение, со значением из
+/// [`SettingsView::defaults`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub enum SettingsPatch {
+    DestinationFolder(DestinationFolder),
+    NameTemplate(String),
+    MaxAttempts(u32),
+}
+
+/// Что именно не так с шаблоном имени (Ф-12, дизайн E5, пункт 3).
+///
+/// Вместо `reason: String` дизайна — перечисление, см. пункт 3 шапки
+/// секции. Позиция лежит внутри вариантов, а не рядом: у пустого результата
+/// указать некуда, и «пустой результат в символе 8» не должен быть
+/// выразим.
+///
+/// **`position` — номер символа для показа, с единицы**, в символах
+/// Unicode (`char` Rust), а не в байтах и не в единицах UTF-16. Интерфейс
+/// печатает его как есть («символ 8») и не режет им строку.
+///
+/// Набор вариантов — белый список TL-86 на момент контракта. Если
+/// валидатору понадобится новый класс, он добавляется сюда, и зеркало
+/// перегенерируется.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum TemplateProblem {
+    /// `{имя}` не из белого списка. `name` — текст между скобками как есть,
+    /// в том числе пустой (`{}`).
+    UnknownVariable { position: u32, name: String },
+    /// `{` без закрывающей `}`. Позиция — открывающей скобки.
+    UnclosedBrace { position: u32 },
+    /// `}` без открывающей `{`. Белый список, а не чёрный: одиночная скобка
+    /// не становится литералом по умолчанию.
+    StrayClosingBrace { position: u32 },
+    /// На образце шаблон даёт пустую основу имени: пустая строка или
+    /// строка, от которой санитизация ничего не оставила.
+    EmptyResult,
+}
+
+/// Почему отклонены `settings_set` или `preview_name_template`.
+///
+/// Предпросмотр делит тип с сохранением, как и требует дизайн («тот же
+/// `invalidTemplate`»). Из четырёх классов он возвращает только
+/// `invalidTemplate`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SettingsCommandErrorKind {
+    /// Путь из диалога не является существующей папкой (Ф-11). Файл
+    /// настроек не изменён.
+    NotADirectory,
+    /// Шаблон имени не прошёл белый список (Ф-12).
+    InvalidTemplate { problem: TemplateProblem },
+    /// Число попыток вне диапазона (Ф-13). Границы едут значением, чтобы
+    /// текст «от 1 до 20» не был второй копией чисел ядра.
+    InvalidValue { min: u32, max: u32 },
+    /// Файл настроек не записался (Ф-9). Сверх перечня Ф-17: запись через
+    /// временный файл и переименование может отказать, а значения в памяти
+    /// остаются прежними.
+    WriteFailed,
+}
+
+/// Отказ команды настроек в сериализуемом виде.
+///
+/// `message` — диагностика для лога; решение принимается по `kind`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsCommandError {
+    /// Разворачивается в поля объекта: `kind` лежит рядом с `message`.
+    #[serde(flatten)]
+    pub kind: SettingsCommandErrorKind,
+    pub message: String,
+}
+
+/// Успешный ответ `preview_name_template`: основа имени по черновому шаблону.
+///
+/// **Образец данных фиксирован** — решение неясности дизайна (сноска ¹ в
+/// пункте 3). Значения лежат константами рядом с командой, в
+/// `crate::commands::settings`:
+///
+/// - название — «Как приручить дракона» (`PREVIEW_SAMPLE_TITLE`);
+/// - id ролика — `dQw4w9WgXcQ` (`PREVIEW_SAMPLE_VIDEO_ID`);
+/// - качество — стандартная ступень 1080 (`PREVIEW_SAMPLE_QUALITY`),
+///   `{quality}` даёт `1080p`;
+/// - дата — **сегодняшняя по локальному времени на момент запроса**, как
+///   того требует дизайн. Это единственная непостоянная часть образца.
+///
+/// `result` — основа имени после того же конвейера, что у настоящего файла
+/// (подстановка, затем санитизация E3), **без расширения** и без суффикса
+/// коллизии « (N)»: расширение даёт фактический контейнер, а суффикс — папка
+/// в момент финализации, и предпросмотр не смотрит ни на то, ни на другое.
+/// Файл не пишется, папка назначения не требуется.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "settings.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct TemplatePreview {
+    pub result: String,
+}
+
 /// Фиксированные stub-данные: реальный запуск и разбор бинарников теперь
 /// реализованы (`crate::commands::sidecar::check_sidecar`, TL-5), эта
 /// функция больше не используется как продакшен-заглушка — оставлена ради
@@ -2642,6 +3234,7 @@ mod tests {
             DownloadProgress::Merging,
             DownloadProgress::Done {
                 file_name: "Как приручить дракона.mp4".to_string(),
+                folder_display: FolderDisplay::SystemDownloads,
             },
             DownloadProgress::Failed {
                 error: DownloadError {
@@ -3011,20 +3604,6 @@ mod tests {
             .as_object()
             .expect("event must be an object")
             .contains_key("percent"));
-    }
-
-    #[test]
-    fn serializes_done_with_the_final_file_name_only() {
-        assert_eq!(
-            download_event(DownloadProgress::Done {
-                file_name: "Как приручить дракона.mp4".to_string(),
-            }),
-            json!({
-                "taskId": "task-1",
-                "phase": "done",
-                "fileName": "Как приручить дракона.mp4",
-            })
-        );
     }
 
     #[test]
@@ -3686,5 +4265,725 @@ mod tests {
             assert_eq!(failure.version(), version, "{failure:?}");
             assert_eq!(failure.message(), "неважно", "{failure:?}");
         }
+    }
+
+    // ─────────────── история и настройки (TL-83, эпик E5) ───────────────
+    //
+    // Сравнение — со значением целиком, как в секциях выше: лишнее поле
+    // обязано ронять равенство само по себе.
+
+    #[test]
+    fn serializes_done_with_the_file_name_and_the_system_downloads_folder() {
+        assert_eq!(
+            download_event(DownloadProgress::Done {
+                file_name: "Как приручить дракона.mp4".to_string(),
+                folder_display: FolderDisplay::SystemDownloads,
+            }),
+            json!({
+                "taskId": "task-1",
+                "phase": "done",
+                "fileName": "Как приручить дракона.mp4",
+                "folderDisplay": { "kind": "systemDownloads" },
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_done_into_a_custom_folder_with_its_absolute_path() {
+        assert_eq!(
+            download_event(DownloadProgress::Done {
+                file_name: "Летний влог.mp4".to_string(),
+                folder_display: FolderDisplay::Custom {
+                    path: "/Users/execaus/Movies/YouTube".to_string(),
+                },
+            }),
+            json!({
+                "taskId": "task-1",
+                "phase": "done",
+                "fileName": "Летний влог.mp4",
+                "folderDisplay": { "kind": "custom", "path": "/Users/execaus/Movies/YouTube" },
+            })
+        );
+    }
+
+    #[test]
+    fn every_folder_display_variant_has_its_own_wire_value() {
+        let variants = [
+            (FolderDisplay::SystemDownloads, "systemDownloads"),
+            (
+                FolderDisplay::Custom {
+                    path: "/tmp/x".to_string(),
+                },
+                "custom",
+            ),
+        ];
+
+        // Ф-15: папка либо системная, либо своя — третьего не бывает.
+        assert_eq!(variants.len(), 2);
+
+        for (variant, expected) in variants {
+            assert_eq!(
+                serde_json::to_value(variant).expect("serialization must not fail")["kind"],
+                json!(expected)
+            );
+        }
+        // Имени системной папки на проводе нет: подпись выбирает UI.
+        assert_eq!(
+            serde_json::to_value(FolderDisplay::SystemDownloads)
+                .expect("serialization must not fail"),
+            json!({ "kind": "systemDownloads" })
+        );
+    }
+
+    fn history_entry(file_status: HistoryFileStatus) -> HistoryEntry {
+        HistoryEntry {
+            id: "h-42".to_string(),
+            video_id: "dQw4w9WgXcQ".to_string(),
+            url: "https://youtu.be/dQw4w9WgXcQ?si=abc".to_string(),
+            title: "Как приручить дракона".to_string(),
+            quality: SelectedQuality {
+                kind: QualityKind::Standard,
+                height_px: Some(1080),
+            },
+            file_name: "Как приручить дракона.mp4".to_string(),
+            folder_display: FolderDisplay::Custom {
+                path: "/Users/execaus/Movies/YouTube".to_string(),
+            },
+            size_bytes: 224_395_264,
+            finished_at_unix_secs: 1_789_000_000,
+            file_status,
+        }
+    }
+
+    #[test]
+    fn serializes_a_history_entry_with_every_field_in_camel_case() {
+        assert_eq!(
+            serde_json::to_value(history_entry(HistoryFileStatus::Present))
+                .expect("serialization must not fail"),
+            json!({
+                "id": "h-42",
+                "videoId": "dQw4w9WgXcQ",
+                "url": "https://youtu.be/dQw4w9WgXcQ?si=abc",
+                "title": "Как приручить дракона",
+                "quality": { "kind": "standard", "heightPx": 1080 },
+                "fileName": "Как приручить дракона.mp4",
+                "folderDisplay": { "kind": "custom", "path": "/Users/execaus/Movies/YouTube" },
+                "sizeBytes": 224_395_264_u64,
+                "finishedAtUnixSecs": 1_789_000_000_u64,
+                "fileStatus": { "kind": "present" },
+            })
+        );
+    }
+
+    /// Ни сырого пути папки, ни вычислимого «на месте» в виде отдельного
+    /// флага, ни потоков yt-dlp — у записи ровно десять ключей дизайна.
+    #[test]
+    fn a_history_entry_carries_no_raw_path_streams_or_progress() {
+        let value = serde_json::to_value(history_entry(HistoryFileStatus::Present))
+            .expect("serialization must not fail");
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("entry must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+
+        assert_eq!(
+            keys,
+            [
+                "fileName",
+                "fileStatus",
+                "finishedAtUnixSecs",
+                "folderDisplay",
+                "id",
+                "quality",
+                "sizeBytes",
+                "title",
+                "url",
+                "videoId",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_history_file_status_has_its_own_wire_shape() {
+        let statuses = [
+            (HistoryFileStatus::Present, json!({ "kind": "present" })),
+            (
+                HistoryFileStatus::Missing {
+                    folder_exists: true,
+                },
+                json!({ "kind": "missing", "folderExists": true }),
+            ),
+            (
+                HistoryFileStatus::Missing {
+                    folder_exists: false,
+                },
+                json!({ "kind": "missing", "folderExists": false }),
+            ),
+        ];
+
+        // Три строки таблицы дизайна (файл есть / нет, папка есть / нет
+        // папки) — три формы на проводе.
+        assert_eq!(statuses.len(), 3);
+
+        for (status, expected) in statuses {
+            assert_eq!(
+                serde_json::to_value(status).expect("serialization must not fail"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn serializes_the_last_page_without_a_cursor_and_without_a_notice() {
+        assert_eq!(
+            serde_json::to_value(HistoryPage {
+                entries: Vec::new(),
+                next_cursor: None,
+                notice: None,
+            })
+            .expect("serialization must not fail"),
+            json!({ "entries": [] })
+        );
+    }
+
+    #[test]
+    fn serializes_a_page_with_a_cursor_and_a_one_time_notice() {
+        assert_eq!(
+            serde_json::to_value(HistoryPage {
+                entries: vec![history_entry(HistoryFileStatus::Missing {
+                    folder_exists: true,
+                })],
+                next_cursor: Some(HistoryCursor {
+                    finished_at_unix_secs: 1_789_000_000,
+                    id: "h-42".to_string(),
+                }),
+                notice: Some(HistoryNotice::LastWriteFailed {
+                    cause: HistoryWriteFailure::DiskFull,
+                }),
+            })
+            .expect("serialization must not fail"),
+            json!({
+                "entries": [{
+                    "id": "h-42",
+                    "videoId": "dQw4w9WgXcQ",
+                    "url": "https://youtu.be/dQw4w9WgXcQ?si=abc",
+                    "title": "Как приручить дракона",
+                    "quality": { "kind": "standard", "heightPx": 1080 },
+                    "fileName": "Как приручить дракона.mp4",
+                    "folderDisplay": { "kind": "custom", "path": "/Users/execaus/Movies/YouTube" },
+                    "sizeBytes": 224_395_264_u64,
+                    "finishedAtUnixSecs": 1_789_000_000_u64,
+                    "fileStatus": { "kind": "missing", "folderExists": true },
+                }],
+                "nextCursor": { "finishedAtUnixSecs": 1_789_000_000_u64, "id": "h-42" },
+                "notice": { "kind": "lastWriteFailed", "cause": "diskFull" },
+            })
+        );
+    }
+
+    /// Курсор фронтенд не собирает, а возвращает: то, что уехало в
+    /// `nextCursor`, обязано разобраться обратно в то же значение.
+    #[test]
+    fn a_history_cursor_travels_back_unchanged() {
+        let cursor = HistoryCursor {
+            finished_at_unix_secs: 1_789_000_000,
+            id: "h-42".to_string(),
+        };
+        let wire = serde_json::to_value(&cursor).expect("serialization must not fail");
+        let back: HistoryCursor = serde_json::from_value(wire).expect("deserialization must work");
+        assert_eq!(back, cursor);
+    }
+
+    #[test]
+    fn every_history_notice_kind_has_its_own_wire_value() {
+        let notices = [
+            (HistoryNotice::BaseRecreated, "baseRecreated"),
+            (
+                HistoryNotice::LastWriteFailed {
+                    cause: HistoryWriteFailure::NoAccess,
+                },
+                "lastWriteFailed",
+            ),
+        ];
+
+        // Два баннера дизайна: «файл истории был повреждён» и «последняя
+        // запись не сохранена».
+        assert_eq!(notices.len(), 2);
+
+        for (notice, expected) in notices {
+            assert_eq!(
+                serde_json::to_value(notice).expect("serialization must not fail")["kind"],
+                json!(expected)
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(HistoryNotice::BaseRecreated)
+                .expect("serialization must not fail"),
+            json!({ "kind": "baseRecreated" })
+        );
+    }
+
+    #[test]
+    fn every_history_write_failure_has_its_own_wire_value() {
+        let causes = [
+            (HistoryWriteFailure::DiskFull, "diskFull"),
+            (HistoryWriteFailure::NoAccess, "noAccess"),
+            (HistoryWriteFailure::StorageFailed, "storageFailed"),
+        ];
+        assert_eq!(causes.len(), 3);
+
+        for (cause, expected) in causes {
+            assert_eq!(
+                serde_json::to_value(cause).expect("serialization must not fail"),
+                json!(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn every_history_unavailable_reason_has_its_own_wire_value() {
+        let reasons = [
+            (HistoryUnavailableReason::NewerVersion, "newerVersion"),
+            (HistoryUnavailableReason::NoAccess, "noAccess"),
+            (HistoryUnavailableReason::MigrationFailed, "migrationFailed"),
+        ];
+
+        // Три, а не четыре Ф-17: `corrupted` не делает историю недоступной
+        // — ядро заводит новую базу, и это `HistoryNotice::BaseRecreated`.
+        assert_eq!(reasons.len(), 3);
+
+        for (reason, expected) in reasons {
+            assert_eq!(
+                serde_json::to_value(reason).expect("serialization must not fail"),
+                json!(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn serializes_an_unavailable_history_with_the_reason_and_a_log_message() {
+        assert_eq!(
+            serde_json::to_value(HistoryUnavailableError {
+                reason: HistoryUnavailableReason::NewerVersion,
+                message: "user_version 9 > 1".to_string(),
+            })
+            .expect("serialization must not fail"),
+            json!({ "reason": "newerVersion", "message": "user_version 9 > 1" })
+        );
+    }
+
+    #[test]
+    fn every_history_command_error_kind_has_its_own_wire_value() {
+        let kinds = [
+            (HistoryCommandErrorKind::UnknownRecord, "unknownRecord"),
+            (HistoryCommandErrorKind::WriteFailed, "writeFailed"),
+            (
+                HistoryCommandErrorKind::Unavailable {
+                    reason: HistoryUnavailableReason::NoAccess,
+                },
+                "unavailable",
+            ),
+        ];
+        assert_eq!(kinds.len(), 3);
+
+        for (kind, expected) in kinds {
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialization must not fail")["kind"],
+                json!(expected)
+            );
+        }
+    }
+
+    /// Причина недоступности лежит рядом с тегом, а не вложенным объектом —
+    /// та же пара `flatten` + `rename_all_fields`, что у отказа по дублю.
+    #[test]
+    fn serializes_a_history_command_rejection_with_the_reason_next_to_the_tag() {
+        assert_eq!(
+            serde_json::to_value(HistoryCommandError {
+                kind: HistoryCommandErrorKind::Unavailable {
+                    reason: HistoryUnavailableReason::MigrationFailed,
+                },
+                message: "миграция 2 откатилась".to_string(),
+            })
+            .expect("serialization must not fail"),
+            json!({
+                "kind": "unavailable",
+                "reason": "migrationFailed",
+                "message": "миграция 2 откатилась",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(HistoryCommandError {
+                kind: HistoryCommandErrorKind::UnknownRecord,
+                message: "записи h-7 нет".to_string(),
+            })
+            .expect("serialization must not fail"),
+            json!({ "kind": "unknownRecord", "message": "записи h-7 нет" })
+        );
+    }
+
+    #[test]
+    fn every_show_in_folder_error_kind_has_its_own_wire_value() {
+        let kinds = [
+            (ShowInFolderErrorKind::FileMissing, "fileMissing"),
+            (ShowInFolderErrorKind::FolderMissing, "folderMissing"),
+            (
+                ShowInFolderErrorKind::LauncherFailed {
+                    details: LauncherFailureDetails {
+                        exit_code: None,
+                        stderr_tail: None,
+                    },
+                },
+                "launcherFailed",
+            ),
+            (ShowInFolderErrorKind::UnknownRecord, "unknownRecord"),
+            (
+                ShowInFolderErrorKind::Unavailable {
+                    reason: HistoryUnavailableReason::NoAccess,
+                },
+                "unavailable",
+            ),
+        ];
+
+        // Три класса Ф-17 и два сверх него (doc варианта): запись могла
+        // исчезнуть, а база — не открыться.
+        assert_eq!(kinds.len(), 5);
+
+        for (kind, expected) in kinds {
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialization must not fail")["kind"],
+                json!(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn serializes_a_launcher_failure_with_details_next_to_the_tag() {
+        assert_eq!(
+            serde_json::to_value(ShowInFolderError {
+                kind: ShowInFolderErrorKind::LauncherFailed {
+                    details: LauncherFailureDetails {
+                        exit_code: Some(4),
+                        stderr_tail: Some("xdg-open: no method available".to_string()),
+                    },
+                },
+                message: "xdg-open завершился с кодом 4".to_string(),
+            })
+            .expect("serialization must not fail"),
+            json!({
+                "kind": "launcherFailed",
+                "details": { "exitCode": 4, "stderrTail": "xdg-open: no method available" },
+                "message": "xdg-open завершился с кодом 4",
+            })
+        );
+        // Программа не запустилась вовсе — кода и stderr нет, и ключей нет.
+        assert_eq!(
+            serde_json::to_value(ShowInFolderError {
+                kind: ShowInFolderErrorKind::LauncherFailed {
+                    details: LauncherFailureDetails {
+                        exit_code: None,
+                        stderr_tail: None,
+                    },
+                },
+                message: "xdg-open не найден".to_string(),
+            })
+            .expect("serialization must not fail"),
+            json!({
+                "kind": "launcherFailed",
+                "details": {},
+                "message": "xdg-open не найден",
+            })
+        );
+    }
+
+    fn default_settings() -> Settings {
+        Settings {
+            destination_folder: DestinationFolder::System,
+            name_template: "{title}".to_string(),
+            max_attempts: 8,
+        }
+    }
+
+    #[test]
+    fn serializes_a_settings_view_with_defaults_and_reset_marks() {
+        assert_eq!(
+            serde_json::to_value(SettingsView {
+                settings: Settings {
+                    destination_folder: DestinationFolder::Custom {
+                        path: "/Volumes/Внешний диск/YouTube".to_string(),
+                    },
+                    name_template: "{id} — {title}".to_string(),
+                    max_attempts: 8,
+                },
+                defaults: default_settings(),
+                reset_fields: vec![SettingsField::MaxAttempts],
+                whole_file_reset: false,
+                destination_folder_exists: false,
+            })
+            .expect("serialization must not fail"),
+            json!({
+                "settings": {
+                    "destinationFolder": { "kind": "custom", "path": "/Volumes/Внешний диск/YouTube" },
+                    "nameTemplate": "{id} — {title}",
+                    "maxAttempts": 8,
+                },
+                "defaults": {
+                    "destinationFolder": { "kind": "system" },
+                    "nameTemplate": "{title}",
+                    "maxAttempts": 8,
+                },
+                "resetFields": ["maxAttempts"],
+                "wholeFileReset": false,
+                "destinationFolderExists": false,
+            })
+        );
+    }
+
+    #[test]
+    fn every_destination_folder_travels_both_ways_unchanged() {
+        let folders = [
+            (DestinationFolder::System, json!({ "kind": "system" })),
+            (
+                DestinationFolder::Custom {
+                    path: "C:\\Users\\me\\Videos".to_string(),
+                },
+                json!({ "kind": "custom", "path": "C:\\Users\\me\\Videos" }),
+            ),
+        ];
+        assert_eq!(folders.len(), 2);
+
+        for (folder, wire) in folders {
+            assert_eq!(
+                serde_json::to_value(&folder).expect("serialization must not fail"),
+                wire
+            );
+            let back: DestinationFolder =
+                serde_json::from_value(wire).expect("deserialization must work");
+            assert_eq!(back, folder);
+        }
+    }
+
+    /// Три списка одних и тех же полей не расходятся: ключи [`Settings`],
+    /// значения [`SettingsField`] (пометки «сброшено») и единственные ключи
+    /// [`SettingsPatch`].
+    ///
+    /// Разошедшееся имя сломало бы экран молча: пометка «сброшено» не нашла
+    /// бы своё поле, а сохранение отправило бы ключ, которого ядро не знает.
+    #[test]
+    fn settings_fields_patch_keys_and_reset_marks_are_one_list() {
+        let settings =
+            serde_json::to_value(default_settings()).expect("serialization must not fail");
+        let mut from_settings: Vec<String> = settings
+            .as_object()
+            .expect("settings must be an object")
+            .keys()
+            .cloned()
+            .collect();
+        from_settings.sort_unstable();
+
+        let mut from_fields: Vec<String> = [
+            SettingsField::DestinationFolder,
+            SettingsField::NameTemplate,
+            SettingsField::MaxAttempts,
+        ]
+        .into_iter()
+        .map(|field| {
+            serde_json::to_value(field)
+                .expect("serialization must not fail")
+                .as_str()
+                .expect("field must be a string")
+                .to_string()
+        })
+        .collect();
+        from_fields.sort_unstable();
+
+        let mut from_patches: Vec<String> = [
+            SettingsPatch::DestinationFolder(DestinationFolder::System),
+            SettingsPatch::NameTemplate("{title}".to_string()),
+            SettingsPatch::MaxAttempts(8),
+        ]
+        .into_iter()
+        .map(|patch| {
+            let value = serde_json::to_value(patch).expect("serialization must not fail");
+            let object = value.as_object().expect("patch must be an object");
+            assert_eq!(
+                object.len(),
+                1,
+                "патч обязан нести ровно одно поле: {value}"
+            );
+            object.keys().next().expect("one key").clone()
+        })
+        .collect();
+        from_patches.sort_unstable();
+
+        // Ф-10 и Р-5: ровно три поля — папка, шаблон, попытки.
+        assert_eq!(
+            from_settings,
+            ["destinationFolder", "maxAttempts", "nameTemplate"]
+        );
+        assert_eq!(from_fields, from_settings);
+        assert_eq!(from_patches, from_settings);
+    }
+
+    /// Одно поле за раз — свойство формы, а не договорённость (doc
+    /// [`SettingsPatch`]).
+    ///
+    /// Разбор идёт через `serde_json::Value`, потому что так аргументы
+    /// команды получает Tauri: из уже разобранного JSON-объекта запроса, а
+    /// не из текста.
+    #[test]
+    fn a_settings_patch_carries_exactly_one_field() {
+        for (wire, expected) in [
+            (
+                json!({ "destinationFolder": { "kind": "custom", "path": "/tmp/x" } }),
+                SettingsPatch::DestinationFolder(DestinationFolder::Custom {
+                    path: "/tmp/x".to_string(),
+                }),
+            ),
+            (
+                json!({ "destinationFolder": { "kind": "system" } }),
+                SettingsPatch::DestinationFolder(DestinationFolder::System),
+            ),
+            (
+                json!({ "nameTemplate": "{id} — {title}" }),
+                SettingsPatch::NameTemplate("{id} — {title}".to_string()),
+            ),
+            (json!({ "maxAttempts": 20 }), SettingsPatch::MaxAttempts(20)),
+        ] {
+            let patch: SettingsPatch =
+                serde_json::from_value(wire.clone()).expect("patch of one field must parse");
+            assert_eq!(patch, expected, "{wire}");
+        }
+
+        for rejected in [
+            // Два поля сразу — черновик соседнего поля уехал бы вместе со
+            // своим.
+            json!({ "nameTemplate": "{title}", "maxAttempts": 3 }),
+            // Объект настроек целиком — ровно та форма, которую тип
+            // исключает.
+            json!({
+                "destinationFolder": { "kind": "system" },
+                "nameTemplate": "{title}",
+                "maxAttempts": 8,
+            }),
+            json!({}),
+            json!({ "theme": "dark" }),
+        ] {
+            assert!(
+                serde_json::from_value::<SettingsPatch>(rejected.clone()).is_err(),
+                "патч обязан отклоняться до кода команды: {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_template_problem_has_its_own_wire_shape() {
+        let problems = [
+            (
+                TemplateProblem::UnknownVariable {
+                    position: 8,
+                    name: "channel".to_string(),
+                },
+                json!({ "kind": "unknownVariable", "position": 8, "name": "channel" }),
+            ),
+            (
+                TemplateProblem::UnclosedBrace { position: 12 },
+                json!({ "kind": "unclosedBrace", "position": 12 }),
+            ),
+            (
+                TemplateProblem::StrayClosingBrace { position: 1 },
+                json!({ "kind": "strayClosingBrace", "position": 1 }),
+            ),
+            // У пустого результата указать некуда — и ключа позиции нет.
+            (
+                TemplateProblem::EmptyResult,
+                json!({ "kind": "emptyResult" }),
+            ),
+        ];
+        assert_eq!(problems.len(), 4);
+
+        for (problem, expected) in problems {
+            assert_eq!(
+                serde_json::to_value(problem).expect("serialization must not fail"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn every_settings_command_error_kind_has_its_own_wire_value() {
+        let kinds = [
+            (SettingsCommandErrorKind::NotADirectory, "notADirectory"),
+            (
+                SettingsCommandErrorKind::InvalidTemplate {
+                    problem: TemplateProblem::EmptyResult,
+                },
+                "invalidTemplate",
+            ),
+            (
+                SettingsCommandErrorKind::InvalidValue { min: 1, max: 20 },
+                "invalidValue",
+            ),
+            (SettingsCommandErrorKind::WriteFailed, "writeFailed"),
+        ];
+
+        // Три класса Ф-17 и `writeFailed` сверх него (doc варианта).
+        assert_eq!(kinds.len(), 4);
+
+        for (kind, expected) in kinds {
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialization must not fail")["kind"],
+                json!(expected)
+            );
+        }
+    }
+
+    /// Проблема шаблона — вложенный объект со своим тегом, а не поля рядом
+    /// с `kind` отказа: два поля `kind` на одном уровне не уживутся.
+    #[test]
+    fn serializes_an_invalid_template_with_the_problem_in_its_own_object() {
+        assert_eq!(
+            serde_json::to_value(SettingsCommandError {
+                kind: SettingsCommandErrorKind::InvalidTemplate {
+                    problem: TemplateProblem::UnknownVariable {
+                        position: 8,
+                        name: "channel".to_string(),
+                    },
+                },
+                message: "неизвестная переменная channel".to_string(),
+            })
+            .expect("serialization must not fail"),
+            json!({
+                "kind": "invalidTemplate",
+                "problem": { "kind": "unknownVariable", "position": 8, "name": "channel" },
+                "message": "неизвестная переменная channel",
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_an_invalid_value_with_its_bounds_next_to_the_tag() {
+        assert_eq!(
+            serde_json::to_value(SettingsCommandError {
+                kind: SettingsCommandErrorKind::InvalidValue { min: 1, max: 20 },
+                message: "maxAttempts = 21".to_string(),
+            })
+            .expect("serialization must not fail"),
+            json!({ "kind": "invalidValue", "min": 1, "max": 20, "message": "maxAttempts = 21" })
+        );
+    }
+
+    #[test]
+    fn serializes_a_template_preview_as_the_stem_only() {
+        assert_eq!(
+            serde_json::to_value(TemplatePreview {
+                result: "dQw4w9WgXcQ — Как приручить дракона".to_string(),
+            })
+            .expect("serialization must not fail"),
+            json!({ "result": "dQw4w9WgXcQ — Как приручить дракона" })
+        );
     }
 }
