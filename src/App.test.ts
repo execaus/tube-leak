@@ -130,12 +130,18 @@ const warmupFailedError: YtDlpPrepareError = {
  * сразу при монтаже `App.vue`, а не только когда пользователь переключится
  * на «Историю» — без дефолта здесь этот файл (не про историю) был бы обязан
  * мокать и её.
+ *
+ * `settings_get` (эпик E5, TL-94) — тем же приёмом: `SettingsScreen`
+ * рендерится безусловно под вкладкой «Настройки» (`v-show`, К-14) и вызывает
+ * `useSettingsStore().fetchSettings()` в своём `onMounted`, который тоже
+ * срабатывает сразу при монтаже `App.vue`.
  */
 function routeInvoke(handlers: Record<string, () => Promise<unknown>>) {
   const withDefaults: Record<string, () => Promise<unknown>> = {
     ytdlp_update_state: () => new Promise<unknown>(() => {}),
     queue_state: () => new Promise<unknown>(() => {}),
     history_page: () => new Promise<unknown>(() => {}),
+    settings_get: () => new Promise<unknown>(() => {}),
     ...handlers,
   }
   invokeMock.mockImplementation((command: string) => {
@@ -533,8 +539,8 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     // prepare_ytdlp, ytdlp_update_state (TL-59, блок обновления — висит
     // вечно, см. doc `routeInvoke`), queue_state (эпик E4, TL-75 — тоже
     // висит вечно), history_page (эпик E5, TL-93 — тоже висит вечно),
-    // check_sidecar × 2.
-    expect(invokeMock).toHaveBeenCalledTimes(6)
+    // settings_get (эпик E5, TL-94 — тоже висит вечно), check_sidecar × 2.
+    expect(invokeMock).toHaveBeenCalledTimes(7)
     expect(invokeMock.mock.calls.filter(([cmd]) => cmd === 'prepare_ytdlp')).toHaveLength(1)
     expect(buttonLabels(wrapper)).toStrictEqual(['Проверить сейчас'])
   })
