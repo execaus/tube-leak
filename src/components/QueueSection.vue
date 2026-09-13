@@ -189,13 +189,24 @@ const resumeBannerText = computed(() =>
 .queue-section__banner {
   padding: 0.75rem;
   margin-bottom: 0.75rem;
-  background: #eef4fd;
+  background: var(--color-accent-soft);
   border-radius: 0.3rem;
+  /*
+   * TL-22 ревью: в тёмной теме баннер почти сливается с фоном окна
+   * (контраст 1.18:1) — нужна отделяющая рамка. `box-shadow`, а не
+   * `border`: высота этого блока не задана явно (auto, по контенту), а
+   * настоящий `border` добавил бы 2px к итоговой высоте независимо от
+   * `box-sizing` — «светлая тема не должна измениться ни на пиксель» не
+   * выполнилось бы даже с прозрачным цветом. `box-shadow` в блочную
+   * модель не входит вообще, поэтому светлое значение токена
+   * (`transparent`) даёт буквально нулевое отличие от прежнего вида.
+   */
+  box-shadow: inset 0 0 0 1px var(--color-banner-border);
 }
 
 .queue-section__banner-text {
   margin: 0 0 0.5rem;
-  color: #333;
+  color: var(--color-text-secondary);
 }
 
 .queue-section__pause {
@@ -203,7 +214,7 @@ const resumeBannerText = computed(() =>
   align-items: center;
   gap: 0.5rem;
   margin: 0.75rem 0;
-  color: #555;
+  color: var(--color-text-muted);
 }
 
 .queue-section__list {
@@ -217,7 +228,7 @@ const resumeBannerText = computed(() =>
 }
 
 .queue-section__task--active {
-  border-left: 3px solid #1a73e8;
+  border-left: 3px solid var(--color-accent);
   padding-left: 0.75rem;
 }
 
@@ -248,7 +259,7 @@ const resumeBannerText = computed(() =>
 }
 
 .tap-target:focus-visible {
-  outline: 2px solid #1a73e8;
+  outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
 </style>

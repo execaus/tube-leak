@@ -4,6 +4,26 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>tube-leak</title>
+    <!--
+      Критический фолбэк фона (TL-22, issue execaus/tube-leak#23): красится
+      синхронно, до того как загрузится `src/style.css` как ES-модуль, —
+      иначе при системной тёмной теме окно на первый кадр мигает белым.
+      Значения продублированы вручную из `:root`/`@media (prefers-color-
+      scheme: dark)` того файла и обязаны совпадать с ними; расхождение
+      сторож не ловит (файл вне `src/`), поэтому при правке палитры менять
+      оба места. Единственное место вне `src/style.css`, где литерал цвета
+      разрешён осознанно.
+    -->
+    <style>
+      html {
+        background: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        html {
+          background: #121212;
+        }
+      }
+    </style>
   </head>
   <body>
     <div id="app"></div>

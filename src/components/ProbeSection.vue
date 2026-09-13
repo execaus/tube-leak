@@ -175,14 +175,14 @@ const inlineNotAUrlText = computed(() =>
 }
 
 .probe-section__input:focus-visible {
-  outline: 2px solid #1a73e8;
+  outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
 
 .probe-section__inline-error {
   min-height: 1.2em;
   margin: 0.35rem 0 0;
-  color: #b3261e;
+  color: var(--color-error);
 }
 
 .probe-section__body {
@@ -191,13 +191,13 @@ const inlineNotAUrlText = computed(() =>
 
 .probe-section__hint {
   margin: 0;
-  color: #555;
+  color: var(--color-text-muted);
 }
 
 .probe-section__disclaimer {
   margin: 0.75rem 0 0;
   font-size: 0.8rem;
-  color: #777;
+  color: var(--color-text-subtle);
 }
 
 .probe-section__loading {
@@ -210,7 +210,7 @@ const inlineNotAUrlText = computed(() =>
 .probe-section__loading-slow {
   margin: 0.35rem 0 0;
   font-size: 0.85rem;
-  color: #555;
+  color: var(--color-text-muted);
 }
 
 .spinner {

@@ -117,25 +117,25 @@ const etaText = computed(() => (props.etaSecs !== undefined ? formatEta(props.et
 .prepare-screen__bar {
   height: 0.5rem;
   border-radius: 0.25rem;
-  background: rgba(0, 0, 0, 0.08);
+  background: var(--color-progress-track);
   overflow: hidden;
 }
 
 .prepare-screen__bar-fill {
   height: 100%;
-  background: #1a73e8;
+  background: var(--color-accent);
   transition: width 0.2s ease-out;
 }
 
 .prepare-screen__percent {
   margin: 0.5rem 0 0;
-  color: #555;
+  color: var(--color-text-muted);
   font-variant-numeric: tabular-nums;
 }
 
 .prepare-screen__hint {
   margin: 0.75rem 0 0;
-  color: #777;
+  color: var(--color-text-subtle);
   font-size: 0.9rem;
 }
 </style>

@@ -66,8 +66,8 @@ function onError(): void {
   height: 90px;
   flex-shrink: 0;
   overflow: hidden;
-  background: #eee;
-  border: 1px solid #ccc;
+  background: var(--color-surface-muted);
+  border: 1px solid var(--color-border-strong);
 }
 
 .thumb__img {
@@ -91,6 +91,6 @@ function onError(): void {
   align-items: center;
   justify-content: center;
   font-size: 2rem;
-  color: #999;
+  color: var(--color-text-faint);
 }
 </style>

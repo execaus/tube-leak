@@ -454,35 +454,43 @@ const showDetailsToggle = computed(() => {
   display: flex;
   align-items: center;
   gap: 0.3rem;
-  color: #777;
+  color: var(--color-text-subtle);
 }
 
 .download-panel__step--current {
-  color: #111;
+  color: var(--color-text-strong);
   font-weight: 600;
 }
 
 .download-panel__step--done {
-  color: #555;
+  color: var(--color-text-muted);
 }
 
 .download-panel__step:not(:last-child)::after {
   content: '→';
   margin-left: 0.4rem;
-  color: #aaa;
+  /*
+   * Отдельный токен, а не `--color-text-faint` (ревью TL-22, Б-2): у
+   * стрелки-разделителя был свой оттенок (`#aaa`), чуть светлее, чем у
+   * плейсхолдера превью (`#999`) — совпадение по смыслу («едва заметно»),
+   * а не по значению. `--color-text-faint` держит светлое значение `#999`
+   * ради VideoThumbnail; сюда нужен именно `#aaa`, иначе светлая тема
+   * меняется на пиксель.
+   */
+  color: var(--color-text-decorative);
 }
 
 .download-panel__bar {
   width: 100%;
   height: 0.6rem;
-  background: rgba(0, 0, 0, 0.08);
+  background: var(--color-progress-track);
   border-radius: 999px;
   overflow: hidden;
 }
 
 .download-panel__bar-fill {
   height: 100%;
-  background: #1a73e8;
+  background: var(--color-accent);
   transition: width 0.2s ease;
 }
 
@@ -496,12 +504,12 @@ const showDetailsToggle = computed(() => {
   align-items: center;
   gap: 0.4rem;
   margin: 0.35rem 0 0;
-  color: #333;
+  color: var(--color-text-secondary);
 }
 
 .download-panel__stall {
   margin: 0.35rem 0 0;
-  color: #b3261e;
+  color: var(--color-error);
 }
 
 .download-panel__actions {
@@ -520,7 +528,7 @@ const showDetailsToggle = computed(() => {
   padding: 0.5rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.8rem;
-  background: rgba(0, 0, 0, 0.04);
+  background: var(--color-surface-subtle);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -552,7 +560,7 @@ const showDetailsToggle = computed(() => {
 }
 
 .tap-target:focus-visible {
-  outline: 2px solid #1a73e8;
+  outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
 </style>
