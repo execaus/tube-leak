@@ -233,10 +233,12 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
     expect(tabPanel(wrapper, 'tabpanel-settings').isVisible()).toBe(false)
 
     // «Главный» показывает ровно то, что показывал бы без вкладок (дизайн,
-    // пункт 1): версия и обе строки sidecar видны сразу, как в E1.
+    // пункт 1): версия и все три строки sidecar видны сразу, как в E1
+    // (deno — с TL-111).
     expect(wrapper.text()).toContain('версия 0.1.0')
     expect(wrapper.text()).toContain('2026.08.20')
     expect(wrapper.text()).toContain('7.1')
+    expect(wrapper.text()).toContain('2.9.6')
   })
 
   it('tabs render unconditionally even while the yt-dlp prepare screen is up, and «История»/«Настройки» work without waiting for sidecar', async () => {

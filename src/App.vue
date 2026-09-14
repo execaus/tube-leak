@@ -22,10 +22,11 @@
  * и промис резолвится за доли секунды. Пока подготовка идёт, но событий
  * ещё не было (тёплый запуск целиком, либо сверхкороткое окно до первого
  * события на холодном), экран не «Запускаем…», а сразу тот же служебный
- * экран, что и после готовности: шапка с версией и обе строки sidecar в
- * состоянии «Проверяем…» — это устраивает и критерий приёмки 2 (служебный
- * экран сразу), и исходный дизайн E1 (Ф-9, Н-6, обе строки к t ≤ 3 с), и
- * не требует четвёртой раскладки только ради доли секунды ожидания.
+ * экран, что и после готовности: шапка с версией и все строки sidecar (три
+ * с TL-111 — yt-dlp, ffmpeg, deno) в состоянии «Проверяем…» — это устраивает
+ * и критерий приёмки 2 (служебный экран сразу), и исходный дизайн E1 (Ф-9,
+ * Н-6, обе строки к t ≤ 3 с — тогда их было две), и не требует четвёртой
+ * раскладки только ради доли секунды ожидания.
  */
 import { storeToRefs } from 'pinia'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
@@ -47,7 +48,9 @@ import { useDownloadTaskStore } from '@/stores/downloadTask'
 import type { DownloadPhase } from '@/types/generated/download'
 import type { QualitySize, QualityStreams } from '@/types/generated/probe'
 import type { SelectedQuality } from '@/types/generated/queue'
+import type { SidecarCheckReport } from '@/types/generated/sidecar'
 import { assertNever } from '@/utils/assertNever'
+import { knownKindsOf } from '@/utils/knownKinds'
 import { isTerminalQueuePhase } from '@/utils/queueTaskPhase'
 import { toDownloadProgress } from '@/utils/queueTaskProgress'
 import { formatTaskDisplayTitle } from '@/utils/queueTaskTitle'
@@ -100,9 +103,24 @@ const showPrepareScreen = computed(() => isPreparing.value && stage.value !== un
 const showPrepareError = computed(() => prepareError.value !== undefined)
 
 /**
+ * Три ключа `SidecarCheckReport` (yt-dlp, ffmpeg, deno — TL-110, #114),
+ * перечисленные тем же приёмом, что белые списки `kind` (`knownKindsOf`,
+ * TL-52): `satisfies Record<keyof SidecarCheckReport, true>` требует от
+ * литерала ровно набор полей контракта. Если TL-51 принесёт в
+ * `SidecarCheckReport` четвёртый sidecar, этот литерал перестанет
+ * собираться раньше, чем `showRetry` молча продолжит проверять только три
+ * старых поля.
+ */
+const SIDECAR_REPORT_KEYS = knownKindsOf({
+  ytDlp: true,
+  ffmpeg: true,
+  deno: true,
+} satisfies Record<keyof SidecarCheckReport, true>)
+
+/**
  * Кнопка «Повторить проверку» — одна на весь экран (Ф-9 — одна команда на
- * оба бинарника сразу). Показывается тогда и только тогда, когда отчёт уже
- * пришёл и хотя бы одна из строк не в состоянии «в порядке». Отчёт
+ * все три бинарника сразу). Показывается тогда и только тогда, когда отчёт
+ * уже пришёл и хотя бы одна из строк не в состоянии «в порядке». Отчёт
  * появляется только после того, как `prepare_ytdlp` уже разрешился (см.
  * {@link runPrepareAndCheckSidecar}), так что достижимость кнопки не нужно
  * охранять отдельно.
@@ -110,20 +128,25 @@ const showPrepareError = computed(() => prepareError.value !== undefined)
 const showRetry = computed(() => {
   const r = report.value
   if (!r) return false
-  return r.ytDlp.status !== 'ok' || r.ffmpeg.status !== 'ok'
+  return SIDECAR_REPORT_KEYS.some((key) => r[key].status !== 'ok')
 })
 
 /**
  * Гейт поля ссылки (эпик E2, TL-33) — зависит только от статуса **yt-dlp**
- * (дизайн, «Где живёт поле ссылки»): статус ffmpeg его не блокирует,
- * разбор ролика ffmpeg не использует (он нужен только в E3, для склейки).
+ * (дизайн, «Где живёт поле ссылки»): статусы ffmpeg и deno его не
+ * блокируют, но по разным причинам. Разбор ролика ffmpeg не использует
+ * вовсе (он нужен только в E3, для склейки). deno разбору как раз нужен —
+ * это JS-рантайм, который yt-dlp запускает для YouTube-извлечения
+ * (TL-110, #114), — но работает с деградацией: без deno пропадает часть
+ * форматов, а не сам разбор, поэтому отказ deno не переводит поле ссылки
+ * в `blocked` (решение ведущего, TL-111).
  */
 const ytDlpState = computed<'checking' | 'blocked' | 'ready'>(() => {
   if (isLoading.value || !report.value) return 'checking'
   return report.value.ytDlp.status === 'ok' ? 'ready' : 'blocked'
 })
 
-/** Готовит yt-dlp и, только по успешному разрешению, проверяет оба sidecar. */
+/** Готовит yt-dlp и, только по успешному разрешению, проверяет все sidecar. */
 async function runPrepareAndCheckSidecar(): Promise<void> {
   await prepare()
   if (!prepareError.value) {
@@ -741,6 +764,10 @@ watch(activeTab, (tab) => {
             fallback-name="ffmpeg"
             :result="report?.ffmpeg"
           />
+          <SidecarStatusRow
+            fallback-name="deno"
+            :result="report?.deno"
+          />
         </section>
 
         <footer
@@ -775,8 +802,8 @@ watch(activeTab, (tab) => {
         <!--
           Разделитель — единственное, что явно отделяет «служебную» часть
           экрана (E1, про инструменты) от «рабочей» (про конкретный ролик,
-          E2), чтобы ошибка ffmpeg выше не путалась с состоянием разбора
-          ниже (дизайн E2, «Где живёт поле ссылки»).
+          E2), чтобы ошибка ffmpeg или deno выше не путалась с состоянием
+          разбора ниже (дизайн E2, «Где живёт поле ссылки»).
         -->
         <hr class="screen__divider">
 
