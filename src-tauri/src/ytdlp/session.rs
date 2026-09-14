@@ -54,7 +54,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use super::error::PrepareError;
-use super::prepare::{self, BackgroundOutcome, BackgroundWarmup, ProgressSink, WarmLaunch};
+use super::prepare::{
+    self, BackgroundOutcome, BackgroundWarmup, ProgressSink, WarmLaunch, WarmupSink,
+};
 use crate::sidecar::ChildRegistry;
 use crate::types::YtDlpPrepared;
 
@@ -170,12 +172,23 @@ impl Session {
         state.warm_launch = None;
     }
 
-    /// Выполняет фоновый прогрев, выданный [`Self::prepare`], и отмечает
-    /// его завершение — в том числе если future бросили недовыполненным.
+    /// Выполняет фоновый прогрев, выданный [`Self::prepare`], отмечает его
+    /// завершение — в том числе если future бросили недовыполненным — и
+    /// сообщает исход в `sink` (TL-21).
+    ///
+    /// Без события экран не узнавал о конце прогрева вовсе: подготовка его
+    /// не ждала, а строка yt-dlp на служебном экране так и оставалась той,
+    /// что собрана, пока дерево ещё было холодным.
+    ///
+    /// Событие уходит **после** того, как снята отметка «прогрев идёт»:
+    /// экран по нему зовёт подготовку и проверку, и те обязаны застать
+    /// сеанс уже без прогрева. Брошенный future события не шлёт — так
+    /// бывает только при выходе из приложения, когда слушать некому.
     pub async fn run_background(
         &self,
         warmup: BackgroundWarmup,
         registry: &ChildRegistry,
+        sink: &dyn WarmupSink,
     ) -> BackgroundOutcome {
         struct InFlight<'a>(&'a Session);
 
@@ -185,8 +198,13 @@ impl Session {
             }
         }
 
-        let _in_flight = InFlight(self);
-        warmup.run(registry).await
+        let outcome = {
+            let _in_flight = InFlight(self);
+            warmup.run(registry).await
+        };
+
+        sink.warmup_finished(outcome.event());
+        outcome
     }
 
     /// Помнит ли сеанс хоть что-то — вопрос тестов инвалидации.
@@ -209,6 +227,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{YtDlpWarmupEvent, YtDlpWarmupOutcome};
     use crate::ytdlp::layout::{self, Layout, SlowWarmupMark};
     use crate::ytdlp::testing::{Control, SilentSink, EXECUTABLE};
     use std::path::PathBuf;
@@ -375,10 +394,14 @@ mod tests {
         let (_, second) = fixture.prepare(&session).await;
         assert!(second.is_none(), "пока первый идёт, второй не выдаётся");
 
-        let (outcome, ()) = tokio::join!(session.run_background(first, &fixture.registry), async {
-            fixture.control.wait_until_hanging().await;
-            fixture.control.release();
-        });
+        let sink = RecordingWarmup::default();
+        let (outcome, ()) = tokio::join!(
+            session.run_background(first, &fixture.registry, &sink),
+            async {
+                fixture.control.wait_until_hanging().await;
+                fixture.control.release();
+            }
+        );
         assert_eq!(outcome, BackgroundOutcome::Warmed);
 
         // Прогрев снял отметку, и следующая подготовка идёт обычным путём;
@@ -389,5 +412,104 @@ mod tests {
         session.invalidate();
         let (_, third) = fixture.prepare(&session).await;
         assert!(third.is_some(), "завершившийся прогрев освобождает место");
+    }
+
+    /// Приёмник, который запоминает исходы из событий конца прогрева.
+    #[derive(Default)]
+    struct RecordingWarmup(Mutex<Vec<YtDlpWarmupEvent>>);
+
+    impl RecordingWarmup {
+        fn outcomes(&self) -> Vec<YtDlpWarmupOutcome> {
+            self.0
+                .lock()
+                .expect("mutex")
+                .iter()
+                .map(|event| event.outcome)
+                .collect()
+        }
+    }
+
+    impl WarmupSink for RecordingWarmup {
+        fn warmup_finished(&self, event: YtDlpWarmupEvent) {
+            self.0.lock().expect("mutex").push(event);
+        }
+    }
+
+    impl Fixture {
+        fn write_mark(&self) {
+            SlowWarmupMark::recorded(None, 120_000, crate::clock::now_unix_secs())
+                .write_atomic(&self.mark_path())
+                .expect("отметка записывается");
+        }
+
+        /// Ломает установленный yt-dlp, сохраняя размер: сверка с
+        /// манифестом его пропускает, запуск — нет.
+        fn break_executable(&self) {
+            let path = Layout::new(&self.data_dir)
+                .install_dir(&layout::bundled_build_id().expect("пин проходит проверку"))
+                .join(EXECUTABLE);
+            let size = usize::try_from(std::fs::metadata(&path).expect("размер").len())
+                .expect("размер помещается");
+            let mut broken = b"#!/bin/sh\nexit 3\n".to_vec();
+            broken.resize(size, b'#');
+            std::fs::write(&path, broken).expect("сломать, сохранив размер");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_end_of_a_background_warm_up_is_reported_with_its_outcome() {
+        // Б-1 ревью TL-21: подготовка прогрев не ждёт, и без события экран
+        // не узнавал, что он кончился.
+        let fixture = installed().await;
+        let session = Session::new();
+
+        // Уложился.
+        fixture.write_mark();
+        fixture.control.hang();
+        let (_, background) = fixture.prepare(&session).await;
+        let sink = RecordingWarmup::default();
+        let (outcome, ()) = tokio::join!(
+            session.run_background(
+                background.expect("отметка есть — прогрев в фоне"),
+                &fixture.registry,
+                &sink,
+            ),
+            async {
+                fixture.control.wait_until_hanging().await;
+                assert!(sink.outcomes().is_empty(), "пока прогрев идёт, события нет");
+                fixture.control.release();
+            }
+        );
+        assert_eq!(outcome, BackgroundOutcome::Warmed);
+        assert_eq!(sink.outcomes(), vec![YtDlpWarmupOutcome::Warmed]);
+
+        // Не запустился.
+        fixture.write_mark();
+        fixture.break_executable();
+        session.invalidate();
+        let (_, background) = fixture.prepare(&session).await;
+        let sink = RecordingWarmup::default();
+        let outcome = session
+            .run_background(
+                background.expect("отметка есть — прогрев в фоне"),
+                &fixture.registry,
+                &sink,
+            )
+            .await;
+        assert!(
+            matches!(outcome, BackgroundOutcome::Failed(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(sink.outcomes(), vec![YtDlpWarmupOutcome::Failed]);
+
+        // Класс «снова не уложился» — свой, а не один из двух выше.
+        assert_eq!(
+            BackgroundOutcome::TimedOut.event().outcome,
+            YtDlpWarmupOutcome::TimedOut
+        );
+        assert_eq!(
+            serde_json::to_value(BackgroundOutcome::Warmed.event()).expect("сериализуется"),
+            serde_json::json!({ "outcome": "warmed" })
+        );
     }
 }

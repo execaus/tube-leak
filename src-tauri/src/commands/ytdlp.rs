@@ -150,6 +150,11 @@ async fn prepare_now(app: &AppHandle) -> Result<YtDlpPrepared, YtDlpPrepareError
 /// контура обновления (Ф-7) не должна снести дерево из-под работающего
 /// процесса. Процесс регистрируется в [`ChildRegistry`], как любой запуск
 /// sidecar, поэтому выход из приложения его убивает.
+///
+/// Исход уходит фронтенду событием `ytdlp://warmup`
+/// ([`crate::types::YtDlpWarmupEvent`]) — иначе экран не узнал бы, что
+/// прогрев закончился, и строка yt-dlp осталась бы собранной по холодному
+/// дереву до ручного повтора.
 fn continue_warm_up_in_background(app: &AppHandle, warmup: ytdlp::BackgroundWarmup) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -158,6 +163,8 @@ fn continue_warm_up_in_background(app: &AppHandle, warmup: ytdlp::BackgroundWarm
         let in_use = app.state::<InUse>();
         let _in_use = in_use.inner().mark(warmup.build_id());
 
-        session.run_background(warmup, &registry).await;
+        session
+            .run_background(warmup, &registry, &ytdlp::AppSink(&app))
+            .await;
     });
 }

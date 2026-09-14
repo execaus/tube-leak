@@ -229,6 +229,38 @@ pub struct YtDlpPrepared {
     pub duration_ms: u64,
 }
 
+/// Чем кончился фоновый прогрев yt-dlp (TL-21).
+///
+/// - `warmed` — прогрев уложился: дерево тёплое, повторная проверка
+///   служебного экрана увидит его рабочим;
+/// - `timedOut` — снова не уложился, машина по-прежнему медленная:
+///   следующий старт тоже не станет ждать прогрева;
+/// - `failed` — yt-dlp не запустился либо завис несколько раз подряд:
+///   память сеанса сброшена, и повтор проверки идёт обычным путём — с
+///   пробой и, если дерево сломано, переустановкой.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "ytdlp.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub enum YtDlpWarmupOutcome {
+    Warmed,
+    TimedOut,
+    Failed,
+}
+
+/// Событие конца фонового прогрева yt-dlp, эмитится под именем
+/// `ytdlp://warmup` (константа `WARMUP_EVENT` в `crate::ytdlp::prepare`).
+///
+/// Подготовка, отдавшая прогрев в фон, возвращает итог сразу, и экран
+/// закрывается раньше, чем прогрев кончится. Без этого события строка
+/// yt-dlp так и осталась бы собранной по холодному дереву до ручного
+/// «Повторить проверку». Приходит одно событие на один фоновый прогрев.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(TS), ts(export_to = "ytdlp.ts", optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct YtDlpWarmupEvent {
+    pub outcome: YtDlpWarmupOutcome,
+}
+
 // ────────────────────── разбор ссылки на ролик (TL-27) ──────────────────────
 //
 // Контракт эпика E2: что команда `probe_url` возвращает фронтенду при успехе

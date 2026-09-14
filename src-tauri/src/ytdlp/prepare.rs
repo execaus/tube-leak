@@ -127,11 +127,21 @@ use super::layout::{self, BuildId, Installed, Layout, RepairLog, SlowWarmupMark}
 use super::state::{self, InUse, InUseGuard, InstallEntry, InstallState};
 use super::unpack;
 use crate::sidecar::{self, ChildRegistry, RunOutput, SidecarError};
-use crate::types::{YtDlpPrepareEvent, YtDlpPrepareStage, YtDlpPrepared};
+use crate::types::{
+    YtDlpPrepareEvent, YtDlpPrepareStage, YtDlpPrepared, YtDlpWarmupEvent, YtDlpWarmupOutcome,
+};
 
 /// Имя Tauri-события с ходом подготовки. Полезная нагрузка —
 /// [`YtDlpPrepareEvent`].
 pub const PREPARE_EVENT: &str = "ytdlp://prepare";
+
+/// Имя Tauri-события с исходом фонового прогрева (TL-21). Полезная
+/// нагрузка — [`YtDlpWarmupEvent`].
+///
+/// Отдельный канал, а не терминальная стадия в [`PREPARE_EVENT`]: на том
+/// поднимается блокирующий экран подготовки, а фоновый прогрев по
+/// построению идёт тогда, когда этот экран уже закрыт.
+pub const WARMUP_EVENT: &str = "ytdlp://warmup";
 
 /// Аргументы прогона, которым дерево прогревается и одновременно
 /// сообщает свою версию.
@@ -438,6 +448,40 @@ impl ProgressSink for AppSink<'_> {
         // случае.
         if let Err(err) = self.0.emit(PREPARE_EVENT, event) {
             eprintln!("yt-dlp: не удалось отправить событие подготовки: {err}");
+        }
+    }
+}
+
+/// Куда уходит исход фонового прогрева (TL-21).
+///
+/// Отдельный трейт, а не ещё один метод [`ProgressSink`]: подготовка
+/// переднего плана о фоновом прогреве не знает, а фоновый прогрев не шлёт
+/// ничего в [`PREPARE_EVENT`] — на том канале поднимается блокирующий экран.
+pub trait WarmupSink: Send + Sync {
+    fn warmup_finished(&self, event: YtDlpWarmupEvent);
+}
+
+impl WarmupSink for AppSink<'_> {
+    fn warmup_finished(&self, event: YtDlpWarmupEvent) {
+        // Неотправленное событие не отменяет прогрева: дерево уже тёплое
+        // (или нет) независимо от того, узнал ли об этом экран, а ручной
+        // повтор проверки покажет то же самое.
+        if let Err(err) = self.0.emit(WARMUP_EVENT, event) {
+            eprintln!("yt-dlp: не удалось отправить событие конца фонового прогрева: {err}");
+        }
+    }
+}
+
+impl BackgroundOutcome {
+    /// Исход в форме контракта. Причина отказа остаётся в логе: экрану
+    /// нужен класс, по которому он решает, перепроверять ли строку.
+    pub fn event(&self) -> YtDlpWarmupEvent {
+        YtDlpWarmupEvent {
+            outcome: match self {
+                Self::Warmed => YtDlpWarmupOutcome::Warmed,
+                Self::TimedOut => YtDlpWarmupOutcome::TimedOut,
+                Self::Failed(_) => YtDlpWarmupOutcome::Failed,
+            },
         }
     }
 }
