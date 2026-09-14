@@ -506,7 +506,14 @@ fn completed_run_result(
                             display = parsed.display,
                         );
             }
-            (parsed.display, clip_version_raw(&parsed.line))
+            // `display` — тоже вывод чужого бинарника: у yt-dlp это первый
+            // токен строки как есть, без нормализации, и ESC или RLO внутри
+            // него доезжали до заголовка строки экрана. Фильтр и предел те
+            // же, что у `versionRaw`; настоящий токен версии они не меняют.
+            (
+                clip_version_raw(&parsed.display),
+                clip_version_raw(&parsed.line),
+            )
         }
         None => match check.unrecognized {
             // Разобрать нечего: вместо версии показывается первая
@@ -1659,6 +1666,96 @@ mod tests {
         }
         // Обычный текст фильтр не трогает — ни кириллицу, ни символы вне BMP.
         assert_eq!(clip_version_raw("ёж 🦔 2.9.6"), "ёж 🦔 2.9.6");
+    }
+
+    #[tokio::test]
+    async fn a_recognized_version_token_passes_the_same_filter_as_its_line() {
+        // Разобранная версия — тоже вывод бинарника под именем sidecar. У
+        // yt-dlp это первый токен первой строки как есть: ESC и RLO не
+        // пробельные символы и остаются внутри токена, а `version` — это
+        // заголовок строки служебного экрана.
+        let dir = tempdir().expect("failed to create temp dir");
+        let registry = ChildRegistry::new();
+        let hostile = write_script(
+            &dir,
+            "hostile.sh",
+            "#!/bin/sh\nprintf '2026.08.19\\033[31m\\342\\200\\256x\\n'\nexit 0\n",
+            0o755,
+        );
+        let result = check_binary(
+            "yt-dlp",
+            Ok(hostile),
+            &["--version"],
+            Duration::from_secs(5),
+            sidecar::parse_ytdlp_version,
+            &registry,
+        )
+        .await;
+        assert_eq!(result.status, SidecarStatus::Ok, "{result:?}");
+        assert_eq!(
+            result.version.as_deref(),
+            Some("2026.08.19\u{FFFD}[31m\u{FFFD}x"),
+            "{result:?}"
+        );
+
+        // Мегабайт в одном токене — тот же предел, что у `versionRaw`.
+        let long = write_script(
+            &dir,
+            "long.sh",
+            "#!/bin/sh\nprintf '%0999d\\n' 0\nexit 0\n",
+            0o755,
+        );
+        let result = check_binary(
+            "yt-dlp",
+            Ok(long),
+            &["--version"],
+            Duration::from_secs(5),
+            sidecar::parse_ytdlp_version,
+            &registry,
+        )
+        .await;
+        let shown = result.version.expect("версия разобрана");
+        assert_eq!(shown.chars().count(), VERSION_RAW_MAX_CHARS + 1, "{shown}");
+        assert!(shown.ends_with('…'), "{shown}");
+
+        // Настоящие версии фильтр не меняет ни на символ.
+        for (name, line, parse, expected) in [
+            (
+                "yt-dlp",
+                "2026.08.19",
+                sidecar::parse_ytdlp_version as fn(&str) -> Option<sidecar::SidecarVersion>,
+                "2026.08.19",
+            ),
+            (
+                "ffmpeg",
+                "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+                sidecar::parse_ffmpeg_version,
+                "9.0.1",
+            ),
+            (
+                "deno",
+                "deno 2.9.6 (stable, release, aarch64-apple-darwin)",
+                sidecar::parse_deno_version,
+                "2.9.6",
+            ),
+        ] {
+            let script = write_script(
+                &dir,
+                &format!("{name}.sh"),
+                &format!("#!/bin/sh\necho '{line}'\nexit 0\n"),
+                0o755,
+            );
+            let result = check_binary(
+                name,
+                Ok(script),
+                &["--version"],
+                Duration::from_secs(5),
+                parse,
+                &registry,
+            )
+            .await;
+            assert_eq!(result.version.as_deref(), Some(expected), "{result:?}");
+        }
     }
 
     #[tokio::test]
