@@ -7,7 +7,7 @@
  * Компонент только отображает то, что ему передали, — сам `invoke` не
  * вызывает (это делает `useSidecarCheck` в родителе, App.vue).
  */
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import type { LaunchFailedReason, SidecarCheckResult } from '@/types/generated/sidecar'
 import { assertNever } from '@/utils/assertNever'
@@ -32,6 +32,53 @@ const displayName = computed(() => props.result?.name ?? props.fallbackName)
 const isChecking = computed(() => props.result === undefined)
 const isOk = computed(() => props.result?.status === 'ok')
 const isError = computed(() => props.result !== undefined && props.result.status !== 'ok')
+
+/**
+ * `ok` получает свой собственный, гораздо более скромный повод показать
+ * «Подробнее» (TL-116, core TL-15): только когда `versionRaw` пришёл и
+ * реально отличается от уже показанной `version` — иначе кнопка была бы
+ * визуальным шумом на каждой успешной строке (особенно у yt-dlp, где
+ * `versionRaw` дословно совпадает с `version`).
+ */
+const hasVersionDetails = computed(() => {
+  const result = props.result
+  return (
+    result !== undefined &&
+    result.status === 'ok' &&
+    result.versionRaw !== undefined &&
+    result.versionRaw !== result.version
+  )
+})
+
+/** Показывать ли кнопку «Подробнее» и (при раскрытии) блок `dl` — для ошибок и для `ok` с отличающимся `versionRaw`. */
+const showDetailsToggle = computed(() => isError.value || hasVersionDetails.value)
+
+/**
+ * Свёрнутое по умолчанию «Подробнее» не должно пережить смену отчёта, если
+ * это может подсунуть пользователю раскрытый блок с чужим содержимым без
+ * его щелчка (ревью TL-116, #123/#124). Два повода сбросить:
+ *
+ * - `showDetailsToggle` стало `false` — кнопка и сам блок пропали; если
+ *   позже у новой строки снова появится повод (другой `versionRaw`,
+ *   очередная ошибка), блок не должен воскреснуть уже раскрытым;
+ * - `status` сменился — даже когда кнопка не исчезала (например,
+ *   `ok` → `notFound`, оба показывают «Подробнее»), это уже другое
+ *   содержимое `dl`, и его раскрытие пользователь не заказывал.
+ *
+ * Если статус тот же и кнопка не пропадала (например, `notFound` сменился
+ * на другой `notFound` с иным путём), раскрытие сохраняется — повторная
+ * проверка с тем же результатом не должна схлопывать то, что пользователь
+ * читает.
+ */
+watch(
+  () => props.result,
+  (newResult, oldResult) => {
+    const statusChanged = newResult?.status !== oldResult?.status
+    if (statusChanged || !showDetailsToggle.value) {
+      detailsOpen.value = false
+    }
+  },
+)
 
 const icon = computed(() => {
   if (isChecking.value) return '○'
@@ -161,7 +208,19 @@ interface DetailEntry {
  */
 const details = computed<DetailEntry[]>(() => {
   const result = props.result
-  if (!result || result.status === 'ok') return []
+  if (!result) return []
+
+  if (result.status === 'ok') {
+    // `versionRaw` есть только при `ok` и только когда сервер его прислал
+    // (`hasVersionDetails` уже проверил и наличие, и отличие от `version`);
+    // подпись «Полная версия» стоит первой — это единственная причина, по
+    // которой у `ok` вообще открылось «Подробнее».
+    if (!hasVersionDetails.value || result.versionRaw === undefined) return []
+    return [
+      { label: 'Полная версия', value: result.versionRaw },
+      { label: 'Путь', value: result.path },
+    ]
+  }
 
   const entries: DetailEntry[] = [{ label: 'Путь', value: result.path }]
 
@@ -226,7 +285,7 @@ function toggleDetails(): void {
     </p>
 
     <div
-      v-if="isError"
+      v-if="showDetailsToggle"
       class="sidecar-row__actions"
     >
       <button
@@ -250,7 +309,7 @@ function toggleDetails(): void {
     </div>
 
     <dl
-      v-if="isError && detailsOpen"
+      v-if="showDetailsToggle && detailsOpen"
       class="sidecar-row__details"
     >
       <template
