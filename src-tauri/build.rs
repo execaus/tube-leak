@@ -104,7 +104,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
-use pinned_file::{PinnedFile, StubPolicy, Verdict, ALLOW_STUB_ENV};
+use pinned_file::{PlannedCheck, Verdict, ALLOW_STUB_ENV};
 
 /// Имя, под которым onedir-архив yt-dlp кладётся в ресурсы бандла.
 /// Должно совпадать с `bundle.resources` в `tauri.conf.json` и с
@@ -134,26 +134,34 @@ fn main() {
     });
     let pin = YtDlpPin::load(&pin_path, &raw_pin, &target);
 
-    // `PROFILE` — `release` у всех профилей, наследующих release, то есть
-    // у `tauri build`; форточка там не действует (см. doc модуля).
-    let policy = StubPolicy {
-        release: env::var("PROFILE").as_deref() == Ok("release"),
-        stub_allowed: env::var(ALLOW_STUB_ENV).as_deref() == Ok("1"),
-    };
+    // Решение о сверках — в `pinned_file::plan_build_checks` (TL-114):
+    // переменные окружения здесь только читаются и передаются как есть.
+    // Политику билд-скрипт не собирает и не трогает — её несёт каждая
+    // сверка, — а проводку ниже сверяет по исходнику
+    // `tests/build_pinned_file.rs`.
+    let checks = pinned_file::plan_build_checks(
+        &raw_pin,
+        &target,
+        env::var("PROFILE").ok().as_deref(),
+        env::var(ALLOW_STUB_ENV).ok().as_deref(),
+    )
+    .unwrap_or_else(|err| panic!("{}: {err}", pin_path.display()));
 
     println!("cargo:rustc-env=TUBE_LEAK_YTDLP_VERSION={}", pin.version);
-    println!("cargo:rustc-env=TUBE_LEAK_YTDLP_SHA256={}", pin.sha256);
+    println!(
+        "cargo:rustc-env=TUBE_LEAK_YTDLP_SHA256={}",
+        checks.yt_dlp_archive.expected_sha256
+    );
     println!(
         "cargo:rustc-env=TUBE_LEAK_YTDLP_ARCHIVE_NAME={}",
-        pin.archive_name
+        checks.yt_dlp_archive.file_name
     );
     println!(
         "cargo:rustc-env=TUBE_LEAK_YTDLP_UPSTREAM_ASSET={}",
         pin.upstream_asset
     );
 
-    let source = manifest_dir.join("binaries").join(&pin.archive_name);
-    println!("cargo:rerun-if-changed={}", source.display());
+    let binaries = manifest_dir.join("binaries");
 
     // Цель тоже под наблюдением: без этого удалённый или подменённый
     // `resources/yt-dlp.zip` не восстанавливался бы до следующей правки
@@ -162,32 +170,25 @@ fn main() {
     let destination = manifest_dir.join(RESOURCE_RELATIVE_PATH);
     println!("cargo:rerun-if-changed={}", destination.display());
 
-    place_archive(&source, &destination, &pin.sha256, policy);
+    place_archive(&binaries, &destination, &checks.yt_dlp_archive);
 
     // deno — sidecar из `externalBin`, его кладёт в бандл сама Tauri, так
     // что здесь только сверка, без копирования (см. «Сверка deno»).
-    let deno = pinned_file::pinned_binary(&raw_pin, "deno", &target)
-        .unwrap_or_else(|err| panic!("{}: {err}", pin_path.display()));
-    let deno_path = manifest_dir.join("binaries").join(&deno.binary_name);
-    println!("cargo:rerun-if-changed={}", deno_path.display());
-    check_pinned_file(
-        &PinnedFile {
-            tool: "deno",
-            path: &deno_path,
-            expected_sha256: &deno.binary_sha256,
-            consequence: DENO_CONSEQUENCE,
-        },
-        policy,
-    );
+    check_pinned_file(&binaries, &checks.deno, DENO_CONSEQUENCE);
 
     tauri_build::build()
 }
 
-/// Проводит решение [`pinned_file::verify_pinned_file`] в сборку: отказ —
-/// паника билд-скрипта, предупреждения — `cargo:warning`. Возвращает, есть
-/// ли файл, с которым можно работать дальше.
-fn check_pinned_file(file: &PinnedFile<'_>, policy: StubPolicy) -> bool {
-    match pinned_file::verify_pinned_file(file, policy) {
+/// Проводит решение [`PlannedCheck::verify`] в сборку: отказ — паника
+/// билд-скрипта, предупреждения — `cargo:warning`. Возвращает, есть ли
+/// файл, с которым можно работать дальше. Политику сверка несёт в себе:
+/// здесь её не собирают и не трогают (сторож — `tests/build_pinned_file.rs`).
+fn check_pinned_file(binaries: &Path, check: &PlannedCheck, consequence: &str) -> bool {
+    println!(
+        "cargo:rerun-if-changed={}",
+        check.path_in(binaries).display()
+    );
+    match check.verify(binaries, consequence) {
         Ok(Verdict::Verified) => true,
         Ok(Verdict::StubTolerated { warning }) => {
             println!("cargo:warning={}", warning.replace('\n', " "));
@@ -212,14 +213,16 @@ fn check_pinned_file(file: &PinnedFile<'_>, policy: StubPolicy) -> bool {
 const YTDLP_RELEASE_URL_PREFIX: &str = "https://github.com/yt-dlp/yt-dlp/releases/download/";
 
 /// Данные о вложенном архиве yt-dlp, взятые из пина для текущей тройки.
+///
+/// Имени архива в `binaries/` и его суммы здесь нет: их читает
+/// [`pinned_file::plan_build_checks`] вместе с политикой сверки, и второго
+/// читателя тех же полей у сборки нет (TL-114).
 struct YtDlpPin {
     version: String,
-    sha256: String,
-    archive_name: String,
     /// Имя ассета **у апстрима** (`yt-dlp_macos.zip` и т. п.) — последний
     /// сегмент пинованного адреса.
     ///
-    /// Не то же самое, что [`Self::archive_name`]: то — имя файла в
+    /// Не то же самое, что `binaryName` записи пина: то — имя файла в
     /// `binaries/` с суффиксом тройки, наше собственное. Обновлению
     /// (TL-55) нужно апстримное: именно его оно ищет среди двух десятков
     /// ассетов релиза. Выводится из того же пина и той же записи, что
@@ -280,8 +283,6 @@ impl YtDlpPin {
 
         Self {
             version: pin.yt_dlp.version.clone(),
-            sha256: entry.sha256.clone(),
-            archive_name: entry.binary_name.clone(),
             upstream_asset,
         }
     }
@@ -302,9 +303,6 @@ struct PinSection {
 #[derive(serde::Deserialize)]
 struct PinEntry {
     url: String,
-    sha256: String,
-    #[serde(rename = "binaryName")]
-    binary_name: String,
     kind: Option<String>,
 }
 
@@ -324,22 +322,17 @@ struct PinEntry {
 /// А вот исходник, который есть, но не тот — обрывает: см. «Сверка архива
 /// с пином» в doc модуля. Отсутствие файла ещё поймает бандлер, подмену
 /// содержимого не поймает никто.
-fn place_archive(source: &Path, destination: &Path, expected_sha256: &str, policy: StubPolicy) {
+fn place_archive(binaries: &Path, destination: &Path, check: &PlannedCheck) {
     let _ = fs::remove_file(destination);
 
     // Сверка с пином заодно закрывает и пустой, и обрезанный архив: ни
     // один из них по сумме не пройдёт, отдельной проверки на непустоту не
     // нужно.
-    let archive = PinnedFile {
-        tool: "yt-dlp",
-        path: source,
-        expected_sha256,
-        consequence: YTDLP_CONSEQUENCE,
-    };
-    if !check_pinned_file(&archive, policy) {
+    if !check_pinned_file(binaries, check, YTDLP_CONSEQUENCE) {
         return;
     }
-    let source_len = fs::metadata(source)
+    let source = check.path_in(binaries);
+    let source_len = fs::metadata(&source)
         .map(|metadata| metadata.len())
         .unwrap_or_else(|err| panic!("failed to stat {}: {err}", source.display()));
 
@@ -352,7 +345,7 @@ fn place_archive(source: &Path, destination: &Path, expected_sha256: &str, polic
 
     let temp = destination.with_extension("zip.tmp");
     let _ = fs::remove_file(&temp);
-    fs::copy(source, &temp).unwrap_or_else(|err| {
+    fs::copy(&source, &temp).unwrap_or_else(|err| {
         let _ = fs::remove_file(&temp);
         panic!(
             "failed to copy {} to {}: {err}",

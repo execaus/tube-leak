@@ -7,8 +7,13 @@
 //! `build_support/pinned_file.rs` и подключено сюда тем же `#[path]`, что и
 //! в `build.rs`: тест проверяет ровно тот код, что стоит на сборке.
 //!
-//! Чего тест не видит: проводку — что `build.rs` вообще зовёт сверку для
-//! deno и берёт путь из пина. Она доказывается живой сборкой в
+//! Решение о политике и записях пина вынесено туда же
+//! (`plan_build_checks`, TL-114): `build.rs` только читает `PROFILE` и
+//! форточку и передаёт значения как есть, а политику несёт каждая сверка.
+//! Проводку — что `build.rs` зовёт обе сверки из плана и политику не
+//! трогает — тест не исполняет, а сверяет по исходнику
+//! (`build_rs_wires_both_checks_from_the_plan_and_never_touches_the_policy`).
+//! Проводку целиком по-прежнему доказывает только живая сборка в
 //! release-профиле с заглушкой на месте deno (отчёт TL-112).
 
 #[path = "../build_support/pinned_file.rs"]
@@ -19,8 +24,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use pinned_file::{
-    pinned_binary, sha256_file, verify_pinned_file, PinnedBinary, PinnedFile, StubPolicy, Verdict,
-    ALLOW_STUB_ENV,
+    pinned_binary, plan_build_checks, sha256_file, verify_pinned_file, BuildChecks, PinnedBinary,
+    PinnedFile, StubPolicy, Verdict, ALLOW_STUB_ENV,
 };
 
 /// Содержимое заглушки `scripts/ci/stub-binaries.mjs`. Сумма посчитана
@@ -308,4 +313,220 @@ fn pinned_binary_refuses_an_entry_it_could_not_check() {
     assert!(pinned_binary(&ok, "deno", "aarch64-apple-darwin").is_ok());
     let err = pinned_binary(&ok, "deno", "x86_64-apple-darwin").expect_err("no entry");
     assert_contains(&err, &["deno.targets.x86_64-apple-darwin"]);
+}
+
+// ─────────────── Решение сборки и его проводка (TL-114) ───────────────
+
+/// Тройка, на которой тесты плана читают настоящий пин.
+const PLAN_TARGET: &str = "aarch64-apple-darwin";
+
+/// Замечание 1 ревью TL-112: при `PROFILE=release` форточка `=1` не
+/// открывает ни одну из двух сверок, и обе берут записи своей тройки.
+#[test]
+fn the_release_profile_keeps_both_checks_closed_even_with_the_stub_window() {
+    let raw = repo_pin();
+    let json: serde_json::Value = serde_json::from_str(&raw).expect("pin is JSON");
+    let BuildChecks {
+        yt_dlp_archive,
+        deno,
+    } = plan_build_checks(&raw, PLAN_TARGET, Some("release"), Some("1")).expect("plan");
+
+    assert_eq!(yt_dlp_archive.policy, RELEASE_WITH_WINDOW, "yt-dlp");
+    assert_eq!(deno.policy, RELEASE_WITH_WINDOW, "deno");
+
+    assert_eq!(yt_dlp_archive.tool, "yt-dlp");
+    assert_eq!(
+        yt_dlp_archive.file_name,
+        format!("yt-dlp-{PLAN_TARGET}.zip")
+    );
+    assert_eq!(
+        Some(yt_dlp_archive.expected_sha256.as_str()),
+        json["ytDlp"]["targets"][PLAN_TARGET]["sha256"].as_str()
+    );
+    assert_eq!(deno.tool, "deno");
+    assert_eq!(deno.file_name, format!("deno-{PLAN_TARGET}"));
+    assert_eq!(deno.expected_sha256, DENO_AARCH64_DARWIN_SHA256);
+
+    // Поведением, а не только полем: заглушка под именем каждого файла —
+    // отказ, и отказ называет проигнорированную форточку.
+    let dir = tempfile::tempdir().expect("tempdir");
+    for check in [&yt_dlp_archive, &deno] {
+        let path = check.path_in(dir.path());
+        fs::write(&path, STUB_CONTENT).expect("write stub");
+        let refusal = check
+            .verify(dir.path(), "Собрался бы нерабочий бандл")
+            .expect_err("release refuses the stub whatever the window says");
+        assert!(
+            refusal.starts_with(&format!("{}: ", check.tool)),
+            "{refusal}"
+        );
+        assert_contains(
+            &refusal,
+            &[
+                &path.display().to_string(),
+                &format!("{ALLOW_STUB_ENV}=1 задано, но профиль release его не учитывает"),
+            ],
+        );
+    }
+}
+
+#[test]
+fn the_policy_is_taken_from_exact_environment_values() {
+    let raw = repo_pin();
+    let cases = [
+        (Some("release"), None, RELEASE),
+        (Some("release"), Some("1"), RELEASE_WITH_WINDOW),
+        (Some("debug"), None, DEV),
+        (Some("debug"), Some("1"), DEV_WITH_WINDOW),
+        (None, Some("1"), DEV_WITH_WINDOW),
+        (None, None, DEV),
+        // Форточка открыта ровно значением `1`, профиль релизный ровно `release`.
+        (Some("debug"), Some("true"), DEV),
+        (Some("debug"), Some("0"), DEV),
+        (Some("debug"), Some(""), DEV),
+        (Some("Release"), None, DEV),
+        (Some("release "), Some("1"), DEV_WITH_WINDOW),
+    ];
+    for (profile, window, expected) in cases {
+        let checks = plan_build_checks(&raw, PLAN_TARGET, profile, window).expect("plan");
+        assert_eq!(
+            (checks.yt_dlp_archive.policy, checks.deno.policy),
+            (expected, expected),
+            "PROFILE={profile:?} {ALLOW_STUB_ENV}={window:?}"
+        );
+    }
+}
+
+#[test]
+fn the_plan_refuses_a_pin_it_could_not_check() {
+    let raw = repo_pin();
+    let json: serde_json::Value = serde_json::from_str(&raw).expect("pin is JSON");
+
+    for section in ["ytDlp", "deno"] {
+        let mut broken = json.clone();
+        broken[section]["targets"]
+            .as_object_mut()
+            .expect("targets")
+            .remove(PLAN_TARGET);
+        let err = plan_build_checks(&broken.to_string(), PLAN_TARGET, Some("release"), None)
+            .expect_err("entry missing");
+        assert_contains(&err, &[&format!("{section}.targets.{PLAN_TARGET}")]);
+    }
+
+    // Сумма архива yt-dlp проверяется так же, как сумма deno.
+    let mut upper = json.clone();
+    let sum = upper["ytDlp"]["targets"][PLAN_TARGET]["sha256"]
+        .as_str()
+        .expect("archive sha256")
+        .to_ascii_uppercase();
+    upper["ytDlp"]["targets"][PLAN_TARGET]["sha256"] = serde_json::json!(sum);
+    let err = plan_build_checks(&upper.to_string(), PLAN_TARGET, Some("release"), None)
+        .expect_err("malformed archive sum");
+    assert_contains(&err, &[&format!("ytDlp.targets.{PLAN_TARGET}.sha256")]);
+}
+
+/// Проводка `build.rs` по исходнику (TL-114): билд-скрипт тест не
+/// исполняет, поэтому сверяется текст.
+///
+/// - Политику `build.rs` не собирает, не читает и не меняет: в коде нет
+///   слов `StubPolicy`, `policy`, `release`, `stub_allowed`, построения
+///   `PlannedCheck { … }`, `..` поверх сверки и сверки в обход плана
+///   (`verify_pinned_file`, `PinnedFile`, `pinned_binary`), нет и `#[cfg`.
+/// - Окружение читается ровно раз и уходит в план как есть.
+/// - Обе сверки зовутся ровно раз на верхнем уровне `main` (отступ 4 — не
+///   под `if`), в `main` нет `return` и `exit(`, отказ сверки — паника.
+///
+/// Не видит: выход из `main` паникой или бесконечным циклом до вызовов и
+/// вызов, собранный макросом.
+#[test]
+fn build_rs_wires_both_checks_from_the_plan_and_never_touches_the_policy() {
+    let code: Vec<(usize, &str)> = include_str!("../build.rs")
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with("//")
+        })
+        .map(|line| (line.len() - line.trim_start().len(), line.trim()))
+        .collect();
+    let is_ident = |c: char| c == '_' || c.is_alphanumeric();
+    let has_word = |line: &str, word: &str| {
+        line.match_indices(word).any(|(at, _)| {
+            !line[..at].chars().next_back().is_some_and(is_ident)
+                && !line[at + word.len()..].chars().next().is_some_and(is_ident)
+        })
+    };
+    let containing = |needle: &str| {
+        code.iter()
+            .filter(|(_, line)| line.contains(needle))
+            .count()
+    };
+
+    for word in [
+        "StubPolicy",
+        "policy",
+        "release",
+        "stub_allowed",
+        "PinnedFile",
+        "verify_pinned_file",
+        "pinned_binary",
+    ] {
+        let found: Vec<_> = code
+            .iter()
+            .filter(|(_, line)| has_word(line, word))
+            .collect();
+        assert!(found.is_empty(), "build.rs: {word} в коде: {found:?}");
+    }
+    for fragment in ["PlannedCheck {", "..checks", "..check", "..*check", "#[cfg"] {
+        assert_eq!(containing(fragment), 0, "build.rs: {fragment:?} в коде");
+    }
+
+    for (indent, text) in [
+        (4, "let checks = pinned_file::plan_build_checks("),
+        (8, "env::var(\"PROFILE\").ok().as_deref(),"),
+        (8, "env::var(ALLOW_STUB_ENV).ok().as_deref(),"),
+        (
+            4,
+            "place_archive(&binaries, &destination, &checks.yt_dlp_archive);",
+        ),
+        (
+            4,
+            "check_pinned_file(&binaries, &checks.deno, DENO_CONSEQUENCE);",
+        ),
+        (
+            4,
+            "if !check_pinned_file(binaries, check, YTDLP_CONSEQUENCE) {",
+        ),
+        (4, "match check.verify(binaries, consequence) {"),
+        (8, "Err(refusal) => panic!(\"{refusal}\"),"),
+    ] {
+        let found = code
+            .iter()
+            .filter(|(at, line)| *at == indent && *line == text)
+            .count();
+        assert_eq!(found, 1, "build.rs: строка {text:?} с отступом {indent}");
+    }
+    for (needle, expected) in [
+        ("env::var(\"PROFILE\")", 1),
+        ("env::var(ALLOW_STUB_ENV)", 1),
+        ("plan_build_checks(", 1),
+        ("checks.deno", 1),
+        ("check_pinned_file(", 3),
+        ("place_archive(", 2),
+    ] {
+        assert_eq!(containing(needle), expected, "build.rs: {needle:?}");
+    }
+
+    let main: Vec<&str> = code
+        .iter()
+        .skip_while(|(_, line)| *line != "fn main() {")
+        .take_while(|(at, line)| !(*at == 0 && *line == "}"))
+        .map(|(_, line)| *line)
+        .collect();
+    assert!(main.len() > 10, "main не найден: {main:?}");
+    for line in &main {
+        assert!(
+            !has_word(line, "return") && !line.contains("exit("),
+            "build.rs: ранний выход из main: {line}"
+        );
+    }
 }

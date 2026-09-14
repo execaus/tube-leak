@@ -32,7 +32,7 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -41,7 +41,8 @@ use sha2::{Digest, Sha256};
 pub const ALLOW_STUB_ENV: &str = "TUBE_LEAK_ALLOW_STUB_YTDLP";
 
 /// В каком режиме идёт сборка — ровно то, что политике нужно знать об
-/// окружении. Собирается в `build.rs` из `PROFILE` и [`ALLOW_STUB_ENV`].
+/// окружении. Собирается [`plan_build_checks`] из значений `PROFILE` и
+/// [`ALLOW_STUB_ENV`], которые передаёт `build.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StubPolicy {
     /// Профиль наследует `release` — это `tauri build`.
@@ -137,13 +138,13 @@ pub fn verify_pinned_file(file: &PinnedFile<'_>, policy: StubPolicy) -> Result<V
     ))
 }
 
-/// Запись пина, чей итоговый файл в `binaries/` сверяется по
-/// `binarySha256`.
+/// Запись пина: имя файла в `binaries/` и сумма, с которой он сверяется
+/// (`binarySha256` у deno, `sha256` у архива yt-dlp).
 #[derive(Debug, PartialEq, Eq)]
 pub struct PinnedBinary {
     /// Имя файла в `binaries/` — голое имя, без каталогов.
     pub binary_name: String,
-    /// Сумма распакованного бинарника, нижний регистр.
+    /// Сумма этого файла, нижний регистр.
     pub binary_sha256: String,
 }
 
@@ -151,6 +152,38 @@ pub struct PinnedBinary {
 /// `<section>.targets.<target>`. Оба поля обязательны: запись без суммы
 /// означала бы release-сборку, которая не отличает бинарник от заглушки.
 pub fn pinned_binary(pin_json: &str, section: &str, target: &str) -> Result<PinnedBinary, String> {
+    pinned_entry(
+        pin_json,
+        section,
+        target,
+        "binarySha256",
+        "the unpacked binary (upstream publishes it as a separate .sha256sum asset) — without it \
+         a release build cannot tell the binary from a stub",
+    )
+}
+
+/// Достаёт из пина `binaryName` и `sha256` записи `ytDlp.targets.<target>`:
+/// архив yt-dlp едет в бандл как есть, и сумма скачанного — это и есть
+/// сумма лежащего в `binaries/` (см. doc модуля).
+fn pinned_archive(pin_json: &str, target: &str) -> Result<PinnedBinary, String> {
+    pinned_entry(
+        pin_json,
+        "ytDlp",
+        target,
+        "sha256",
+        "the archive as downloaded — it is bundled as is",
+    )
+}
+
+/// Общая часть [`pinned_binary`] и [`pinned_archive`]: голое имя файла и
+/// сумма из поля `sum_field`; `sum_of` — чья это сумма, для текста отказа.
+fn pinned_entry(
+    pin_json: &str,
+    section: &str,
+    target: &str,
+    sum_field: &str,
+    sum_of: &str,
+) -> Result<PinnedBinary, String> {
     let pin: serde_json::Value =
         serde_json::from_str(pin_json).map_err(|err| format!("pin is not valid JSON: {err}"))?;
     let label = format!("{section}.targets.{target}");
@@ -179,7 +212,7 @@ pub fn pinned_binary(pin_json: &str, section: &str, target: &str) -> Result<Pinn
     }
 
     let binary_sha256 = entry
-        .get("binarySha256")
+        .get(sum_field)
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     let well_formed = binary_sha256.len() == 64
@@ -188,15 +221,110 @@ pub fn pinned_binary(pin_json: &str, section: &str, target: &str) -> Result<Pinn
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
     if !well_formed {
         return Err(format!(
-            "\"{label}.binarySha256\" must be the 64-char lowercase hex sha256 of the unpacked binary \
-             (upstream publishes it as a separate .sha256sum asset) — without it a release build \
-             cannot tell the binary from a stub; got {binary_sha256:?}"
+            "\"{label}.{sum_field}\" must be the 64-char lowercase hex sha256 of {sum_of}; \
+             got {binary_sha256:?}"
         ));
     }
 
     Ok(PinnedBinary {
         binary_name: binary_name.to_owned(),
         binary_sha256: binary_sha256.to_owned(),
+    })
+}
+
+/// Одна сверка сборки: какой файл `binaries/` сверяется, с какой суммой и
+/// по какой политике.
+///
+/// Политика едет внутри сверки, а не рядом: `build.rs` получает её готовой
+/// из [`plan_build_checks`] и не собирает, не читает и не меняет. До TL-114
+/// политика собиралась в `build.rs`, и мутация «deno сверяется с
+/// `release: false`» проходила все тесты, а release-сборка с ней принимала
+/// заглушку (замечание 1 ревью TL-112).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedCheck {
+    /// Имя инструмента для сообщений: `yt-dlp`, `deno`.
+    pub tool: &'static str,
+    /// Имя файла в `binaries/` — голое имя, без каталогов.
+    pub file_name: String,
+    /// Ожидаемая сумма файла, нижний регистр.
+    pub expected_sha256: String,
+    /// С какой политикой сверяется файл.
+    pub policy: StubPolicy,
+}
+
+impl PlannedCheck {
+    /// Путь сверяемого файла в каталоге `binaries_dir`.
+    pub fn path_in(&self, binaries_dir: &Path) -> PathBuf {
+        binaries_dir.join(&self.file_name)
+    }
+
+    /// Сверяет файл в `binaries_dir` с пином по политике этой сверки;
+    /// `consequence` — см. [`PinnedFile::consequence`].
+    pub fn verify(&self, binaries_dir: &Path, consequence: &str) -> Result<Verdict, String> {
+        let path = self.path_in(binaries_dir);
+        verify_pinned_file(
+            &PinnedFile {
+                tool: self.tool,
+                path: &path,
+                expected_sha256: &self.expected_sha256,
+                consequence,
+            },
+            self.policy,
+        )
+    }
+}
+
+/// Все сверки сборки. Поля, а не список: архив yt-dlp после сверки
+/// копируется в ресурсы, deno только сверяется, и `build.rs` зовёт их
+/// по-разному.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildChecks {
+    /// Onedir-архив yt-dlp: `ytDlp.targets.<тройка>`, поля `binaryName` и
+    /// `sha256`.
+    pub yt_dlp_archive: PlannedCheck,
+    /// Распакованный deno: `deno.targets.<тройка>`, поля `binaryName` и
+    /// `binarySha256`.
+    pub deno: PlannedCheck,
+}
+
+/// Решение сборки о сверках: политика из значений окружения и записи пина
+/// для обоих файлов.
+///
+/// Окружение приходит аргументами, а не читается здесь: `profile` —
+/// значение `PROFILE`, `allow_stub` — значение [`ALLOW_STUB_ENV`] (`None`,
+/// если переменная не задана или не записывается строкой). Так тест видит
+/// ровно то решение, что стоит на сборке, а `build.rs` только читает
+/// переменные и передаёт их сюда как есть.
+///
+/// Политика одна на обе сверки: у сборки один профиль и одна форточка.
+pub fn plan_build_checks(
+    pin_json: &str,
+    target: &str,
+    profile: Option<&str>,
+    allow_stub: Option<&str>,
+) -> Result<BuildChecks, String> {
+    // `PROFILE` — `release` у всех профилей, наследующих release, то есть у
+    // `tauri build`; форточка там не действует (см. `verify_pinned_file`).
+    let policy = StubPolicy {
+        release: profile == Some("release"),
+        stub_allowed: allow_stub == Some("1"),
+    };
+    let archive = pinned_archive(pin_json, target)?;
+    let deno = pinned_binary(pin_json, "deno", target)?;
+
+    Ok(BuildChecks {
+        yt_dlp_archive: PlannedCheck {
+            tool: "yt-dlp",
+            file_name: archive.binary_name,
+            expected_sha256: archive.binary_sha256,
+            policy,
+        },
+        deno: PlannedCheck {
+            tool: "deno",
+            file_name: deno.binary_name,
+            expected_sha256: deno.binary_sha256,
+            policy,
+        },
     })
 }
 

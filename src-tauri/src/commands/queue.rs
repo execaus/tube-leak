@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use super::sidecar::{resolve_deno, resolve_ytdlp_path};
+use super::sidecar::resolve_ytdlp_path;
 use super::update::trigger_broken_extraction_check;
 use super::{HistoryState, SettingsState};
 use crate::download::{self, AppSink, DownloadTask, SidecarDownloader, SidecarFfmpeg, TaskEnv};
@@ -166,7 +166,7 @@ async fn run(app: AppHandle, task: Arc<DownloadTask>) {
     // deno — путь и окружение одним значением (TL-109), тем же построителем,
     // что у разбора; без deno yt-dlp получает `--no-js-runtimes`, а не
     // ищет чужой deno в `PATH`.
-    let js_runtime = YtDlpJsRuntime::from_deno(resolve_deno(&app));
+    let js_runtime = YtDlpJsRuntime::for_app(&app);
 
     let registry = app.state::<ChildRegistry>();
     let launcher = SidecarDownloader::new(ytdlp, js_runtime, &registry);
