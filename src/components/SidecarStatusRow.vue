@@ -7,7 +7,7 @@
  * Компонент только отображает то, что ему передали, — сам `invoke` не
  * вызывает (это делает `useSidecarCheck` в родителе, App.vue).
  */
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import type { LaunchFailedReason, SidecarCheckResult } from '@/types/generated/sidecar'
 import { assertNever } from '@/utils/assertNever'
@@ -52,6 +52,33 @@ const hasVersionDetails = computed(() => {
 
 /** Показывать ли кнопку «Подробнее» и (при раскрытии) блок `dl` — для ошибок и для `ok` с отличающимся `versionRaw`. */
 const showDetailsToggle = computed(() => isError.value || hasVersionDetails.value)
+
+/**
+ * Свёрнутое по умолчанию «Подробнее» не должно пережить смену отчёта, если
+ * это может подсунуть пользователю раскрытый блок с чужим содержимым без
+ * его щелчка (ревью TL-116, #123/#124). Два повода сбросить:
+ *
+ * - `showDetailsToggle` стало `false` — кнопка и сам блок пропали; если
+ *   позже у новой строки снова появится повод (другой `versionRaw`,
+ *   очередная ошибка), блок не должен воскреснуть уже раскрытым;
+ * - `status` сменился — даже когда кнопка не исчезала (например,
+ *   `ok` → `notFound`, оба показывают «Подробнее»), это уже другое
+ *   содержимое `dl`, и его раскрытие пользователь не заказывал.
+ *
+ * Если статус тот же и кнопка не пропадала (например, `notFound` сменился
+ * на другой `notFound` с иным путём), раскрытие сохраняется — повторная
+ * проверка с тем же результатом не должна схлопывать то, что пользователь
+ * читает.
+ */
+watch(
+  () => props.result,
+  (newResult, oldResult) => {
+    const statusChanged = newResult?.status !== oldResult?.status
+    if (statusChanged || !showDetailsToggle.value) {
+      detailsOpen.value = false
+    }
+  },
+)
 
 const icon = computed(() => {
   if (isChecking.value) return '○'

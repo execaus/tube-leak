@@ -52,6 +52,18 @@ const notFoundResult: SidecarCheckResult = {
   osErrorCode: 'ENOENT',
 }
 
+/**
+ * Тот же статус `notFound`, что и `notFoundResult`, но другой отчёт (иной
+ * путь) — для проверки, что повторная проверка с тем же статусом не
+ * схлопывает уже раскрытое «Подробнее» (TL-117).
+ */
+const notFoundResultAgain: SidecarCheckResult = {
+  name: 'yt-dlp',
+  path: '/opt/tube-leak/bin/yt-dlp-renamed',
+  status: 'notFound',
+  osErrorCode: 'ENOENT',
+}
+
 const launchFailedCorruptedResult: SidecarCheckResult = {
   name: 'ffmpeg',
   path: '/opt/tube-leak/bin/ffmpeg',
@@ -349,4 +361,71 @@ describe('SidecarStatusRow', () => {
       expect(detailsButton?.attributes('aria-label')).toContain(expectedName)
     },
   )
+
+  it('orders the Ok details block as "Полная версия" then "Путь" (TL-117 regression guard)', async () => {
+    const wrapper = mount(SidecarStatusRow, {
+      props: { fallbackName: 'ffmpeg', result: okWithVersionRawResult },
+    })
+
+    await wrapper.get('button').trigger('click')
+
+    const labels = wrapper.findAll('dt').map((dt) => dt.text())
+    expect(labels).toEqual(['Полная версия', 'Путь'])
+  })
+
+  describe('resetting "Подробнее" across reports (TL-117, review TL-116)', () => {
+    it('does not reappear already open once the toggle disappears and comes back (ok with differing versionRaw -> ok with matching -> ok with differing again)', async () => {
+      const wrapper = mount(SidecarStatusRow, {
+        props: { fallbackName: 'ffmpeg', result: okWithVersionRawResult },
+      })
+
+      await wrapper.get('button').trigger('click')
+      expect(wrapper.find('dl').exists()).toBe(true)
+
+      // Совпадающий versionRaw — кнопка и блок пропадают вместе с поводом.
+      await wrapper.setProps({ result: okWithMatchingVersionRawResult })
+      expect(wrapper.find('button').exists()).toBe(false)
+      expect(wrapper.find('dl').exists()).toBe(false)
+
+      // Повод вернулся (снова отличающийся versionRaw) — блок не должен
+      // воскреснуть уже раскрытым без нового щелчка (дефект ревью TL-116).
+      await wrapper.setProps({ result: okWithVersionRawResult })
+      const detailsButton = wrapper.get('button')
+      expect(detailsButton.attributes('aria-expanded')).toBe('false')
+      expect(wrapper.find('dl').exists()).toBe(false)
+    })
+
+    it('resets on a status change even when the toggle stays visible (ok -> notFound)', async () => {
+      const wrapper = mount(SidecarStatusRow, {
+        props: { fallbackName: 'ffmpeg', result: okWithVersionRawResult },
+      })
+
+      await wrapper.get('button').trigger('click')
+      expect(wrapper.find('dl').exists()).toBe(true)
+
+      await wrapper.setProps({ result: notFoundResult })
+
+      // Кнопка никуда не делась (notFound тоже показывает «Подробнее»), но
+      // блок с содержимым другого статуса не должен быть уже раскрыт.
+      const detailsButton = wrapper.get('button')
+      expect(detailsButton.attributes('aria-expanded')).toBe('false')
+      expect(wrapper.find('dl').exists()).toBe(false)
+    })
+
+    it('keeps "Подробнее" open when a new report arrives with the same status and the toggle never disappeared', async () => {
+      const wrapper = mount(SidecarStatusRow, {
+        props: { fallbackName: 'yt-dlp', result: notFoundResult },
+      })
+
+      await wrapper.get('button').trigger('click')
+      expect(wrapper.find('dl').exists()).toBe(true)
+
+      await wrapper.setProps({ result: notFoundResultAgain })
+
+      const detailsButton = wrapper.get('button')
+      expect(detailsButton.attributes('aria-expanded')).toBe('true')
+      expect(wrapper.find('dl').exists()).toBe(true)
+      expect(wrapper.text()).toContain(notFoundResultAgain.path)
+    })
+  })
 })
