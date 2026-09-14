@@ -5171,3 +5171,241 @@ fn no_generated_title_puts_another_videos_file_under_our_prefixes() {
     }
     assert!(checks > 100_000, "корпус выродился: {checks}");
 }
+
+// ─────────── Отметка «забран» сверяется с диском (TL-105) ───────────
+
+/// Имя файла потока задачи [`request`] — рабочая основа [`BASE`], формат и
+/// расширение.
+fn stream_name(format_id: &str, extension: &str) -> String {
+    format!("{BASE}.f{format_id}.{extension}")
+}
+
+#[tokio::test]
+async fn the_same_video_in_another_quality_removes_the_shared_audio_and_the_retry_downloads_it_again(
+) {
+    // TL-105 (воспроизведение ревью TL-104). A (`133+139`) оборвалась: звук
+    // забран целиком и отмечен, видео — `.part`. B — тот же ролик в другом
+    // качестве (`134+139`, дубль разрешён E4) — принимает звук A как «уже
+    // скачан» (байты те же), доходит до `Done`, и её подчистка удаляет
+    // `f139.m4a` (решение ведущего (б): подчистка не различает принятое и
+    // скачанное). Повтор A обязан спросить звук у yt-dlp снова, а не отдать
+    // склейке файл, которого нет.
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let env = env_with(
+        Some(settings_with(data.path(), None, "{title}", 1)),
+        None,
+        Some(dir.path()),
+    );
+    let a = new_task(request(streams(Some("133"), Some("139"))));
+    let b = new_task(request(streams(Some("134"), Some("139"))));
+    let video = stream_name("133", "mp4");
+    let audio = stream_name("139", "m4a");
+
+    // ── A: звук забран, видео оборвано ──
+    let video_part = dir.path().join(format!("{video}.part"));
+    let interrupted = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::failing(1, &connection_lost_stderr())
+            .line(&destination_line(dir.path(), &video))
+            .hook(move || std::fs::write(&video_part, PARTIAL_BYTES).unwrap())
+            .line(&destination_line(dir.path(), &audio))
+            .lines(fixture_progress("video-and-audio.json", "139"))
+            .creates(&audio)],
+    );
+    let sink = RecordingSink::new();
+    super::run_task(&a, &interrupted, &ScriptedFfmpeg::merging(), &sink, &env).await;
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("A обязана оборваться: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::ConnectionLost);
+    assert_eq!(error.partial_data, PartialData::Kept);
+    assert_eq!(
+        contents(dir.path()),
+        [
+            (format!("{video}.part"), PARTIAL_BYTES.to_vec()),
+            (audio.clone(), b"stream bytes".to_vec()),
+        ]
+    );
+
+    // ── B: тот же ролик, другое качество ──
+    let other = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+    let sink = RecordingSink::new();
+    super::run_task(&b, &other, &ScriptedFfmpeg::merging(), &sink, &env).await;
+    let call = &other.calls()[0];
+    assert_eq!(call.value_of("-f"), Some("134,139"));
+    assert!(
+        call.lines[1].ends_with(&format!("{audio} has already been downloaded")),
+        "B принимает звук A как свой: {:?}",
+        call.lines
+    );
+    assert!(
+        matches!(sink.last(), DownloadProgress::Done { .. }),
+        "{:?}",
+        sink.last()
+    );
+    assert_eq!(
+        dir_listing(dir.path()),
+        ["Big Buck Bunny.mp4".to_string(), format!("{video}.part")],
+        "подчистка B удалила общий звук, `.part` видео A не тронут"
+    );
+
+    // ── Повтор A ──
+    a.set_progress(DownloadProgress::Queued);
+    let retry = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let sink = RecordingSink::new();
+    super::run_task(&a, &retry, &ffmpeg, &sink, &env).await;
+
+    assert_eq!(
+        retry.formats_asked(),
+        ["133,139"],
+        "звука на диске нет — повтор спрашивает его снова"
+    );
+    let call = &retry.calls()[0];
+    assert!(
+        call.lines[1].starts_with("[download] Destination: ") && call.lines[1].ends_with(&audio),
+        "звук качается заново: {:?}",
+        call.lines
+    );
+    assert_eq!(ffmpeg.calls(), 1);
+    assert_eq!(ffmpeg.last_input_names(), (video.clone(), audio.clone()));
+    assert_eq!(
+        ffmpeg.last_input_bytes(),
+        (PARTIAL_BYTES.to_vec(), b"stream bytes".to_vec()),
+        "в склейку ушли докачанное видео A и заново скачанный звук"
+    );
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: "Big Buck Bunny (2).mp4".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
+        }
+    );
+    assert_eq!(
+        dir_listing(dir.path()),
+        ["Big Buck Bunny (2).mp4", "Big Buck Bunny.mp4"]
+    );
+}
+
+#[tokio::test]
+async fn a_stream_marked_done_whose_file_the_user_deleted_is_downloaded_again_on_retry() {
+    // TL-105. Оба потока забраны, склейка отказала (`mergeFailed`, частичное
+    // сохранено). Пользователь почистил папку — звука больше нет. Повтор
+    // обязан скачать звук заново, а не склеивать отсутствующий файл.
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let sink = RecordingSink::new();
+    let video = stream_name("133", "mp4");
+    let audio = stream_name("139", "m4a");
+
+    let first = ScriptedLauncher::new(dir.path(), two_stream_scripts(dir.path()));
+    run_task(&task, &first, &ScriptedFfmpeg::failing(), &sink, dir.path()).await;
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("склейка обязана отказать: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::MergeFailed);
+    assert_eq!(dir_listing(dir.path()), [video.clone(), audio.clone()]);
+    let video_bytes = std::fs::read(dir.path().join(&video)).unwrap();
+
+    std::fs::remove_file(dir.path().join(&audio)).unwrap();
+
+    task.set_progress(DownloadProgress::Queued);
+    let retry = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+    let ffmpeg = ScriptedFfmpeg::merging();
+    run_task(&task, &retry, &ffmpeg, &sink, dir.path()).await;
+
+    assert_eq!(retry.formats_asked(), ["139"], "видео на месте, звука нет");
+    assert_eq!(ffmpeg.calls(), 1);
+    assert_eq!(
+        ffmpeg.last_input_bytes(),
+        (video_bytes, b"stream bytes".to_vec()),
+        "в склейку ушли лежавшее видео и заново скачанный звук"
+    );
+    assert!(
+        matches!(sink.last(), DownloadProgress::Done { .. }),
+        "{:?}",
+        sink.last()
+    );
+    assert_eq!(dir_listing(dir.path()), ["Big Buck Bunny.mp4"]);
+}
+
+#[tokio::test]
+async fn a_stream_file_gone_between_the_download_and_the_merge_is_not_merged_and_the_retry_downloads_it(
+) {
+    // TL-105, вторая проверка — перед склейкой. Видео забрано прошлым
+    // стартом и на его начале лежит на месте; пока идёт докачка звука, файл
+    // видео удаляют. Склейка отсутствующего файла не запускается, отказ
+    // сохраняет частичное, а следующий повтор спрашивает видео снова.
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let env = env_with(
+        Some(settings_with(data.path(), None, "{title}", 1)),
+        None,
+        Some(dir.path()),
+    );
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let video = stream_name("133", "mp4");
+    let audio = stream_name("139", "m4a");
+
+    let interrupted = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::failing(1, &connection_lost_stderr())
+            .line(&destination_line(dir.path(), &video))
+            .lines(fixture_progress("video-and-audio.json", "133"))
+            .creates(&video)
+            .line(&destination_line(dir.path(), &audio))],
+    );
+    let sink = RecordingSink::new();
+    super::run_task(&task, &interrupted, &ScriptedFfmpeg::merging(), &sink, &env).await;
+    assert!(
+        matches!(&sink.last(), DownloadProgress::Failed { error } if error.kind == DownloadErrorKind::ConnectionLost),
+        "{:?}",
+        sink.last()
+    );
+
+    task.set_progress(DownloadProgress::Queued);
+    let video_path = dir.path().join(&video);
+    let during = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::ok()
+            .hook(move || std::fs::remove_file(&video_path).unwrap())
+            .emulate()],
+    );
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let sink = RecordingSink::new();
+    super::run_task(&task, &during, &ffmpeg, &sink, &env).await;
+
+    assert_eq!(during.formats_asked(), ["139"], "на старте видео лежало");
+    assert_eq!(
+        ffmpeg.calls(),
+        0,
+        "склейка отсутствующего файла не запускается"
+    );
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("склеивать нечего — отказ: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::MergeFailed);
+    assert_eq!(error.partial_data, PartialData::Kept);
+    assert!(error.retryable);
+
+    task.set_progress(DownloadProgress::Queued);
+    let retry = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let sink = RecordingSink::new();
+    super::run_task(&task, &retry, &ffmpeg, &sink, &env).await;
+
+    assert_eq!(retry.formats_asked(), ["133"], "видео спрашивается снова");
+    assert_eq!(ffmpeg.last_input_names(), (video.clone(), audio.clone()));
+    assert_eq!(
+        ffmpeg.last_input_bytes(),
+        (b"stream bytes".to_vec(), b"stream bytes".to_vec()),
+        "оба входа склейки лежат на диске"
+    );
+    assert!(
+        matches!(sink.last(), DownloadProgress::Done { .. }),
+        "{:?}",
+        sink.last()
+    );
+    assert_eq!(dir_listing(dir.path()), ["Big Buck Bunny.mp4"]);
+}
