@@ -1154,14 +1154,162 @@ fn a_format_id_that_is_not_one_is_refused_whole() {
         "137;rm -rf /", // попытка из другого мира
         "",             // пустой
         "a".repeat(MAX_FORMAT_ID_BYTES + 1).as_str(),
+        "1".repeat(MAX_FORMAT_ID_BYTES + 1).as_str(),
         ".hidden", // имя частичного файла стало бы скрытым
+        "137,140", // запятую ставит только format_selector
+        "137/140", // альтернатива селектора
+        // Формы, которых нет ни в одной фикстуре (TL-97): белый список
+        // формы, а не алфавита.
+        "hls-1080p",
+        "616_2",
+        "sb.0",
+        "sb",
+        "sb-1",
+        "140-",
+        "-140",
+        "140-drc-1",
+        "140-DRC",
+        "١٤٠", // цифры, но не ASCII
     ] {
         assert!(!usable_format_id(id), "«{id}» не идентификатор формата");
     }
 
-    for id in ["137", "140-drc", "hls-1080", "616_2", "sb.0"] {
+    for id in ["18", "137", "140-drc", "251-21", "sb0", "sb3"] {
         assert!(usable_format_id(id), "«{id}» — настоящий идентификатор");
     }
+}
+
+#[test]
+fn a_selector_word_is_not_a_format_id() {
+    // TL-97. Слова, которые yt-dlp в `-f` читает как селектор, а не как
+    // идентификатор: снято вложенным пином 2026.08.19 офлайн
+    // (`--load-info-json`, мёртвый прокси, `sandbox-exec` без сети) —
+    // формат с идентификатором, равным слову, по `-f <слово>` не выбран:
+    // yt-dlp взял другой формат или ответил `Requested format is not
+    // available`. `--help` этих слов не перечисляет (отсылает к разделу
+    // FORMAT SELECTION), источник кандидатов — регулярное выражение
+    // `(?P<bw>best|worst|b|w)(?P<type>video|audio|v|a)?` из байткода
+    // `yt_dlp.YoutubeDL` и списки контейнеров `--help`. Все слова ниже
+    // проходили прежнюю проверку алфавита. Не селекторы по тому же замеру
+    // (`aac`, `vorbis`, `gif`, `wma`, `srt`) отвергаются формой, но сюда не
+    // внесены: список — про то, что опасно, а не про всё, что не число.
+    const SELECTOR_WORDS: &[&str] = &[
+        // лучший/худший
+        "best",
+        "worst",
+        "b",
+        "w",
+        "bestvideo",
+        "bestaudio",
+        "worstvideo",
+        "worstaudio",
+        "bv",
+        "ba",
+        "wv",
+        "wa",
+        // все форматы
+        "all",
+        "mergeall",
+        // фильтр по расширению
+        "mp4",
+        "webm",
+        "m4a",
+        "mp3",
+        "ogg",
+        "flac",
+        "opus",
+        "wav",
+        "alac",
+        "3gp",
+        "flv",
+        "mhtml",
+        "mkv",
+        "mov",
+        "avi",
+        "aiff",
+        "mka",
+    ];
+    for &word in SELECTOR_WORDS {
+        assert!(
+            !usable_format_id(word),
+            "«{word}» — слово селектора yt-dlp: скачался бы не выбранный формат"
+        );
+        assert!(
+            build_task(
+                "dl-слово".to_string(),
+                request(streams(Some(word), Some("140")))
+            )
+            .is_err(),
+            "«{word}» дошло бы до -f"
+        );
+    }
+}
+
+#[test]
+fn every_format_id_from_the_fixtures_is_usable() {
+    // TL-97: белый список формы описан по фикстурам — значит каждая форма,
+    // которую YouTube отдал в снятых метаданных и в снятых запусках,
+    // обязана проходить. Каталог разбора читается целиком, без списка
+    // имён: новая фикстура с новой формой уронит этот тест сама.
+    let probe_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ytdlp-probe");
+    let mut names: Vec<String> = std::fs::read_dir(&probe_dir)
+        .expect("каталог фикстур разбора")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".json"))
+        .collect();
+    names.sort();
+    assert!(names.len() >= 7, "фикстуры разбора не найдены: {names:?}");
+
+    let mut seen = BTreeSet::new();
+    for name in &names {
+        let metadata = fixtures::probe_metadata(name);
+        let formats = metadata["formats"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name}: нет массива formats"));
+        for format in formats {
+            let id = format["format_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}: format_id не строка"));
+            seen.insert(id.to_string());
+        }
+    }
+    let launches = SINGLE_LAUNCH_FIXTURES
+        .iter()
+        .map(|name| fixtures::single_launch(name).stdout);
+    let progress = fixtures::PROGRESS_FIXTURES
+        .iter()
+        .map(|name| fixtures::stdout(name));
+    for stdout in launches.chain(progress) {
+        for line in stdout.lines() {
+            match parse_line(line) {
+                StdoutLine::Progress(sample) => {
+                    seen.insert(sample.format_id.to_string());
+                }
+                StdoutLine::SelectedFormats { format_ids } => {
+                    // `133+139` у прежнего набора `progress/` — селектор
+                    // с плюсом, а не идентификатор: он в перечне потому,
+                    // что тот запуск склеивал чужим постпроцессором.
+                    seen.extend(
+                        format_ids
+                            .into_iter()
+                            .filter(|id| !id.contains('+'))
+                            .map(str::to_string),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for form in ["137", "140-drc", "251-21", "sb0"] {
+        assert!(seen.contains(form), "в фикстурах нет формы «{form}»");
+    }
+    let refused: Vec<&String> = seen.iter().filter(|id| !usable_format_id(id)).collect();
+    assert!(
+        refused.is_empty(),
+        "идентификаторы из фикстур отвергнуты: {refused:?}"
+    );
 }
 
 #[test]
@@ -2146,6 +2294,124 @@ async fn a_format_that_fell_out_of_the_selection_of_an_interrupted_launch_is_sta
     assert_eq!(dir_listing(dir.path()), Vec::<String>::new());
 }
 
+/// Сценарий снятого запуска без строки перечня `[info] … Downloading N
+/// format(s)` — так выглядел бы вывод yt-dlp, сменившего её текст (TL-97).
+///
+/// Всё прочее — строки, код, stderr, файлы — как в [`launch_script`]; из
+/// сценария вырезана ровно одна строка, и это проверяется.
+fn launch_script_without_format_list(name: &str, dir: &Path) -> Script {
+    let mut script = launch_script(name, dir);
+    let before = script.steps.len();
+    script.steps.retain(|step| {
+        !matches!(step, Step::Line(line)
+            if matches!(parse_line(line), StdoutLine::SelectedFormats { .. }))
+    });
+    assert_eq!(
+        before - script.steps.len(),
+        1,
+        "{name}: из сценария обязана уйти ровно одна строка перечня"
+    );
+    script
+}
+
+#[tokio::test]
+async fn lost_format_list_with_a_stream_left_without_file_is_not_a_merge_failure() {
+    // TL-97: `one-format-missing.json` без строки перечня. yt-dlp выбрал
+    // только 133, скачал его и вышел с кодом 0 — а сказать, что 139 выпал,
+    // приложению нечем. Прежде это молча уходило в `mergeFailed` с текстом
+    // «оба потока скачались», хотя второго потока нет.
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![launch_script_without_format_list(
+            "one-format-missing.json",
+            dir.path(),
+        )],
+    );
+
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
+
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("второго потока нет — отказ: {:?}", sink.last());
+    };
+    assert_ne!(
+        error.kind,
+        DownloadErrorKind::MergeFailed,
+        "«оба потока скачались» — ложь: файла звука нет"
+    );
+    assert_eq!(error.kind, DownloadErrorKind::YtDlpFailure);
+    assert_eq!(
+        error.reason,
+        Some(YtDlpFailureReason::Generic),
+        "устарел не yt-dlp, а разбор его вывода"
+    );
+    assert!(
+        error.retryable,
+        "выпадение не доказано — повтор разрешён, он и докажет"
+    );
+    assert_eq!(
+        error.partial_data,
+        PartialData::Kept,
+        "скачанное видео не удаляется по догадке"
+    );
+    assert_eq!(
+        dir_listing(dir.path()),
+        ["aqz-KE-bpKQ.Big Buck Bunny.f133.mp4"]
+    );
+    assert_eq!(launcher.calls().len(), 1);
+    assert_eq!(ffmpeg.calls(), 0, "склейки не было");
+
+    // Повтор заказывает один незабранный формат, и выпадение yt-dlp
+    // называет сам — кодом 1 (снятый stderr `outcomes/stale-format.json`).
+    task.set_progress(DownloadProgress::Queued);
+    let retry = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::failing(
+            1,
+            &fixtures::outcome("stale-format.json").stderr,
+        )],
+    );
+    run_task(&task, &retry, &ffmpeg, &sink, dir.path()).await;
+
+    assert_eq!(retry.formats_asked(), ["139"], "видео не качается заново");
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("формата нет — отказ: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::StaleFormat);
+}
+
+#[tokio::test]
+async fn lost_format_list_does_not_break_a_download_that_named_every_file() {
+    // Обратная сторона TL-97: сменившийся текст строки не должен ломать
+    // загрузку, которая доказала себя без перечня — оба файла названы,
+    // оба `finished`, код 0. yt-dlp обновляется отдельным контуром (E6), и
+    // отказ здесь ломал бы каждую загрузку до выпуска приложения.
+    let dir = tempfile::tempdir().unwrap();
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+
+    run_two_streams(
+        &dir,
+        &sink,
+        vec![launch_script_without_format_list(
+            "video-and-audio.json",
+            dir.path(),
+        )],
+        &ffmpeg,
+    )
+    .await;
+
+    assert!(
+        matches!(sink.last(), DownloadProgress::Done { .. }),
+        "{:?}",
+        sink.last()
+    );
+    assert_eq!(ffmpeg.calls(), 1);
+}
+
 #[tokio::test]
 async fn a_selected_stream_whose_file_was_never_named_is_asked_for_again() {
     // Прежняя ветка, названная честно: перечень называет оба формата, код 0,
@@ -2251,6 +2517,32 @@ async fn a_failure_that_removes_the_streams_also_forgets_that_they_were_done() {
 
     assert_eq!(second.formats_asked(), ["133,139"]);
     assert!(matches!(sink.last(), DownloadProgress::Done { .. }));
+}
+
+#[test]
+fn every_single_launch_fixture_carries_the_format_list() {
+    // TL-97, пункт README набора: сторож выпавшего формата (Р-1 ревью
+    // TL-48) держится на строке `[info] … Downloading N format(s)`. Новый пин
+    // yt-dlp, сменивший её текст, даст пересъёмку, где разбор этой строки не
+    // находит, — и краснеть обязан этот тест, а не пользователь.
+    for name in SINGLE_LAUNCH_FIXTURES {
+        let launch = fixtures::single_launch(name);
+        let lists: Vec<Vec<&str>> = launch
+            .stdout
+            .lines()
+            .filter_map(|line| match parse_line(line) {
+                StdoutLine::SelectedFormats { format_ids } => Some(format_ids),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lists.len(),
+            1,
+            "single-launch/{name}: строки перечня выбранных форматов нет или она не одна — \
+             разбор разошёлся с выводом пина {} (README набора)",
+            launch.capture.yt_dlp_version
+        );
+    }
 }
 
 #[test]

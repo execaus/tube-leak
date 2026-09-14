@@ -132,3 +132,15 @@ id ролика съёмки перед основой съёмки обязан
 Смена пина или шаблона роняет
 `fixtures_are_the_output_of_this_template_and_of_the_pinned_yt_dlp`, смена
 аргументов запуска — `the_single_launch_fixtures_were_shot_with_the_arguments_of_the_app`.
+
+**При смене пина пересъёмка обязана содержать строку перечня**
+`[info] <id>: Downloading N format(s): a, b` — ровно одну в каждой
+фикстуре, в той форме, которую понимает разбор (`selected_formats` в
+`src/download/progress.rs`). На ней стоит сторож выпавшего формата (Р-1
+ревью TL-48): без неё выпадение формата из выбора не отличить от прочих
+потерь потока. Если новый yt-dlp сменил текст строки, переснятый набор её
+не разберёт, и краснеет `every_single_launch_fixture_carries_the_format_list`
+в `src/download/orchestrate_tests.rs`. Чинить разбор под новый текст, а не
+тест: приложение с прежним разбором на таком yt-dlp отвечает
+`ytDlpFailure` там, где формат выпал, — честно, но без `staleFormat`
+(TL-97, `lost_format_list_*` в тех же тестах).
