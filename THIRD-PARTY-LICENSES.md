@@ -846,6 +846,29 @@ For more information, please refer to <http://unlicense.org/>
 `rusqlite` и `libsqlite3-sys` распространяются под MIT,
 `fallible-iterator` и `fallible-streaming-iterator` — под MIT/Apache-2.0.
 
+## Системный диалог выбора папки — `tauri-plugin-dialog` 2.7.3
+
+Выбор папки назначения (TL-84) показывает родной диалог операционной
+системы через плагин Tauri. Rust-крейты плагина статически линкуются в
+исполняемый файл приложения. Все они пермиссивные и указания авторства
+сверх самих пакетов не требуют. Запись перечисляет, что физически попадает
+в бинарник, и под какой лицензией:
+
+- `tauri-plugin-dialog` 2.7.3 — Apache-2.0 OR MIT;
+- `rfd` 0.16.0 (реализация диалогов на трёх платформах) — MIT;
+- `tauri-plugin-fs` 2.5.2 (приходит транзитивно, в приложении не
+  зарегистрирован) — Apache-2.0 OR MIT;
+- только в сборке под Windows: `windows-sys` 0.60.2, `windows-targets`
+  0.53.5 и `windows_x86_64_msvc` 0.53.1 — MIT OR Apache-2.0.
+
+`tauri-plugin` 2.6.3 (Apache-2.0 OR MIT) — build-зависимость плагина. Она
+выполняется при сборке и в дистрибутив не попадает. Системные библиотеки
+диалогов (AppKit на macOS, GTK на Linux, Common Controls на Windows)
+принадлежат операционной системе и вместе с приложением не поставляются.
+
+npm-часть плагина, `@tauri-apps/plugin-dialog` 2.7.3 (MIT OR Apache-2.0),
+указана в разделе ниже.
+
 ## Прочие зависимости (Rust-крейты и npm-пакеты)
 
 Остальной код приложения (Rust-крейты `tauri`, `serde`, `thiserror`,

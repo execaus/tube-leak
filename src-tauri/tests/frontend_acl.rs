@@ -24,7 +24,8 @@
 //!
 //! Ловит: новую подписку или новый вызов Tauri API во фронтенде без
 //! выданного разрешения — в любой форме импорта, включая корневую
-//! `from '@tauri-apps/api'` и `import * as`; вызов плагина по
+//! `from '@tauri-apps/api'` и `import * as`; импорт из npm-пакета
+//! официального плагина (`@tauri-apps/plugin-*`), см. ниже; вызов плагина по
 //! литеральному имени; вызов метода объекта окна, за которым нет
 //! разрешения; разрешение, за которым нет вызова; capability,
 //! открытую наружу (`remote`) или привязанную к окнам по glob;
@@ -58,6 +59,24 @@
 //! разобрать однозначно, — это падение с объяснением, а не пропуск.
 //! Скан файлов устроен так же: сканируется всё, кроме заведомо
 //! неисполняемых расширений.
+//!
+//! # Пакеты плагинов — отдельная ось, и до TL-84 её не было
+//!
+//! Скан импортов искал только `@tauri-apps/api`. Импорт
+//! `open` из `@tauri-apps/plugin-dialog` (TL-94) под него не попадал: вызов
+//! `plugin:dialog|open` сторож не видел, и тесты оставались зелёными при
+//! незарегистрированном плагине и capability без разрешения. На собранном
+//! приложении это дефект TL-24: отказ ACL вместо диалога. Показано
+//! прогоном, а не чтением. После выдачи `dialog:allow-open` прежний тест
+//! упал на проверке *избытка*: «разрешено `plugin:dialog|open`, а вызова
+//! нет». Вызов при этом был.
+//!
+//! Теперь импорты из `@tauri-apps/plugin-*` разбираются так же строго,
+//! как из `@tauri-apps/api`: неизвестный пакет или привязка — падение
+//! (`plugin_commands_of`). Разрешения плагинов, кроме того, сверяются
+//! с белым списком решений `PLUGIN_PERMISSIONS` поимённо. Появление
+//! вызова во фронтенде не расширяет его само: `save()` из того же пакета —
+//! падение, а не повод выдать `dialog:allow-save`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -408,6 +427,110 @@ fn parse_literal_plugin_commands(content: &str) -> Vec<String> {
     found
 }
 
+/// Префикс npm-пакетов официальных плагинов Tauri (`@tauri-apps/plugin-dialog`).
+///
+/// Скан отдельный от [`PACKAGE`]: у `@tauri-apps/api` имя модуля стоит после
+/// слеша, а у плагина оно часть имени пакета. Поиск по `@tauri-apps/api`
+/// таких импортов не видит вовсе (doc модуля, TL-84).
+const PLUGIN_PACKAGE_PREFIX: &str = "@tauri-apps/plugin-";
+
+/// Единственная команда плагина диалога, выданная фронтенду (Р-3 эпика E5).
+const DIALOG_OPEN: &str = "plugin:dialog|open";
+
+/// Что вызывает по IPC привязка из npm-пакета плагина.
+///
+/// `None` означает, что пакет или привязка неизвестны, и это падение, как у
+/// [`ipc_commands_of`]. Состав сверен с
+/// `node_modules/@tauri-apps/plugin-dialog/dist-js/index.js` версии 2.7.3:
+/// `open` делает ровно один `invoke('plugin:dialog|open')`. `save`,
+/// `message`, `ask` и `confirm` здесь отсутствуют намеренно. Их разрешения
+/// не выданы решением Р-3, поэтому импорт должен падать, а не превращаться
+/// в требование выдать ещё одно разрешение.
+fn plugin_commands_of(plugin: &str, binding: &str) -> Option<&'static [&'static str]> {
+    match (plugin, binding) {
+        ("dialog", "open") => Some(&[DIALOG_OPEN]),
+        _ => None,
+    }
+}
+
+/// Разобранный импорт из npm-пакета плагина.
+#[derive(Debug, PartialEq)]
+struct PluginImport {
+    /// Имя плагина из имени пакета: `dialog` для `@tauri-apps/plugin-dialog`.
+    plugin: String,
+    /// `Err` — привязки не разобраны. Как и у [`ApiImport`], это падение.
+    bindings: Result<Vec<String>, &'static str>,
+}
+
+/// Импорты из `@tauri-apps/plugin-*`.
+///
+/// Разбор идёт по тексту без комментариев. Упоминание пакета в прозе не
+/// импорт: `SettingsScreen.vue` называет `@tauri-apps/plugin-dialog` в
+/// doc-блоке. Всё, что осталось в коде, обязано быть оператором
+/// `import … from '<пакет>'` или `export … from '<пакет>'`. Иначе `Err`, а
+/// не пропуск: динамический `import('…')`, импорт ради побочного эффекта,
+/// подпуть пакета, спецификатор в обратных кавычках. Какие команды стоят за
+/// ними, статически не видно.
+///
+/// Вырезать комментарии здесь безопасно в нужную сторону. Настоящий
+/// оператор импорта в комментарий не попадает. Если разбор строк собьётся
+/// на апострофе из текста шаблона, комментарий останется в тексте, а
+/// упоминание в нём даст падение, но не пропуск.
+fn parse_plugin_imports(content: &str) -> Vec<PluginImport> {
+    let code = strip_comments(content);
+    let mut imports = Vec::new();
+
+    for (idx, _) in code.match_indices(PLUGIN_PACKAGE_PREFIX) {
+        let rest = &code[idx + PLUGIN_PACKAGE_PREFIX.len()..];
+        let plugin: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        let after = &rest[plugin.len()..];
+
+        let bindings = match code[..idx].chars().next_back() {
+            Some(quote @ ('\'' | '"')) => {
+                // Кавычка — один байт, срез по ней безопасен.
+                let head = code[..idx - 1].trim_end();
+                if !after.starts_with(quote) {
+                    Err(
+                        "импортируется подпуть пакета плагина: какие команды за ним \
+                         стоят, статически не видно",
+                    )
+                } else if rfind_token(head, "from").is_none_or(|at| at + "from".len() != head.len())
+                {
+                    Err("спецификатор пакета плагина стоит не после `from`. Это \
+                         динамический импорт, импорт ради побочного эффекта или \
+                         передача имени пакета в функцию: какие команды за ним \
+                         стоят, статически не видно")
+                } else {
+                    match rfind_token(head, "import")
+                        .into_iter()
+                        .chain(rfind_token(head, "export"))
+                        .max()
+                    {
+                        None => Err("перед `from` нет оператора import/export"),
+                        Some(start) => {
+                            let stmt = &head[start..];
+                            if stmt.starts_with("import type") || stmt.starts_with("export type") {
+                                Ok(Vec::new())
+                            } else {
+                                parse_bindings(stmt)
+                            }
+                        }
+                    }
+                }
+            }
+            _ => Err("пакет плагина упомянут в коде, но не как строковый \
+                      спецификатор импорта"),
+        };
+
+        imports.push(PluginImport { plugin, bindings });
+    }
+
+    imports
+}
+
 /// Обращение к члену объекта сразу за выражением.
 ///
 /// `Some(Some("m"))` — вызов метода `.m(…)` (и `?.m(…)`), `Some(None)` —
@@ -633,6 +756,38 @@ fn frontend_ipc_commands() -> BTreeMap<String, BTreeSet<String>> {
                         "{shown}: {specifier}.{binding} — неизвестная привязка. \
                          Добавь её в `ipc_commands_of` (и, если она делает IPC, \
                          выдай разрешение в src-tauri/capabilities/).",
+                    )),
+                }
+            }
+        }
+
+        for import in parse_plugin_imports(&content) {
+            let package = format!("{PLUGIN_PACKAGE_PREFIX}{}", import.plugin);
+            let bindings = match import.bindings {
+                Ok(bindings) => bindings,
+                Err(reason) => {
+                    unknown.push(format!("{shown}: импорт {package} — {reason}."));
+                    continue;
+                }
+            };
+            for binding in bindings {
+                match plugin_commands_of(&import.plugin, &binding) {
+                    Some(cmds) => {
+                        for cmd in cmds {
+                            commands
+                                .entry((*cmd).to_string())
+                                .or_default()
+                                .insert(format!("{shown}: {package}.{binding}"));
+                        }
+                    }
+                    None => unknown.push(format!(
+                        "{shown}: {package}.{binding} — привязка плагина, о которой \
+                         проверка ACL ничего не знает. Разрешения плагинов выдаются \
+                         решением, а не выводятся из кода. Сверь состав команд по \
+                         node_modules/{package}/dist-js/index.js и добавь строку в \
+                         `plugin_commands_of`. Разрешение добавь в `PLUGIN_PERMISSIONS` \
+                         и в src-tauri/capabilities/ — только вместе с решением, которое \
+                         его выдаёт (для диалога это Р-3 эпика E5).",
                     )),
                 }
             }
@@ -1939,4 +2094,281 @@ fn the_event_permission_still_carries_no_scope_of_its_own() {
             .is_none_or(serde_json::Value::is_null),
         "у разрешения allow-listen появился собственный scope — см. выше"
     );
+}
+
+// ───────────────────── разрешения плагинов (TL-84) ─────────────────────
+//
+// Проверка избытка выше сверяет разрешённое с вызываемым. Для core-команд
+// этого достаточно, для плагинов — нет: решение Р-3 эпика E5 выдаёт из
+// плагина диалога ровно `open`. Появись во фронтенде `save()`, проверка
+// избытка сама по себе требование бы только расширила. Поэтому разрешения
+// плагинов держит белый список по идентификатору, а привязки, которых в
+// нём нет, роняет `plugin_commands_of`.
+
+/// Разрешения плагинов, выданные решениями, — поимённо.
+///
+/// `dialog:allow-open` — Р-3 эпика E5 (TL-84). Любое другое разрешение не из
+/// `core:` появляется здесь только вместе с решением, которое его выдаёт:
+/// `dialog:default` (это ещё `save` и `message`), `dialog:allow-save`,
+/// любое `fs:*`. `tauri-plugin-fs` приходит с диалогом транзитивно, и его
+/// команды фронтенду не выдаются.
+const PLUGIN_PERMISSIONS: &[&str] = &["dialog:allow-open"];
+
+/// Идентификаторы разрешений capability, не принадлежащие `core:`.
+///
+/// Запись бывает строкой или объектом с `identifier` (так записан scope
+/// каналов у `core:event:allow-listen`). Любая третья форма — падение, а не
+/// пропуск: пропущенная запись была бы разрешением, которого сторож не
+/// видит.
+fn plugin_permission_identifiers(capability: &serde_json::Value, whence: &str) -> BTreeSet<String> {
+    let entries = capability["permissions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{whence}: у capability нет массива permissions"));
+    entries
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .or_else(|| entry["identifier"].as_str())
+                .unwrap_or_else(|| panic!("{whence}: запись разрешения неизвестной формы: {entry}"))
+        })
+        .filter(|identifier| !identifier.starts_with("core:"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Разрешения плагинов в capability — ровно белый список, не больше и не меньше.
+///
+/// Сверяются оба файла: исходный `capabilities/main.json` и
+/// сгенерированный `gen/schemas/capabilities.json`. В приложение уезжает
+/// второй, а в нём могут оказаться и другие capability-файлы каталога.
+#[test]
+fn plugin_permissions_are_exactly_the_decided_whitelist() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let expected: BTreeSet<String> = PLUGIN_PERMISSIONS
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect();
+
+    let source: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(manifest_dir.join("capabilities/main.json"))
+            .expect("capabilities/main.json читается"),
+    )
+    .expect("capabilities/main.json — валидный JSON");
+    let generated: BTreeMap<String, serde_json::Value> = serde_json::from_str(
+        &fs::read_to_string(manifest_dir.join("gen/schemas/capabilities.json"))
+            .expect("gen/schemas/capabilities.json читается"),
+    )
+    .expect("capabilities.json — валидный JSON");
+
+    let declared = plugin_permission_identifiers(&source, "capabilities/main.json");
+    let shipped: BTreeSet<String> = generated
+        .iter()
+        .flat_map(|(id, capability)| plugin_permission_identifiers(capability, id))
+        .collect();
+
+    for (whence, actual) in [
+        ("capabilities/main.json", &declared),
+        ("gen/schemas/capabilities.json", &shipped),
+    ] {
+        let extra: Vec<&String> = actual.difference(&expected).collect();
+        let missing: Vec<&String> = expected.difference(actual).collect();
+        assert!(
+            extra.is_empty() && missing.is_empty(),
+            "{whence}: разрешения плагинов разошлись с белым списком \
+             `PLUGIN_PERMISSIONS`. Лишние: {extra:?}; недостающие: {missing:?}.\n\
+             Из плагина диалога выдан только `dialog:allow-open` (Р-3 эпика E5); \
+             `fs:*` не выдаётся вовсе. Лишнее разрешение появляется только вместе \
+             с решением, недостающее означает отказ ACL вместо диалога на \
+             собранном приложении (TL-24)."
+        );
+    }
+}
+
+/// Настоящая резолюция ACL: диалог открывается, всё прочее из `dialog` и `fs` — нет.
+///
+/// Белый список выше проверяет форму capability. Здесь проверяется то, что
+/// из неё собрал `tauri-build`: `dialog:allow-open` не протащил за собой
+/// соседние команды, а команды `fs` недоступны. Имена `fs` проверяются
+/// явным списком, независимо от манифестов. Если однажды `tauri-plugin-fs`
+/// станет прямой зависимостью, его манифест появится, и прямой список
+/// останется в силе.
+#[test]
+fn the_acl_opens_the_folder_dialog_and_nothing_else_from_dialog_or_fs() {
+    let labels = configured_window_labels();
+    let plugin_commands = all_plugin_commands();
+    for neighbour in ["plugin:dialog|save", "plugin:dialog|message"] {
+        assert!(
+            plugin_commands.contains(neighbour),
+            "в ACL-манифесте диалога нет {neighbour}: проверка соседних команд \
+             ниже прошла бы вхолостую — плагин переименовал команды или \
+             перестал собираться в манифесты"
+        );
+    }
+
+    let fs_probes = [
+        "plugin:fs|read_file",
+        "plugin:fs|read_text_file",
+        "plugin:fs|write_file",
+        "plugin:fs|write_text_file",
+        "plugin:fs|read_dir",
+        "plugin:fs|mkdir",
+        "plugin:fs|remove",
+        "plugin:fs|rename",
+        "plugin:fs|copy_file",
+        "plugin:fs|exists",
+        "plugin:fs|stat",
+    ];
+
+    let mut context = app_context();
+    let authority = context.runtime_authority_mut();
+    let mut wrong = Vec::new();
+    for label in &labels {
+        if authority
+            .resolve_access(DIALOG_OPEN, label, label, &Origin::Local)
+            .is_none()
+        {
+            wrong.push(format!(
+                "{DIALOG_OPEN} запрещена для окна «{label}» — выбор папки откажет"
+            ));
+        }
+        let forbidden = plugin_commands
+            .iter()
+            .map(String::as_str)
+            .filter(|c| c.starts_with("plugin:dialog|") || c.starts_with("plugin:fs|"))
+            .filter(|c| *c != DIALOG_OPEN)
+            .chain(fs_probes);
+        for command in forbidden {
+            if authority
+                .resolve_access(command, label, label, &Origin::Local)
+                .is_some()
+            {
+                wrong.push(format!("{command} разрешена для окна «{label}»"));
+            }
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "ACL разошлась с решением Р-3 эпика E5 (из плагинов — только \
+         `dialog:allow-open`):\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// Растяжка под утверждением `Cargo.toml`: у `fs` нет своего ACL-манифеста.
+///
+/// `tauri-plugin-fs` в графе есть, но только транзитивно, через диалог.
+/// `tauri-build` собирает манифесты прямых зависимостей, поэтому сейчас
+/// разрешение `fs:*` в capability ломает сборку, а не выдаётся. Появление
+/// манифеста значит, что fs стал прямой зависимостью. С этого момента
+/// разрешения `fs:*` выдаваемы, и держит их только белый список выше. Это
+/// повод пересмотреть решение осознанно, а не узнать о нём потом.
+#[test]
+fn the_transitive_fs_plugin_still_has_no_acl_manifest_of_its_own() {
+    let manifests = acl_manifests();
+    assert!(
+        manifests.contains_key("dialog"),
+        "ACL-манифеста dialog нет — плагин не собран в манифесты, и \
+         проверка ниже ничего не значит"
+    );
+    assert!(
+        !manifests.contains_key("fs"),
+        "у tauri-plugin-fs появился собственный ACL-манифест: плагин стал \
+         прямой зависимостью, и разрешения `fs:*` теперь можно выдать \
+         capability. Сверь с Р-3 эпика E5 и комментарием у tauri-plugin-dialog \
+         в Cargo.toml."
+    );
+}
+
+/// Канарейка: скан видит вызов диалога, который во фронтенде точно есть.
+///
+/// Без неё новая ось скана вырождается молча — ровно так, как она
+/// отсутствовала до TL-84, при зелёных тестах.
+#[test]
+fn the_scan_still_finds_the_folder_dialog_the_settings_screen_opens() {
+    let commands = frontend_ipc_commands();
+    let sources = commands.get(DIALOG_OPEN).unwrap_or_else(|| {
+        panic!(
+            "скан исходников фронтенда не нашёл {DIALOG_OPEN}, хотя \
+             src/composables/usePickFolder.ts импортирует `open` из \
+             @tauri-apps/plugin-dialog. Либо сломан разбор импортов плагинов, \
+             либо вызова не стало — тогда и разрешение пора забрать."
+        )
+    });
+    assert!(
+        sources.iter().any(|s| s.contains("usePickFolder.ts")),
+        "{DIALOG_OPEN} найдена, но не в usePickFolder.ts: {sources:?}"
+    );
+}
+
+#[test]
+fn plugin_imports_are_parsed_down_to_the_bindings_that_do_ipc() {
+    let parsed = parse_plugin_imports(
+        "import { open } from '@tauri-apps/plugin-dialog'\n\
+         import { open as pick, type OpenDialogOptions } from \"@tauri-apps/plugin-dialog\"\n\
+         import type { DialogFilter } from '@tauri-apps/plugin-dialog'\n",
+    );
+    let dialog = |bindings: &[&str]| PluginImport {
+        plugin: "dialog".to_string(),
+        bindings: Ok(bindings.iter().map(|b| (*b).to_string()).collect()),
+    };
+    assert_eq!(
+        parsed,
+        vec![dialog(&["open"]), dialog(&["open"]), dialog(&[])]
+    );
+
+    assert_eq!(
+        plugin_commands_of("dialog", "open"),
+        Some(&[DIALOG_OPEN][..])
+    );
+    for (plugin, binding) in [
+        ("dialog", "save"),
+        ("dialog", "message"),
+        ("dialog", "ask"),
+        ("dialog", "confirm"),
+        ("fs", "readTextFile"),
+    ] {
+        assert!(
+            plugin_commands_of(plugin, binding).is_none(),
+            "{plugin}.{binding} не выдан решением Р-3 и обязан ронять скан"
+        );
+    }
+}
+
+/// Упоминание пакета в комментарии не импорт.
+///
+/// Форма взята из `SettingsScreen.vue`: пакет назван в doc-блоке.
+#[test]
+fn a_plugin_package_mentioned_in_a_comment_is_not_an_import() {
+    for mention in [
+        "/**\n * Rust (TL-84) `open()` из `@tauri-apps/plugin-dialog` бросает\n */\n",
+        "// import { save } from '@tauri-apps/plugin-dialog'\n",
+        "<template>\n<!-- '@tauri-apps/plugin-dialog' -->\n</template>\n",
+    ] {
+        assert_eq!(
+            parse_plugin_imports(mention),
+            Vec::new(),
+            "принято за импорт: {mention}"
+        );
+    }
+}
+
+/// Всё, что не оператор `import … from`, — падение, а не пропуск.
+#[test]
+fn a_plugin_import_the_scan_cannot_narrow_is_reported() {
+    for source in [
+        "import * as dialog from '@tauri-apps/plugin-dialog'\n",
+        "const dialog = await import('@tauri-apps/plugin-dialog')\n",
+        "import '@tauri-apps/plugin-dialog'\n",
+        "import { open } from '@tauri-apps/plugin-dialog/internal'\n",
+        "const pkg = `@tauri-apps/plugin-dialog`\n",
+        "load('@tauri-apps/plugin-fs')\n",
+    ] {
+        let parsed = parse_plugin_imports(source);
+        assert!(
+            !parsed.is_empty() && parsed.iter().all(|i| i.bindings.is_err()),
+            "скан промолчал о форме, которую не может сузить до команд: {source}\n{parsed:?}"
+        );
+    }
 }

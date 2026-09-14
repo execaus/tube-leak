@@ -280,6 +280,88 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # прошла и для 0.37. Остальной проект под 1.83 этой проверкой не
 # покрыт: поле по-прежнему утверждение на дисциплине (см. rust-version).
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+# Системный диалог выбора папки назначения (TL-84, Р-3 эпика E5). Зовёт его
+# фронтенд сам — `open({ directory: true })` из `@tauri-apps/plugin-dialog`
+# (src/composables/usePickFolder.ts); ядро только регистрирует плагин
+# (src/main.rs), а capability выдаёт ровно `dialog:allow-open`.
+#
+# Версия 2.7.3 совпадает с npm-частью плагина до патча: в package-lock.json
+# `@tauri-apps/plugin-dialog` 2.7.3. Последняя на crates.io — 3.0.0-alpha.0,
+# она не взята: JS-часть на 2.x, а IPC-контракт у частей один.
+#
+# Фичи по умолчанию (`gtk3`): диалог на Linux идёт через GTK, который в
+# графе уже есть у tao и wry. Альтернатива `xdg-portal` не включена: по
+# манифесту rfd 0.16.0 она тянет ashpd (портал через D-Bus) и pollster.
+# Это та же дорога ко второй асинхронной машинерии, что отклонила Р-6а E4.
+#
+# Измерено 2026-09-14 на main 1d3189e командой Н-5, до и после этой строки:
+#
+#   cargo tree -e normal,no-proc-macro --target <тройка> --prefix none \
+#     | sed 's/ (\*)$//' | sort -u
+#
+# затем `comm -13 до после`. Исчезнувших крейтов нет ни на одной тройке.
+#
+#   тройка                      новые имена  новые версии уже имеющихся
+#   aarch64-apple-darwin        +3           —
+#   x86_64-pc-windows-msvc      +3           windows-sys 0.60.2 (третья, к 0.59.0 и 0.61.2),
+#                                            windows-targets 0.53.5 (вторая, к 0.52.6),
+#                                            windows_x86_64_msvc 0.53.1 (вторая, к 0.52.6)
+#   x86_64-unknown-linux-gnu    +3           —
+#
+# Новые имена одни и те же на всех трёх: rfd 0.16.0, tauri-plugin-dialog
+# 2.7.3, tauri-plugin-fs 2.5.2. Итого в целевом графе +3 / +6 / +3.
+#
+# Против анализа (Н-5, 2026-09-13). Сошлись +3 имени на тройку, третья
+# windows-sys и вторые windows-targets / windows_x86_64_msvc на Windows.
+# НЕ подтвердилась вторая версия dispatch2 на macOS: rfd требует `^0.3.0`,
+# в локе уже 0.3.1, и она переиспользуется (`cargo tree -i dispatch2
+# --target aarch64-apple-darwin`: над 0.3.1 стоят rfd и tao).
+#
+# Build-сторона (`-e normal,build`) добавляет к трём именам на каждой
+# тройке tauri-plugin 2.6.3. Это build-зависимость build.rs у dialog и fs:
+# собирается на host и в бинарник не попадает.
+#
+# Cargo.lock: +14 пакетов. Шесть перечислены выше, седьмой — tauri-plugin.
+# Остальные семь — windows_* 0.53.1 под чужие Windows-архитектуры
+# (aarch64_gnullvm, aarch64_msvc, i686_gnu, i686_gnullvm, i686_msvc,
+# x86_64_gnu, x86_64_gnullvm). Лок перечисляет их все, на наших тройках они
+# не собираются.
+#
+# Фичи уже присутствующих крейтов. Сравнены выводы
+# `cargo tree -e normal,build,features --target <тройка> -f '{p} | {f}'`
+# до и после:
+#
+# - Linux и Windows: ни у одного прежнего крейта набор фич не изменился,
+#   в разнице только новые строки. tokio не изменился ни на одной тройке.
+# - macOS: изменился у двух крейтов. У objc2-app-kit 0.3.2 прибавилась
+#   NSAlert, у objc2-core-foundation 0.3.2 — CFBase, CFString и
+#   CFUserNotification. Новых крейтов эти фичи не тянут.
+#
+# Почему это не класс дефекта flate2 (зависимость от фичи, которую включила
+# чужая ветка графа на одной тройке). Все четыре фичи rfd объявляет сам,
+# поимённо, в `[target.'cfg(target_os = "macos")'.dependencies]` своего
+# манифеста. Сами objc2-app-kit и objc2-core-foundation есть только в
+# графе macOS: `cargo tree -i` под Linux и Windows печатает «nothing to
+# print». Значит, прибавка не может замаскировать недостающую фичу на
+# тройке, которую никто не собирает. На Linux rfd сам объявляет
+# `gtk-sys/v3_24`, и строка gtk-sys не изменилась, потому что фича уже была
+# включена. На Windows windows-sys 0.60.2 — отдельный узел графа: фичи
+# разных версий не объединяются, и его набор целиком объявлен rfd.
+#
+# Принятый риск (Р-3, записан в #70): набор версий по тройкам НЕ совпадает.
+# Третья windows-sys существует только в графе Windows, а Windows никто не
+# собирает, пока мёртв CI. Единственный сторож — матрица build, прогнать
+# её до публичного релиза.
+#
+# tauri-plugin-fs приходит транзитивно (типы путей и ошибок диалога) и в
+# приложении НЕ регистрируется. `open` с `directory: true` расширяет fs-scope
+# только через `try_fs_scope()`: без зарегистрированного fs-плагина это
+# `None`, а не паника (tauri-plugin-dialog 2.7.3, src/commands.rs). ACL-манифеста
+# `fs` в gen/schemas/acl-manifests.json нет: tauri-build собирает манифесты
+# только прямых зависимостей. Разрешений `fs:*` в capability нет, белый
+# список держит tests/frontend_acl.rs. tauri-plugin-opener и крейт open,
+# отклонённые Н-5, в Cargo.lock по-прежнему отсутствуют.
+tauri-plugin-dialog = "2.7.3"
 
 [dev-dependencies]
 tempfile = "3"
