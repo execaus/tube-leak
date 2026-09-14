@@ -129,10 +129,44 @@ const DENO_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
 /// может весить мегабайт, а уходит она через IPC прямо в «Подробнее».
 const VERSION_RAW_MAX_CHARS: usize = 200;
 
-/// Строка для `versionRaw`: без краевых пробелов и не длиннее
-/// [`VERSION_RAW_MAX_CHARS`] символов, при обрезке — с `…` в конце. Режет
-/// по символам, а не по байтам: срез UTF-8 посередине символа — паника.
+/// Символы, которые меняют порядок отрисовки текста, оставаясь невидимыми
+/// (Unicode Bidi: ALM, LRM, RLM, встраивания и переопределения
+/// U+202A–U+202E, изоляты U+2066–U+2069). `char::is_control` их не ловит:
+/// это категория `Cf`, а не `Cc`.
+fn is_bidi_formatting(symbol: char) -> bool {
+    matches!(
+        symbol,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Заменяет управляющие и bidi-форматирующие символы на U+FFFD.
+///
+/// Строка приходит из вывода бинарника, подменённого под именем sidecar, и
+/// уходит через IPC прямо в текст экрана: ESC-последовательность, NUL или
+/// RLO (`deno 2.9.6 \x1b[31m\u{202E}lave\x07\0x` — воспроизведение ревью
+/// TL-15) иначе доехали бы до пользователя как есть — RLO разворачивает
+/// отрисовку всего, что стоит за ним. Замена, а не удаление: «здесь был
+/// непечатаемый символ» — сведение, которое «Подробнее» обязано показать.
+fn replace_unprintable(line: &str) -> String {
+    line.chars()
+        .map(|symbol| {
+            if symbol.is_control() || is_bidi_formatting(symbol) {
+                char::REPLACEMENT_CHARACTER
+            } else {
+                symbol
+            }
+        })
+        .collect()
+}
+
+/// Строка для `versionRaw` (и для `version`, когда версии в выводе не
+/// нашлось): непечатаемые символы заменены ([`replace_unprintable`]), без
+/// краевых пробелов и не длиннее [`VERSION_RAW_MAX_CHARS`] символов, при
+/// обрезке — с `…` в конце. Режет по символам, а не по байтам: срез UTF-8
+/// посередине символа — паника.
 fn clip_version_raw(line: &str) -> String {
+    let line = replace_unprintable(line);
     let line = line.trim();
     if line.chars().count() <= VERSION_RAW_MAX_CHARS {
         return line.to_string();
@@ -387,12 +421,16 @@ async fn run_check(
                     (parsed.display, clip_version_raw(&parsed.line))
                 }
                 None => match check.unrecognized {
-                    // Разобрать нечего, но `versionRaw` приходит с `version`
-                    // всегда: первая строка того, что показано вместо версии.
-                    UnrecognizedOutput::ShowAsIs => (
-                        output.stdout.trim().to_string(),
-                        clip_version_raw(output.stdout.trim().lines().next().unwrap_or_default()),
-                    ),
+                    // Разобрать нечего: вместо версии показывается первая
+                    // непустая строка вывода, и `versionRaw` приходит с
+                    // `version` всегда — это та же строка. Не весь stdout:
+                    // `version` — заголовок строки экрана, и мегабайт с
+                    // внутренними `\r\n` от подменённого бинарника уехал бы
+                    // туда целиком (остаток ревью TL-15).
+                    UnrecognizedOutput::ShowAsIs => {
+                        let shown = clip_version_raw(first_non_empty_line(&output.stdout));
+                        (shown.clone(), shown)
+                    }
                     UnrecognizedOutput::Refuse => {
                         eprintln!("{}", unrecognized_output_log_line(name, &output.stdout));
                         let error = SidecarError::LaunchFailed {
@@ -421,6 +459,16 @@ async fn run_check(
         }
         Err(error) => error_to_result(name, path_string, checked_at, duration_ms, error),
     }
+}
+
+/// Первая строка вывода, в которой есть что-то кроме пробелов; пустая
+/// строка — если такой нет.
+fn first_non_empty_line(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
 }
 
 /// Строка лога для вывода без версии: хвост stdout в пределе
@@ -1337,6 +1385,135 @@ mod tests {
         // Ровно на пределе — не обрезается, хотя байтов вдвое больше.
         let at_limit = "ё".repeat(VERSION_RAW_MAX_CHARS);
         assert_eq!(clip_version_raw(&at_limit), at_limit);
+    }
+
+    #[test]
+    fn unprintable_symbols_of_a_version_line_are_replaced_not_passed_through() {
+        // Воспроизведение ревью TL-15: подменённый deno печатает ESC, RLO,
+        // BEL и NUL внутри строки версии.
+        let line = "deno 2.9.6 \u{1b}[31m\u{202E}lave\u{7}\u{0}x";
+
+        let clipped = clip_version_raw(line);
+
+        assert_eq!(
+            clipped,
+            "deno 2.9.6 \u{FFFD}[31m\u{FFFD}lave\u{FFFD}\u{FFFD}x"
+        );
+        for bidi in [
+            '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+            '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
+            assert_eq!(
+                clip_version_raw(&format!("a{bidi}b")),
+                "a\u{FFFD}b",
+                "U+{:04X} обязан быть заменён",
+                u32::from(bidi)
+            );
+        }
+        // Обычный текст фильтр не трогает — ни кириллицу, ни символы вне BMP.
+        assert_eq!(clip_version_raw("ёж 🦔 2.9.6"), "ёж 🦔 2.9.6");
+    }
+
+    #[tokio::test]
+    async fn unrecognized_output_of_yt_dlp_and_ffmpeg_shows_its_first_line_only() {
+        // Ветка `ShowAsIs`: код 0, версии в выводе нет. На экран уходит
+        // первая строка, а не весь поток с внутренними переводами строк.
+        let dir = tempdir().expect("failed to create temp dir");
+        let registry = ChildRegistry::new();
+        let garbage = write_script(
+            &dir,
+            "garbage.sh",
+            "#!/bin/sh\nprintf '\\n  \\ngarbage\\nsecond\\n'\nexit 0\n",
+            0o755,
+        );
+
+        for (name, args, parse) in [
+            (
+                "yt-dlp",
+                &["--version"][..],
+                sidecar::parse_ytdlp_version as fn(&str) -> Option<sidecar::SidecarVersion>,
+            ),
+            ("ffmpeg", &["-version"][..], sidecar::parse_ffmpeg_version),
+        ] {
+            let result = check_binary(
+                name,
+                Ok(garbage.clone()),
+                args,
+                Duration::from_secs(5),
+                parse,
+                &registry,
+            )
+            .await;
+
+            assert_eq!(result.status, SidecarStatus::Ok, "{result:?}");
+            assert_eq!(result.version_raw.as_deref(), Some("garbage"), "{result:?}");
+            assert_eq!(result.version.as_deref(), Some("garbage"), "{result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_megabyte_of_unrecognized_output_reaches_the_screen_clipped_and_filtered() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let registry = ChildRegistry::new();
+        let flood = write_script(
+            &dir,
+            "flood.sh",
+            "#!/bin/sh\nprintf 'x\\033'\ni=0\nwhile [ $i -lt 2000 ]; do \
+             printf 'ёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёё'; i=$((i + 1)); done\n\
+             printf '\\r\\nsecond\\n'\nexit 0\n",
+            0o755,
+        );
+
+        let result = check_binary(
+            "ffmpeg",
+            Ok(flood),
+            &["-version"],
+            Duration::from_secs(5),
+            sidecar::parse_ffmpeg_version,
+            &registry,
+        )
+        .await;
+
+        assert_eq!(result.status, SidecarStatus::Ok, "{result:?}");
+        let version = result.version.expect("version при ok");
+        assert_eq!(version.chars().count(), VERSION_RAW_MAX_CHARS + 1);
+        assert!(
+            version.starts_with("x\u{FFFD}ё") && version.ends_with('…'),
+            "{version:?}"
+        );
+        assert_eq!(result.version_raw.as_deref(), Some(version.as_str()));
+    }
+
+    #[tokio::test]
+    async fn recognized_versions_are_shown_unchanged_by_the_filter() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let registry = ChildRegistry::new();
+        let yt_dlp = version_script(&dir, "yt-dlp.sh", YT_DLP_VERSION_LINE);
+        let ffmpeg = version_script(&dir, "ffmpeg.sh", FFMPEG_VERSION_LINE);
+
+        let yt_dlp = check_binary(
+            "yt-dlp",
+            Ok(yt_dlp),
+            &["--version"],
+            Duration::from_secs(5),
+            sidecar::parse_ytdlp_version,
+            &registry,
+        )
+        .await;
+        let ffmpeg = check_binary(
+            "ffmpeg",
+            Ok(ffmpeg),
+            &["-version"],
+            Duration::from_secs(5),
+            sidecar::parse_ffmpeg_version,
+            &registry,
+        )
+        .await;
+
+        assert_eq!(yt_dlp.version.as_deref(), Some("2026.08.19"));
+        assert_eq!(yt_dlp.version_raw.as_deref(), Some("2026.08.19"));
+        assert_eq!(ffmpeg.version.as_deref(), Some("9.0.1"));
+        assert_eq!(ffmpeg.version_raw.as_deref(), Some(FFMPEG_VERSION_LINE));
     }
 
     #[tokio::test]
