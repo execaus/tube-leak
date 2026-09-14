@@ -33,6 +33,26 @@ const isChecking = computed(() => props.result === undefined)
 const isOk = computed(() => props.result?.status === 'ok')
 const isError = computed(() => props.result !== undefined && props.result.status !== 'ok')
 
+/**
+ * `ok` получает свой собственный, гораздо более скромный повод показать
+ * «Подробнее» (TL-116, core TL-15): только когда `versionRaw` пришёл и
+ * реально отличается от уже показанной `version` — иначе кнопка была бы
+ * визуальным шумом на каждой успешной строке (особенно у yt-dlp, где
+ * `versionRaw` дословно совпадает с `version`).
+ */
+const hasVersionDetails = computed(() => {
+  const result = props.result
+  return (
+    result !== undefined &&
+    result.status === 'ok' &&
+    result.versionRaw !== undefined &&
+    result.versionRaw !== result.version
+  )
+})
+
+/** Показывать ли кнопку «Подробнее» и (при раскрытии) блок `dl` — для ошибок и для `ok` с отличающимся `versionRaw`. */
+const showDetailsToggle = computed(() => isError.value || hasVersionDetails.value)
+
 const icon = computed(() => {
   if (isChecking.value) return '○'
   return isOk.value ? '✓' : '✕'
@@ -161,7 +181,19 @@ interface DetailEntry {
  */
 const details = computed<DetailEntry[]>(() => {
   const result = props.result
-  if (!result || result.status === 'ok') return []
+  if (!result) return []
+
+  if (result.status === 'ok') {
+    // `versionRaw` есть только при `ok` и только когда сервер его прислал
+    // (`hasVersionDetails` уже проверил и наличие, и отличие от `version`);
+    // подпись «Полная версия» стоит первой — это единственная причина, по
+    // которой у `ok` вообще открылось «Подробнее».
+    if (!hasVersionDetails.value || result.versionRaw === undefined) return []
+    return [
+      { label: 'Полная версия', value: result.versionRaw },
+      { label: 'Путь', value: result.path },
+    ]
+  }
 
   const entries: DetailEntry[] = [{ label: 'Путь', value: result.path }]
 
@@ -226,7 +258,7 @@ function toggleDetails(): void {
     </p>
 
     <div
-      v-if="isError"
+      v-if="showDetailsToggle"
       class="sidecar-row__actions"
     >
       <button
@@ -250,7 +282,7 @@ function toggleDetails(): void {
     </div>
 
     <dl
-      v-if="isError && detailsOpen"
+      v-if="showDetailsToggle && detailsOpen"
       class="sidecar-row__details"
     >
       <template
