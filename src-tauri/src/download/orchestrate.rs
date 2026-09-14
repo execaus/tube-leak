@@ -109,19 +109,34 @@
 //! автоматические повторы. «Повторить» после отказа — новый вызов
 //! [`run_task`], то есть новый старт с текущими значениями.
 //!
-//! Если на новом старте папка или основа имени не те, что на прошлом, всё,
-//! что задача знала о забранных потоках, забывается: они лежат в прежней
-//! папке под прежними именами, и докачивать их некуда. Задача качается с
-//! нуля, прежние частичные файлы остаются, где лежали, — цена, названная в
-//! Р-4 и в тексте экрана настроек.
+//! Если на новом старте **папка** не та, что на прошлом, всё, что задача
+//! знала о забранных потоках, забывается: они лежат в прежней папке, и
+//! докачивать их некуда. Задача качается с нуля, прежние частичные файлы
+//! остаются, где лежали, — цена, названная в Р-4 и в тексте экрана настроек.
+//! Смена шаблона докачке не мешает (решение ведущего по ревью TL-89, B1).
 //!
-//! Имя строит только `Settings::file_stem` (шаблон целиком уходит в
-//! санитизацию E3). `{id}` — [`video_id_of`], тот же id, что E3 брал для
-//! запасного имени, а не канонический id очереди (решение ведущего по ревью
-//! TL-86). `{date}` — дата **завершения** по UTC (Ф-12): рабочие имена
-//! потоков и склейки строятся на старте, финальное — перед финализацией, с
-//! тем же шаблоном и датой из того же шва. У шаблона без `{date}` обе основы
-//! совпадают байт в байт.
+//! # Две основы имени: рабочая и финальная (ревью TL-89, B1)
+//!
+//! **Рабочая** — основа частичных файлов потоков и рабочего файла склейки —
+//! та же, что в E3: `sanitized_stem(название, video_id_of(ссылка))`. Она
+//! выводится из запроса задачи и **не зависит ни от шаблона, ни от даты**:
+//! строится один раз в [`build_task`] и живёт столько же, сколько задача.
+//! На этом стоит докачка через полночь по UTC и через перезапуск: до B1 в
+//! рабочую основу входил `{date}`, и старт в другой день качал потоки
+//! заново, а вчерашние частичные файлы оставались в папке навсегда —
+//! подчистка их больше не узнавала.
+//!
+//! **Финальная** — имя готового файла — строит только `Settings::file_stem`
+//! (шаблон целиком уходит в санитизацию E3) перед финализацией. `{id}` —
+//! [`video_id_of`], тот же id, что E3 брал для запасного имени, а не
+//! канонический id очереди (решение ведущего по ревью TL-86). `{date}` —
+//! дата **завершения** по UTC (Ф-12).
+//!
+//! Раз основы независимы, финальное имя может начинаться с префикса
+//! частичного файла: шаблон `{title}.f140.{id}` даёт `Название.f140.<id>.m4a`
+//! под префиксом потока `Название.f140.`. Поэтому подчистка на `Done` щадит
+//! только что финализированный файл ([`Cleanup::apply_sparing`]); без этого
+//! такая настройка удаляла бы каждую готовую загрузку.
 //!
 //! # Запись в историю (TL-89, Р-1 эпика E5)
 //!
@@ -132,7 +147,7 @@
 //! меняет: Done остаётся Done, экран истории получает пометку
 //! `lastWriteFailed`. `Failed` и `Cancelled` в историю не пишутся.
 //!
-//! `folderDisplay` у `Done` строит `commands::history::folder_display` —
+//! `folderDisplay` у `Done` строит `storage::history::folder_display` —
 //! та же функция, что у записи на экране истории, на том же значении папки,
 //! что уходит в запись, и с тем же резолвом системной «Загрузок». Без
 //! канонизации ни с одной стороны.
@@ -155,18 +170,20 @@ use std::time::{Duration, Instant};
 use super::aggregate::{ProgressAggregator, SampleOutcome};
 use super::classify::{classify_attempt, AttemptOutcome, AttemptVerdict};
 use super::error::{DownloadCommandRejection, DownloadFailure};
-use super::filename::finalize_in_dir;
+use super::filename::{finalize_in_dir, sanitized_stem};
 use super::merge::{merge_streams, FfmpegLauncher, MergeRequest, MergeVerdict};
 use super::progress::{SampleStatus, StdoutLine, PROGRESS_TEMPLATE};
 use super::retry::{RetryDecision, RetryPolicy};
 use super::PROGRESS_EVENT;
 use crate::clock::{self, monotonic_now};
-use crate::commands::{folder_display, HistoryState, SettingsState};
+// Managed-состояния истории и настроек живут в слое команд: там их открывает
+// `setup` и там стоят сторожи единственного открытия (ревью TL-89, S3).
+use crate::commands::{HistoryState, SettingsState};
 use crate::queue::video_id::canonical_video_id;
 use crate::sidecar::{
     run_streaming, stderr_tail, ChildRegistry, RunHandle, SidecarError, StreamedRun,
 };
-use crate::storage::history::NewHistoryRecord;
+use crate::storage::history::{folder_display, NewHistoryRecord};
 use crate::storage::settings::{Destination, Settings, TemplateContext, TemplateDate};
 use crate::types::{
     DownloadErrorDetails, DownloadErrorKind, DownloadPercent, DownloadPlan, DownloadProgress,
@@ -487,22 +504,29 @@ fn template_safe(ch: char) -> bool {
 /// Чем заменяется всё, что в шаблон не пускают.
 const TEMPLATE_REPLACEMENT: char = '_';
 
-/// Основа имени частичных файлов: финальная основа, пропущенная через
+/// Основа имени частичных файлов: рабочая основа E3
+/// (`sanitized_stem(название, video_id_of(ссылка))`), пропущенная через
 /// белый список [`template_safe`] и укороченная под свой бюджет.
 ///
-/// Выводится из финальной, а не считается заново, потому что на этом
-/// стоит обещание Р-2: после выхода из приложения пользователь вставляет
-/// ту же ссылку, ядро строит **то же** имя частичного файла, и yt-dlp
-/// продолжает с места своим штатным механизмом. Любая
-/// недетерминированная часть имени это обещание отменяет — а вот
-/// совпадать с финальным именем оно не обязано.
+/// **Основа частичных — E3, финальная — шаблон** (ревью TL-89, B1). Сюда
+/// не входят ни шаблон имени из настроек, ни `{date}`: на этом стоит
+/// обещание Р-2 — после выхода из приложения, после ночной паузы, после
+/// смены шаблона пользователь вставляет ту же ссылку, ядро строит **то
+/// же** имя частичного файла, и yt-dlp продолжает с места своим штатным
+/// механизмом. Любая часть имени, зависящая от чего-то кроме запроса
+/// (дата, настройка), это обещание отменяет. Финальное имя строит шаблон
+/// при завершении (doc модуля, «Две основы имени»); совпадать с ним рабочее
+/// не обязано.
 ///
 /// Цена белого списка названа прямо: два разных названия, отличающихся
 /// только непропущенными символами, дают одну основу частичного файла.
-/// Столкнуться они могут лишь через сохранённое частичное от **другой**
-/// задачи — активная в E3 одна, а штатный исход частичных не оставляет.
-/// Финальные имена при этом не сталкиваются никогда: их разводит суффикс
-/// коллизии (Ф-7).
+/// Цена E3 — тоже: `sanitized_stem` берёт id ролика только для запасного
+/// имени, поэтому два **разных** ролика с одинаковым названием дают одну
+/// рабочую основу. Столкнуться они могут лишь через частичное, сохранённое
+/// **другой** задачей (отказ с сохранением, приостановленная задача):
+/// активная задача одна, а штатный исход частичных не оставляет. Финальные
+/// имена при этом не сталкиваются никогда: их разводит суффикс коллизии
+/// (Ф-7).
 fn download_stem(stem: &str) -> String {
     let allowed: String = stem
         .chars()
@@ -810,11 +834,12 @@ struct StreamJob {
 struct TaskWork {
     aggregator: ProgressAggregator,
     jobs: Vec<StreamJob>,
-    /// Основа имени, построенная на старте (шаблон из настроек через
-    /// санитизацию E3): от неё — рабочий файл склейки и префикс подчистки.
-    /// Пустая до первого старта.
+    /// Рабочая основа имени E3 — `sanitized_stem(название,
+    /// video_id_of(ссылка))`: от неё — рабочий файл склейки и его префикс
+    /// подчистки. Строится из запроса при создании задачи и не зависит ни от
+    /// шаблона, ни от даты (doc модуля, «Две основы имени»).
     stem: String,
-    /// Основа имени частичных файлов. Пустая до первого старта.
+    /// Основа имени частичных файлов — [`download_stem`] от рабочей.
     download_stem: String,
     /// Папка назначения последнего старта. `None` — задача ещё не
     /// стартовала: имён нет, подчищать нечего.
@@ -980,10 +1005,14 @@ pub fn build_task(
         .ok_or(DownloadCommandRejection::NoStreamsSelected)?;
     let plan = aggregator.plan();
 
-    // Имени и папки здесь нет (TL-89): их снимает с настроек старт задачи,
-    // а постановка случается раньше — иногда в прошлом сеансе (снимок
+    // Рабочие имена — из запроса, как в E3 (ревью TL-89, B1): тот же запрос
+    // в любой день и при любом шаблоне даёт те же частичные файлы. Папки и
+    // финального имени здесь нет: их снимает с настроек старт задачи, а
+    // постановка случается раньше — иногда в прошлом сеансе (снимок
     // очереди), — и ожидающая задача обязана увидеть настройки своего
     // старта (Р-4).
+    let stem = sanitized_stem(&request.title, &video_id_of(&request.url));
+    let download_stem = download_stem(&stem);
     let jobs = jobs_of(&request.streams);
 
     eprintln!(
@@ -1004,8 +1033,8 @@ pub fn build_task(
         work: tokio::sync::Mutex::new(TaskWork {
             aggregator,
             jobs,
-            stem: String::new(),
-            download_stem: String::new(),
+            stem,
+            download_stem,
             destination: None,
             last_interrupt: None,
         }),
@@ -1152,7 +1181,10 @@ impl TaskStart {
         }
     }
 
-    /// Основа имени по снятому шаблону на дату `date` (Ф-12).
+    /// **Финальная** основа имени по снятому шаблону на дату `date` (Ф-12).
+    ///
+    /// Только для имени готового файла: рабочие имена от шаблона не зависят
+    /// (doc модуля, «Две основы имени»).
     fn file_stem(&self, task: &DownloadTask, date: TemplateDate) -> String {
         let video_id = video_id_of(&task.request.url);
         self.settings.file_stem(&TemplateContext {
@@ -1165,24 +1197,23 @@ impl TaskStart {
 }
 
 impl TaskWork {
-    /// Раскладывает имена и папку этого старта.
+    /// Запоминает папку этого старта.
     ///
-    /// Сменились папка или основа имени с прошлого старта — забранные потоки
-    /// забываются (doc модуля, «Настройки снимаются на старте задачи»).
-    fn begin(&mut self, destination: &Path, stem: String) {
+    /// Сменилась **папка** с прошлого старта — забранные потоки забываются
+    /// (doc модуля, «Настройки снимаются на старте задачи»). Шаблон и дата
+    /// сюда не приходят вовсе: рабочие имена от них не зависят (B1).
+    fn begin(&mut self, destination: &Path) {
         let moved = self
             .destination
             .as_deref()
-            .is_some_and(|previous| previous != destination || self.stem != stem);
+            .is_some_and(|previous| previous != destination);
         if moved {
             eprintln!(
-                "download: папка назначения или имя сменились с прошлого старта задачи — \
-                 потоки качаются заново, прежние частичные файлы остаются на месте (Р-4)"
+                "download: папка назначения сменилась с прошлого старта задачи — потоки \
+                 качаются заново, прежние частичные файлы остаются на месте (Р-4)"
             );
             forget_streams(self);
         }
-        self.download_stem = download_stem(&stem);
-        self.stem = stem;
         self.destination = Some(destination.to_path_buf());
     }
 }
@@ -1196,7 +1227,17 @@ impl TaskWork {
 ///
 /// Работа блокирующая (`metadata` и транзакция SQLite с `fsync`) и уходит с
 /// потока рантайма (Н-3) — тот же приём, что у команд истории.
-async fn record_done(task: &DownloadTask, env: &TaskEnv, folder: &Path, file_name: &str) {
+///
+/// `write` — тело блокирующей записи, в бою [`write_done`]. Параметр — шов
+/// ради тестов (ревью TL-89, S2): паника на потоке блокирующего пула
+/// приходит сюда `JoinError`, а настоящую запись довести до паники нечем.
+async fn record_done(
+    task: &DownloadTask,
+    env: &TaskEnv,
+    folder: &Path,
+    file_name: &str,
+    write: WriteDone,
+) {
     let Some(history) = env.history.clone() else {
         eprintln!(
             "download: задача {} готова, но история не подключена — запись не сделана",
@@ -1211,7 +1252,7 @@ async fn record_done(task: &DownloadTask, env: &TaskEnv, folder: &Path, file_nam
     let folder = folder.to_path_buf();
     let file_name = file_name.to_owned();
     let written = tokio::task::spawn_blocking(move || {
-        write_done(&writer, &task_id, &request, folder, file_name);
+        write(&writer, &task_id, &request, folder, file_name);
     })
     .await;
 
@@ -1225,6 +1266,9 @@ async fn record_done(task: &DownloadTask, env: &TaskEnv, folder: &Path, file_nam
         }
     }
 }
+
+/// Тело блокирующей записи истории — [`write_done`] в бою (шов [`record_done`]).
+type WriteDone = fn(&HistoryState, &str, &StartDownloadRequest, PathBuf, String);
 
 /// Тело [`record_done`] — на потоке блокирующего пула.
 fn write_done(
@@ -1309,15 +1353,25 @@ pub async fn run_task(
     sink: &dyn ProgressSink,
     env: &TaskEnv,
 ) {
+    run_task_with(task, launcher, ffmpeg, sink, env, write_done).await;
+}
+
+/// [`run_task`] с телом записи истории параметром (шов [`record_done`]).
+async fn run_task_with(
+    task: &Arc<DownloadTask>,
+    launcher: &dyn DownloadLauncher,
+    ffmpeg: &dyn FfmpegLauncher,
+    sink: &dyn ProgressSink,
+    env: &TaskEnv,
+    write: WriteDone,
+) {
     // Р-4: настройки снимаются здесь и больше не читаются — ни на повторах
-    // внутри задачи, ни на финализации. Имена раскладываются до всего
-    // остального: подчистка любого исхода ищет файлы по ним.
+    // внутри задачи, ни на финализации. Папка запоминается до всего
+    // остального: подчистка любого исхода ищет файлы в ней. Рабочие имена
+    // уже есть — они из запроса (B1).
     let start = TaskStart::read(task, env);
     let destination = start.destination.as_path();
-    task.work
-        .lock()
-        .await
-        .begin(destination, start.file_stem(task, (env.today)()));
+    task.work.lock().await.begin(destination);
 
     let mut emitter = Emitter::new(task, sink);
     let started = monotonic_now();
@@ -1335,8 +1389,10 @@ pub async fn run_task(
             // Готовый файл лежит под финальным именем; всё, что от задачи
             // могло остаться рядом (потоки после склейки, хвосты
             // фрагментов), — мусор, а Н-4 требует, чтобы штатные исходы
-            // его не оставляли.
-            Cleanup::Remove.apply(destination, &work);
+            // его не оставляли. Сам готовый файл щадится: финальное имя
+            // строит шаблон, и оно может лечь под префикс частичного (doc
+            // модуля, «Две основы имени»).
+            Cleanup::Remove.apply_sparing(destination, &work, Some(&file_name));
             eprintln!(
                 "download: задача {} готова за {} мс: «{file_name}»",
                 task.id,
@@ -1388,7 +1444,7 @@ pub async fn run_task(
     // Запись — раньше события: к моменту, когда о готовой задаче узнает
     // окно, она уже в базе (Ф-3).
     if let Some(file_name) = finished {
-        record_done(task, env, destination, &file_name).await;
+        record_done(task, env, destination, &file_name, write).await;
     }
 
     emitter.emit(progress);
@@ -1584,7 +1640,8 @@ async fn execute(
     // внутри одной операции — требование TL-40, между ними не должно быть
     // ни строки нашего кода.
     let (ready_file, extension) = ready;
-    // Финальная основа — шаблон старта на дату завершения (Ф-12). Считается
+    // Финальная основа — шаблон старта на дату завершения (Ф-12); рабочая,
+    // по которой лежат потоки и склейка, от неё не зависит (B1). Считается
     // до финализации, а не между занятием имени и переименованием.
     let final_stem = start.file_stem(task, (env.today)());
     match finalize_in_dir(destination, &ready_file, &final_stem, &extension) {
@@ -2120,11 +2177,26 @@ impl Cleanup {
     /// поэтому пустая папка даёт [`PartialData::NothingCreated`] при
     /// обоих решениях.
     fn apply(self, destination: &Path, work: &TaskWork) -> PartialData {
+        self.apply_sparing(destination, work, None)
+    }
+
+    /// То же, но файл с именем `spare` не трогается и не считается.
+    ///
+    /// Нужно одному месту — `Done`: готовый файл лежит в той же папке, а его
+    /// имя строит шаблон независимо от рабочего, и `{title}.f140.{id}` кладёт
+    /// его под префикс потока `Название.f140.` (doc модуля). Сравнивается имя
+    /// целиком, не префикс.
+    fn apply_sparing(
+        self,
+        destination: &Path,
+        work: &TaskWork,
+        spare: Option<&str>,
+    ) -> PartialData {
         let prefixes = prefixes_of(work);
 
         match self {
             Self::Remove => {
-                let removed = remove_by_prefix(destination, &prefixes);
+                let removed = remove_by_prefix(destination, &prefixes, spare);
                 if removed == 0 {
                     PartialData::NothingCreated
                 } else {
@@ -2132,7 +2204,7 @@ impl Cleanup {
                 }
             }
             Self::Keep => {
-                if exists_by_prefix(destination, &prefixes) {
+                if exists_by_prefix(destination, &prefixes, spare) {
                     PartialData::Kept
                 } else {
                     PartialData::NothingCreated
@@ -2168,9 +2240,12 @@ fn forget_streams(work: &mut TaskWork) {
 }
 
 /// Все префиксы, под которыми задача могла оставить файлы.
+///
+/// Строятся от рабочей основы E3 ([`TaskWork::stem`]), которая не зависит
+/// ни от шаблона, ни от даты (B1): задача, стартовавшая вчера под другим
+/// шаблоном, узнаёт свои частичные файлы и сегодня.
 fn prefixes_of(work: &TaskWork) -> Vec<String> {
-    // До первого старта имён нет: пустая основа дала бы префикс `.f140.`,
-    // под который попал бы чужой скрытый файл в папке назначения.
+    // До первого старта папки нет: подчищать негде и нечего.
     if work.destination.is_none() {
         return Vec::new();
     }
@@ -2191,10 +2266,10 @@ fn prefixes_of(work: &TaskWork) -> Vec<String> {
 /// список у себя значило бы отставать от него на каждую его правку. Зато
 /// префикс задаётся нами целиком и содержит название ролика,
 /// идентификатор формата и точку — совпасть с чужим файлом ему нечем.
-fn remove_by_prefix(destination: &Path, prefixes: &[String]) -> usize {
+fn remove_by_prefix(destination: &Path, prefixes: &[String], spare: Option<&str>) -> usize {
     let mut removed = 0;
 
-    for path in entries_by_prefix(destination, prefixes) {
+    for path in entries_by_prefix(destination, prefixes, spare) {
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 removed += 1;
@@ -2212,11 +2287,11 @@ fn remove_by_prefix(destination: &Path, prefixes: &[String]) -> usize {
     removed
 }
 
-fn exists_by_prefix(destination: &Path, prefixes: &[String]) -> bool {
-    !entries_by_prefix(destination, prefixes).is_empty()
+fn exists_by_prefix(destination: &Path, prefixes: &[String], spare: Option<&str>) -> bool {
+    !entries_by_prefix(destination, prefixes, spare).is_empty()
 }
 
-fn entries_by_prefix(destination: &Path, prefixes: &[String]) -> Vec<PathBuf> {
+fn entries_by_prefix(destination: &Path, prefixes: &[String], spare: Option<&str>) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(destination) else {
         // Папка исчезла или недоступна: удалять и нечего, и нечем.
         return Vec::new();
@@ -2227,9 +2302,10 @@ fn entries_by_prefix(destination: &Path, prefixes: &[String]) -> Vec<PathBuf> {
         .filter(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            prefixes
-                .iter()
-                .any(|prefix| name.starts_with(prefix.as_str()))
+            spare != Some(name.as_ref())
+                && prefixes
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix.as_str()))
         })
         .map(|entry| entry.path())
         .collect()

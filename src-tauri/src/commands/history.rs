@@ -105,14 +105,16 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 
 use crate::os_reveal::{self, RevealError};
+// `folder_display` — доменная функция пути (ревью TL-89, S3): её же зовёт
+// оркестрация для `Done`.
 use crate::storage::history::{
-    self, HistoryDeleteError, HistoryOpenError, HistoryRecord, HistoryRecordsPage,
+    self, folder_display, HistoryDeleteError, HistoryOpenError, HistoryRecord, HistoryRecordsPage,
     HistoryStorageError, HistoryStore, ShownId, StorageFailure,
 };
 use crate::types::{
-    FolderDisplay, HistoryCommandError, HistoryCommandErrorKind, HistoryCursor, HistoryEntry,
-    HistoryPage, HistoryUnavailableError, HistoryUnavailableReason, LauncherFailureDetails,
-    ShowInFolderError, ShowInFolderErrorKind,
+    HistoryCommandError, HistoryCommandErrorKind, HistoryCursor, HistoryEntry, HistoryPage,
+    HistoryUnavailableError, HistoryUnavailableReason, LauncherFailureDetails, ShowInFolderError,
+    ShowInFolderErrorKind,
 };
 
 /// История загрузок этого процесса: открытое хранилище либо причина, по
@@ -493,28 +495,6 @@ fn entry_to_contract(record: HistoryRecord, system_downloads: Option<&Path>) -> 
         size_bytes: record.size_bytes,
         finished_at_unix_secs: record.finished_at_unix_secs,
         file_status: record.file_status,
-    }
-}
-
-/// Как назвать папку записи: системная «Загрузки» или своя.
-///
-/// Сравнение — по компонентам пути (`Path::eq`: хвостовой разделитель не
-/// важен), без обращения к диску. Символьные ссылки и регистр на
-/// нечувствительных к нему томах не разрешаются: такая папка покажется
-/// своим путём, что не ложь, а только менее короткая подпись.
-///
-/// `Done` строится **этой же** функцией (оркестрация, TL-89) на том же
-/// значении папки, что уходит в запись истории, и с тем же резолвом
-/// системной «Загрузок» (`download_dir()`), — иначе одна и та же папка
-/// называлась бы по-разному на панели и в истории. Сторож —
-/// `download::orchestrate` тесты «folderDisplay совпадает».
-pub(crate) fn folder_display(folder: &Path, system_downloads: Option<&Path>) -> FolderDisplay {
-    if system_downloads == Some(folder) {
-        FolderDisplay::SystemDownloads
-    } else {
-        FolderDisplay::Custom {
-            path: folder.to_string_lossy().into_owned(),
-        }
     }
 }
 

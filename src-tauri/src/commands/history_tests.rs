@@ -23,7 +23,8 @@ use crate::os_reveal::{
 };
 use crate::storage::history::{HistoryOpenError, NewHistoryRecord, ShownId, HISTORY_FILE_NAME};
 use crate::types::{
-    HistoryFileStatus, HistoryNotice, HistoryWriteFailure, QualityKind, SelectedQuality,
+    FolderDisplay, HistoryFileStatus, HistoryNotice, HistoryWriteFailure, QualityKind,
+    SelectedQuality,
 };
 
 /// Сколько рандеву ждёт соседа, прежде чем признать рантайм заблокированным.
@@ -251,27 +252,6 @@ async fn a_foreign_cursor_gives_an_empty_page_and_is_logged_with_its_class() {
             cause: HistoryWriteFailure::NoAccess
         }],
         "чужой курсор погасил пометку"
-    );
-}
-
-#[test]
-fn folder_display_names_the_system_downloads_only_by_equal_path() {
-    let downloads = Path::new("/Users/u/Downloads");
-    assert_eq!(
-        folder_display(Path::new("/Users/u/Downloads/"), Some(downloads)),
-        FolderDisplay::SystemDownloads
-    );
-    assert_eq!(
-        folder_display(Path::new("/Users/u/Downloads/sub"), Some(downloads)),
-        FolderDisplay::Custom {
-            path: "/Users/u/Downloads/sub".to_owned()
-        }
-    );
-    assert_eq!(
-        folder_display(downloads, None),
-        FolderDisplay::Custom {
-            path: "/Users/u/Downloads".to_owned()
-        }
     );
 }
 

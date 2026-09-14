@@ -179,8 +179,8 @@ use rusqlite::{
 };
 
 use crate::types::{
-    HistoryCursor, HistoryFileStatus, HistoryNotice, HistoryUnavailableReason, HistoryWriteFailure,
-    QualityKind, SelectedQuality, HISTORY_PAGE_SIZE,
+    FolderDisplay, HistoryCursor, HistoryFileStatus, HistoryNotice, HistoryUnavailableReason,
+    HistoryWriteFailure, QualityKind, SelectedQuality, HISTORY_PAGE_SIZE,
 };
 
 /// Имя файла базы в корне каталога данных приложения.
@@ -330,6 +330,31 @@ pub struct NewHistoryRecord {
     pub size_bytes: u64,
     /// Время завершения, Unix-секунды UTC.
     pub finished_at_unix_secs: u64,
+}
+
+/// Как назвать папку записи: системная «Загрузки» или своя.
+///
+/// Чистая функция пути, без обращения к диску, поэтому живёт рядом с моделью
+/// записи, а не в слое команд (ревью TL-89, S3). Правило — покомпонентное
+/// равенство с резолвом системной «Загрузок» (`download_dir()`), `Path::eq`:
+/// хвостовой разделитель не важен. Без `canonicalize`: символьные ссылки и
+/// регистр на нечувствительных к нему томах не разрешаются, и такая папка
+/// покажется своим путём — не ложь, а только менее короткая подпись.
+///
+/// Функция одна на двух потребителей: запись на экране истории
+/// (`commands::history`) и событие `Done` (оркестрация, TL-89) — на том же
+/// значении папки, что уходит в запись, и с тем же резолвом «Загрузок».
+/// Иначе одна и та же папка называлась бы по-разному на панели и в истории.
+/// Сторож — тесты `download::orchestrate` «панель и история называют папку
+/// одинаково».
+pub fn folder_display(folder: &Path, system_downloads: Option<&Path>) -> FolderDisplay {
+    if system_downloads == Some(folder) {
+        FolderDisplay::SystemDownloads
+    } else {
+        FolderDisplay::Custom {
+            path: folder.to_string_lossy().into_owned(),
+        }
+    }
 }
 
 /// Запись истории, как её прочитали.

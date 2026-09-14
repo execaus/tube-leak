@@ -1378,3 +1378,28 @@ fn record_ids_parse_only_their_canonical_form() {
         assert_eq!(RecordId::parse(foreign), None, "{foreign:?}");
     }
 }
+
+/// Правило подписи папки (ревью TL-89, S3: функция переехала сюда из слоя
+/// команд): покомпонентное равенство с системной «Загрузками», без диска.
+#[test]
+fn folder_display_names_the_system_downloads_only_by_equal_path() {
+    use crate::types::FolderDisplay;
+
+    let downloads = Path::new("/Users/u/Downloads");
+    assert_eq!(
+        folder_display(Path::new("/Users/u/Downloads/"), Some(downloads)),
+        FolderDisplay::SystemDownloads
+    );
+    assert_eq!(
+        folder_display(Path::new("/Users/u/Downloads/sub"), Some(downloads)),
+        FolderDisplay::Custom {
+            path: "/Users/u/Downloads/sub".to_owned()
+        }
+    );
+    assert_eq!(
+        folder_display(downloads, None),
+        FolderDisplay::Custom {
+            path: "/Users/u/Downloads".to_owned()
+        }
+    );
+}
