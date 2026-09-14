@@ -87,7 +87,14 @@ const notFoundYtDlp: SidecarCheckResult = {
   osErrorCode: 'ENOENT',
 }
 
-const okReport: SidecarCheckReport = { ytDlp: okYtDlp, ffmpeg: okFfmpeg }
+const okDeno: SidecarCheckResult = {
+  name: 'deno',
+  path: '/opt/tube-leak/bin/deno',
+  status: 'ok',
+  version: '2.9.6',
+}
+
+const okReport: SidecarCheckReport = { ytDlp: okYtDlp, ffmpeg: okFfmpeg, deno: okDeno }
 
 const preparedWarm: YtDlpPrepared = {
   version: '2026.08.20',

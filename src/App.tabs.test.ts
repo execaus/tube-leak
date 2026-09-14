@@ -89,6 +89,7 @@ const preparedWarm: YtDlpPrepared = {
 const okReport: SidecarCheckReport = {
   ytDlp: { name: 'yt-dlp', path: '/opt/tube-leak/bin/yt-dlp', status: 'ok', version: '2026.08.20' },
   ffmpeg: { name: 'ffmpeg', path: '/opt/tube-leak/bin/ffmpeg', status: 'ok', version: '7.1' },
+  deno: { name: 'deno', path: '/opt/tube-leak/bin/deno', status: 'ok', version: '2.9.6' },
 }
 
 const resultA: ProbeResult = {

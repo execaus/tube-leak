@@ -66,7 +66,7 @@ beforeEach(() => {
 
 describe('checkSidecar', () => {
   it('calls the check_sidecar Tauri command with no arguments', async () => {
-    const report: SidecarCheckReport = { ytDlp: okResult, ffmpeg: okResult }
+    const report: SidecarCheckReport = { ytDlp: okResult, ffmpeg: okResult, deno: okResult }
     invokeMock.mockResolvedValueOnce(report)
 
     await checkSidecar()
@@ -84,7 +84,7 @@ describe('checkSidecar', () => {
   ] satisfies Array<[string, SidecarCheckResult]>)(
     'resolves a report matching the %s result field-by-field',
     async (_label, result) => {
-      const report: SidecarCheckReport = { ytDlp: result, ffmpeg: okResult }
+      const report: SidecarCheckReport = { ytDlp: result, ffmpeg: okResult, deno: okResult }
       invokeMock.mockResolvedValueOnce(report)
 
       const received = await checkSidecar()
@@ -112,7 +112,7 @@ describe('useSidecarCheck', () => {
   })
 
   it('populates the report on a successful check and resets loading', async () => {
-    const report: SidecarCheckReport = { ytDlp: okResult, ffmpeg: notFoundResult }
+    const report: SidecarCheckReport = { ytDlp: okResult, ffmpeg: notFoundResult, deno: okResult }
     invokeMock.mockResolvedValueOnce(report)
 
     const state = useSidecarCheck()
