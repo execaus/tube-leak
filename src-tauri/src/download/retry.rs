@@ -119,7 +119,9 @@ use crate::types::DownloadAttempt;
 /// терминального события), но задача, которой сеть не вернётся, обязана
 /// честно сдаться, а не ждать вечно.
 ///
-/// Пользовательской настройкой число станет в E5; здесь оно одно на всех.
+/// С E5 это **умолчание** настройки «число попыток» (Ф-13, Р-5), а не
+/// предел для всех: действующий предел задача снимает с настроек на своём
+/// старте и передаёт в [`RetryPolicy::new`] (TL-89).
 pub const MAX_ATTEMPTS: u32 = 8;
 
 /// Пауза перед первым повтором; дальше удваивается.
@@ -223,7 +225,7 @@ pub enum RetryDecision {
 /// # Как этим пользуется оркестрация (TL-44)
 ///
 /// ```ignore
-/// let mut policy = RetryPolicy::new(clock::monotonic_now());
+/// let mut policy = RetryPolicy::new(clock::monotonic_now(), settings.max_attempts());
 /// loop {
 ///     policy.attempt_started(clock::monotonic_now());
 ///     // …запустить yt-dlp; на каждую применённую строку прогресса:
@@ -241,6 +243,10 @@ pub enum RetryDecision {
 pub struct RetryPolicy {
     /// Номер идущей попытки, считая с единицы.
     attempt: u32,
+    /// Предел попыток этой задачи — снят с настроек на её старте (Ф-13) и
+    /// не меняется до терминального исхода, что бы ни случилось с
+    /// настройкой (Р-4). Не меньше единицы.
+    total: u32,
     /// Наибольшее число принятых байт, которое задача видела за всю свою
     /// жизнь. Отметка, по которой различается «продвинулись» и
     /// «пересказали уже принятое» — докачка сообщает абсолютные байты
@@ -263,9 +269,14 @@ pub struct RetryPolicy {
 
 impl RetryPolicy {
     /// Политика в начале задачи: идёт первая попытка, принято ноль байт.
-    pub fn new(now: Instant) -> Self {
+    ///
+    /// `max_attempts` — предел попыток задачи (настройка, 1…20, проверена
+    /// хранилищем). Ноль поднимается до единицы: попытка, которой не было,
+    /// исчерпанием быть не может, а «попытка 1 из 0» — не состояние.
+    pub fn new(now: Instant, max_attempts: u32) -> Self {
         Self {
             attempt: 1,
+            total: max_attempts.max(1),
             high_water_bytes: 0,
             last_progress_at: now,
             attempt_running: false,
@@ -281,7 +292,7 @@ impl RetryPolicy {
     pub fn attempt(&self) -> DownloadAttempt {
         DownloadAttempt {
             number: self.attempt,
-            total: MAX_ATTEMPTS,
+            total: self.total,
         }
     }
 
@@ -374,7 +385,7 @@ impl RetryPolicy {
         // `attempt_started` не объявит следующую.
         self.attempt_running = false;
 
-        if self.attempt >= MAX_ATTEMPTS {
+        if self.attempt >= self.total {
             return RetryDecision::GiveUp {
                 attempts: self.attempt,
             };
@@ -436,7 +447,7 @@ mod tests {
     #[test]
     fn failures_in_a_row_exhaust_the_attempts_and_no_more() {
         let base = t0();
-        let mut policy = RetryPolicy::new(base);
+        let mut policy = RetryPolicy::new(base, MAX_ATTEMPTS);
 
         // Лестница выводится из констант, а не переписывается числом:
         // калибровка на bundle правит `MAX_ATTEMPTS` (TL-44 подняла его с
@@ -482,12 +493,58 @@ mod tests {
     }
 
     #[test]
+    fn the_limit_comes_from_the_caller_and_not_from_the_constant() {
+        // Ф-13 и К-6 E5: предел — настройка, снятая на старте задачи.
+        // Числа выбраны не равными умолчанию, иначе тест не отличил бы
+        // предел из аргумента от захардкоженного `MAX_ATTEMPTS`.
+        let base = t0();
+
+        let mut one = RetryPolicy::new(base, 1);
+        assert_eq!(one.attempt().total, 1);
+        assert_eq!(
+            one.attempt_failed(),
+            RetryDecision::GiveUp { attempts: 1 },
+            "предел 1 — сдаётся после первой же неудачи"
+        );
+
+        let mut twenty = RetryPolicy::new(base, MAX_ATTEMPTS_LIMIT_FOR_TESTS);
+        for step in 1..MAX_ATTEMPTS_LIMIT_FOR_TESTS {
+            match twenty.attempt_failed() {
+                RetryDecision::Retry { attempt, .. } => {
+                    assert_eq!(attempt.total, MAX_ATTEMPTS_LIMIT_FOR_TESTS);
+                    assert_eq!(attempt.number, step + 1);
+                }
+                RetryDecision::GiveUp { .. } => panic!("предел 20 кончился на шаге {step}"),
+            }
+        }
+        assert_eq!(
+            twenty.attempt_failed(),
+            RetryDecision::GiveUp {
+                attempts: MAX_ATTEMPTS_LIMIT_FOR_TESTS
+            }
+        );
+    }
+
+    #[test]
+    fn a_zero_limit_still_means_one_attempt() {
+        let mut policy = RetryPolicy::new(t0(), 0);
+        assert_eq!(policy.attempt().total, 1, "«попытка 1 из 0» — не состояние");
+        assert_eq!(
+            policy.attempt_failed(),
+            RetryDecision::GiveUp { attempts: 1 }
+        );
+    }
+
+    /// Верхняя граница настройки — берётся у хранилища, а не выписывается.
+    const MAX_ATTEMPTS_LIMIT_FOR_TESTS: u32 = crate::storage::settings::MAX_ATTEMPTS_LIMIT;
+
+    #[test]
     fn any_progress_resets_the_counter_of_attempts() {
         // С-6 буквально: час загрузки на нестабильной сети не исчерпывает
         // лимит суммированием редких обрывов. Здесь их девять — больше
         // предела, — и задача не падает ни разу.
         let base = t0();
-        let mut policy = RetryPolicy::new(base);
+        let mut policy = RetryPolicy::new(base, MAX_ATTEMPTS);
         let mut received = 0u64;
 
         for round in 0..9 {
@@ -516,7 +573,7 @@ mod tests {
         // Обратная сторона того же: попытка поднялась, доложила уже
         // принятое и снова умерла. Продвижения не было — счётчик стоит.
         let base = t0();
-        let mut policy = RetryPolicy::new(base);
+        let mut policy = RetryPolicy::new(base, MAX_ATTEMPTS);
 
         assert!(policy.observe(995_883, at(base, 10)));
         assert!(matches!(
@@ -544,7 +601,7 @@ mod tests {
     fn the_watchdog_counts_time_and_not_lines() {
         // С-8: порог отсчитывается от последнего принятого байта.
         let base = t0();
-        let mut policy = RetryPolicy::new(base);
+        let mut policy = RetryPolicy::new(base, MAX_ATTEMPTS);
         policy.attempt_started(base);
 
         policy.observe(1024, at(base, 5));
@@ -572,7 +629,7 @@ mod tests {
         // объявил бы зависшей попытку, которой ещё нет. Момента в этом
         // промежутке не выдаётся вовсе: вооружать нечем.
         let base = t0();
-        let mut policy = RetryPolicy::new(base);
+        let mut policy = RetryPolicy::new(base, MAX_ATTEMPTS);
         policy.attempt_started(base);
         policy.observe(1024, at(base, 5));
 
@@ -596,7 +653,7 @@ mod tests {
     #[test]
     fn the_start_of_the_next_stream_rearms_the_watchdog_without_counting_as_progress() {
         let base = t0();
-        let mut policy = RetryPolicy::new(base);
+        let mut policy = RetryPolicy::new(base, MAX_ATTEMPTS);
         policy.attempt_started(base);
         assert!(matches!(
             policy.attempt_failed(),
@@ -641,7 +698,7 @@ mod tests {
         // новая попытка была бы объявлена зависшей, не успев ничего
         // принять.
         let base = t0();
-        let mut policy = RetryPolicy::new(base);
+        let mut policy = RetryPolicy::new(base, MAX_ATTEMPTS);
         policy.attempt_started(base);
 
         policy.observe(1024, at(base, 5));
@@ -664,7 +721,7 @@ mod tests {
         let mut aggregator = video_and_audio_aggregator();
 
         let base = t0();
-        let mut policy = RetryPolicy::new(base);
+        let mut policy = RetryPolicy::new(base, MAX_ATTEMPTS);
         policy.attempt_started(base);
 
         let mut naive_high_water = 0u64;
@@ -747,10 +804,10 @@ mod tests {
         let mut aggregator = video_and_audio_aggregator();
 
         let base = t0();
-        let mut policy = RetryPolicy::new(base);
+        let mut policy = RetryPolicy::new(base, MAX_ATTEMPTS);
         policy.attempt_started(base);
 
-        let mut naive = RetryPolicy::new(base);
+        let mut naive = RetryPolicy::new(base, MAX_ATTEMPTS);
         naive.attempt_started(base);
 
         let mut naive_stalled_at = None;
@@ -793,7 +850,7 @@ mod tests {
         // обнуляется сразу, а не после того, как заново наберётся
         // потерянное. Обе фикстуры сняты живьём одна за другой.
         let base = t0();
-        let mut policy = RetryPolicy::new(base);
+        let mut policy = RetryPolicy::new(base, MAX_ATTEMPTS);
 
         let interrupted = last_downloaded_bytes("resume-interrupted.json");
         for (index, bytes) in downloaded_bytes("resume-interrupted.json")

@@ -914,3 +914,27 @@ fn millions_of_generated_pairs_never_make_a_path() {
     );
     assert_generator_reaches_the_danger(&sum);
 }
+
+#[test]
+fn a_civil_date_from_the_clock_becomes_a_template_date_only_within_its_range() {
+    // Одно преобразование тройки `clock::today_utc` на предпросмотр (TL-91)
+    // и оркестрацию (TL-89).
+    assert_eq!(
+        TemplateDate::from_civil((2026, 9, 14)).map(|date| date.to_string()),
+        Some("2026-09-14".to_string())
+    );
+    assert_eq!(
+        TemplateDate::from_civil((2028, 2, 29)).map(|date| date.to_string()),
+        Some("2028-02-29".to_string())
+    );
+    for outside in [
+        (10_000, 1, 1),
+        (0, 1, 1),
+        (-1, 1, 1),
+        (2026, 13, 1),
+        (2026, 2, 30),
+    ] {
+        assert_eq!(TemplateDate::from_civil(outside), None, "{outside:?}");
+    }
+    assert_eq!(TemplateDate::UNIX_EPOCH.to_string(), "1970-01-01");
+}

@@ -161,7 +161,9 @@ pub mod retry;
 #[allow(unused_imports)]
 pub use error::{DownloadCommandRejection, DownloadFailure};
 pub use merge::SidecarFfmpeg;
-pub use orchestrate::{build_task, run_task, AppSink, DownloadTask, SidecarDownloader};
+pub use orchestrate::{
+    build_task, run_task, today_utc_date, AppSink, DownloadTask, SidecarDownloader, TaskEnv,
+};
 
 /// Имя Tauri-события с ходом одной задачи скачивания (Ф-2).
 ///

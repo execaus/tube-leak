@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 
 use super::*;
+use crate::download::filename::sanitized_stem;
 use crate::download::fixtures::{self, DESTINATION_PLACEHOLDER, SINGLE_LAUNCH_FIXTURES};
 use crate::download::merge::MERGE_TIMEOUT_SECS;
 use crate::download::progress::parse_line;
@@ -27,6 +28,33 @@ use crate::sidecar::RunOutput;
 use crate::types::{DownloadPhase, QualityKind, QualitySize, SelectedQuality, YtDlpFailureReason};
 
 // ─────────────────────────── Оснастка ───────────────────────────
+
+/// Прогон задачи с папкой назначения E3: настроек нет (умолчания — системная
+/// папка и `{title}`), системная «Загрузки» — `destination`, истории нет.
+///
+/// Тесты E3/E4 проверяют механизм одной задачи, а не настройки, и держат
+/// прежнюю форму вызова: имя затеняет `super::run_task`. Тесты TL-89 зовут
+/// настоящий с собственным [`TaskEnv`].
+async fn run_task(
+    task: &Arc<DownloadTask>,
+    launcher: &dyn DownloadLauncher,
+    ffmpeg: &dyn FfmpegLauncher,
+    sink: &dyn ProgressSink,
+    destination: &Path,
+) {
+    let env = TaskEnv {
+        settings: None,
+        history: None,
+        system_downloads: Some(destination.to_path_buf()),
+        today: fixed_today,
+    };
+    super::run_task(task, launcher, ffmpeg, sink, &env).await;
+}
+
+/// Дата тестов, не зависящая от часов: 2031-02-03.
+fn fixed_today() -> TemplateDate {
+    TemplateDate::new(2031, 2, 3).expect("дата существует")
+}
 
 /// Что делает подменённый запуск.
 #[derive(Debug, Clone)]
@@ -42,6 +70,40 @@ enum Step {
     /// Работает только под `tokio::time::pause()` и без него падает, а не
     /// ждёт по-настоящему.
     Advance(Duration),
+    /// Сделать то, что делает пользователь, пока процесс идёт (TL-89:
+    /// сменить настройку посреди задачи).
+    Hook(Hook),
+    /// Сделать с диском то, что сделал бы yt-dlp **по нашим аргументам**
+    /// (TL-89): для каждого формата из `-f` назвать файл по шаблону `-o` в
+    /// папке `-P` строкой `Destination` и создать его ровно там. Имя и папку
+    /// тест не выписывает сам — их берёт из argv оркестрации.
+    ///
+    /// `partial` — оборвать поток: создать `<имя>.part` (ревью TL-89, B1).
+    /// Без него — как yt-dlp с `--continue` по умолчанию: готовый файл под
+    /// этим именем даёт `has already been downloaded`, лежащий `<имя>.part`
+    /// докачивается (переименовывается в файл потока с прежним содержимым),
+    /// иначе файл пишется заново.
+    ///
+    /// Раскрытия `$`, `%` и `~` здесь нет, и имя, которое не является одним
+    /// именем файла (разделители, `..`), не пишется вовсе — отказ уходит в
+    /// [`Call::emulate_failures`], и задача кончается не `Done`. Так сценарий
+    /// никогда не пишет за пределы папки теста, а проверку `-o` делает сам
+    /// тест по argv.
+    Emulate { partial: bool },
+}
+
+/// Содержимое `.part`, оставленного оборванным потоком: докачанный файл
+/// сохраняет его, и по нему видно, что вчерашнее не скачивалось заново.
+const PARTIAL_BYTES: &[u8] = b"partial bytes";
+
+/// Действие посреди сценария.
+#[derive(Clone)]
+struct Hook(Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Hook")
+    }
 }
 
 /// Сценарий одного запуска.
@@ -103,6 +165,21 @@ impl Script {
         self.steps.push(Step::Advance(by));
         self
     }
+
+    fn hook(mut self, action: impl Fn() + Send + Sync + 'static) -> Self {
+        self.steps.push(Step::Hook(Hook(Arc::new(action))));
+        self
+    }
+
+    fn emulate(mut self) -> Self {
+        self.steps.push(Step::Emulate { partial: false });
+        self
+    }
+
+    fn emulate_partial(mut self) -> Self {
+        self.steps.push(Step::Emulate { partial: true });
+        self
+    }
 }
 
 /// Один состоявшийся запуск: argv и сроки, которые оркестрация выставила.
@@ -117,6 +194,8 @@ struct Call {
     line_times: Vec<Instant>,
     /// Сроки, возвращённые обработчиком строк, по одному на строку.
     deadlines: Vec<Option<Instant>>,
+    /// Что [`Step::Emulate`] не смог или отказался положить на диск.
+    emulate_failures: Vec<String>,
 }
 
 impl Call {
@@ -194,6 +273,7 @@ impl DownloadLauncher for ScriptedLauncher {
                 lines: Vec::new(),
                 line_times: Vec::new(),
                 deadlines: Vec::new(),
+                emulate_failures: Vec::new(),
             };
 
             for step in &script.steps {
@@ -216,6 +296,55 @@ impl DownloadLauncher for ScriptedLauncher {
                     }
                     Step::HangUntilCancelled => handle.cancelled().await,
                     Step::Advance(by) => tokio::time::advance(*by).await,
+                    Step::Hook(hook) => (hook.0)(),
+                    Step::Emulate { partial } => {
+                        let dir = call
+                            .value_of("-P")
+                            .and_then(|value| value.strip_prefix("home:"))
+                            .expect("-P home:<папка> обязателен")
+                            .to_string();
+                        let template = call.value_of("-o").expect("-o обязателен").to_string();
+                        let selector = call.value_of("-f").expect("-f обязателен").to_string();
+                        for format_id in selector.split(',') {
+                            let ext = if matches!(format_id, "139" | "140") {
+                                "m4a"
+                            } else {
+                                "mp4"
+                            };
+                            let name = template
+                                .replace("%(format_id)s", format_id)
+                                .replace("%(ext)s", ext);
+                            if Path::new(&name).file_name() != Some(std::ffi::OsStr::new(&name)) {
+                                call.emulate_failures
+                                    .push(format!("{name:?} — не одно имя файла"));
+                                continue;
+                            }
+                            let path = Path::new(&dir).join(&name);
+                            let part = Path::new(&dir).join(format!("{name}.part"));
+                            let already = !*partial && path.exists();
+                            let line = if already {
+                                format!("[download] {} has already been downloaded", path.display())
+                            } else {
+                                format!("[download] Destination: {}", path.display())
+                            };
+                            call.lines.push(line.clone());
+                            call.line_times.push(monotonic_now());
+                            call.deadlines.push(on_line(&line));
+                            let written = if *partial {
+                                std::fs::write(&part, PARTIAL_BYTES)
+                            } else if already {
+                                Ok(())
+                            } else if part.exists() {
+                                std::fs::rename(&part, &path)
+                            } else {
+                                std::fs::write(&path, b"stream bytes")
+                            };
+                            if let Err(err) = written {
+                                call.emulate_failures
+                                    .push(format!("{}: {err}", path.display()));
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2766,4 +2895,1425 @@ fn the_fallback_stem_id_agrees_with_the_canonical_id_wherever_that_one_exists() 
             "запасное имя и канонический id разошлись на форме «{url}»"
         );
     }
+}
+
+// ─────────────────── Настройки и история (TL-89, эпик E5) ───────────────────
+
+/// Хранилище настроек из `settings.json`, записанного руками.
+///
+/// Путь своей папки кладётся в файл как есть, без канонизации (правило
+/// чтения её не делает): так тест различает «ту же папку» и «ту же, но
+/// канонизированную». Настройки, которые хранилище не приняло, роняют тест:
+/// иначе он молча проверял бы умолчания.
+fn settings_with(
+    data: &Path,
+    folder: Option<&Path>,
+    template: &str,
+    attempts: u32,
+) -> Arc<SettingsState> {
+    let destination = match folder {
+        None => serde_json::json!({ "kind": "system" }),
+        Some(path) => serde_json::json!({
+            "kind": "custom",
+            "path": path.to_str().expect("папка теста в UTF-8"),
+        }),
+    };
+    let file = serde_json::json!({
+        "version": 1,
+        "destinationFolder": destination,
+        "nameTemplate": template,
+        "maxAttempts": attempts,
+    });
+    std::fs::create_dir_all(data).unwrap();
+    std::fs::write(
+        data.join("settings.json"),
+        serde_json::to_vec(&file).unwrap(),
+    )
+    .unwrap();
+
+    let state = SettingsState::open_isolated(Ok(data.to_path_buf()));
+    let readout = state.store().expect("хранилище настроек открыто").readout();
+    assert!(
+        readout.reset_fields.is_empty() && !readout.whole_file_reset,
+        "настройки теста не приняты ({template:?}): сброшены {:?}",
+        readout.reset_fields
+    );
+    Arc::new(state)
+}
+
+fn history_in(data: &Path) -> Arc<HistoryState> {
+    let state = HistoryState::open_isolated(Ok(data.to_path_buf()));
+    assert!(state.store().is_ok(), "история теста открыта");
+    Arc::new(state)
+}
+
+fn records(history: &HistoryState) -> Vec<crate::storage::history::HistoryRecord> {
+    history
+        .store()
+        .expect("история открыта")
+        .page(None)
+        .expect("страница истории читается")
+        .records
+}
+
+fn env_with(
+    settings: Option<Arc<SettingsState>>,
+    history: Option<Arc<HistoryState>>,
+    system_downloads: Option<&Path>,
+) -> TaskEnv {
+    TaskEnv {
+        settings,
+        history,
+        system_downloads: system_downloads.map(Path::to_path_buf),
+        today: fixed_today,
+    }
+}
+
+fn custom(path: &Path) -> crate::types::FolderDisplay {
+    crate::types::FolderDisplay::Custom {
+        path: path.to_str().expect("UTF-8").to_string(),
+    }
+}
+
+fn audio_task() -> Arc<DownloadTask> {
+    new_task(request(streams(None, Some("140"))))
+}
+
+/// Всё под `root` — каталоги и файлы, пути через `/`, по порядку.
+fn tree(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("каталог читается").flatten() {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("под корнем")
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            out.push(relative);
+            if entry.file_type().expect("тип").is_dir() {
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn a_custom_folder_from_the_settings_reaches_the_process_the_file_the_panel_and_the_history()
+{
+    // К-4 [авто]: папка из настроек доезжает до `run_task` (`-P`), до файла,
+    // до `Done.folderDisplay` и до записи истории.
+    let root = tempfile::tempdir().unwrap();
+    let system = root.path().join("Загрузки");
+    let own = root.path().join("своя папка");
+    std::fs::create_dir(&system).unwrap();
+    std::fs::create_dir(&own).unwrap();
+    let data = root.path().join("data");
+
+    let history = history_in(&data);
+    let env = env_with(
+        Some(settings_with(&data, Some(&own), "{title}", 8)),
+        Some(Arc::clone(&history)),
+        Some(&system),
+    );
+    let sink = RecordingSink::new();
+    let launcher = ScriptedLauncher::new(&own, vec![Script::ok().emulate()]);
+
+    super::run_task(
+        &audio_task(),
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &env,
+    )
+    .await;
+
+    assert_eq!(
+        launcher.calls()[0].value_of("-P"),
+        Some(format!("home:{}", own.display()).as_str()),
+        "yt-dlp получил папку из настроек"
+    );
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: "Big Buck Bunny.m4a".to_string(),
+            folder_display: custom(&own),
+        }
+    );
+    assert_eq!(dir_listing(&own), ["Big Buck Bunny.m4a"]);
+    assert_eq!(
+        dir_listing(&system),
+        Vec::<String>::new(),
+        "не в «Загрузки»"
+    );
+
+    let records = records(&history);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].folder, own);
+    assert_eq!(records[0].file_name, "Big Buck Bunny.m4a");
+    assert_eq!(
+        folder_display(&records[0].folder, Some(&system)),
+        custom(&own),
+        "панель «Готово» и история называют папку одинаково"
+    );
+}
+
+#[tokio::test]
+async fn a_settings_change_during_a_task_waits_for_the_next_task() {
+    // К-4, Р-4: смена папки и шаблона посреди задачи не трогает идущую и
+    // достаётся ожидающей. Обе задачи поставлены **до** старта первой —
+    // вторая стоит в очереди, пока меняются настройки.
+    let root = tempfile::tempdir().unwrap();
+    let folder_a = root.path().join("A");
+    let folder_b = root.path().join("B");
+    std::fs::create_dir(&folder_a).unwrap();
+    std::fs::create_dir(&folder_b).unwrap();
+    let data = root.path().join("data");
+
+    let settings = settings_with(&data, Some(&folder_a), "{title}", 8);
+    let env = env_with(Some(Arc::clone(&settings)), None, None);
+
+    let first = audio_task();
+    let mut other = request(streams(None, Some("140")));
+    other.url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string();
+    other.title = "Never Gonna Give You Up".to_string();
+    let second = new_task(other);
+
+    let changer = Arc::clone(&settings);
+    let path_b = folder_b.to_str().unwrap().to_string();
+    let change = move || {
+        let store = changer.store().expect("хранилище настроек");
+        store
+            .set(&crate::types::SettingsPatch::DestinationFolder(
+                crate::types::DestinationFolder::Custom {
+                    path: path_b.clone(),
+                },
+            ))
+            .expect("папка сохранена");
+        store
+            .set(&crate::types::SettingsPatch::NameTemplate(
+                "{id} — {title}".to_string(),
+            ))
+            .expect("шаблон сохранён");
+    };
+
+    let sink_a = RecordingSink::new();
+    let launcher_a = ScriptedLauncher::new(&folder_a, vec![Script::ok().hook(change).emulate()]);
+    super::run_task(
+        &first,
+        &launcher_a,
+        &ScriptedFfmpeg::merging(),
+        &sink_a,
+        &env,
+    )
+    .await;
+
+    assert_eq!(
+        sink_a.last(),
+        DownloadProgress::Done {
+            file_name: "Big Buck Bunny.m4a".to_string(),
+            folder_display: custom(&folder_a),
+        },
+        "идущая задача держит папку и имя своего старта"
+    );
+
+    let sink_b = RecordingSink::new();
+    let launcher_b = ScriptedLauncher::new(&folder_b, vec![Script::ok().emulate()]);
+    super::run_task(
+        &second,
+        &launcher_b,
+        &ScriptedFfmpeg::merging(),
+        &sink_b,
+        &env,
+    )
+    .await;
+
+    // Сохранение канонизирует путь папки (TL-87) — ожидание берёт то же.
+    let saved_b = std::fs::canonicalize(&folder_b).unwrap();
+    assert_eq!(
+        sink_b.last(),
+        DownloadProgress::Done {
+            file_name: "dQw4w9WgXcQ — Never Gonna Give You Up.m4a".to_string(),
+            folder_display: custom(&saved_b),
+        },
+        "ожидавшая задача получила настройки своего старта"
+    );
+    assert_eq!(dir_listing(&folder_a), ["Big Buck Bunny.m4a"]);
+    assert_eq!(
+        dir_listing(&folder_b),
+        ["dQw4w9WgXcQ — Never Gonna Give You Up.m4a"]
+    );
+}
+
+#[tokio::test]
+async fn an_id_and_title_template_gives_the_expected_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let env = env_with(
+        Some(settings_with(data.path(), None, "{id} — {title}", 8)),
+        None,
+        Some(dir.path()),
+    );
+    let sink = RecordingSink::new();
+    let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+
+    super::run_task(
+        &audio_task(),
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &env,
+    )
+    .await;
+
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: "aqz-KE-bpKQ — Big Buck Bunny.m4a".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
+        }
+    );
+    assert_eq!(
+        dir_listing(dir.path()),
+        ["aqz-KE-bpKQ — Big Buck Bunny.m4a"]
+    );
+}
+
+#[tokio::test]
+async fn the_default_template_names_every_file_exactly_like_e3_did() {
+    // Ф-12, К-5: умолчание `{title}` из настоящего хранилища (файла нет —
+    // умолчания) даёт байт в байт имя E3 — `sanitized_stem(название,
+    // video_id_of(ссылка))` — на корпусе названий E3, включая запасное имя.
+    let mut titles: Vec<String> = HOSTILE_TITLES.iter().map(|t| (*t).to_string()).collect();
+    titles.extend(
+        [
+            TITLE,
+            "CON",
+            "отчёт\u{202e}gpj.exe",
+            "a/b\\c:d*e?f\"g<h>i|j",
+            "..",
+            "???",
+            "   ",
+            "Название. ",
+        ]
+        .map(str::to_string),
+    );
+    titles.push("я".repeat(400));
+
+    for title in titles {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let settings = Arc::new(SettingsState::open_isolated(Ok(data.path().to_path_buf())));
+        let env = env_with(Some(settings), None, Some(dir.path()));
+        let mut req = request(streams(None, Some("140")));
+        req.title = title.clone();
+        let sink = RecordingSink::new();
+        let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+
+        super::run_task(
+            &new_task(req),
+            &launcher,
+            &ScriptedFfmpeg::merging(),
+            &sink,
+            &env,
+        )
+        .await;
+
+        let e3 = format!("{}.m4a", sanitized_stem(&title, &video_id_of(URL)));
+        assert_eq!(
+            sink.last(),
+            DownloadProgress::Done {
+                file_name: e3.clone(),
+                folder_display: crate::types::FolderDisplay::SystemDownloads,
+            },
+            "название {title:?}"
+        );
+        assert_eq!(dir_listing(dir.path()), [e3], "название {title:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_fallback_name_takes_the_id_e3_took_even_where_the_canonical_id_differs() {
+    // F3 ревью TL-86: `{id}` и запасное имя — `video_id_of`, как в E3, а не
+    // канонический id очереди. У `youtu.be/ID#t=10` они разные: канонический
+    // разбор отбрасывает фрагмент, нестрогий E3 — нет.
+    const LINK: &str = "https://youtu.be/aqz-KE-bpKQ#t=10";
+    const NOTHING_LEFT: &str = "???";
+    let e3_id = video_id_of(LINK);
+    let canonical = canonical_video_id(LINK).expect("форма разбирается TL-72");
+    assert_ne!(
+        sanitized_stem(NOTHING_LEFT, &e3_id),
+        sanitized_stem(NOTHING_LEFT, canonical.as_str()),
+        "проверять нечего, если на этой ссылке запасные имена совпадают"
+    );
+
+    for (template, stem) in [
+        ("{title}", sanitized_stem(NOTHING_LEFT, &e3_id)),
+        ("{id}", sanitized_stem(&e3_id, &e3_id)),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let env = env_with(
+            Some(settings_with(data.path(), None, template, 8)),
+            None,
+            Some(dir.path()),
+        );
+        let mut req = request(streams(None, Some("140")));
+        req.url = LINK.to_string();
+        req.title = NOTHING_LEFT.to_string();
+        let sink = RecordingSink::new();
+        let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+
+        super::run_task(
+            &new_task(req),
+            &launcher,
+            &ScriptedFfmpeg::merging(),
+            &sink,
+            &env,
+        )
+        .await;
+
+        assert_eq!(
+            sink.last(),
+            DownloadProgress::Done {
+                file_name: format!("{stem}.m4a"),
+                folder_display: crate::types::FolderDisplay::SystemDownloads,
+            },
+            "шаблон {template}"
+        );
+    }
+}
+
+/// Шов даты «следующего дня» после [`fixed_today`]: 2031-02-04.
+fn next_day() -> TemplateDate {
+    TemplateDate::new(2031, 2, 4).expect("дата существует")
+}
+
+#[tokio::test]
+async fn the_date_in_the_name_is_the_completion_date_from_the_clock_seam() {
+    // Ф-12: `{date}` — дата завершения из шва часов. Шов зовётся только перед
+    // финализацией: в рабочие имена дата не входит вовсе (ревью TL-89, B1),
+    // и `-o` запуска её не несёт. Что дата — именно дня завершения, а не
+    // старта, доказывают тесты B1 со сменой дня между стартами.
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut env = env_with(
+        Some(settings_with(data.path(), None, "{date} {title}", 8)),
+        None,
+        Some(dir.path()),
+    );
+    env.today = next_day;
+    let sink = RecordingSink::new();
+    let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+
+    super::run_task(
+        &audio_task(),
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &env,
+    )
+    .await;
+
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: "2031-02-04 Big Buck Bunny.m4a".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
+        }
+    );
+    assert_eq!(dir_listing(dir.path()), ["2031-02-04 Big Buck Bunny.m4a"]);
+    assert_eq!(
+        launcher.calls()[0].value_of("-o"),
+        Some("Big Buck Bunny.f%(format_id)s.%(ext)s"),
+        "рабочее имя — основа E3, без даты и шаблона"
+    );
+}
+
+#[test]
+fn the_production_date_is_today_by_the_clock_the_preview_uses() {
+    // Та же функция, что у предпросмотра (TL-91): `clock::today_utc`.
+    let format = |(year, month, day): (i64, u32, u32)| format!("{year:04}-{month:02}-{day:02}");
+    let before = format(clock::today_utc());
+    let date = today_utc_date().to_string();
+    let after = format(clock::today_utc());
+    assert!(
+        date == before || date == after,
+        "{date} — не сегодня по UTC ({before})"
+    );
+}
+
+#[tokio::test]
+async fn one_attempt_from_the_settings_fails_after_the_first_interruption() {
+    // К-6: настройка 1 — после первой же неудачи `connectionLost`, без пауз.
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let env = env_with(
+        Some(settings_with(data.path(), None, "{title}", 1)),
+        None,
+        Some(dir.path()),
+    );
+    let sink = RecordingSink::new();
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::failing(1, &connection_lost_stderr())
+            .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
+            .creates("Big Buck Bunny.f140.m4a.part")],
+    );
+
+    super::run_task(
+        &audio_task(),
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &env,
+    )
+    .await;
+
+    assert_eq!(launcher.calls().len(), 1, "ровно одна попытка");
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("ожидался отказ, а не {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::ConnectionLost);
+    assert!(
+        error.message.contains(": 1 попыток"),
+        "исчерпано 1 из 1: {}",
+        error.message
+    );
+    assert!(
+        !sink.events().iter().any(|p| matches!(
+            p,
+            DownloadProgress::Downloading(DownloadingState::WaitingRetry { .. })
+        )),
+        "паузы перед повтором при пределе 1 не бывает"
+    );
+}
+
+fn waiting_attempts(sink: &RecordingSink) -> Vec<crate::types::DownloadAttempt> {
+    let mut attempts: Vec<crate::types::DownloadAttempt> = sink
+        .events()
+        .iter()
+        .filter_map(|progress| match progress {
+            DownloadProgress::Downloading(DownloadingState::WaitingRetry { attempt, .. }) => {
+                Some(*attempt)
+            }
+            _ => None,
+        })
+        .collect();
+    attempts.dedup();
+    attempts
+}
+
+#[tokio::test]
+async fn the_attempt_total_is_taken_at_the_start_and_survives_a_change_of_the_setting() {
+    // Ф-13, К-6: предел 3 из настроек — в `total` событий; смена настройки
+    // на 5 посреди задачи его не трогает: задача сдаётся после третьей.
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let settings = settings_with(data.path(), None, "{title}", 3);
+    let env = env_with(Some(Arc::clone(&settings)), None, Some(dir.path()));
+    let failing = || {
+        Script::failing(1, &connection_lost_stderr())
+            .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
+            .creates("Big Buck Bunny.f140.m4a.part")
+    };
+    let changer = Arc::clone(&settings);
+    let scripts = vec![
+        failing().hook(move || {
+            changer
+                .store()
+                .expect("хранилище")
+                .set(&crate::types::SettingsPatch::MaxAttempts(5))
+                .expect("число попыток сохранено");
+        }),
+        failing(),
+        failing(),
+    ];
+    let launcher = ScriptedLauncher::new(dir.path(), scripts);
+    let sink = RecordingSink::new();
+
+    tokio::time::pause();
+    super::run_task(
+        &audio_task(),
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &env,
+    )
+    .await;
+    tokio::time::resume();
+
+    assert_eq!(
+        launcher.calls().len(),
+        3,
+        "попыток ровно три — предел старта"
+    );
+    assert_eq!(
+        waiting_attempts(&sink)
+            .iter()
+            .map(|a| (a.number, a.total))
+            .collect::<Vec<_>>(),
+        [(2, 3), (3, 3)]
+    );
+    assert!(matches!(
+        sink.last(),
+        DownloadProgress::Failed { error } if error.kind == DownloadErrorKind::ConnectionLost
+    ));
+}
+
+#[tokio::test]
+async fn twenty_attempts_from_the_settings_show_twenty_in_the_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let env = env_with(
+        Some(settings_with(data.path(), None, "{title}", 20)),
+        None,
+        Some(dir.path()),
+    );
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![
+            Script::failing(1, &connection_lost_stderr())
+                .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
+                .creates("Big Buck Bunny.f140.m4a.part"),
+            Script::ok().emulate(),
+        ],
+    );
+    let sink = RecordingSink::new();
+
+    tokio::time::pause();
+    super::run_task(
+        &audio_task(),
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &env,
+    )
+    .await;
+    tokio::time::resume();
+
+    assert_eq!(
+        waiting_attempts(&sink)
+            .iter()
+            .map(|a| (a.number, a.total))
+            .collect::<Vec<_>>(),
+        [(2, 20)]
+    );
+    assert!(matches!(sink.last(), DownloadProgress::Done { .. }));
+}
+
+/// Приёмник, который на событии `done` смотрит, есть ли уже запись в
+/// истории (Ф-3: запись раньше, чем о готовой задаче узнает окно).
+struct SinkSeeingHistory {
+    inner: RecordingSink,
+    history: Arc<HistoryState>,
+    records_at_done: StdMutex<Vec<usize>>,
+}
+
+impl ProgressSink for SinkSeeingHistory {
+    fn emit(&self, event: DownloadProgressEvent) {
+        if matches!(event.progress, DownloadProgress::Done { .. }) {
+            let count = self
+                .history
+                .store()
+                .expect("история")
+                .page(None)
+                .expect("страница")
+                .records
+                .len();
+            self.records_at_done.lock().unwrap().push(count);
+        }
+        self.inner.emit(event);
+    }
+}
+
+#[tokio::test]
+async fn a_done_task_writes_exactly_one_record_and_failed_or_cancelled_write_none() {
+    // Р-1, Р-2, К-2 [авто]: Done — одна запись с верными полями, записанная
+    // раньше события; Failed и Cancelled — ни одной; запись переживает новое
+    // открытие того же файла.
+    let root = tempfile::tempdir().unwrap();
+    let downloads = root.path().join("Загрузки");
+    std::fs::create_dir(&downloads).unwrap();
+    let data = root.path().join("data");
+    let history = history_in(&data);
+
+    // Done.
+    let env = env_with(None, Some(Arc::clone(&history)), Some(&downloads));
+    let sink = SinkSeeingHistory {
+        inner: RecordingSink::new(),
+        history: Arc::clone(&history),
+        records_at_done: StdMutex::new(Vec::new()),
+    };
+    let launcher = ScriptedLauncher::new(&downloads, vec![Script::ok().emulate()]);
+    let before = clock::now_unix_secs();
+    super::run_task(
+        &audio_task(),
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &env,
+    )
+    .await;
+    let after = clock::now_unix_secs();
+
+    let DownloadProgress::Done {
+        file_name,
+        folder_display: shown,
+    } = sink.inner.last()
+    else {
+        panic!("ожидался Done, а не {:?}", sink.inner.last());
+    };
+    assert_eq!(
+        *sink.records_at_done.lock().unwrap(),
+        [1],
+        "к событию done запись уже в базе"
+    );
+
+    // Failed: папки назначения нет.
+    let missing = root.path().join("нет такой папки");
+    let failed_env = env_with(None, Some(Arc::clone(&history)), Some(&missing));
+    let failed_sink = RecordingSink::new();
+    super::run_task(
+        &audio_task(),
+        &ScriptedLauncher::new(&missing, Vec::new()),
+        &ScriptedFfmpeg::merging(),
+        &failed_sink,
+        &failed_env,
+    )
+    .await;
+    assert!(matches!(
+        failed_sink.last(),
+        DownloadProgress::Failed { .. }
+    ));
+
+    // Cancelled.
+    let cancelled = audio_task();
+    cancelled.cancel().await;
+    let cancelled_sink = RecordingSink::new();
+    super::run_task(
+        &cancelled,
+        &ScriptedLauncher::new(&downloads, Vec::new()),
+        &ScriptedFfmpeg::merging(),
+        &cancelled_sink,
+        &env,
+    )
+    .await;
+    assert!(matches!(
+        cancelled_sink.last(),
+        DownloadProgress::Cancelled { .. }
+    ));
+
+    let records = records(&history);
+    assert_eq!(
+        records.len(),
+        1,
+        "Done — одна запись, Failed и Cancelled — ни одной"
+    );
+    let record = &records[0];
+    assert_eq!(record.video_id, "aqz-KE-bpKQ", "канонический id TL-72");
+    assert_eq!(record.url, URL);
+    assert_eq!(record.title, TITLE);
+    assert_eq!(
+        record.quality,
+        SelectedQuality {
+            kind: QualityKind::Standard,
+            height_px: Some(720),
+        }
+    );
+    assert_eq!(record.file_name, file_name);
+    assert_eq!(record.folder, downloads);
+    assert_eq!(
+        record.size_bytes,
+        std::fs::metadata(downloads.join(&file_name)).unwrap().len()
+    );
+    assert!((before..=after).contains(&record.finished_at_unix_secs));
+    assert_eq!(
+        folder_display(&record.folder, Some(&downloads)),
+        shown,
+        "системная папка названа одинаково на панели и в истории"
+    );
+    assert_eq!(shown, crate::types::FolderDisplay::SystemDownloads);
+
+    // К-2: новое открытие того же файла отдаёт запись первой.
+    let reopened = crate::storage::history::HistoryStore::open_isolated(&data).expect("открытие");
+    let page = reopened.page(None).expect("страница");
+    assert_eq!(page.records.first().map(|r| r.id), Some(record.id));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_insert_leaves_the_task_done_and_leaves_a_notice() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let downloads = root.path().join("Загрузки");
+    std::fs::create_dir(&downloads).unwrap();
+    let data = root.path().join("data");
+    let history = history_in(&data);
+    let env = env_with(None, Some(Arc::clone(&history)), Some(&downloads));
+    let sink = RecordingSink::new();
+    let launcher = ScriptedLauncher::new(&downloads, vec![Script::ok().emulate()]);
+
+    // Журнал SQLite в каталоге только на чтение не создаётся — вставка
+    // отказывает на настоящем диске (приём `history_tests`).
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o555)).unwrap();
+    super::run_task(
+        &audio_task(),
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &env,
+    )
+    .await;
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: "Big Buck Bunny.m4a".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
+        },
+        "отказ записи в историю не меняет исход (Н-4)"
+    );
+    assert_eq!(dir_listing(&downloads), ["Big Buck Bunny.m4a"]);
+    let page = history.store().unwrap().page(None).unwrap();
+    assert!(page.records.is_empty());
+    assert_eq!(
+        page.notices,
+        vec![crate::types::HistoryNotice::LastWriteFailed {
+            cause: HistoryWriteFailure::NoAccess
+        }]
+    );
+}
+
+#[tokio::test]
+async fn without_a_history_the_task_is_still_done() {
+    for history in [
+        None,
+        Some(Arc::new(HistoryState::open_isolated(Err(
+            "каталог данных не определяется".to_string(),
+        )))),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with(None, history, Some(dir.path()));
+        let sink = RecordingSink::new();
+        let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+
+        super::run_task(
+            &audio_task(),
+            &launcher,
+            &ScriptedFfmpeg::merging(),
+            &sink,
+            &env,
+        )
+        .await;
+
+        assert!(matches!(sink.last(), DownloadProgress::Done { .. }));
+        assert_eq!(dir_listing(dir.path()), ["Big Buck Bunny.m4a"]);
+    }
+}
+
+#[tokio::test]
+async fn no_hostile_template_or_title_puts_a_file_outside_the_folder_or_into_a_subfolder() {
+    // К-5 через настоящий путь оркестрации: шаблон из файла настроек, файл
+    // потока — по argv (`Step::Emulate`), финализация — своя. Что доказывает
+    // каждая из двух проверок (ревью TL-89, S1):
+    //
+    // - **argv**: `-o` запуска равен `output_template(download_stem(основа
+    //   E3))` и до нашего хвоста состоит только из символов `template_safe`.
+    //   В шаблон yt-dlp не уходит ничего, что он раскрыл бы (`$`, `%`, ведущая
+    //   `~`, разделители), и ничего от шаблона настроек. Раскрытия сценарий не
+    //   моделирует, поэтому доказывает это только argv, а не обход диска.
+    //   Мутация «сырое название в `-o`» краснеет здесь, до исхода задачи.
+    // - **обход ФС**: после `Done` под корнем ровно папка назначения и один
+    //   файл в ней. Он ловит пояс финализации — `candidate_name` санитизирует
+    //   основу сам и не выпускает разделителей — и отсутствие подпапок. Чего
+    //   он **не** доказывает: что финальная основа прошла `file_stem`
+    //   (подстановка и санитизация E3). Мутация «финальная основа — сырое
+    //   название» здесь зелёная, её держит `candidate_name`; ловят её тесты
+    //   имени (`the_default_template_names_every_file_exactly_like_e3_did` и
+    //   соседние, сверяющие имя готового файла байт в байт).
+    const TEMPLATES: &[&str] = &[
+        "{title}",
+        "../{title}",
+        "..\\{title}",
+        "{title}/../../escape",
+        "/{id}",
+        "C:\\{id}",
+        "~/{title}",
+        "$HOME/{title}",
+        // `${HOME}` — не шаблон (`{HOME}` вне белого списка) и до оркестрации
+        // не доходит; раскрытие доллара проверяется литералом `$HOME`.
+        "$HOME-{id}",
+        "%(ext)s{title}",
+        "%%(title)s{id}",
+        "{id}/{title}",
+        "\u{202e}{title}",
+        "{quality}",
+        ".{date}.",
+        "CON{quality}",
+        "{title}\n{id}",
+        "  {title}  ",
+        "{title}.part",
+        "{title}:{id}*?",
+        // Финальное имя под префиксом частичного файла и склейки (B1):
+        // подчистка на `Done` обязана пощадить готовый файл.
+        "{title}.f140.{id}",
+        "{title}.tl-merging.{id}",
+    ];
+    let mut titles: Vec<String> = HOSTILE_TITLES.iter().map(|t| (*t).to_string()).collect();
+    titles.extend(
+        [
+            "..",
+            "../../etc/passwd",
+            "CON",
+            "a/b\\c",
+            "{id}",
+            "$HOME",
+            ".hidden",
+            "\u{202e}gpj.exe",
+            "",
+        ]
+        .map(str::to_string),
+    );
+    titles.push("я/".repeat(200));
+
+    let mut checked = 0;
+    for (index, template) in TEMPLATES.iter().enumerate() {
+        for title in &titles {
+            let root = tempfile::tempdir().unwrap();
+            let dest = root.path().join("dest");
+            std::fs::create_dir(&dest).unwrap();
+            let data = tempfile::tempdir().unwrap();
+            let env = env_with(
+                Some(settings_with(data.path(), Some(&dest), template, 1)),
+                None,
+                None,
+            );
+            let mut req = request(streams(None, Some("140")));
+            req.title = title.clone();
+            // Чётные шаблоны — со ступенью, нечётные — без: `{quality}` бывает
+            // и пустым.
+            req.quality.height_px = (index % 2 == 0).then_some(720);
+            let sink = RecordingSink::new();
+            let launcher = ScriptedLauncher::new(&dest, vec![Script::ok().emulate()]);
+
+            super::run_task(
+                &new_task(req),
+                &launcher,
+                &ScriptedFfmpeg::merging(),
+                &sink,
+                &env,
+            )
+            .await;
+
+            // argv — раньше исхода задачи: неверный `-o` обязан краснеть
+            // здесь, а не побочным отказом.
+            let calls = launcher.calls();
+            assert_eq!(calls.len(), 1, "шаблон {template:?}, название {title:?}");
+            let output = calls[0].value_of("-o").expect("-o обязателен");
+            assert_eq!(
+                output,
+                output_template(&download_stem(&sanitized_stem(title, &video_id_of(URL)))),
+                "шаблон {template:?}, название {title:?}: -o не из рабочей основы E3"
+            );
+            let head = output
+                .strip_suffix(".f%(format_id)s.%(ext)s")
+                .unwrap_or_else(|| panic!("хвост -o не наш: {output:?}"));
+            assert!(
+                !head.is_empty() && head.chars().all(template_safe),
+                "шаблон {template:?}, название {title:?}: в -o символ вне белого списка: {output:?}"
+            );
+            assert_eq!(
+                calls[0].emulate_failures,
+                Vec::<String>::new(),
+                "шаблон {template:?}, название {title:?}"
+            );
+
+            let DownloadProgress::Done { file_name, .. } = sink.last() else {
+                panic!("шаблон {template:?}, название {title:?}: {:?}", sink.last());
+            };
+            assert_eq!(
+                tree(root.path()),
+                ["dest".to_string(), format!("dest/{file_name}")],
+                "шаблон {template:?}, название {title:?}: файл вне папки назначения или подпапка"
+            );
+            assert!(dest.join(&file_name).is_file());
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, TEMPLATES.len() * titles.len());
+}
+
+#[tokio::test]
+async fn a_retry_after_the_folder_changed_downloads_again_into_the_new_folder() {
+    // Ф-14, Р-4: «Повторить» — новый старт с текущими настройками. Папка
+    // сменилась — забранные потоки лежат в прежней, задача качается с нуля в
+    // новую, прежние частичные остаются, где лежали.
+    let root = tempfile::tempdir().unwrap();
+    let folder_a = root.path().join("A");
+    let folder_b = root.path().join("B");
+    std::fs::create_dir(&folder_a).unwrap();
+    std::fs::create_dir(&folder_b).unwrap();
+    let settings = settings_with(&root.path().join("data"), Some(&folder_a), "{title}", 8);
+    let env = env_with(Some(Arc::clone(&settings)), None, None);
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+
+    let sink = RecordingSink::new();
+    let first = ScriptedLauncher::new(&folder_a, vec![Script::ok().emulate()]);
+    super::run_task(&task, &first, &ScriptedFfmpeg::failing(), &sink, &env).await;
+    assert!(matches!(
+        sink.last(),
+        DownloadProgress::Failed { error } if error.kind == DownloadErrorKind::MergeFailed
+    ));
+    let left_in_a = dir_listing(&folder_a);
+    assert_eq!(left_in_a.len(), 2, "оба потока сохранены: {left_in_a:?}");
+
+    settings
+        .store()
+        .unwrap()
+        .set(&crate::types::SettingsPatch::DestinationFolder(
+            crate::types::DestinationFolder::Custom {
+                path: folder_b.to_str().unwrap().to_string(),
+            },
+        ))
+        .unwrap();
+    task.set_progress(DownloadProgress::Queued);
+
+    let second = ScriptedLauncher::new(&folder_b, vec![Script::ok().emulate()]);
+    let ffmpeg = ScriptedFfmpeg::merging();
+    super::run_task(&task, &second, &ffmpeg, &sink, &env).await;
+
+    let saved_b = std::fs::canonicalize(&folder_b).unwrap();
+    assert_eq!(
+        second.formats_asked(),
+        ["133,139"],
+        "качаются оба потока заново"
+    );
+    assert_eq!(
+        second.calls()[0].value_of("-P"),
+        Some(format!("home:{}", saved_b.display()).as_str())
+    );
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: "Big Buck Bunny.mp4".to_string(),
+            folder_display: custom(&saved_b),
+        }
+    );
+    assert_eq!(dir_listing(&folder_b), ["Big Buck Bunny.mp4"]);
+    assert_eq!(
+        dir_listing(&folder_a),
+        left_in_a,
+        "прежние частичные на месте"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_folder_is_named_from_the_path_as_given_on_the_panel_and_in_the_history() {
+    // Без канонизации ни с одной стороны: путь через символьную ссылку —
+    // тот же путь и на панели, и в истории, для системной и своей папки.
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let real_downloads = root.path().join("настоящие Загрузки");
+    let real_own = root.path().join("настоящая своя");
+    std::fs::create_dir(&real_downloads).unwrap();
+    std::fs::create_dir(&real_own).unwrap();
+    let downloads = root.path().join("Загрузки");
+    let own = root.path().join("своя");
+    symlink(&real_downloads, &downloads).unwrap();
+    symlink(&real_own, &own).unwrap();
+    assert_ne!(std::fs::canonicalize(&own).unwrap(), own);
+
+    for (folder, expected) in [
+        (None, crate::types::FolderDisplay::SystemDownloads),
+        (Some(own.as_path()), custom(&own)),
+    ] {
+        let data = tempfile::tempdir().unwrap();
+        let history = history_in(data.path());
+        let env = env_with(
+            Some(settings_with(data.path(), folder, "{title}", 8)),
+            Some(Arc::clone(&history)),
+            Some(&downloads),
+        );
+        let target = folder.unwrap_or(&downloads);
+        let sink = RecordingSink::new();
+        let launcher = ScriptedLauncher::new(target, vec![Script::ok().emulate()]);
+
+        super::run_task(
+            &audio_task(),
+            &launcher,
+            &ScriptedFfmpeg::merging(),
+            &sink,
+            &env,
+        )
+        .await;
+
+        let DownloadProgress::Done {
+            folder_display: shown,
+            ..
+        } = sink.last()
+        else {
+            panic!("ожидался Done, а не {:?}", sink.last());
+        };
+        let records = records(&history);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].folder, target);
+        assert_eq!(shown, expected);
+        assert_eq!(
+            folder_display(&records[0].folder, Some(&downloads)),
+            shown,
+            "панель и история называют папку {folder:?} одинаково"
+        );
+    }
+}
+
+// ───────────── Рабочие имена не зависят от шаблона и даты (ревью TL-89, B1) ─────────────
+
+#[tokio::test]
+async fn a_retry_after_a_failed_merge_on_the_next_day_merges_yesterdays_streams_and_leaves_only_the_file(
+) {
+    // B1, сценарий ревьюера 1: шаблон с `{date}`, склейка отказала 3-го,
+    // «Повторить» 4-го. Потоки не качаются заново, а после готовности в
+    // папке только готовый файл — вчерашних частичных не остаётся.
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let settings = settings_with(data.path(), None, "{date} {title}", 8);
+    let today = env_with(Some(Arc::clone(&settings)), None, Some(dir.path()));
+    let mut tomorrow = env_with(Some(settings), None, Some(dir.path()));
+    tomorrow.today = next_day;
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    // Один сценарий на оба старта: второй запуск yt-dlp уронил бы тест.
+    let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+    let sink = RecordingSink::new();
+
+    super::run_task(&task, &launcher, &ScriptedFfmpeg::failing(), &sink, &today).await;
+    assert!(matches!(
+        sink.last(),
+        DownloadProgress::Failed { error } if error.kind == DownloadErrorKind::MergeFailed
+    ));
+    assert_eq!(
+        dir_listing(dir.path()),
+        ["Big Buck Bunny.f133.mp4", "Big Buck Bunny.f139.m4a"],
+        "в рабочих именах нет ни даты, ни шаблона"
+    );
+
+    task.set_progress(DownloadProgress::Queued);
+    super::run_task(
+        &task,
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &tomorrow,
+    )
+    .await;
+
+    assert_eq!(
+        launcher.calls().len(),
+        1,
+        "вчерашние потоки не качаются заново"
+    );
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: "2031-02-04 Big Buck Bunny.mp4".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
+        }
+    );
+    assert_eq!(
+        dir_listing(dir.path()),
+        ["2031-02-04 Big Buck Bunny.mp4"],
+        "частичные файлы подчищены"
+    );
+}
+
+#[tokio::test]
+async fn a_task_restored_on_the_next_day_resumes_yesterdays_part_file_and_leaves_only_the_file() {
+    // B1, сценарий ревьюера 2: 3-го поток оборвался (`.part` сохранён),
+    // приложение перезапущено, очередь восстановила задачу из снимка тем же
+    // запросом, и 4-го она стартует заново. Имя частичного то же, `.part`
+    // докачивается, а не качается рядом под новым именем.
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let settings = settings_with(data.path(), None, "{date} {title}", 1);
+    let today = env_with(Some(Arc::clone(&settings)), None, Some(dir.path()));
+    let mut tomorrow = env_with(Some(settings), None, Some(dir.path()));
+    tomorrow.today = next_day;
+
+    let yesterday = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::failing(1, &connection_lost_stderr()).emulate_partial()],
+    );
+    let sink = RecordingSink::new();
+    super::run_task(
+        &audio_task(),
+        &yesterday,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &today,
+    )
+    .await;
+    assert!(matches!(
+        sink.last(),
+        DownloadProgress::Failed { error } if error.kind == DownloadErrorKind::ConnectionLost
+    ));
+    assert_eq!(dir_listing(dir.path()), ["Big Buck Bunny.f140.m4a.part"]);
+
+    // Перезапуск: новая задача из того же запроса (снимок очереди, Ф-9 E4).
+    let restored = audio_task();
+    let next = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+    let sink = RecordingSink::new();
+    super::run_task(
+        &restored,
+        &next,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &tomorrow,
+    )
+    .await;
+
+    assert_eq!(
+        next.calls()[0].value_of("-o"),
+        yesterday.calls()[0].value_of("-o"),
+        "имя частичного файла то же, что вчера"
+    );
+    let done = "2031-02-04 Big Buck Bunny.m4a";
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: done.to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
+        }
+    );
+    assert_eq!(
+        dir_listing(dir.path()),
+        [done],
+        "вчерашний .part не остался"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(done)).unwrap(),
+        PARTIAL_BYTES,
+        "готовый файл — докачанный вчерашний .part, а не новая загрузка"
+    );
+}
+
+#[tokio::test]
+async fn a_template_change_between_starts_does_not_stop_the_resume() {
+    // B1: смена шаблона между стартами забранные потоки не забывает — задачу
+    // сбрасывает только смена папки. Имя готового файла — по новому шаблону.
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let settings = settings_with(data.path(), None, "{title}", 8);
+    let env = env_with(Some(Arc::clone(&settings)), None, Some(dir.path()));
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+    let sink = RecordingSink::new();
+
+    super::run_task(&task, &launcher, &ScriptedFfmpeg::failing(), &sink, &env).await;
+    assert!(matches!(
+        sink.last(),
+        DownloadProgress::Failed { error } if error.kind == DownloadErrorKind::MergeFailed
+    ));
+
+    settings
+        .store()
+        .unwrap()
+        .set(&crate::types::SettingsPatch::NameTemplate(
+            "{id} {title}".to_string(),
+        ))
+        .unwrap();
+    task.set_progress(DownloadProgress::Queued);
+    super::run_task(&task, &launcher, &ScriptedFfmpeg::merging(), &sink, &env).await;
+
+    assert_eq!(launcher.calls().len(), 1, "потоки не качаются заново");
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: "aqz-KE-bpKQ Big Buck Bunny.mp4".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
+        }
+    );
+    assert_eq!(dir_listing(dir.path()), ["aqz-KE-bpKQ Big Buck Bunny.mp4"]);
+}
+
+#[tokio::test]
+async fn a_final_name_under_a_partial_prefix_survives_the_cleanup_on_done() {
+    // Следствие B1: финальное имя строит шаблон независимо от рабочего, и
+    // оно может начинаться с префикса потока или склейки. Подчистка на
+    // `Done` щадит готовый файл — иначе такая настройка удаляла бы каждую
+    // готовую загрузку.
+    for (template, video, audio, expected) in [
+        (
+            "{title}.f140.{id}",
+            None,
+            "140",
+            "Big Buck Bunny.f140.aqz-KE-bpKQ.m4a",
+        ),
+        (
+            "{title}.tl-merging.{id}",
+            None,
+            "140",
+            "Big Buck Bunny.tl-merging.aqz-KE-bpKQ.m4a",
+        ),
+        (
+            "{title}.f133.{id}",
+            Some("133"),
+            "139",
+            "Big Buck Bunny.f133.aqz-KE-bpKQ.mp4",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let env = env_with(
+            Some(settings_with(data.path(), None, template, 8)),
+            None,
+            Some(dir.path()),
+        );
+        let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+        let sink = RecordingSink::new();
+
+        super::run_task(
+            &new_task(request(streams(video, Some(audio)))),
+            &launcher,
+            &ScriptedFfmpeg::merging(),
+            &sink,
+            &env,
+        )
+        .await;
+
+        assert_eq!(
+            sink.last(),
+            DownloadProgress::Done {
+                file_name: expected.to_string(),
+                folder_display: crate::types::FolderDisplay::SystemDownloads,
+            },
+            "шаблон {template}"
+        );
+        assert_eq!(dir_listing(dir.path()), [expected], "шаблон {template}");
+    }
+}
+
+// ───────────── Отказы записи истории до вставки (ревью TL-89, S2) ─────────────
+
+#[test]
+fn a_finished_file_gone_before_its_size_was_taken_leaves_a_storage_failed_notice() {
+    // `metadata` готового файла не снялся: файл удалили между финализацией и
+    // `stat`. Записи нет, пометка — в первой странице истории.
+    let data = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let history = history_in(data.path());
+    let task = audio_task();
+
+    write_done(
+        &history,
+        &task.id,
+        task.request(),
+        folder.path().to_path_buf(),
+        "Big Buck Bunny.m4a".to_string(),
+    );
+
+    let page = history.store().unwrap().page(None).unwrap();
+    assert!(page.records.is_empty());
+    assert_eq!(
+        page.notices,
+        vec![crate::types::HistoryNotice::LastWriteFailed {
+            cause: HistoryWriteFailure::StorageFailed
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_panic_in_the_history_write_leaves_a_storage_failed_notice() {
+    // Паника на потоке блокирующего пула приходит `JoinError`: исход задачи
+    // она не трогает (зовущий не падает), а пометка ставится.
+    let data = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let history = history_in(data.path());
+    let env = env_with(None, Some(Arc::clone(&history)), None);
+
+    record_done(
+        &audio_task(),
+        &env,
+        folder.path(),
+        "Big Buck Bunny.m4a",
+        |_, _, _, _, _| panic!("запись истории упала (намеренно, тест S2)"),
+    )
+    .await;
+
+    let page = history.store().unwrap().page(None).unwrap();
+    assert!(page.records.is_empty());
+    assert_eq!(
+        page.notices,
+        vec![crate::types::HistoryNotice::LastWriteFailed {
+            cause: HistoryWriteFailure::StorageFailed
+        }]
+    );
+}
+
+/// Задача, которую отменяет [`cancelling_write`]. Своя на единственный тест.
+static CANCEL_DURING_WRITE: StdMutex<Option<Arc<DownloadTask>>> = StdMutex::new(None);
+
+/// Тело записи истории, которое посреди записи поднимает флаг отмены задачи
+/// и пишет по-настоящему.
+fn cancelling_write(
+    history: &HistoryState,
+    task_id: &str,
+    request: &StartDownloadRequest,
+    folder: PathBuf,
+    file_name: String,
+) {
+    let task = CANCEL_DURING_WRITE
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("задача теста");
+    // Флаг, а не `DownloadTask::cancel`: процесса к этому моменту нет
+    // (`set_child(None)` раньше записи), и убивать нечего.
+    task.cancel.cancel();
+    write_done(history, task_id, request, folder, file_name);
+}
+
+#[tokio::test]
+async fn a_cancel_during_the_history_write_leaves_one_record_and_one_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let history = history_in(data.path());
+    let env = env_with(None, Some(Arc::clone(&history)), Some(dir.path()));
+    let task = audio_task();
+    *CANCEL_DURING_WRITE.lock().unwrap() = Some(Arc::clone(&task));
+    let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+    let sink = RecordingSink::new();
+
+    run_task_with(
+        &task,
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &env,
+        cancelling_write,
+    )
+    .await;
+
+    assert!(task.cancel.is_cancelled(), "отмена пришла во время записи");
+    let done = DownloadProgress::Done {
+        file_name: "Big Buck Bunny.m4a".to_string(),
+        folder_display: crate::types::FolderDisplay::SystemDownloads,
+    };
+    let terminal: Vec<DownloadProgress> = sink
+        .events()
+        .into_iter()
+        .filter(DownloadProgress::is_terminal)
+        .collect();
+    assert_eq!(terminal, std::slice::from_ref(&done), "исход один — Done");
+    assert_eq!(task.snapshot(), done);
+    assert_eq!(records(&history).len(), 1, "запись одна");
+    assert_eq!(dir_listing(dir.path()), ["Big Buck Bunny.m4a"]);
 }
