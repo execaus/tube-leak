@@ -13,7 +13,8 @@
 //! - [`version`] — разбор строки версии `yt-dlp --version` / `ffmpeg -version`
 //!   / `deno --version`;
 //! - [`deno`] — окружение, с которым запускается deno (TL-110): без
-//!   проверки обновлений и с кэшем в каталоге данных приложения.
+//!   проверки обновлений и с кэшем в каталоге данных приложения; путь и
+//!   окружение одним значением и аргументы рантайма для yt-dlp (TL-109).
 //!
 //! Композиция этих частей в команду `check_sidecar` (проверка всех трёх
 //! бинарников параллельно, конвертация в `crate::types::SidecarCheckReport`,
@@ -29,7 +30,9 @@ mod registry;
 mod resolve;
 mod version;
 
-pub use deno::DenoEnv;
+#[cfg(test)]
+pub use deno::testing as deno_testing;
+pub use deno::{DenoEnv, DenoLaunch, YtDlpJsRuntime};
 pub use error::SidecarError;
 pub use process::{
     run, run_cancellable, run_streaming, run_with_env, stderr_tail, RunHandle, RunOutput,

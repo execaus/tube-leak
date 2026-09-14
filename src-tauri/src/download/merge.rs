@@ -277,6 +277,7 @@ impl FfmpegLauncher for SidecarFfmpeg<'_> {
         Box::pin(run_cancellable(
             &self.executable,
             args,
+            &[],
             timeout,
             self.registry,
             handle,

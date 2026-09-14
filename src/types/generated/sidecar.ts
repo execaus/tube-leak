@@ -12,7 +12,7 @@
  *
  * См. пояснение у [`SidecarStatus`] — варианты заполняются в TL-4/TL-5.
  */
-export type LaunchFailedReason = "permissionDenied" | "corrupted" | "other";
+export type LaunchFailedReason = "permissionDenied" | "corrupted" | "other" | "unrecognizedOutput";
 
 /**
  * Агрегат результатов проверки sidecar-бинарников, возвращаемый командой
@@ -22,9 +22,11 @@ export type LaunchFailedReason = "permissionDenied" | "corrupted" | "other";
  * `deno.version` — нормализованная версия из первой строки `deno --version`
  * (`deno 2.9.6 (stable, …)` даёт `2.9.6`). Одно отличие deno от двух других
  * строк: если бинарник ответил, но версии в выводе не нашлось, приходит не
- * `ok` с выводом вместо версии, а `launchFailed` с причиной `other`, и
- * нераспознанный вывод лежит в `stderrTail`. У yt-dlp и ffmpeg в этом
- * случае по-прежнему `ok`.
+ * `ok` с выводом вместо версии, а `launchFailed` с причиной
+ * `unrecognizedOutput`, и нераспознанный вывод лежит в `stderrTail`. У
+ * yt-dlp и ffmpeg в этом случае по-прежнему `ok`. Причина `other` у deno
+ * остаётся за отказом до запуска — например, когда не определяется
+ * каталог данных приложения для его кэша.
  */
 export type SidecarCheckReport = { ytDlp: SidecarCheckResult, ffmpeg: SidecarCheckResult, deno: SidecarCheckResult, };
 

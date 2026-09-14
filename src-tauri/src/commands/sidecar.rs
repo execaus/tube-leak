@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 
 use crate::clock::now_iso8601;
-use crate::sidecar::{self, stderr_tail, ChildRegistry, DenoEnv, SidecarError};
+use crate::sidecar::{self, stderr_tail, ChildRegistry, DenoEnv, DenoLaunch, SidecarError};
 use crate::types::{LaunchFailedReason, SidecarCheckReport, SidecarCheckResult, SidecarStatus};
 use crate::ytdlp::{self, InUse, InUseGuard};
 
@@ -110,9 +110,12 @@ const FFMPEG_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
 /// копия с новым inode 1,51 с, повторный 0,01 с. Природа надбавки та же,
 /// что у ffmpeg: платится один раз на файл.
 ///
-/// В `.app` холодный старт не мерился (исследование TL-107, B4); значение
-/// — то же [`CHECK_TIMEOUT_SECS`], обоснование единой величины — у
-/// [`YT_DLP_TIMEOUT`]. К худшему замеру это запас 5×.
+/// Худший замер — не одиночный запуск, а тот, что бывает на экране:
+/// холодный старт deno параллельно с холодным ffmpeg (проверки идут
+/// `tokio::join!`), **3,07 с**. В `.app` холодный старт не мерился
+/// (исследование TL-107, B4); значение — то же [`CHECK_TIMEOUT_SECS`],
+/// обоснование единой величины — у [`YT_DLP_TIMEOUT`]. К худшему замеру
+/// это запас ≈3× (9 с / 3,07 с), а не 5×, как считалось по одиночному.
 const DENO_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
 
 /// Возвращает результат проверки sidecar-бинарников (yt-dlp, ffmpeg, deno).
@@ -145,44 +148,33 @@ pub async fn check_sidecar(
         Err(error) => (Err(error), None),
     };
 
+    let deno = resolve_deno(&app).inspect_err(|err| {
+        eprintln!(
+            "deno: запуск невозможен: {}",
+            DenoLaunch::failure_reason(err)
+        );
+    });
+
     Ok(check_report(
         yt_dlp_path,
         sidecar::resolve_sidecar_path("ffmpeg"),
-        resolve_deno(&app),
+        deno,
         &registry,
     )
     .await)
 }
 
-/// Всё, что нужно для запуска deno: путь к sidecar и окружение.
+/// Резолвит deno: sidecar рядом с приложением плюс окружение с кэшем в
+/// каталоге данных — для служебного экрана (TL-110) и для запусков yt-dlp
+/// разбора и скачивания (TL-109, `crate::sidecar::YtDlpJsRuntime`).
 ///
-/// Путь и окружение едут вместе, чтобы запустить deno без окружения было
-/// нельзя по построению: нет каталога данных — нет и запуска.
-struct DenoLaunch {
-    path: PathBuf,
-    env: DenoEnv,
-}
-
-/// Резолвит deno (TL-110): sidecar рядом с приложением плюс окружение с
-/// кэшем в каталоге данных.
-///
-/// Каталог данных, который не определяется, — отказ запуска
-/// ([`LaunchFailedReason::Other`]), а не запуск с кэшем «где-нибудь»:
-/// иначе deno без `DENO_DIR` писал бы в домашний каталог пользователя.
-/// Причина уходит в `stderr` и доезжает до «Подробнее» на экране.
-fn resolve_deno(app: &AppHandle) -> Result<DenoLaunch, SidecarError> {
-    let data_dir = app.path().app_data_dir().map_err(|err| {
-        eprintln!("deno: каталог данных приложения не определяется: {err}");
-        SidecarError::LaunchFailed {
-            reason: LaunchFailedReason::Other,
-            stderr: format!("каталог данных приложения не определяется: {err}"),
-        }
-    })?;
-
-    Ok(DenoLaunch {
-        path: sidecar::resolve_sidecar_path("deno")?,
-        env: DenoEnv::in_data_dir(&data_dir),
-    })
+/// Тонкая обёртка над чистой [`DenoLaunch::resolve`], где и живёт логика
+/// (какое имя резолвится, куда ложится `DENO_DIR`, что делать без каталога
+/// данных) вместе с тестами. Каталог данных, который не определяется, —
+/// отказ с причиной в `stderr`: на экране она доезжает до «Подробнее». В
+/// лог пишет вызывающий — у экрана и у запуска yt-dlp строка разная.
+pub(super) fn resolve_deno(app: &AppHandle) -> Result<DenoLaunch, SidecarError> {
+    DenoLaunch::resolve(app.path().app_data_dir(), sidecar::resolve_sidecar_path)
 }
 
 /// Путь к yt-dlp — в каталоге данных, а не рядом с приложением (TL-12),
@@ -238,7 +230,7 @@ async fn check_report(
     registry: &ChildRegistry,
 ) -> SidecarCheckReport {
     let (deno_path, deno_env) = match deno {
-        Ok(launch) => (Ok(launch.path), Some(launch.env)),
+        Ok(launch) => (Ok(launch.path().to_path_buf()), Some(launch.env().clone())),
         Err(error) => (Err(error), None),
     };
     let deno_vars = deno_env.as_ref().map(DenoEnv::vars);
@@ -317,11 +309,16 @@ enum UnrecognizedOutput {
     /// Показать вывод вместо версии со статусом `ok` — поведение yt-dlp и
     /// ffmpeg со времён E1.
     ShowAsIs,
-    /// Отказ [`LaunchFailedReason::Other`] с нераспознанным выводом в
-    /// `stderrTail` — поведение deno (TL-110). Под именем deno может
-    /// оказаться что угодно исполняемое; yt-dlp требует deno не ниже 2.3.0,
-    /// и `ok` с чужой строкой на экране прятал бы ровно ту поломку, ради
-    /// которой строка на экране существует.
+    /// Отказ [`LaunchFailedReason::UnrecognizedOutput`] с нераспознанным
+    /// выводом в `stderrTail` — поведение deno (TL-110; своя причина, а не
+    /// `other`, — с TL-109: процесс запустился, и кода ОС у отказа нет). Под именем deno может
+    /// оказаться что угодно исполняемое, и `ok` с чужой строкой на экране
+    /// прятал бы ровно ту поломку, ради которой строка на экране существует.
+    ///
+    /// Проверяется только то, что версия **распознана**, а не то, что она
+    /// подходит yt-dlp: минимальную версию (у yt-dlp 2026.08.19 — 2.3.0)
+    /// экран не сверяет. Слишком старый deno покажется `ok` со своей
+    /// версией, а yt-dlp сам пометит его `(unsupported)` и не возьмёт.
     Refuse,
 }
 
@@ -382,12 +379,9 @@ async fn run_check(
                 None => match check.unrecognized {
                     UnrecognizedOutput::ShowAsIs => output.stdout.trim().to_string(),
                     UnrecognizedOutput::Refuse => {
-                        eprintln!(
-                            "sidecar {name}: версия в выводе не найдена, stdout: {stdout:?}",
-                            stdout = output.stdout,
-                        );
+                        eprintln!("{}", unrecognized_output_log_line(name, &output.stdout));
                         let error = SidecarError::LaunchFailed {
-                            reason: LaunchFailedReason::Other,
+                            reason: LaunchFailedReason::UnrecognizedOutput,
                             stderr: format!("{}\n{}", output.stdout.trim(), output.stderr.trim()),
                         };
                         return error_to_result(name, path_string, checked_at, duration_ms, error);
@@ -411,6 +405,16 @@ async fn run_check(
         }
         Err(error) => error_to_result(name, path_string, checked_at, duration_ms, error),
     }
+}
+
+/// Строка лога для вывода без версии: хвост stdout в пределе
+/// [`stderr_tail`], а не весь поток — под именем deno может оказаться
+/// бинарник, печатающий мегабайты, и лог приложения им не засоряется.
+fn unrecognized_output_log_line(name: &str, stdout: &str) -> String {
+    format!(
+        "sidecar {name}: версия в выводе не найдена, хвост stdout: {tail:?}",
+        tail = stderr_tail(stdout).unwrap_or_default(),
+    )
 }
 
 /// Конвертирует [`SidecarError`] в [`SidecarCheckResult`] по контракту
@@ -440,7 +444,8 @@ fn error_to_result(
                 // ошибки, которым он в итоге проявляется (через shell-фолбэк,
                 // код выхода 126, классифицированный как `Corrupted`).
                 LaunchFailedReason::Corrupted => Some("ENOEXEC".to_string()),
-                LaunchFailedReason::Other => None,
+                // Процесс стартовал и завершился успешно — ошибки ОС нет.
+                LaunchFailedReason::Other | LaunchFailedReason::UnrecognizedOutput => None,
             };
             (
                 SidecarStatus::LaunchFailed,
@@ -828,10 +833,22 @@ mod tests {
     /// Запуск deno из фикстурного скрипта с окружением, построенным от
     /// `data_dir`, — то, что в продакшене собирает `resolve_deno`.
     fn deno_launch(path: PathBuf, data_dir: &std::path::Path) -> Result<DenoLaunch, SidecarError> {
-        Ok(DenoLaunch {
-            path,
-            env: DenoEnv::in_data_dir(data_dir),
-        })
+        Ok(DenoLaunch::new(path, data_dir))
+    }
+
+    #[test]
+    fn the_log_of_unrecognized_output_is_bounded_by_the_tail_limit() {
+        // Остаток ревью TL-110: в лог уходил весь stdout.
+        let stdout = "x".repeat(STDERR_TAIL_MAX_CHARS * 5);
+
+        let line = unrecognized_output_log_line("deno", &stdout);
+
+        assert!(line.starts_with("sidecar deno: "), "{line}");
+        assert_eq!(
+            line.chars().filter(|symbol| *symbol == 'x').count(),
+            STDERR_TAIL_MAX_CHARS,
+            "в лог уходит хвост в пределе, а не весь поток"
+        );
     }
 
     /// Скрипт, который печатает строку версии и выходит успешно.
@@ -971,13 +988,26 @@ mod tests {
         let report = report_with_deno(&dir, deno_launch(deno, dir.path())).await;
 
         assert_eq!(report.deno.status, SidecarStatus::LaunchFailed);
-        assert_eq!(report.deno.reason, Some(LaunchFailedReason::Other));
+        assert_eq!(
+            report.deno.reason,
+            Some(LaunchFailedReason::UnrecognizedOutput),
+            "процесс запустился — это не `other` («не запустился»), а нераспознанный вывод"
+        );
         assert!(report.deno.os_error_code.is_none());
         assert!(report.deno.version.is_none());
         assert_eq!(
             report.deno.stderr_tail.as_deref(),
             Some("hello from something else"),
             "нераспознанный вывод обязан доехать до «Подробнее»"
+        );
+    }
+
+    #[test]
+    fn the_unrecognized_output_reason_crosses_the_boundary_as_camel_case() {
+        assert_eq!(
+            serde_json::to_value(LaunchFailedReason::UnrecognizedOutput)
+                .expect("причина сериализуется"),
+            serde_json::json!("unrecognizedOutput")
         );
     }
 
@@ -1045,9 +1075,10 @@ mod tests {
 
     #[tokio::test]
     async fn yt_dlp_and_ffmpeg_are_not_given_the_deno_environment() {
-        // Окружение deno добавляется только его проверке: у yt-dlp его
-        // выставит TL-109 в своих запусках, а служебному экрану ffmpeg
-        // оно ни к чему.
+        // Окружение deno добавляется только его проверке: `--version`
+        // yt-dlp до экстрактора не доходит и deno не запускает (окружение
+        // deno yt-dlp получает в запусках разбора и скачивания, TL-109), а
+        // ffmpeg оно ни к чему.
         let dir = tempdir().expect("failed to create temp dir");
         let seen = dir.path().join("yt-dlp-env.txt");
         let yt_dlp = write_script(

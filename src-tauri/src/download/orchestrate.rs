@@ -204,7 +204,7 @@ use crate::clock::{self, monotonic_now};
 use crate::commands::{HistoryState, SettingsState};
 use crate::queue::video_id::canonical_video_id;
 use crate::sidecar::{
-    run_streaming, stderr_tail, ChildRegistry, RunHandle, SidecarError, StreamedRun,
+    run_streaming, stderr_tail, ChildRegistry, RunHandle, SidecarError, StreamedRun, YtDlpJsRuntime,
 };
 use crate::storage::history::{folder_display, NewHistoryRecord};
 use crate::storage::settings::{Destination, Settings, TemplateContext, TemplateDate};
@@ -356,6 +356,12 @@ const SOCKET_TIMEOUT_ARG: &str = "10";
 /// `--ignore-config` (то же решение, что в разборе: поведение «как у
 /// обычного yt-dlp на машине пользователя» ближе к инварианту эпика, чем
 /// герметичность запуска).
+///
+/// Аргументов JS-рантайма (`--js-runtimes deno:<путь>` или
+/// `--no-js-runtimes`, TL-109) здесь тоже нет: путь известен только на
+/// рантайме, и ставит их вместе с окружением deno запускатель
+/// ([`SidecarDownloader`]) — перед этим набором, то есть заведомо до `--`.
+/// Фикстуры одного запуска сняты без рантайма; переснятие — после v0.1.
 const DOWNLOAD_ARGS: [&str; 8] = [
     "--no-playlist",
     "--newline",
@@ -925,6 +931,11 @@ pub trait DownloadLauncher: Send + Sync {
 /// Продакшен-реализация: запуск через домен `sidecar` (E1) — реестр
 /// процессов, группа процессов и убийство по сроку живут в
 /// [`crate::sidecar::run_streaming`].
+///
+/// JS-рантайм yt-dlp (TL-109) — часть запускателя: аргументы и окружение
+/// deno берутся из одного [`YtDlpJsRuntime`] в одной точке запуска, как у
+/// разбора (`crate::probe::SidecarLauncher`). Отмена убивает группу
+/// процессов, и deno, потомок yt-dlp в той же группе, уходит вместе с ним.
 pub struct SidecarDownloader<'a> {
     /// `None` — готовой установки yt-dlp нет вовсе (подготовка не
     /// выполнялась, дерево не сошлось с манифестом).
@@ -937,13 +948,19 @@ pub struct SidecarDownloader<'a> {
     /// (`"yt-dlp"`) нельзя: относительное имя ОС ищет в `PATH`, то есть
     /// приложение запустило бы **чужой** yt-dlp с машины пользователя.
     executable: Option<PathBuf>,
+    js_runtime: YtDlpJsRuntime,
     registry: &'a ChildRegistry,
 }
 
 impl<'a> SidecarDownloader<'a> {
-    pub fn new(executable: Option<PathBuf>, registry: &'a ChildRegistry) -> Self {
+    pub fn new(
+        executable: Option<PathBuf>,
+        js_runtime: YtDlpJsRuntime,
+        registry: &'a ChildRegistry,
+    ) -> Self {
         Self {
             executable,
+            js_runtime,
             registry,
         }
     }
@@ -961,14 +978,20 @@ impl DownloadLauncher for SidecarDownloader<'_> {
             return Box::pin(std::future::ready(Err(SidecarError::NotFound)));
         };
 
-        Box::pin(run_streaming(
-            executable,
-            args,
-            self.registry,
-            handle,
-            first_deadline,
-            on_line,
-        ))
+        Box::pin(async move {
+            let argv = self.js_runtime.argv(args);
+            let env = self.js_runtime.env();
+            run_streaming(
+                executable,
+                &argv,
+                &env,
+                self.registry,
+                handle,
+                first_deadline,
+                on_line,
+            )
+            .await
+        })
     }
 }
 
