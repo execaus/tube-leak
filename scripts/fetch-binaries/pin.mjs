@@ -2,7 +2,13 @@ import { readFile } from 'node:fs/promises'
 
 import { KNOWN_TARGETS } from './targets.mjs'
 
-const BINARY_NAMES = Object.freeze(['ytDlp', 'ffmpeg'])
+/**
+ * Разделы пина — по одному на sidecar. Единственный список в скриптах:
+ * по нему идут и валидация, и доставка (index.mjs), и заглушки
+ * (scripts/ci/stub-binaries.mjs), так что новый sidecar не может оказаться
+ * провалидированным, но не доставленным.
+ */
+export const BINARY_NAMES = Object.freeze(['ytDlp', 'ffmpeg', 'deno'])
 /** Допустимые значения `kind` у записи пина; см. entryKind(). */
 export const ENTRY_KINDS = Object.freeze(['binary', 'archive'])
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/
@@ -97,6 +103,25 @@ function validateEntry(entry, label, pinPath) {
     )
   }
 
+  // У архива, который кладётся как есть (kind: archive), архитектуру
+  // проверить не у чего, пока не назван исполняемый файл внутри него
+  // (install.mjs извлекает его во временный файл и читает заголовок).
+  // Поле обязательно: запись без него означала бы доставку без проверки
+  // архитектуры, то есть ровно долг #15.
+  if (entryKind(entry) === 'archive') {
+    const { executableMember } = entry
+    if (typeof executableMember !== 'string' || executableMember.length === 0 || executableMember.includes('/')) {
+      throw new Error(
+        `pin file ${pinPath}: "${label}.executableMember" must be the basename of the executable inside the archive (kind "archive" requires it for the architecture check)`,
+      )
+    }
+    if (deliveredArchiveType(entry) === null) {
+      throw new Error(
+        `pin file ${pinPath}: "${label}.binaryName" of a kind "archive" entry must end with .zip or .tar.xz`,
+      )
+    }
+  }
+
   if (entry.archive !== undefined) {
     if (typeof entry.archive !== 'object' || entry.archive === null) {
       throw new Error(`pin file ${pinPath}: "${label}.archive" must be an object when present`)
@@ -121,4 +146,17 @@ function validateEntry(entry, label, pinPath) {
  */
 export function entryKind(entry) {
   return entry.kind ?? 'binary'
+}
+
+/**
+ * Тип архива, который кладётся в binaries/ как есть (kind: archive), —
+ * по расширению итогового имени.
+ *
+ * @param {{ binaryName: string }} entry
+ * @returns {'zip' | 'tar.xz' | null}
+ */
+export function deliveredArchiveType(entry) {
+  if (entry.binaryName.endsWith('.zip')) return 'zip'
+  if (entry.binaryName.endsWith('.tar.xz')) return 'tar.xz'
+  return null
 }

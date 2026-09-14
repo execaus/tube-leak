@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Скрипт доставки sidecar-бинарников (yt-dlp, ffmpeg) в src-tauri/binaries/
-// по файлу пина версия+SHA256 (Ф-10, Р-1, Р-2 эпика E1, задача TL-6).
+// Скрипт доставки sidecar-бинарников (yt-dlp, ffmpeg, deno) в src-tauri/binaries/
+// по файлу пина версия+SHA256 (Ф-10, Р-1, Р-2 эпика E1, задача TL-6) с
+// проверкой архитектуры доставленного исполняемого файла (TL-108, #15).
 //
 // Использование:
 //   node scripts/fetch-binaries/index.mjs                  # только хост-тройка
@@ -15,7 +16,7 @@ import { dirname, join, resolve } from 'node:path'
 import { mkdir } from 'node:fs/promises'
 
 import { installBinary } from './install.mjs'
-import { loadPin } from './pin.mjs'
+import { BINARY_NAMES, loadPin } from './pin.mjs'
 import { KNOWN_TARGETS, resolveHostTarget } from './targets.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -82,14 +83,14 @@ export async function run({ targets, pinPath, outDir }) {
   const results = []
 
   for (const target of targets) {
-    for (const binaryName of ['ytDlp', 'ffmpeg']) {
+    for (const binaryName of BINARY_NAMES) {
       const entry = pin[binaryName].targets[target]
       const label = `${binaryName} (${target})`
       try {
         // Загрузка последовательная (не Promise.all) намеренно: экономим
         // сеть/диск, не соревнуемся за пропускную способность между
         // параллельными закачками больших бинарников.
-        const finalPath = await installBinary(entry, outDir)
+        const finalPath = await installBinary(entry, outDir, target)
         results.push({ label, ok: true, detail: finalPath })
       } catch (err) {
         results.push({ label, ok: false, detail: err.message })

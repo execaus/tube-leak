@@ -11,7 +11,8 @@
 //
 // Настоящую доставку в тестовом джобе гоняли бы впустую: ни один тест не
 // запускает yt-dlp или ffmpeg — в фикстурах используются собственные
-// sh-скрипты (см. src-tauri/src/sidecar, src-tauri/src/commands). Зато
+// sh-скрипты (см. src-tauri/src/sidecar, src-tauri/src/commands); deno не
+// запускает никто вовсе. Зато
 // джоб получил бы ~150 МиБ трафика на прогон и зависимость от чужих
 // хостингов ассетов: у linux-сборки ffmpeg (BtbN) тег релиза по политике
 // ретенции живёт не вечно (см. _note в binaries.lock.json). Красный
@@ -39,7 +40,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
 import { mkdir, writeFile, access } from 'node:fs/promises'
 
-import { loadPin } from '../fetch-binaries/pin.mjs'
+import { BINARY_NAMES, loadPin } from '../fetch-binaries/pin.mjs'
 import { KNOWN_TARGETS, resolveHostTarget } from '../fetch-binaries/targets.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -87,7 +88,7 @@ async function main() {
 
   let stubbed = false
 
-  for (const binaryName of ['ytDlp', 'ffmpeg']) {
+  for (const binaryName of BINARY_NAMES) {
     const { binaryName: fileName } = pin[binaryName].targets[target]
     const path = join(OUT_DIR, fileName)
 

@@ -100,10 +100,11 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # Доставка sidecar-бинарников (yt-dlp, ffmpeg) под тройку джоба — по
-      # пину версия+SHA256, см. scripts/fetch-binaries (TL-6). Обязательно
+      # Доставка sidecar-бинарников (yt-dlp, ffmpeg, deno) под тройку джоба —
+      # по пину версия+SHA256 с проверкой архитектуры, см. scripts/fetch-binaries
+      # (TL-6, TL-108). Обязательно
       # до `tauri build`: externalBin резолвит их из src-tauri/binaries/.
-      - name: Fetch sidecar binaries (yt-dlp, ffmpeg)
+      - name: Fetch sidecar binaries (yt-dlp, ffmpeg, deno)
         run: node scripts/fetch-binaries/index.mjs --target ${{ matrix.target }}
 
       - name: Build installer

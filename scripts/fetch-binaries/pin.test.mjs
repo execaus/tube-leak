@@ -4,7 +4,8 @@ import { join } from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { entryKind, loadPin } from './pin.mjs'
+import { parseArgs } from './index.mjs'
+import { BINARY_NAMES, entryKind, loadPin } from './pin.mjs'
 import { KNOWN_TARGETS } from './targets.mjs'
 
 const VALID_SHA = 'a'.repeat(64)
@@ -21,6 +22,7 @@ function makeValidPin() {
   return {
     ytDlp: { version: '1.0.0', targets: makeTargets() },
     ffmpeg: { version: '1.0.0', targets: makeTargets() },
+    deno: { version: '1.0.0', targets: makeTargets() },
   }
 }
 
@@ -65,6 +67,14 @@ describe('loadPin', () => {
     const path = await writePin(pin)
 
     await expect(loadPin(path)).rejects.toThrow(/missing "ffmpeg" section/)
+  })
+
+  it('rejects a pin missing the deno section', async () => {
+    const pin = makeValidPin()
+    delete pin.deno
+    const path = await writePin(pin)
+
+    await expect(loadPin(path)).rejects.toThrow(/missing "deno" section/)
   })
 
   it('rejects a pin missing a known target triple', async () => {
@@ -136,10 +146,67 @@ describe('loadPin', () => {
     pin.ytDlp.targets['aarch64-apple-darwin'] = makeEntry({
       kind: 'archive',
       binaryName: 'yt-dlp-aarch64-apple-darwin.zip',
+      executableMember: 'yt-dlp_macos',
     })
     const path = await writePin(pin)
 
     await expect(loadPin(path)).resolves.toStrictEqual(pin)
+  })
+
+  it('rejects an as-is archive entry without executableMember — its architecture could not be checked', async () => {
+    const pin = makeValidPin()
+    pin.ytDlp.targets['aarch64-apple-darwin'] = makeEntry({
+      kind: 'archive',
+      binaryName: 'yt-dlp-aarch64-apple-darwin.zip',
+    })
+    const path = await writePin(pin)
+
+    await expect(loadPin(path)).rejects.toThrow(/ytDlp\.targets\.aarch64-apple-darwin\.executableMember.* must be the basename/)
+  })
+
+  it('rejects an executableMember that is a path rather than a basename', async () => {
+    const pin = makeValidPin()
+    pin.ytDlp.targets['aarch64-apple-darwin'] = makeEntry({
+      kind: 'archive',
+      binaryName: 'yt-dlp-aarch64-apple-darwin.zip',
+      executableMember: '_internal/yt-dlp_macos',
+    })
+    const path = await writePin(pin)
+
+    await expect(loadPin(path)).rejects.toThrow(/executableMember.* must be the basename/)
+  })
+
+  it('rejects an as-is archive entry whose name does not tell the archive type', async () => {
+    const pin = makeValidPin()
+    pin.ytDlp.targets['aarch64-apple-darwin'] = makeEntry({
+      kind: 'archive',
+      binaryName: 'yt-dlp-aarch64-apple-darwin.7z',
+      executableMember: 'yt-dlp_macos',
+    })
+    const path = await writePin(pin)
+
+    await expect(loadPin(path)).rejects.toThrow(/binaryName.* must end with \.zip or \.tar\.xz/)
+  })
+})
+
+describe('the real repository pin', () => {
+  it('validates, names deno 2.9.6 for every target and lets every as-is archive be architecture-checked', async () => {
+    // Тот же путь по умолчанию, по которому читает пин настоящая доставка.
+    const pin = await loadPin(parseArgs([]).pinPath)
+
+    expect(pin.deno.version).toBe('2.9.6')
+    for (const target of KNOWN_TARGETS) {
+      const entry = pin.deno.targets[target]
+      expect(entry.url).toBe(`https://github.com/denoland/deno/releases/download/v2.9.6/deno-${target}.zip`)
+      expect(entry.archive).toStrictEqual({ type: 'zip', member: target.includes('windows') ? 'deno.exe' : 'deno' })
+      expect(entry.binaryName).toBe(`deno-${target}${target.includes('windows') ? '.exe' : ''}`)
+    }
+    for (const section of BINARY_NAMES) {
+      for (const target of KNOWN_TARGETS) {
+        const entry = pin[section].targets[target]
+        if (entryKind(entry) === 'archive') expect(entry.executableMember).toBeTruthy()
+      }
+    }
   })
 })
 
