@@ -44,6 +44,7 @@ import { useExitConfirmation } from '@/composables/useExitConfirmation'
 import { useSidecarCheck } from '@/composables/useSidecarCheck'
 import { useYtDlpPrepare } from '@/composables/useYtDlpPrepare'
 import { useYtDlpUpdate } from '@/composables/useYtDlpUpdate'
+import { useYtDlpWarmupRecheck } from '@/composables/useYtDlpWarmupRecheck'
 import { useDownloadTaskStore } from '@/stores/downloadTask'
 import type { DownloadPhase } from '@/types/generated/download'
 import type { QualitySize, QualityStreams } from '@/types/generated/probe'
@@ -76,6 +77,15 @@ const {
 } = useYtDlpPrepare()
 
 const { report, isLoading, check } = useSidecarCheck()
+
+/**
+ * Перепроверка по концу фонового прогрева yt-dlp (TL-118, долг #22) — та
+ * же пара `isLoading`/`check`, что и у кнопки «Повторить проверку» ниже
+ * (doc-комментарий `useYtDlpWarmupRecheck.ts`, «Защита от повторного
+ * вызова»): подписка на `ytdlp://warmup` устанавливается и снимается сама,
+ * возвращаемого значения у composable нет.
+ */
+useYtDlpWarmupRecheck({ isLoading, check })
 
 /**
  * Блок «Обновление yt-dlp» (Ф-10, TL-59, дизайн E6) — независимый
