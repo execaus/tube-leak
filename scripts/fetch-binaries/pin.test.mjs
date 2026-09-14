@@ -187,6 +187,18 @@ describe('loadPin', () => {
 
     await expect(loadPin(path)).rejects.toThrow(/binaryName.* must end with \.zip or \.tar\.xz/)
   })
+
+  it('rejects a malformed binarySha256 and accepts a well-formed one', async () => {
+    const bad = makeValidPin()
+    bad.deno.targets['aarch64-apple-darwin'] = makeEntry({ binarySha256: 'B'.repeat(64) })
+    await expect(loadPin(await writePin(bad))).rejects.toThrow(
+      /deno\.targets\.aarch64-apple-darwin\.binarySha256.* must be a 64-char lowercase hex/,
+    )
+
+    const good = makeValidPin()
+    good.deno.targets['aarch64-apple-darwin'] = makeEntry({ binarySha256: 'b'.repeat(64) })
+    await expect(loadPin(await writePin(good))).resolves.toStrictEqual(good)
+  })
 })
 
 describe('the real repository pin', () => {
@@ -200,7 +212,13 @@ describe('the real repository pin', () => {
       expect(entry.url).toBe(`https://github.com/denoland/deno/releases/download/v2.9.6/deno-${target}.zip`)
       expect(entry.archive).toStrictEqual({ type: 'zip', member: target.includes('windows') ? 'deno.exe' : 'deno' })
       expect(entry.binaryName).toBe(`deno-${target}${target.includes('windows') ? '.exe' : ''}`)
+      // TL-112: сумма распакованного бинарника — отдельная от суммы архива.
+      expect(entry.binarySha256).toMatch(/^[0-9a-f]{64}$/)
+      expect(entry.binarySha256).not.toBe(entry.sha256)
     }
+    expect(pin.deno.targets['aarch64-apple-darwin'].binarySha256).toBe(
+      'b3ac3bd206e48c26026cadd80c1367e96c149f9c66130952382a642b09fa8a71',
+    )
     for (const section of BINARY_NAMES) {
       for (const target of KNOWN_TARGETS) {
         const entry = pin[section].targets[target]

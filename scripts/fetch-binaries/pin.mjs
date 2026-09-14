@@ -122,6 +122,19 @@ function validateEntry(entry, label, pinPath) {
     }
   }
 
+  // `binarySha256` (TL-112) — сумма ИТОГОВОГО файла под binaryName, когда он
+  // не совпадает со скачанным: у deno это распакованный бинарник, сумму
+  // которого апстрим публикует отдельно. Сверяют install.mjs и
+  // src-tauri/build.rs; у deno build.rs требует поле обязательно.
+  if (
+    entry.binarySha256 !== undefined &&
+    (typeof entry.binarySha256 !== 'string' || !SHA256_HEX_RE.test(entry.binarySha256))
+  ) {
+    throw new Error(
+      `pin file ${pinPath}: "${label}.binarySha256" must be a 64-char lowercase hex string when present`,
+    )
+  }
+
   if (entry.archive !== undefined) {
     if (typeof entry.archive !== 'object' || entry.archive === null) {
       throw new Error(`pin file ${pinPath}: "${label}.archive" must be an object when present`)

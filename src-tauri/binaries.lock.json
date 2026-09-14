@@ -19,7 +19,12 @@
     "(Mach-O, в т.ч. fat/universal, PE, ELF) и сверяет его с тройкой записи;",
     "расхождение — отказ. У kind \"binary\" проверяется сам итоговый файл, у",
     "kind \"archive\" — член executableMember (basename исполняемого файла",
-    "внутри архива; для такой записи поле обязательно)."
+    "внутри архива; для такой записи поле обязательно).",
+    "binarySha256 (TL-112) — сумма ИТОГОВОГО файла под binaryName, когда он не",
+    "совпадает со скачанным (извлечён из архива). Доставка сверяет с ней",
+    "извлечённый файл, src-tauri/build.rs — файл в binaries/ на каждой сборке:",
+    "в профиле release несовпадение (например, заглушка scripts/ci/stub-binaries.mjs)",
+    "обрывает сборку. У deno поле обязательно (его требует build.rs)."
   ],
   "ytDlp": {
     "version": "2026.08.19",
@@ -99,12 +104,13 @@
   },
   "deno": {
     "version": "2.9.6",
-    "_source": "GitHub Releases denoland/deno (официальный апстрим), тег v2.9.6 — неизменяемые ассеты. sha256 — сумма архива из опубликованного рядом <ассет>.zip.sha256sum, сверена с полем digest GitHub API релиза.",
+    "_source": "GitHub Releases denoland/deno (официальный апстрим), тег v2.9.6 — неизменяемые ассеты. sha256 — сумма архива из опубликованного рядом <ассет>.zip.sha256sum, сверена с полем digest GitHub API релиза. binarySha256 — сумма распакованного бинарника из опубликованного рядом deno-<тройка>.sha256sum (TL-112); у Windows это вывод PowerShell Get-FileHash, хэш приведён к нижнему регистру. Каждый .sha256sum-файл сверен с полем digest GitHub API; для aarch64-apple-darwin сумма совпала с shasum -a 256 доставленного бинарника.",
     "_note": "TL-108 (#114, решение владельца 2026-09-14): JavaScript-рантайм для YouTube-извлечения yt-dlp (--js-runtimes), поставляется третьим sidecar через externalBin. yt-dlp требует deno >= 2.3.0, верхней границы нет. macOS-ассеты раздельные по архитектуре (universal2 нет), поэтому у каждой тройки свой ассет и своя сумма — перепутанный адрес поймает проверка архитектуры доставки, а не sha256. В каждом архиве ровно один файл.",
     "targets": {
       "x86_64-pc-windows-msvc": {
         "url": "https://github.com/denoland/deno/releases/download/v2.9.6/deno-x86_64-pc-windows-msvc.zip",
         "sha256": "15e5300b0ba3c3695a7621d90160a746ec9e710228cee639afa9d580f6e3cd11",
+        "binarySha256": "2ff9493dfa356be2975f477025ea770088e9e9cb2c83d983236d13561b96b7a6",
         "archive": { "type": "zip", "member": "deno.exe" },
         "binaryName": "deno-x86_64-pc-windows-msvc.exe",
         "_note": "deno-x86_64-pc-windows-msvc.zip.sha256sum у Windows — вывод PowerShell Get-FileHash (Algorithm/Hash/Path, хэш в верхнем регистре); здесь тот же хэш в нижнем регистре, совпадает с digest GitHub API. ЖИВЬЁМ НЕ ПРОВЕРЕНО (Р-6, машины нет): архив не скачивался; член deno.exe подтверждён чтением центрального каталога zip по HTTP Range."
@@ -112,6 +118,7 @@
       "x86_64-apple-darwin": {
         "url": "https://github.com/denoland/deno/releases/download/v2.9.6/deno-x86_64-apple-darwin.zip",
         "sha256": "7d4524b82bcc557fe020a1a5b56956ed42b992ae5b28026e8ad5d17329533f5f",
+        "binarySha256": "ec9fbd8e8f5f6ca5ceb0ebe4a564636f2c698bf60e3187460ded400cc0147fd5",
         "archive": { "type": "zip", "member": "deno" },
         "binaryName": "deno-x86_64-apple-darwin",
         "_note": "ЖИВЬЁМ НЕ ПРОВЕРЕНО (Р-6, машины на Intel нет): сумма сверена с .zip.sha256sum и digest GitHub API."
@@ -119,6 +126,7 @@
       "aarch64-apple-darwin": {
         "url": "https://github.com/denoland/deno/releases/download/v2.9.6/deno-aarch64-apple-darwin.zip",
         "sha256": "213a2f304f04d3c9cb5220669afad138f60a5aab1fe80962abdeb8f35807a472",
+        "binarySha256": "b3ac3bd206e48c26026cadd80c1367e96c149f9c66130952382a642b09fa8a71",
         "archive": { "type": "zip", "member": "deno" },
         "binaryName": "deno-aarch64-apple-darwin",
         "_note": "Сверено скачиванием (TL-108): сумма архива совпала с .zip.sha256sum и digest GitHub API, распакованный бинарник — thin Mach-O arm64."
@@ -126,6 +134,7 @@
       "x86_64-unknown-linux-gnu": {
         "url": "https://github.com/denoland/deno/releases/download/v2.9.6/deno-x86_64-unknown-linux-gnu.zip",
         "sha256": "394f07f4da2bebe6ce6f1e7ce0fa16429b29b08c35e3fac3fe25972676dff4b2",
+        "binarySha256": "bceb5b6a6239b0b010418406d8c77a508f67cf4337d94288f1c19fe71304aab0",
         "archive": { "type": "zip", "member": "deno" },
         "binaryName": "deno-x86_64-unknown-linux-gnu",
         "_note": "ЖИВЬЁМ НЕ ПРОВЕРЕНО (Р-6, машины нет): сумма сверена с .zip.sha256sum и digest GitHub API. Минимальная glibc deno 2.9.6 не выяснена (риск 11 исследования TL-107)."

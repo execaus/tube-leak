@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -153,5 +153,83 @@ describe('verifyExecutableArch — own header accepted, every foreign one refuse
     await expect(verifyExecutableArch(path, 'x86_64-unknown-linux-gnu')).rejects.toThrow(
       /got elf x86_64 \(ELFCLASS32\)/,
     )
+  })
+})
+
+// TL-112: мутации ревью TL-108, которые прежние тесты пропускали (каждая
+// давала зелёный прогон). Тесты сверяют точное имя архитектуры, а не только
+// факт отказа: подмена разбора на «неизвестную архитектуру» тоже отказ, и
+// по одному отказу её не отличить.
+describe('readExecutableHeader — the details a mutation used to slip past', () => {
+  it('marks a 64-bit CPU type under a 32-bit Mach-O magic, and the target refuses it', async () => {
+    const path = await fileWith(machoThin('aarch64', { bits: 32 }))
+    await expect(readExecutableHeader(path)).resolves.toStrictEqual({
+      format: 'mach-o',
+      archs: ['aarch64 (32-bit header)'],
+    })
+    await expect(verifyExecutableArch(path, 'aarch64-apple-darwin')).rejects.toThrow(
+      /expects mach-o aarch64, got mach-o aarch64 \(32-bit header\)$/,
+    )
+  })
+
+  it('does not take arm64_32 (watchOS ILP32) for aarch64', async () => {
+    const path = await fileWith(machoThin('arm64_32', { bits: 32 }))
+    await expect(readExecutableHeader(path)).resolves.toStrictEqual({ format: 'mach-o', archs: ['arm64_32'] })
+    await expect(verifyExecutableArch(path, 'aarch64-apple-darwin')).rejects.toThrow(
+      /expects mach-o aarch64, got mach-o arm64_32$/,
+    )
+  })
+
+  it('reads ELF e_machine in the byte order EI_DATA declares', async () => {
+    // 183 (aarch64) в обратном порядке байт — 0xb700, то есть разбор не в
+    // том порядке дал бы «unknown», а не случайное совпадение.
+    await expect(readExecutableHeader(await fileWith(elf('aarch64', { endian: 'big' })))).resolves.toStrictEqual({
+      format: 'elf',
+      archs: ['aarch64'],
+    })
+    await expect(
+      readExecutableHeader(await fileWith(elf('powerpc64', { endian: 'big' }), 'ppc64')),
+    ).resolves.toStrictEqual({ format: 'elf', archs: ['powerpc64'] })
+  })
+
+  it('refuses a big-endian ELF for the Linux target, naming its real machine', async () => {
+    const path = await fileWith(elf('powerpc64', { endian: 'big' }))
+    await expect(verifyExecutableArch(path, 'x86_64-unknown-linux-gnu')).rejects.toThrow(
+      /expects elf x86_64, got elf powerpc64$/,
+    )
+  })
+
+  it('refuses a big-endian Mach-O for both macOS targets, naming its real CPU', async () => {
+    const path = await fileWith(machoThin('powerpc64', { endian: 'big' }))
+    await expect(readExecutableHeader(path)).resolves.toStrictEqual({ format: 'mach-o', archs: ['powerpc64'] })
+    for (const target of ['x86_64-apple-darwin', 'aarch64-apple-darwin']) {
+      await expect(verifyExecutableArch(path, target)).rejects.toThrow(/got mach-o powerpc64$/)
+    }
+  })
+
+  it('refuses a degenerate 8-byte Mach-O (magic and cputype, no header)', async () => {
+    await expect(readExecutableHeader(await fileWith(machoThin('aarch64').subarray(0, 8)))).rejects.toThrow(
+      /truncated Mach-O header \(8 of 32 bytes\)/,
+    )
+    await expect(
+      readExecutableHeader(await fileWith(machoThin('aarch64', { bits: 32 }).subarray(0, 27), 'short32')),
+    ).rejects.toThrow(/truncated Mach-O header \(27 of 28 bytes\)/)
+    // Граница: ровно полный mach_header_64 — уже заголовок.
+    await expect(
+      readExecutableHeader(await fileWith(machoThin('aarch64').subarray(0, 32), 'exact')),
+    ).resolves.toStrictEqual({ format: 'mach-o', archs: ['aarch64'] })
+  })
+
+  it('names the path when a directory stands where the executable should be', async () => {
+    const path = join(dir, 'deno-aarch64-apple-darwin')
+    await mkdir(path)
+    await expect(readExecutableHeader(path)).rejects.toThrow(`reading executable header of ${path}:`)
+  })
+
+  it('promises nothing about files left in place — only installBinary can', async () => {
+    const err = await verifyExecutableArch(await fileWith(machoThin('x86_64')), 'aarch64-apple-darwin').catch((e) => e)
+    expect(err).toBeInstanceOf(Error)
+    expect(err.message).toMatch(/^architecture mismatch for .*got mach-o x86_64$/)
+    expect(err.message).not.toMatch(/no file left in place/)
   })
 })

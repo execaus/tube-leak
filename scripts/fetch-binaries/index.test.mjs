@@ -114,11 +114,11 @@ describe('run — end to end against a temporary pin file (real repo pin is neve
     await rm(dir, { recursive: true, force: true })
   })
 
-  function buildPin({ ffmpegSha256, denoSha256 } = {}) {
+  function buildPin({ ffmpegSha256, denoSha256, forTarget = target } = {}) {
     // Пин обязан покрывать все известные тройки (см. pin.mjs), поэтому
     // остальные три получают инертные заглушки-плейсхолдеры — run() в
-    // этом тесте запрашивается только для `target`, они не скачиваются.
-    const otherTargets = KNOWN_TARGETS.filter((t) => t !== target)
+    // этом тесте запрашивается только для `forTarget`, они не скачиваются.
+    const otherTargets = KNOWN_TARGETS.filter((t) => t !== forTarget)
     const placeholders = (tool) =>
       Object.fromEntries(
         otherTargets.map((t) => [
@@ -132,10 +132,10 @@ describe('run — end to end against a temporary pin file (real repo pin is neve
         version: '2026.01.01',
         targets: {
           ...placeholders('yt-dlp'),
-          [target]: {
+          [forTarget]: {
             url: 'https://example.invalid/yt-dlp',
             sha256: sha256Of(ytDlpContent),
-            binaryName: `yt-dlp-${target}`,
+            binaryName: `yt-dlp-${forTarget}`,
           },
         },
       },
@@ -143,10 +143,10 @@ describe('run — end to end against a temporary pin file (real repo pin is neve
         version: '9.0.1',
         targets: {
           ...placeholders('ffmpeg'),
-          [target]: {
+          [forTarget]: {
             url: 'https://example.invalid/ffmpeg.zip',
             sha256: ffmpegSha256 ?? sha256Of(archives.ffmpeg.bytes),
-            binaryName: `ffmpeg-${target}`,
+            binaryName: `ffmpeg-${forTarget}`,
             archive: { type: 'zip', member: 'ffmpeg' },
           },
         },
@@ -155,10 +155,10 @@ describe('run — end to end against a temporary pin file (real repo pin is neve
         version: '2.9.6',
         targets: {
           ...placeholders('deno'),
-          [target]: {
+          [forTarget]: {
             url: 'https://example.invalid/deno.zip',
             sha256: denoSha256 ?? sha256Of(archives.deno.bytes),
-            binaryName: `deno-${target}`,
+            binaryName: `deno-${forTarget}`,
             archive: { type: 'zip', member: 'deno' },
           },
         },
@@ -215,5 +215,47 @@ describe('run — end to end against a temporary pin file (real repo pin is neve
 
     expect(errors.join('\n')).toMatch(/deno \(x86_64-apple-darwin\): architecture mismatch .*expects mach-o x86_64, got mach-o aarch64/)
     expect((await readdir(outDir)).sort()).toStrictEqual([`ffmpeg-${target}`, `yt-dlp-${target}`])
+  })
+
+  // TL-112: тройка из run() обязана доходить до installBinary. Все тесты
+  // выше идут на x86_64-apple-darwin с x86_64-заголовками, и run(), жёстко
+  // подставлявший 'x86_64-apple-darwin', их проходил (мутация ревью TL-108).
+  it('checks every binary against the triple it is delivered for: aarch64-apple-darwin refuses x86_64 headers', async () => {
+    const arm = 'aarch64-apple-darwin'
+    const pinPath = await writeTempPin(buildPin({ forTarget: arm }))
+    const errors = []
+    const spy = vi.spyOn(console, 'error').mockImplementation((line) => errors.push(line))
+
+    try {
+      await expect(run({ targets: [arm], pinPath, outDir })).rejects.toThrow(/3\/3 binaries failed to install/)
+    } finally {
+      spy.mockRestore()
+    }
+
+    for (const section of BINARY_NAMES) {
+      expect(errors.join('\n')).toMatch(
+        new RegExp(`${section} \\(${arm}\\): architecture mismatch .*target ${arm} expects mach-o aarch64, got mach-o x86_64`),
+      )
+    }
+    expect(await readdir(outDir)).toStrictEqual([])
+  })
+
+  it('installs aarch64 headers for aarch64-apple-darwin', async () => {
+    const arm = 'aarch64-apple-darwin'
+    ytDlpContent = machoThin('aarch64')
+    archives.ffmpeg.member = machoThin('aarch64')
+    archives.ffmpeg.bytes = await zipWith('ffmpeg-arm', 'ffmpeg', archives.ffmpeg.member)
+    archives.deno.member = machoThin('aarch64')
+    archives.deno.bytes = await zipWith('deno-arm', 'deno', archives.deno.member)
+    const pinPath = await writeTempPin(buildPin({ forTarget: arm }))
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    try {
+      await run({ targets: [arm], pinPath, outDir })
+    } finally {
+      spy.mockRestore()
+    }
+
+    expect((await readdir(outDir)).sort()).toStrictEqual([`deno-${arm}`, `ffmpeg-${arm}`, `yt-dlp-${arm}`])
   })
 })

@@ -36,7 +36,10 @@ import { deliveredArchiveType, entryKind } from './pin.mjs'
  * `kind: 'archive'` + `archive: {...}` осмысленна и допустима (архив внутри
  * архива), но в текущем пине не встречается.
  *
- * @param {object} entry запись из пина: `{ url, sha256, binaryName, kind?, archive?, executableMember? }`
+ * `entry.binarySha256` (TL-112), если задано, — сумма итогового файла под
+ * `binaryName`; сверяется после извлечения, до проверки архитектуры.
+ *
+ * @param {object} entry запись из пина: `{ url, sha256, binaryName, binarySha256?, kind?, archive?, executableMember? }`
  * @param {string} outDir каталог назначения (`src-tauri/binaries`)
  * @param {string} target целевая тройка записи — с ней сверяется архитектура
  * @param {{ fetchImpl?: typeof fetch }} [deps] точки подмены для тестов
@@ -71,6 +74,18 @@ export async function installBinary(entry, outDir, target, deps = {}) {
       candidatePath = extractingPath
     }
 
+    // TL-112: сумма итогового файла. У deno `sha256` — сумма архива, и
+    // извлечённый член ею не проверен; апстрим публикует сумму самого
+    // бинарника, с ней же сверяет файл в binaries/ src-tauri/build.rs.
+    if (entry.binarySha256 !== undefined) {
+      const actualBinarySha256 = await sha256File(candidatePath)
+      if (actualBinarySha256 !== entry.binarySha256) {
+        throw new Error(
+          `binarySha256 mismatch for ${entry.binaryName} (the file that would be placed): expected ${entry.binarySha256}, got ${actualBinarySha256} — aborting, no file left in place`,
+        )
+      }
+    }
+
     if (entryKind(entry) === 'archive') {
       const type = deliveredArchiveType(entry)
       if (type === null || !entry.executableMember) {
@@ -79,10 +94,10 @@ export async function installBinary(entry, outDir, target, deps = {}) {
         )
       }
       await extractMember(type, candidatePath, entry.executableMember, archCheckPath)
-      await verifyExecutableArch(archCheckPath, target, `${entry.executableMember} inside ${entry.binaryName}`)
+      await verifyArchOrAbort(archCheckPath, target, `${entry.executableMember} inside ${entry.binaryName}`)
       await rm(archCheckPath, { force: true })
     } else {
-      await verifyExecutableArch(candidatePath, target, entry.binaryName)
+      await verifyArchOrAbort(candidatePath, target, entry.binaryName)
     }
 
     await rename(candidatePath, finalPath)
@@ -98,4 +113,17 @@ export async function installBinary(entry, outDir, target, deps = {}) {
   }
 
   return finalPath
+}
+
+/**
+ * Проверка архитектуры с обещанием, которое может дать только
+ * `installBinary`: при отказе она убирает всё временное, и финальный путь
+ * не создан.
+ */
+async function verifyArchOrAbort(path, target, label) {
+  try {
+    await verifyExecutableArch(path, target, label)
+  } catch (err) {
+    throw new Error(`${err.message} — aborting, no file left in place`, { cause: err })
+  }
 }
