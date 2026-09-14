@@ -278,6 +278,7 @@ describe('App — warm start (no prepare events)', () => {
     expect(wrapper.text()).toContain('версия 0.1.0')
     expect(wrapper.text()).toContain('2026.08.20')
     expect(wrapper.text()).toContain('7.1')
+    expect(wrapper.text()).toContain('2.9.6')
     expect(wrapper.text()).not.toContain('Распаковываем')
     expect(wrapper.text()).not.toContain('Готовим yt-dlp')
   })
@@ -287,7 +288,7 @@ describe('App — first-run preparation (unpacking → warmingUp → ready)', ()
   it('shows the service screen (checking) before the first event, then progress per stage, then the service screen again', async () => {
     // Композиция «starting = ready» — решение ревью TL-17 (#18,
     // «Композиция тёплого старта»): до первого события экран — та же
-    // раскладка, что и после готовности (шапка с версией, обе строки
+    // раскладка, что и после готовности (шапка с версией, все три строки
     // sidecar «Проверяем…»), а не отдельная надпись-заглушка.
     let resolvePrepare: (value: YtDlpPrepared) => void = () => {}
     routeInvoke({
@@ -301,11 +302,11 @@ describe('App — first-run preparation (unpacking → warmingUp → ready)', ()
     const wrapper = mount(App)
     await flushPromises()
 
-    // До первого события — не пустое окно: версия и обе строки sidecar
+    // До первого события — не пустое окно: версия и все три строки sidecar
     // видны сразу (Ф-9/Н-6), check_sidecar при этом ещё не вызван (см.
     // блок «order of calls»).
     expect(wrapper.text()).toContain('версия 0.1.0')
-    expect(wrapper.text().match(/Проверяем…/g)).toHaveLength(2)
+    expect(wrapper.text().match(/Проверяем…/g)).toHaveLength(3)
 
     capturedHandler?.({ payload: { stage: 'unpacking', percent: 4, etaSecs: 1 } })
     await wrapper.vm.$nextTick()
@@ -458,7 +459,7 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     })
   })
 
-  it('renders the title immediately, with both rows Checking before check_sidecar resolves (Н-6)', async () => {
+  it('renders the title immediately, with all three rows Checking before check_sidecar resolves (Н-6)', async () => {
     let resolveCheck: (value: SidecarCheckReport) => void = () => {}
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
@@ -474,7 +475,8 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     expect(wrapper.text()).toContain('tube-leak')
     expect(wrapper.text()).toContain('yt-dlp')
     expect(wrapper.text()).toContain('ffmpeg')
-    expect(wrapper.text().match(/Проверяем…/g)).toHaveLength(2)
+    expect(wrapper.text()).toContain('deno')
+    expect(wrapper.text().match(/Проверяем…/g)).toHaveLength(3)
     // Не «нет ни одной кнопки вовсе» — блок «Обновление yt-dlp» (TL-59)
     // всегда рисует «Проверить сейчас» (неактивной, пока свой снимок не
     // пришёл, см. doc `routeInvoke` выше); точный список подписей — не
@@ -485,12 +487,13 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     await flushPromises()
   })
 
-  it('hides the retry button when both rows resolve Ok', async () => {
+  it('hides the retry button when all three rows resolve Ok', async () => {
     const wrapper = mount(App)
     await flushPromises()
 
     expect(wrapper.text()).toContain('2026.08.20')
     expect(wrapper.text()).toContain('7.1')
+    expect(wrapper.text()).toContain('2.9.6')
     // См. doc-комментарий у предыдущего теста и `buttonLabels` — точный
     // список, не отсутствие одной конкретной подписи.
     expect(buttonLabels(wrapper)).toStrictEqual(['Проверить сейчас'])
@@ -499,7 +502,7 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
   it('shows the retry button when at least one row is not Ok, for a mixed ok/timeout report', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
-      check_sidecar: () => Promise.resolve({ ytDlp: okYtDlp, ffmpeg: timeoutFfmpeg }),
+      check_sidecar: () => Promise.resolve({ ytDlp: okYtDlp, ffmpeg: timeoutFfmpeg, deno: okDeno }),
     })
 
     const wrapper = mount(App)
@@ -512,10 +515,10 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     expect(retryButton).toBeDefined()
   })
 
-  it('shows the retry button when both rows are in error states', async () => {
+  it('shows the retry button when both yt-dlp and ffmpeg are in error states', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
-      check_sidecar: () => Promise.resolve({ ytDlp: notFoundYtDlp, ffmpeg: timeoutFfmpeg }),
+      check_sidecar: () => Promise.resolve({ ytDlp: notFoundYtDlp, ffmpeg: timeoutFfmpeg, deno: okDeno }),
     })
 
     const wrapper = mount(App)
@@ -525,10 +528,68 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     expect(retryButton).toBeDefined()
   })
 
+  /**
+   * TL-111: doc `showRetry` в App.vue меняет условие с «yt-dlp ИЛИ ffmpeg
+   * не ok» на «хотя бы одна из трёх строк не ok» (`SIDECAR_REPORT_KEYS`) —
+   * без этого теста мутация, вернувшая проверку только двух старых полей,
+   * прошла бы: yt-dlp и ffmpeg здесь оба `ok`, отказавший — только deno.
+   */
+  it('shows the retry button when only deno is not Ok, even with yt-dlp and ffmpeg both Ok', async () => {
+    const launchFailedDeno: SidecarCheckResult = {
+      name: 'deno',
+      path: '/opt/tube-leak/bin/deno',
+      status: 'launchFailed',
+      reason: 'other',
+      stderrTail: 'deno: command not found in PATH shim',
+    }
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve({ ytDlp: okYtDlp, ffmpeg: okFfmpeg, deno: launchFailedDeno }),
+    })
+
+    const wrapper = mount(App)
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('не удалось запустить')
+
+    // `stderrTail` живёт в свёрнутом по умолчанию блоке «Подробнее»
+    // (`SidecarStatusRow`, doc `details`) — раскрываем его тем же приёмом,
+    // что `SidecarStatusRow.test.ts`.
+    const detailsButton = wrapper.findAll('button').find((b) => b.text().includes('Подробнее'))
+    expect(detailsButton).toBeDefined()
+    await detailsButton?.trigger('click')
+    expect(wrapper.text()).toContain('deno: command not found in PATH shim')
+
+    const retryButton = wrapper.findAll('button').find((b) => b.text().includes('Повторить проверку'))
+    expect(retryButton).toBeDefined()
+  })
+
+  it('shows the deno row not found the same way as the other rows', async () => {
+    const notFoundDeno: SidecarCheckResult = {
+      name: 'deno',
+      path: '/opt/tube-leak/bin/deno',
+      status: 'notFound',
+      osErrorCode: 'ENOENT',
+    }
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve({ ytDlp: okYtDlp, ffmpeg: okFfmpeg, deno: notFoundDeno }),
+    })
+
+    const wrapper = mount(App)
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('не найден')
+    expect(wrapper.text()).toContain('Не нашли файл deno по ожидаемому пути')
+
+    const retryButton = wrapper.findAll('button').find((b) => b.text().includes('Повторить проверку'))
+    expect(retryButton).toBeDefined()
+  })
+
   it('re-invokes check_sidecar (not prepare_ytdlp again) when the retry button is clicked', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
-      check_sidecar: () => Promise.resolve({ ytDlp: notFoundYtDlp, ffmpeg: okFfmpeg }),
+      check_sidecar: () => Promise.resolve({ ytDlp: notFoundYtDlp, ffmpeg: okFfmpeg, deno: okDeno }),
     })
 
     const wrapper = mount(App)
@@ -578,7 +639,32 @@ describe('App — link probe section gating by yt-dlp status only (эпик E2, 
   it('enables the link field once yt-dlp is ok, even if ffmpeg is not', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
-      check_sidecar: () => Promise.resolve({ ytDlp: okYtDlp, ffmpeg: timeoutFfmpeg }),
+      check_sidecar: () => Promise.resolve({ ytDlp: okYtDlp, ffmpeg: timeoutFfmpeg, deno: okDeno }),
+    })
+
+    const wrapper = mount(App)
+    await flushPromises()
+
+    const input = wrapper.find('input')
+    expect(input.attributes('disabled')).toBeUndefined()
+  })
+
+  /**
+   * TL-111 (#114): deno не блокирует поле ссылки так же, как ffmpeg —
+   * разбор без рантайма деградирует (часть форматов пропадает), а не
+   * отказывает целиком. Без этого теста мутация, добавившая проверку
+   * `report.deno.status` в `ytDlpState`, прошла бы незамеченной.
+   */
+  it('enables the link field once yt-dlp is ok, even if deno is not', async () => {
+    const notFoundDeno: SidecarCheckResult = {
+      name: 'deno',
+      path: '/opt/tube-leak/bin/deno',
+      status: 'notFound',
+      osErrorCode: 'ENOENT',
+    }
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve({ ytDlp: okYtDlp, ffmpeg: okFfmpeg, deno: notFoundDeno }),
     })
 
     const wrapper = mount(App)
@@ -591,7 +677,7 @@ describe('App — link probe section gating by yt-dlp status only (эпик E2, 
   it('disables the link field with a hint (not repeating the yt-dlp row error text) when yt-dlp is not ok', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
-      check_sidecar: () => Promise.resolve({ ytDlp: notFoundYtDlp, ffmpeg: okFfmpeg }),
+      check_sidecar: () => Promise.resolve({ ytDlp: notFoundYtDlp, ffmpeg: okFfmpeg, deno: okDeno }),
     })
 
     const wrapper = mount(App)
