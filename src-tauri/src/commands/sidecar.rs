@@ -137,18 +137,28 @@ const DENO_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
 /// может весить мегабайт, а уходит она через IPC прямо в «Подробнее».
 const VERSION_RAW_MAX_CHARS: usize = 200;
 
-/// Символы, которые меняют порядок отрисовки текста, оставаясь невидимыми
-/// (Unicode Bidi: ALM, LRM, RLM, встраивания и переопределения
-/// U+202A–U+202E, изоляты U+2066–U+2069). `char::is_control` их не ловит:
-/// это категория `Cf`, а не `Cc`.
-fn is_bidi_formatting(symbol: char) -> bool {
+/// Невидимые символы, которые меняют отрисовку или разбивку текста, не
+/// будучи управляющими: `char::is_control` ловит только категорию `Cc`, а
+/// эти — `Cf`, `Zl` и `Zp`.
+///
+/// - bidi: ALM U+061C, LRM и RLM U+200E–U+200F, встраивания и
+///   переопределения U+202A–U+202E, изоляты U+2066–U+2069 — меняют порядок
+///   отрисовки;
+/// - нулевой ширины: ZWSP, ZWNJ, ZWJ U+200B–U+200D и BOM U+FEFF — прячут
+///   символы внутри видимого текста;
+/// - разделители строки и абзаца U+2028–U+2029 — переносят строку там, где
+///   переноса быть не должно.
+///
+/// Список перечисляет символы поимённо, диапазонами только там, где они
+/// сплошные (U+200B–U+200F, U+2028–U+202E).
+fn is_invisible_formatting(symbol: char) -> bool {
     matches!(
         symbol,
-        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
     )
 }
 
-/// Заменяет управляющие и bidi-форматирующие символы на U+FFFD.
+/// Заменяет управляющие и невидимые форматирующие символы на U+FFFD.
 ///
 /// Строка приходит из вывода бинарника, подменённого под именем sidecar, и
 /// уходит через IPC прямо в текст экрана: ESC-последовательность, NUL или
@@ -159,7 +169,7 @@ fn is_bidi_formatting(symbol: char) -> bool {
 fn replace_unprintable(line: &str) -> String {
     line.chars()
         .map(|symbol| {
-            if symbol.is_control() || is_bidi_formatting(symbol) {
+            if symbol.is_control() || is_invisible_formatting(symbol) {
                 char::REPLACEMENT_CHARACTER
             } else {
                 symbol
@@ -168,16 +178,19 @@ fn replace_unprintable(line: &str) -> String {
         .collect()
 }
 
-/// Строка для `versionRaw` (и для `version`, когда версии в выводе не
-/// нашлось): непечатаемые символы заменены ([`replace_unprintable`]), без
-/// краевых пробелов и не длиннее [`VERSION_RAW_MAX_CHARS`] символов, при
-/// обрезке — с `…` в конце. Режет по символам, а не по байтам: срез UTF-8
-/// посередине символа — паника.
+/// Строка для `versionRaw` и `version`: без краевых пробелов, непечатаемые
+/// символы заменены ([`replace_unprintable`]), не длиннее
+/// [`VERSION_RAW_MAX_CHARS`] символов, при обрезке — с `…` в конце. Режет по
+/// символам, а не по байтам: срез UTF-8 посередине символа — паника.
+///
+/// Порядок «сначала края, потом замена» несущий (заметка 1 ревью TL-21):
+/// `\t`, `\r`, `\v` одновременно управляющие и пробельные, и при обратном
+/// порядке краевой `\r` из вывода Windows-сборки становился U+FFFD, который
+/// `trim` уже не срезал. Внутри строки те же символы по-прежнему заменяются.
 fn clip_version_raw(line: &str) -> String {
-    let line = replace_unprintable(line);
-    let line = line.trim();
+    let line = replace_unprintable(line.trim());
     if line.chars().count() <= VERSION_RAW_MAX_CHARS {
-        return line.to_string();
+        return line;
     }
 
     let head: String = line.chars().take(VERSION_RAW_MAX_CHARS).collect();
@@ -1732,19 +1745,51 @@ mod tests {
             clipped,
             "deno 2.9.6 \u{FFFD}[31m\u{FFFD}lave\u{FFFD}\u{FFFD}x"
         );
-        for bidi in [
+        for invisible in [
+            // bidi
             '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
             '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+            // нулевой ширины и BOM, разделители строки и абзаца (заметка 2
+            // ревью TL-21)
+            '\u{200B}', '\u{200C}', '\u{200D}', '\u{FEFF}', '\u{2028}', '\u{2029}',
         ] {
             assert_eq!(
-                clip_version_raw(&format!("a{bidi}b")),
+                clip_version_raw(&format!("a{invisible}b")),
                 "a\u{FFFD}b",
                 "U+{:04X} обязан быть заменён",
-                u32::from(bidi)
+                u32::from(invisible)
             );
         }
         // Обычный текст фильтр не трогает — ни кириллицу, ни символы вне BMP.
         assert_eq!(clip_version_raw("ёж 🦔 2.9.6"), "ёж 🦔 2.9.6");
+        // И соседей диапазонов тоже: границы списка стоят там, где сказано.
+        for neighbour in ['\u{200A}', '\u{2027}', '\u{202F}', '\u{206A}'] {
+            let line = format!("a{neighbour}b");
+            assert_eq!(
+                clip_version_raw(&line),
+                line,
+                "U+{:04X} не из списка",
+                u32::from(neighbour)
+            );
+        }
+    }
+
+    #[test]
+    fn edge_whitespace_is_trimmed_before_unprintable_symbols_are_replaced() {
+        // Заметка 1 ревью TL-21: при замене до `trim` краевые `\t`, `\r`, `\v`
+        // становились U+FFFD и оставались в строке.
+        for (raw, shown) in [
+            ("2026.08.19\t", "2026.08.19"),
+            ("\t2026.08.19", "2026.08.19"),
+            ("2026.08.19\r", "2026.08.19"),
+            ("2026.08.19\u{0B}", "2026.08.19"),
+            (" 2026.08.19 ", "2026.08.19"),
+            ("\u{2028}2026.08.19\u{2029}", "2026.08.19"),
+        ] {
+            assert_eq!(clip_version_raw(raw), shown, "{raw:?}");
+        }
+        // Внутри строки те же символы по-прежнему заменяются.
+        assert_eq!(clip_version_raw("2026\t08\r19"), "2026\u{FFFD}08\u{FFFD}19");
     }
 
     #[tokio::test]
