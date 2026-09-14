@@ -134,6 +134,16 @@ fn queue_store(app: &tauri::AppHandle) -> Option<queue::store::SnapshotStore> {
 
 fn main() {
     let app = tauri::Builder::default()
+        // Системный диалог выбора папки назначения (TL-84, Р-3 эпика E5).
+        // Ядро своей команды вокруг него не заводит: фронтенд зовёт
+        // `open({ directory: true })` из `@tauri-apps/plugin-dialog` сам
+        // (`src/composables/usePickFolder.ts`). Регистрация здесь и
+        // разрешение в capability обязаны появиться раньше первого вызова:
+        // без них `open()` отвечает отказом ACL, а не диалогом (урок TL-24).
+        // Из команд плагина фронтенду выдано ровно `dialog:allow-open`;
+        // транзитивный `tauri-plugin-fs` не регистрируется и не разрешается
+        // (сторож — `tests/frontend_acl.rs`).
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             cancel_download,
             cancel_probe,
