@@ -990,6 +990,70 @@ async fn the_url_is_the_last_argument_and_stands_after_the_separator() {
     );
 }
 
+#[tokio::test]
+async fn upper_case_scheme_and_host_reach_the_process_the_partial_name_and_the_history_lower_cased()
+{
+    // TL-81: yt-dlp выбирает extractor с учётом регистра хоста — сырой
+    // `HTTPS://WWW.YOUTUBE.COM/…` уходит у него в `generic` (замер у теста
+    // `upper_case_scheme_and_host_reach_yt_dlp_as_lower_case` в
+    // `probe::orchestrate`). Разбор нормализует ссылку сам, но задача
+    // скачивания приезжает через IPC с той строкой, что прислал фронтенд,
+    // поэтому нормализация обязана случиться и здесь — в `build_task`, а
+    // оттуда дойти до всех потребителей одной строкой.
+    //
+    // Второй хост не YouTube намеренно: у него рабочее имя — хеш ссылки
+    // (`PartialId`), и только на нём верхний регистр дал бы другие частичные
+    // файлы, то есть докачка Р-2 не нашла бы свои.
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let history = history_in(data.path());
+    let env = env_with(None, Some(Arc::clone(&history)), Some(dir.path()));
+
+    let mut written = Vec::new();
+    for (upper, lower) in [
+        ("HTTPS://WWW.YOUTUBE.COM/watch?v=aqz-KE-bpKQ", URL),
+        (
+            "Https://Example.COM/Watch?V=Mixed-Case",
+            "https://example.com/Watch?V=Mixed-Case",
+        ),
+    ] {
+        let mut argvs = Vec::new();
+        for url in [upper, lower] {
+            let mut req = request(streams(None, Some("140")));
+            req.url = url.to_string();
+            let task = new_task(req);
+            assert_eq!(
+                task.request().url,
+                lower,
+                "«{url}»: задача хранит нормализованную ссылку — её же видят \
+                 сравнение дублей и снимок очереди"
+            );
+
+            let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+            let sink = RecordingSink::new();
+            super::run_task(&task, &launcher, &ScriptedFfmpeg::merging(), &sink, &env).await;
+            assert!(
+                matches!(sink.last(), DownloadProgress::Done { .. }),
+                "«{url}»: {:?}",
+                sink.last()
+            );
+            argvs.push(launcher.calls()[0].argv.clone());
+            written.push(lower);
+        }
+
+        assert_eq!(
+            argvs[0], argvs[1],
+            "«{upper}» обязан дать процессу тот же argv (и то же `-o`), что «{lower}»"
+        );
+        assert_eq!(argvs[0].last().map(String::as_str), Some(lower));
+    }
+
+    let mut urls: Vec<String> = records(&history).into_iter().map(|r| r.url).collect();
+    urls.sort();
+    written.sort_unstable();
+    assert_eq!(urls, written, "история хранит нормализованную ссылку");
+}
+
 /// Названия, которые шаблон вывода yt-dlp понял бы не как текст.
 ///
 /// Каждое снято прямым запуском вложенного бинарника (`--print filename`,

@@ -1207,12 +1207,20 @@ impl DownloadTask {
 /// лог, где на неё есть место.
 pub fn build_task(
     id: String,
-    request: StartDownloadRequest,
+    mut request: StartDownloadRequest,
 ) -> Result<Arc<DownloadTask>, DownloadCommandRejection> {
-    crate::probe::validate_url(&request.url).map_err(|_| {
-        eprintln!("download: ссылка не является http(s)-адресом — yt-dlp не запускался");
-        DownloadCommandRejection::InvalidUrl
-    })?;
+    // Ссылка в запросе заменяется нормализованной (TL-81): схема и хост в
+    // нижнем регистре, остальное как есть. Замена стоит здесь, до всего, и
+    // это единственное место, где ссылка входит в задачу, — постановка и
+    // восстановление снимка идут через эту функцию. Поэтому argv
+    // скачивания, сравнение дублей, рабочее имя, снимок очереди и запись
+    // истории видят одну и ту же строку, и ту же, что ушла в разбор.
+    request.url = crate::probe::validate_url(&request.url)
+        .map_err(|_| {
+            eprintln!("download: ссылка не является http(s)-адресом — yt-dlp не запускался");
+            DownloadCommandRejection::InvalidUrl
+        })?
+        .into_owned();
 
     if !request.streams.has_any() {
         return Err(DownloadCommandRejection::NoStreamsSelected);
