@@ -118,6 +118,30 @@ const FFMPEG_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
 /// это запас ≈3× (9 с / 3,07 с), а не 5×, как считалось по одиночному.
 const DENO_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
 
+/// Предел длины `versionRaw` в Unicode-символах, не считая `…` обрезки
+/// (TL-15).
+///
+/// Самая длинная известная настоящая строка — ffmpeg от gyan.dev
+/// (`ffmpeg version 9.0.1-essentials_build-www.gyan.dev Copyright (c)
+/// 2000-2026 the FFmpeg developers`) — 97 символов, то есть предел вдвое
+/// больше неё: любая настоящая строка версии видна целиком. Предел нужен не
+/// им, а бинарнику, подменённому под именем sidecar: одна строка его вывода
+/// может весить мегабайт, а уходит она через IPC прямо в «Подробнее».
+const VERSION_RAW_MAX_CHARS: usize = 200;
+
+/// Строка для `versionRaw`: без краевых пробелов и не длиннее
+/// [`VERSION_RAW_MAX_CHARS`] символов, при обрезке — с `…` в конце. Режет
+/// по символам, а не по байтам: срез UTF-8 посередине символа — паника.
+fn clip_version_raw(line: &str) -> String {
+    let line = line.trim();
+    if line.chars().count() <= VERSION_RAW_MAX_CHARS {
+        return line.to_string();
+    }
+
+    let head: String = line.chars().take(VERSION_RAW_MAX_CHARS).collect();
+    format!("{head}…")
+}
+
 /// Возвращает результат проверки sidecar-бинарников (yt-dlp, ffmpeg, deno).
 ///
 /// `registry` — реестр PID выполняющихся процессов (TL-10), внедряется
@@ -346,13 +370,12 @@ async fn run_check(
 
     match run_result {
         Ok(output) => {
-            let version = match (check.parse_version)(&output.stdout) {
+            let (version, version_raw) = match (check.parse_version)(&output.stdout) {
                 Some(parsed) => {
-                    // Полная строка сборки в DTO не уходит: `version` в
-                    // контракте один, и новое поле потянуло бы за собой
-                    // TS-зеркало и область ui. На экране — нормализованный
-                    // semver, полная строка пишется в лог, чтобы по ней можно
-                    // было опознать сборку при разборе бага постобработки.
+                    // На экране — нормализованный semver (`version`), полная
+                    // первая строка вывода уходит в `versionRaw` для
+                    // «Подробнее» (TL-15): у собранного `.app` stderr не
+                    // виден, и лог ниже доступен только разработчику.
                     if parsed.is_normalized() {
                         eprintln!(
                             "sidecar {name}: версия сборки {raw}, на служебном экране показывается {display}",
@@ -361,10 +384,15 @@ async fn run_check(
                             display = parsed.display,
                         );
                     }
-                    parsed.display
+                    (parsed.display, clip_version_raw(&parsed.line))
                 }
                 None => match check.unrecognized {
-                    UnrecognizedOutput::ShowAsIs => output.stdout.trim().to_string(),
+                    // Разобрать нечего, но `versionRaw` приходит с `version`
+                    // всегда: первая строка того, что показано вместо версии.
+                    UnrecognizedOutput::ShowAsIs => (
+                        output.stdout.trim().to_string(),
+                        clip_version_raw(output.stdout.trim().lines().next().unwrap_or_default()),
+                    ),
                     UnrecognizedOutput::Refuse => {
                         eprintln!("{}", unrecognized_output_log_line(name, &output.stdout));
                         let error = SidecarError::LaunchFailed {
@@ -381,6 +409,7 @@ async fn run_check(
                 path: path_string,
                 status: SidecarStatus::Ok,
                 version: Some(version),
+                version_raw: Some(version_raw),
                 reason: None,
                 exit_code: None,
                 os_error_code: None,
@@ -466,6 +495,7 @@ fn error_to_result(
         path,
         status,
         version: None,
+        version_raw: None,
         reason,
         exit_code,
         os_error_code,
@@ -1155,5 +1185,188 @@ mod tests {
                 result.stderr_tail
             );
         }
+    }
+
+    /// `versionRaw` так, как его видит фронтенд: `None` — ключа в JSON нет.
+    fn serialized_version_raw(result: &SidecarCheckResult) -> Option<serde_json::Value> {
+        let value = serde_json::to_value(result).expect("результат сериализуется");
+        value
+            .as_object()
+            .expect("результат — объект")
+            .get("versionRaw")
+            .cloned()
+    }
+
+    /// Живой вывод `ffmpeg -version` сборки martin-riedl.de — та же строка,
+    /// что в тестах разбора `crate::sidecar::version`.
+    const FFMPEG_MARTIN_RIEDL_FIRST_LINE: &str =
+        "ffmpeg version 9.0.1-https://www.martin-riedl.de Copyright (c) 2000-2026 the FFmpeg developers";
+
+    #[tokio::test]
+    async fn version_raw_of_each_sidecar_is_its_whole_first_version_line() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let yt_dlp = version_script(&dir, "yt-dlp.sh", YT_DLP_VERSION_LINE);
+        let ffmpeg = write_script(
+            &dir,
+            "ffmpeg.sh",
+            &format!(
+                "#!/bin/sh\necho '{FFMPEG_MARTIN_RIEDL_FIRST_LINE}'\n\
+                 echo 'built with Apple clang version 14.0.0 (clang-1400.0.29.102)'\nexit 0\n"
+            ),
+            0o755,
+        );
+        let deno = write_script(
+            &dir,
+            "deno.sh",
+            &format!(
+                "#!/bin/sh\necho \"{DENO_VERSION_LINE}\"\necho 'v8 15.0.245.2-rusty'\n\
+                 echo 'typescript 6.0.3'\nexit 0\n"
+            ),
+            0o755,
+        );
+
+        let registry = ChildRegistry::new();
+        let report = check_report(
+            Ok(yt_dlp),
+            Ok(ffmpeg),
+            deno_launch(deno, dir.path()),
+            &registry,
+        )
+        .await;
+
+        for (result, display, raw) in [
+            (&report.yt_dlp, "2026.08.19", YT_DLP_VERSION_LINE),
+            (&report.ffmpeg, "9.0.1", FFMPEG_MARTIN_RIEDL_FIRST_LINE),
+            (
+                &report.deno,
+                "2.9.6",
+                "deno 2.9.6 (stable, release, aarch64-apple-darwin)",
+            ),
+        ] {
+            assert_eq!(result.status, SidecarStatus::Ok, "{result:?}");
+            // Экран не меняется: `version` по-прежнему нормализованная.
+            assert_eq!(result.version.as_deref(), Some(display), "{result:?}");
+            assert_eq!(result.version_raw.as_deref(), Some(raw), "{result:?}");
+            assert_eq!(
+                serialized_version_raw(result),
+                Some(serde_json::json!(raw)),
+                "{}: versionRaw обязан пересечь границу",
+                result.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn version_raw_is_absent_from_every_failed_check() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let registry = ChildRegistry::new();
+        let failing = write_script(
+            &dir,
+            "fail.sh",
+            &format!("#!/bin/sh\necho \"{YT_DLP_VERSION_LINE}\"\necho boom >&2\nexit 1\n"),
+            0o755,
+        );
+        let slow = write_script(
+            &dir,
+            "slow.sh",
+            &format!("#!/bin/sh\necho \"{YT_DLP_VERSION_LINE}\"\nsleep 5\n"),
+            0o755,
+        );
+        let not_deno = version_script(&dir, "not-deno.sh", "hello from something else");
+
+        let not_found = check_binary(
+            "ffmpeg",
+            Ok(dir.path().join("missing")),
+            &["-version"],
+            Duration::from_secs(5),
+            sidecar::parse_ffmpeg_version,
+            &registry,
+        )
+        .await;
+        let non_zero = check_binary(
+            "yt-dlp",
+            Ok(failing),
+            &["--version"],
+            Duration::from_secs(5),
+            sidecar::parse_ytdlp_version,
+            &registry,
+        )
+        .await;
+        let timeout = check_binary(
+            "yt-dlp",
+            Ok(slow),
+            &["--version"],
+            Duration::from_millis(150),
+            sidecar::parse_ytdlp_version,
+            &registry,
+        )
+        .await;
+        let unrecognized = report_with_deno(&dir, deno_launch(not_deno, dir.path()))
+            .await
+            .deno;
+
+        for (result, status) in [
+            (&not_found, SidecarStatus::NotFound),
+            (&non_zero, SidecarStatus::NonZeroExit),
+            (&timeout, SidecarStatus::Timeout),
+            (&unrecognized, SidecarStatus::LaunchFailed),
+        ] {
+            assert_eq!(result.status, status, "{result:?}");
+            assert!(result.version_raw.is_none(), "{result:?}");
+            assert_eq!(
+                serialized_version_raw(result),
+                None,
+                "при {status:?} ключа versionRaw в JSON быть не должно"
+            );
+        }
+    }
+
+    #[test]
+    fn clip_version_raw_cuts_by_characters_not_bytes() {
+        // Кириллица по два байта: предел в символах попадает на середину
+        // символа, если считать байтами, — а ведущий ASCII сдвигает
+        // границу на нечётный байт.
+        let long = format!("a{}", "ё".repeat(VERSION_RAW_MAX_CHARS * 3));
+
+        let clipped = clip_version_raw(&long);
+
+        assert_eq!(clipped.chars().count(), VERSION_RAW_MAX_CHARS + 1);
+        assert!(clipped.ends_with('…'), "{clipped:?}");
+        assert!(long.starts_with(clipped.trim_end_matches('…')));
+
+        // Ровно на пределе — не обрезается, хотя байтов вдвое больше.
+        let at_limit = "ё".repeat(VERSION_RAW_MAX_CHARS);
+        assert_eq!(clip_version_raw(&at_limit), at_limit);
+    }
+
+    #[tokio::test]
+    async fn a_megabyte_version_line_reaches_the_contract_clipped() {
+        let dir = tempdir().expect("failed to create temp dir");
+        // `deno` с настоящим префиксом и мегабайтом многобайтного хвоста в
+        // той же строке: разбор проходит, строка — нет.
+        let deno = write_script(
+            &dir,
+            "deno.sh",
+            "#!/bin/sh\nprintf 'deno 2.9.6 '\ni=0\nwhile [ $i -lt 2000 ]; do \
+             printf 'ёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёё'; i=$((i + 1)); done\n\
+             printf '\\n'\nexit 0\n",
+            0o755,
+        );
+
+        let report = report_with_deno(&dir, deno_launch(deno, dir.path())).await;
+
+        assert_eq!(
+            report.deno.status,
+            SidecarStatus::Ok,
+            "{:?}",
+            report.deno.stderr_tail
+        );
+        assert_eq!(report.deno.version.as_deref(), Some("2.9.6"));
+        let raw = report.deno.version_raw.expect("versionRaw при ok");
+        assert_eq!(raw.chars().count(), VERSION_RAW_MAX_CHARS + 1);
+        assert!(
+            raw.starts_with("deno 2.9.6 ёё") && raw.ends_with('…'),
+            "{raw:?}"
+        );
     }
 }

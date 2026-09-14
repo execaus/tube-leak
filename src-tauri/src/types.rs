@@ -53,7 +53,7 @@ pub enum LaunchFailedReason {
 /// Результат проверки одного sidecar-бинарника (yt-dlp, ffmpeg или deno).
 ///
 /// Поля, специфичные для конкретного `status`, сериализуются только когда
-/// заполнены (`version` — при `ok`, `reason` — при `launchFailed`,
+/// заполнены (`version` и `versionRaw` — при `ok`, `reason` — при `launchFailed`,
 /// `exitCode` — при `nonZeroExit`, `timeoutMs` — при `timeout`); остальные
 /// диагностические поля опциональны независимо от статуса.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -65,6 +65,20 @@ pub struct SidecarCheckResult {
     pub status: SidecarStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Полная строка для диагностики в «Подробнее» (TL-15): первая строка
+    /// вывода версии бинарника, из которой разобрана `version`, — дословно,
+    /// с тем, что нормализация отбросила. У ffmpeg это
+    /// `ffmpeg version 9.0.1-https://www.martin-riedl.de Copyright …` (по ней
+    /// видно, чья сборка), у deno — `deno 2.9.6 (stable, release,
+    /// aarch64-apple-darwin)`, у yt-dlp — строка его `--version`.
+    ///
+    /// Приходит вместе с `version` и только с ней, то есть при `ok`. Длина
+    /// ограничена на стороне ядра: длиннее предела строка обрезается по
+    /// символам с `…` в конце — под именем sidecar может лежать бинарник,
+    /// печатающий мегабайт в одну строку. На экран вместо `version` не
+    /// выводится: там остаётся нормализованная версия.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_raw: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<LaunchFailedReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2738,6 +2752,7 @@ pub fn stub_report() -> SidecarCheckReport {
         path: path.to_string(),
         status: SidecarStatus::Ok,
         version: Some("stub".to_string()),
+        version_raw: Some("stub".to_string()),
         reason: None,
         exit_code: None,
         os_error_code: None,
@@ -2773,6 +2788,7 @@ mod tests {
             path: "/opt/tube-leak/bin/yt-dlp".to_string(),
             status: SidecarStatus::Ok,
             version: Some("2026.08.01".to_string()),
+            version_raw: Some("2026.08.01 [b64a3e1] (pip)".to_string()),
             reason: None,
             exit_code: None,
             os_error_code: None,
@@ -2791,6 +2807,7 @@ mod tests {
                 "path": "/opt/tube-leak/bin/yt-dlp",
                 "status": "ok",
                 "version": "2026.08.01",
+                "versionRaw": "2026.08.01 [b64a3e1] (pip)",
             })
         );
     }
@@ -2802,6 +2819,7 @@ mod tests {
             path: "/opt/tube-leak/bin/ffmpeg".to_string(),
             status: SidecarStatus::NotFound,
             version: None,
+            version_raw: None,
             reason: None,
             exit_code: None,
             os_error_code: Some("ENOENT".to_string()),
@@ -2831,6 +2849,7 @@ mod tests {
             path: "/opt/tube-leak/bin/yt-dlp".to_string(),
             status: SidecarStatus::LaunchFailed,
             version: None,
+            version_raw: None,
             reason: Some(LaunchFailedReason::PermissionDenied),
             exit_code: None,
             os_error_code: Some("EACCES".to_string()),
@@ -2861,6 +2880,7 @@ mod tests {
             path: "/opt/tube-leak/bin/ffmpeg".to_string(),
             status: SidecarStatus::LaunchFailed,
             version: None,
+            version_raw: None,
             reason: Some(LaunchFailedReason::Corrupted),
             exit_code: None,
             os_error_code: Some("ENOEXEC".to_string()),
@@ -2891,6 +2911,7 @@ mod tests {
             path: "/opt/tube-leak/bin/yt-dlp".to_string(),
             status: SidecarStatus::NonZeroExit,
             version: None,
+            version_raw: None,
             reason: None,
             exit_code: Some(1),
             os_error_code: None,
@@ -2921,6 +2942,7 @@ mod tests {
             path: "/opt/tube-leak/bin/ffmpeg".to_string(),
             status: SidecarStatus::Timeout,
             version: None,
+            version_raw: None,
             reason: None,
             exit_code: None,
             os_error_code: None,

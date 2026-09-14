@@ -5,11 +5,12 @@
 //! этому модулю не нужен,
 //! что позволяет проверять разбор фикстурами без запуска процессов.
 //!
-//! Разбор возвращает [`SidecarVersion`] — пару «что показываем» и «что
-//! бинарник вывел дословно». Это внутренний тип ядра: границу Rust↔TS он не
-//! пересекает и в `src/types/` не зеркалится, в контрактный
-//! [`crate::types::SidecarCheckResult`] по-прежнему уходит одна строка
-//! (`display`), а `raw` используется только для лога.
+//! Разбор возвращает [`SidecarVersion`] — «что показываем», «что бинарник
+//! вывел дословно» и строку, из которой это разобрано. Это внутренний тип
+//! ядра: границу Rust↔TS он не пересекает и в `src/types/` не зеркалится. В
+//! контрактный [`crate::types::SidecarCheckResult`] уходят `display` (поле
+//! `version`) и `line` (поле `versionRaw`, TL-15) — последнее обрезается
+//! на границе команды; `raw` используется для лога и сверки версии yt-dlp.
 
 /// Версия sidecar-бинарника в двух видах.
 ///
@@ -24,6 +25,10 @@ pub struct SidecarVersion {
     pub display: String,
     /// Дословный токен версии из вывода бинарника, без нормализации.
     pub raw: String,
+    /// Первая строка вывода, из которой разобран токен, — целиком, без
+    /// краевых пробелов и без обрезки по длине (TL-15). Шире `raw`: у
+    /// ffmpeg в ней видно сборщика, у deno — канал и целевую тройку.
+    pub line: String,
 }
 
 impl SidecarVersion {
@@ -48,7 +53,8 @@ impl SidecarVersion {
 /// возможные суффиксы nightly-сборок) нужно сравнивать с апстримом при
 /// проверке «yt-dlp устарел» — округлять его нельзя.
 pub fn parse_ytdlp_version(raw: &str) -> Option<SidecarVersion> {
-    let token = raw.lines().next()?.split_whitespace().next()?;
+    let line = raw.lines().next()?;
+    let token = line.split_whitespace().next()?;
     if token.is_empty() {
         return None;
     }
@@ -56,6 +62,7 @@ pub fn parse_ytdlp_version(raw: &str) -> Option<SidecarVersion> {
     Some(SidecarVersion {
         display: token.to_string(),
         raw: token.to_string(),
+        line: line.trim().to_string(),
     })
 }
 
@@ -68,7 +75,8 @@ pub fn parse_ytdlp_version(raw: &str) -> Option<SidecarVersion> {
 /// сохраняется в `raw`. Фактические форматы всех четырёх вложенных сборок
 /// перечислены в тестах ниже.
 pub fn parse_ffmpeg_version(raw: &str) -> Option<SidecarVersion> {
-    let mut tokens = raw.lines().next()?.split_whitespace();
+    let line = raw.lines().next()?;
+    let mut tokens = line.split_whitespace();
 
     if tokens.next()? != "ffmpeg" {
         return None;
@@ -85,6 +93,7 @@ pub fn parse_ffmpeg_version(raw: &str) -> Option<SidecarVersion> {
     Some(SidecarVersion {
         display: normalize_version(token),
         raw: token.to_string(),
+        line: line.trim().to_string(),
     })
 }
 
@@ -111,7 +120,8 @@ pub fn parse_ffmpeg_version(raw: &str) -> Option<SidecarVersion> {
 /// у deno это не «показать как есть», а отказ — см.
 /// `crate::commands::sidecar`.
 pub fn parse_deno_version(raw: &str) -> Option<SidecarVersion> {
-    let mut tokens = raw.lines().next()?.split_whitespace();
+    let line = raw.lines().next()?;
+    let mut tokens = line.split_whitespace();
 
     if tokens.next()? != "deno" {
         return None;
@@ -125,6 +135,7 @@ pub fn parse_deno_version(raw: &str) -> Option<SidecarVersion> {
     Some(SidecarVersion {
         display: normalize_version(token),
         raw: token.to_string(),
+        line: line.trim().to_string(),
     })
 }
 
@@ -334,6 +345,47 @@ mod tests {
             raw_of(parse_ffmpeg_version(raw)),
             Some("9.0.1-https://www.martin-riedl.de".to_string())
         );
+    }
+
+    #[test]
+    fn keeps_the_whole_first_line_for_diagnostics_of_each_sidecar() {
+        // TL-15: `line` — то, что уходит в `versionRaw`. Строки — живые:
+        // ffmpeg martin-riedl.de (см. `normalizes_ffmpeg_version_of_macos_builds`),
+        // трёхстрочный вывод пина deno 2.9.6, голый вывод pip-релиза yt-dlp.
+        let ffmpeg = "ffmpeg version 9.0.1-https://www.martin-riedl.de Copyright (c) 2000-2026 \
+                      the FFmpeg developers\n\
+                      built with Apple clang version 14.0.0 (clang-1400.0.29.102)\n";
+
+        assert_eq!(
+            parse_ffmpeg_version(ffmpeg).expect("version").line,
+            "ffmpeg version 9.0.1-https://www.martin-riedl.de Copyright (c) 2000-2026 \
+             the FFmpeg developers"
+        );
+        assert_eq!(
+            parse_deno_version(REAL_DENO_VERSION_OUTPUT)
+                .expect("version")
+                .line,
+            "deno 2.9.6 (stable, release, aarch64-apple-darwin)"
+        );
+        assert_eq!(
+            parse_ytdlp_version("2026.08.19\n").expect("version").line,
+            "2026.08.19"
+        );
+    }
+
+    #[test]
+    fn the_first_line_is_neither_the_token_nor_a_later_line_and_has_no_crlf() {
+        // Метаданные сборки yt-dlp после токена в `line` остаются, `\r`
+        // Windows-вывода — нет; строки v8/typescript у deno не попадают.
+        let parsed =
+            parse_ytdlp_version("2026.08.19 [b64a3e1] (win32_exe)\r\nsecond\r\n").expect("version");
+
+        assert_eq!(parsed.display, "2026.08.19");
+        assert_eq!(parsed.line, "2026.08.19 [b64a3e1] (win32_exe)");
+
+        let deno = parse_deno_version(REAL_DENO_VERSION_OUTPUT).expect("version");
+        assert!(!deno.line.contains("v8"), "{:?}", deno.line);
+        assert!(!deno.line.contains('\n'), "{:?}", deno.line);
     }
 
     #[test]

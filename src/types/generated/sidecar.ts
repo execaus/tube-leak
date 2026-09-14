@@ -34,11 +34,26 @@ export type SidecarCheckReport = { ytDlp: SidecarCheckResult, ffmpeg: SidecarChe
  * Результат проверки одного sidecar-бинарника (yt-dlp, ffmpeg или deno).
  *
  * Поля, специфичные для конкретного `status`, сериализуются только когда
- * заполнены (`version` — при `ok`, `reason` — при `launchFailed`,
+ * заполнены (`version` и `versionRaw` — при `ok`, `reason` — при `launchFailed`,
  * `exitCode` — при `nonZeroExit`, `timeoutMs` — при `timeout`); остальные
  * диагностические поля опциональны независимо от статуса.
  */
-export type SidecarCheckResult = { name: string, path: string, status: SidecarStatus, version?: string, reason?: LaunchFailedReason, exitCode?: number, osErrorCode?: string, stderrTail?: string, timeoutMs?: number, checkedAt?: string, durationMs?: number, };
+export type SidecarCheckResult = { name: string, path: string, status: SidecarStatus, version?: string, 
+/**
+ * Полная строка для диагностики в «Подробнее» (TL-15): первая строка
+ * вывода версии бинарника, из которой разобрана `version`, — дословно,
+ * с тем, что нормализация отбросила. У ffmpeg это
+ * `ffmpeg version 9.0.1-https://www.martin-riedl.de Copyright …` (по ней
+ * видно, чья сборка), у deno — `deno 2.9.6 (stable, release,
+ * aarch64-apple-darwin)`, у yt-dlp — строка его `--version`.
+ *
+ * Приходит вместе с `version` и только с ней, то есть при `ok`. Длина
+ * ограничена на стороне ядра: длиннее предела строка обрезается по
+ * символам с `…` в конце — под именем sidecar может лежать бинарник,
+ * печатающий мегабайт в одну строку. На экран вместо `version` не
+ * выводится: там остаётся нормализованная версия.
+ */
+versionRaw?: string, reason?: LaunchFailedReason, exitCode?: number, osErrorCode?: string, stderrTail?: string, timeoutMs?: number, checkedAt?: string, durationMs?: number, };
 
 /**
  * Итог попытки проверить один sidecar-бинарник.
