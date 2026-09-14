@@ -151,7 +151,15 @@ describe('App — ytdlp://warmup rechecks the service screen (TL-118, долг #
     expect(wrapper.find('input').attributes('disabled')).toBeUndefined()
   })
 
-  it('a warmup event that arrives while a check is already in flight does not trigger a second check_sidecar call', async () => {
+  /**
+   * Возврат ведущего (TL-118): сценарий медленной машины, где проверка
+   * (запущенная кнопкой «Повторить проверку», но с тем же исходом, что и
+   * проверка, запущенная предыдущим событием) уже идёт, когда приходит
+   * `ytdlp://warmup`. Событие не должно ни запускать третий параллельный
+   * вызов прямо сейчас, ни теряться — ровно один новый `check_sidecar`
+   * обязан произойти сразу после того, как уже идущая проверка закончится.
+   */
+  it('a warmup event that arrives while a check is already in flight is deferred and rechecks exactly once after it finishes', async () => {
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
       check_sidecar: () => Promise.resolve(coldReport),
@@ -179,11 +187,22 @@ describe('App — ytdlp://warmup rechecks the service screen (TL-118, долг #
     capturedWarmupHandler?.({ payload: { outcome: 'timedOut' } })
     await flushPromises()
 
-    // Событие не добавило третьего вызова поверх уже идущего.
+    // Событие не добавило третьего вызова поверх уже идущего — оно отложено.
     expect(invokeMock.mock.calls.filter(([cmd]) => cmd === 'check_sidecar')).toHaveLength(2)
 
-    resolveRetryCheck(warmReport)
+    // Следующий вызов check_sidecar (отложенная перепроверка) вернёт тёплый
+    // отчёт — им и разрешится текущая, ещё идущая проверка по кнопке.
+    routeInvoke({
+      prepare_ytdlp: () => Promise.resolve(preparedWarm),
+      check_sidecar: () => Promise.resolve(warmReport),
+    })
+    resolveRetryCheck(coldReport)
     await flushPromises()
+
+    // Проверка по кнопке закончилась (isLoading → false) — отложенное
+    // событие запустило ровно одну перепроверку, и её тёплый ответ виден.
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === 'check_sidecar')).toHaveLength(3)
+    expect(wrapper.find('input').attributes('disabled')).toBeUndefined()
   })
 
   it.each<YtDlpWarmupOutcome>(['timedOut', 'failed'])(

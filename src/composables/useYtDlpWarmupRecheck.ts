@@ -1,5 +1,5 @@
 import { listen, type Event as TauriEvent, type UnlistenFn } from '@tauri-apps/api/event'
-import { onMounted, onUnmounted, type Ref } from 'vue'
+import { onMounted, onUnmounted, watch, type Ref } from 'vue'
 
 import type { YtDlpWarmupEvent } from '@/types/generated/ytdlp'
 import { assertNever } from '@/utils/assertNever'
@@ -58,6 +58,32 @@ export interface UseYtDlpWarmupRecheckOptions {
  * ровно в момент клика по «Повторить проверку», могло бы запустить вторую
  * параллельную проверку — обе копии не видели бы состояние друг друга.
  *
+ * # Событие во время идущей проверки — отложено, а не потеряно
+ *
+ * Возврат ведущего по первой версии: событие, пришедшее, пока
+ * `isLoading.value === true` (проверка уже идёт — по кнопке или по
+ * предыдущему событию), не имеет права просто пропадать. Сценарий
+ * медленной машины: проверка стартует на t≈12 и идёт до таймаута 9 с;
+ * фоновый прогрев заканчивается на t≈15, пока проверка ещё не закончилась;
+ * старая версия выходила из `handleEvent` по защите и теряла событие;
+ * проверка, начатая до конца прогрева, на t≈21 всё равно возвращает
+ * `Timeout` — пользователь снова застревал до ручного повтора.
+ *
+ * Вместо немедленного вызова `handleEvent` в этом случае поднимает флаг
+ * `pendingRecheck`. `watch(isLoading, …)` наблюдает конец **любой**
+ * проверки (по кнопке или по предыдущему событию — источник triggера
+ * этому watch неважен) и, если флаг поднят, снимает его и запускает
+ * ровно одну перепроверку. Несколько событий подряд за время одной
+ * проверки идемпотентно схлопываются в один и тот же флаг — не в
+ * очередь и не в счётчик, поэтому после конца проверки происходит ровно
+ * один `check()`, а не по одному на каждое отложенное событие.
+ *
+ * `watch` заводится в `setup()` вызывающего компонента (эта функция сама
+ * вызывается из `<script setup>` `App.vue`) — Vue останавливает такие
+ * watcher'ы автоматически при размонтировании владельца, отдельного
+ * `onUnmounted` для него не нужно (в отличие от подписки `listen()` ниже,
+ * которая живёт вне реактивности Vue и требует ручной отписки).
+ *
  * # Отказ подписки — молчаливый, не полноэкранная ошибка
  *
  * В отличие от `useYtDlpPrepare` (где отказ подписки блокирует экран
@@ -70,6 +96,9 @@ export interface UseYtDlpWarmupRecheckOptions {
 export function useYtDlpWarmupRecheck({ isLoading, check }: UseYtDlpWarmupRecheckOptions): void {
   let unlisten: UnlistenFn | undefined
   let listening: Promise<void> | undefined
+  // Событие пришло, пока проверка уже шла — перепроверка нужна, но не
+  // прямо сейчас (doc функции выше, «Событие во время идущей проверки»).
+  let pendingRecheck = false
 
   function handleEvent(event: TauriEvent<YtDlpWarmupEvent>): void {
     switch (event.payload.outcome) {
@@ -80,9 +109,20 @@ export function useYtDlpWarmupRecheck({ isLoading, check }: UseYtDlpWarmupRechec
       default:
         return assertNever(event.payload.outcome)
     }
-    if (isLoading.value) return
+    if (isLoading.value) {
+      pendingRecheck = true
+      return
+    }
     void check()
   }
+
+  // Конец любой проверки (по кнопке или по предыдущему событию) снимает
+  // отложенный флаг ровно одной перепроверкой (doc функции выше).
+  watch(isLoading, (loading) => {
+    if (loading || !pendingRecheck) return
+    pendingRecheck = false
+    void check()
+  })
 
   onMounted(() => {
     listening = listen<YtDlpWarmupEvent>(WARMUP_EVENT_NAME, handleEvent)

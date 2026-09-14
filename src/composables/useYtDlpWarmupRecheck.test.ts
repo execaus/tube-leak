@@ -1,6 +1,6 @@
 import { mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { defineComponent, ref, type Ref } from 'vue'
+import { defineComponent, nextTick, ref, type Ref } from 'vue'
 
 import type { YtDlpWarmupEvent, YtDlpWarmupOutcome } from '@/types/generated/ytdlp'
 
@@ -57,12 +57,56 @@ describe('useYtDlpWarmupRecheck', () => {
     expect(check).toHaveBeenCalledOnce()
   })
 
-  it('does not recheck when a check is already in flight (isLoading)', async () => {
+  /**
+   * Возврат ведущего (TL-118): раньше событие, пришедшее во время уже
+   * идущей проверки, просто отбрасывалось — на медленной машине фоновый
+   * прогрев кончался в это самое окно, и проверка, начатая до его конца,
+   * всё равно возвращала «не отвечает» (doc-комментарий composable,
+   * «Событие во время идущей проверки»). Теперь оно откладывается и
+   * запускает перепроверку сразу после того, как текущая закончилась.
+   */
+  it('defers a recheck while a check is already in flight, then rechecks exactly once after it finishes', async () => {
+    const isLoading = ref(true)
     const check = vi.fn().mockResolvedValue(undefined)
-    withSetup(ref(true), check)
+    withSetup(isLoading, check)
     await Promise.resolve()
 
     capturedHandler?.({ payload: { outcome: 'warmed' } })
+    expect(check).not.toHaveBeenCalled()
+
+    // Текущая проверка (по кнопке или по прежнему событию) закончилась.
+    isLoading.value = false
+    await nextTick()
+
+    expect(check).toHaveBeenCalledOnce()
+  })
+
+  it('collapses several events that arrive during the same check into a single recheck', async () => {
+    const isLoading = ref(true)
+    const check = vi.fn().mockResolvedValue(undefined)
+    withSetup(isLoading, check)
+    await Promise.resolve()
+
+    capturedHandler?.({ payload: { outcome: 'warmed' } })
+    capturedHandler?.({ payload: { outcome: 'timedOut' } })
+    capturedHandler?.({ payload: { outcome: 'failed' } })
+    expect(check).not.toHaveBeenCalled()
+
+    isLoading.value = false
+    await nextTick()
+
+    expect(check).toHaveBeenCalledOnce()
+  })
+
+  it('does not recheck on isLoading turning false when no event arrived while it was in flight', async () => {
+    const isLoading = ref(true)
+    const check = vi.fn().mockResolvedValue(undefined)
+    withSetup(isLoading, check)
+    await Promise.resolve()
+
+    // Проверка закончилась сама по себе — никакое событие её не отложило.
+    isLoading.value = false
+    await nextTick()
 
     expect(check).not.toHaveBeenCalled()
   })
