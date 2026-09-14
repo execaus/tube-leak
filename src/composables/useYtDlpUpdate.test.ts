@@ -376,6 +376,124 @@ describe('useYtDlpUpdate', () => {
     expect(unlistenMock).toHaveBeenCalledTimes(1)
   })
 
+  /*
+   * TL-120 (issue #127): регрессия TL-66 — откат без активной загрузки
+   * отвечает только после переключения (до 24 с на холодном дереве), а
+   * `snapshot.busy` до этого момента ещё несёт старое значение. `pending`
+   * — отдельный от `snapshot` сигнал «ответ ещё не пришёл», который
+   * вызывающая сторона обязана учитывать наравне со `snapshot.busy` (doc
+   * `pending` в `UseYtDlpUpdateReturn`).
+   */
+  describe('pending (TL-120, issue #127)', () => {
+    it('starts false', () => {
+      invokeMock.mockReturnValueOnce(new Promise<YtDlpUpdateSnapshot>(() => {}))
+
+      const { result } = withSetup(() => useYtDlpUpdate())
+
+      expect(result.pending.value).toBe(false)
+    })
+
+    it('is true while rollback() awaits roll_back_ytdlp, even though snapshot.busy is still the old (false) value', async () => {
+      invokeMock.mockResolvedValueOnce(upToDateSnapshot)
+
+      const { result } = withSetup(() => useYtDlpUpdate())
+      await flushPromises()
+      expect(result.snapshot.value?.busy).toBe(false)
+
+      let resolveRollback: (value: YtDlpUpdateSnapshot) => void = () => {}
+      invokeMock.mockReturnValueOnce(
+        new Promise<YtDlpUpdateSnapshot>((resolve) => {
+          resolveRollback = resolve
+        }),
+      )
+      const pendingCall = result.rollback()
+      await Promise.resolve()
+
+      // Ответ ещё не пришёл — snapshot.busy всё ещё унаследован от
+      // старого снимка (false), но pending уже держит кнопки неактивными.
+      expect(result.pending.value).toBe(true)
+      expect(result.snapshot.value?.busy).toBe(false)
+
+      resolveRollback(rolledBackSnapshot)
+      await pendingCall
+
+      expect(result.pending.value).toBe(false)
+      expect(result.snapshot.value).toStrictEqual(rolledBackSnapshot)
+    })
+
+    it('is true while checkNow() awaits check_ytdlp_update', async () => {
+      invokeMock.mockResolvedValueOnce(neverCheckedSnapshot)
+
+      const { result } = withSetup(() => useYtDlpUpdate())
+      await flushPromises()
+
+      let resolveCheck: (value: YtDlpUpdateSnapshot) => void = () => {}
+      invokeMock.mockReturnValueOnce(
+        new Promise<YtDlpUpdateSnapshot>((resolve) => {
+          resolveCheck = resolve
+        }),
+      )
+      const pendingCall = result.checkNow()
+      await Promise.resolve()
+
+      expect(result.pending.value).toBe(true)
+
+      resolveCheck(checkingSnapshot)
+      await pendingCall
+
+      expect(result.pending.value).toBe(false)
+    })
+
+    it('is cleared when rollback() rejects (command refused as busy/nothingToRollBackTo)', async () => {
+      invokeMock.mockResolvedValueOnce(upToDateSnapshot)
+
+      const { result } = withSetup(() => useYtDlpUpdate())
+      await flushPromises()
+
+      let rejectRollback: (err: unknown) => void = () => {}
+      invokeMock.mockReturnValueOnce(
+        new Promise<YtDlpUpdateSnapshot>((_resolve, reject) => {
+          rejectRollback = reject
+        }),
+      )
+      const pendingCall = result.rollback()
+      await Promise.resolve()
+
+      expect(result.pending.value).toBe(true)
+
+      rejectRollback({ kind: 'busy', message: 'already rolling back' })
+      await pendingCall
+
+      expect(result.pending.value).toBe(false)
+    })
+
+    it('reflects the response case where the command answers immediately with the terminal snapshot (rolledBack, row 13)', async () => {
+      invokeMock.mockResolvedValueOnce(upToDateSnapshot)
+
+      const { result } = withSetup(() => useYtDlpUpdate())
+      await flushPromises()
+
+      invokeMock.mockResolvedValueOnce(rolledBackSnapshot)
+      await result.rollback()
+
+      expect(result.pending.value).toBe(false)
+      expect(result.snapshot.value).toStrictEqual(rolledBackSnapshot)
+    })
+
+    it('reflects the response case where the command answers with rollbackWaiting (row 14, unchanged behaviour)', async () => {
+      invokeMock.mockResolvedValueOnce(upToDateSnapshot)
+
+      const { result } = withSetup(() => useYtDlpUpdate())
+      await flushPromises()
+
+      invokeMock.mockResolvedValueOnce(rollbackWaitingSnapshot)
+      await result.rollback()
+
+      expect(result.pending.value).toBe(false)
+      expect(result.snapshot.value).toStrictEqual(rollbackWaitingSnapshot)
+    })
+  })
+
   it('unsubscribes even when unmount happens before listen() has resolved (unsubscribe race)', async () => {
     let resolveListen: (fn: typeof unlistenMock) => void = () => {}
     listenMock.mockImplementationOnce((_event, handler) => {
