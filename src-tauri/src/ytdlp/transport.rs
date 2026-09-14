@@ -107,20 +107,7 @@ pub struct GithubTransport {
 
 impl GithubTransport {
     pub fn new() -> Self {
-        let config = ureq::Agent::config_builder()
-            .user_agent(USER_AGENT)
-            .timeout_connect(Some(CONNECT_TIMEOUT))
-            // Схема проверяется дважды: белым списком адреса в
-            // `super::release::is_github_url` (там же, где Н-1 и
-            // записана) и здесь, у самого клиента. Второе — не
-            // дублирование первого, а страховка от редиректа на `http://`:
-            // белый список видит только тот адрес, который мы составили.
-            .https_only(true)
-            .build();
-
-        Self {
-            agent: ureq::Agent::new_with_config(config),
-        }
+        Self::with_config(production_config().build())
     }
 
     /// Тот же клиент, но по петле и открытым текстом — только для тестов
@@ -129,15 +116,18 @@ impl GithubTransport {
     /// два, и оба про то, чего у петли нет: TLS (`https_only` снят) и
     /// прокси (снят, иначе `HTTP_PROXY` окружения увёл бы запрос мимо
     /// тестового сервера).
+    ///
+    /// Строится **поверх** боевого сборщика, а не рядом с ним (TL-66): до
+    /// этого у петли была своя копия настроек, и правка боевой —
+    /// например, `http_status_as_error(false)`, превращающая 404 в «тело
+    /// пришло» — проходила все тесты, потому что петлевые тесты её не
+    /// видели.
     #[cfg(test)]
     fn over_loopback() -> Self {
-        let config = ureq::Agent::config_builder()
-            .user_agent(USER_AGENT)
-            .timeout_connect(Some(CONNECT_TIMEOUT))
-            .https_only(false)
-            .proxy(None)
-            .build();
+        Self::with_config(production_config().https_only(false).proxy(None).build())
+    }
 
+    fn with_config(config: ureq::config::Config) -> Self {
         Self {
             agent: ureq::Agent::new_with_config(config),
         }
@@ -169,6 +159,25 @@ impl GithubTransport {
             Ok(Box::new(response.into_body().into_reader()) as Box<dyn Read>)
         })
     }
+}
+
+/// Боевые настройки агента — единственный сборщик, из которого строятся и
+/// [`GithubTransport::new`], и петлевой клиент тестов.
+///
+/// Всё, что задано здесь, петлевые тесты проверяют настоящим `ureq`: код
+/// ответа как ошибка (умолчание `ureq`, на нём держится различие «источник
+/// недоступен» / «нет сети», TL-65), заголовок и срок соединения. Снимать
+/// поверх него разрешено только то, чего у петли нет, — TLS и прокси.
+fn production_config() -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
+    ureq::Agent::config_builder()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        // Схема проверяется дважды: белым списком адреса в
+        // `super::release::is_github_url` (там же, где Н-1 и
+        // записана) и здесь, у самого клиента. Второе — не
+        // дублирование первого, а страховка от редиректа на `http://`:
+        // белый список видит только тот адрес, который мы составили.
+        .https_only(true)
 }
 
 impl MetadataSource for GithubTransport {
@@ -308,6 +317,43 @@ mod tests {
             &mut |_, _, _| {},
         )
         .expect_err("архива по этому адресу нет")
+    }
+
+    #[test]
+    fn the_loopback_agent_differs_from_the_production_one_only_by_tls_and_proxy() {
+        // TL-66: петлевые тесты ниже проверяют настройки боевого агента
+        // лишь постольку, поскольку петля строится из того же сборщика.
+        // Этот тест держит оба конца: боевой агент — тот самый, и петля
+        // отличается от него ровно двумя снятыми пунктами.
+        let production = GithubTransport::new();
+        let loopback = GithubTransport::over_loopback();
+        let production = production.agent.config();
+        let loopback = loopback.agent.config();
+
+        assert!(
+            production.http_status_as_error(),
+            "код ответа обязан быть ошибкой — на нём держится «источник недоступен» (TL-65)"
+        );
+        assert!(
+            production.https_only(),
+            "боевой агент ходит только по https"
+        );
+        assert!(!loopback.https_only(), "у петли TLS нет");
+        assert!(
+            loopback.proxy().is_none(),
+            "петля не уходит в прокси окружения"
+        );
+
+        assert_eq!(
+            production.http_status_as_error(),
+            loopback.http_status_as_error()
+        );
+        assert_eq!(
+            format!("{:?}", production.user_agent()),
+            format!("{:?}", loopback.user_agent())
+        );
+        assert_eq!(production.timeouts().connect, loopback.timeouts().connect);
+        assert_eq!(production.max_redirects(), loopback.max_redirects());
     }
 
     #[test]
