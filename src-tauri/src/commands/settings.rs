@@ -425,3 +425,7 @@ fn view(
 #[cfg(test)]
 #[path = "settings_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "template_verdicts_tests.rs"]
+mod template_verdicts;
