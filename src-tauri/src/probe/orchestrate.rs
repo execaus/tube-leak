@@ -1166,6 +1166,18 @@ mod tests {
                 "HTTPS://User@Name@EXAMPLE.COM/P",
                 "https://User@Name@example.com/P",
             ),
+            // Не-ASCII буквы хоста остаются байт в байт (З-2 ревью #88):
+            // нормализуются только ASCII-буквы. `to_lowercase` сделал бы из
+            // кириллического `СОМ` строчное `сом`, а знак Кельвина U+212A
+            // превратил бы в латинскую `k` — то есть в другой хост.
+            (
+                "HTTPS://WWW.YOUTUBE.СОМ/watch?v=aqz-KE-bpKQ",
+                "https://www.youtube.СОМ/watch?v=aqz-KE-bpKQ",
+            ),
+            (
+                "HTTPS://WWW.YOUTUBE.COM\u{212a}/",
+                "https://www.youtube.com\u{212a}/",
+            ),
         ] {
             assert_eq!(validate_url(input).as_deref(), Ok(expected), "«{input}»");
         }
