@@ -251,7 +251,7 @@ fn the_header_version_matches_what_sqlite_reports() {
             inspect_header(&path).expect("заголовок читается"),
             Header::Sqlite {
                 user_version: version,
-                wal: false,
+                format: FileFormat::JOURNAL,
             }
         );
     }
@@ -292,13 +292,17 @@ fn a_newer_base_is_refused_and_left_byte_for_byte() {
                 err @ HistoryOpenError::NewerVersion {
                     found,
                     supported,
-                    wal,
+                    cause,
                     ..
                 },
             ) => {
                 assert_eq!(*found, version);
                 assert_eq!(*supported, SCHEMA_VERSION);
-                assert!(!wal, "отказ по версии назван отказом по WAL");
+                assert_eq!(
+                    *cause,
+                    NewerCause::SchemaVersion,
+                    "отказ по версии назван другой причиной"
+                );
                 assert_eq!(err.reason(), HistoryUnavailableReason::NewerVersion);
             }
             other => panic!("база версии {version} открыта как {other:?}"),
@@ -410,7 +414,7 @@ fn a_base_with_corrupted_pages_is_set_aside() {
         inspect_header(&db_path(data)),
         Ok(Header::Sqlite {
             user_version: 1,
-            wal: false
+            format: FileFormat::JOURNAL,
         })
     ));
 
@@ -421,6 +425,153 @@ fn a_base_with_corrupted_pages_is_set_aside() {
     assert_eq!(fs::read(&copies[0]).expect("копия читается"), bytes);
     let page = store.page(None).expect("страница новой базы");
     assert!(page.records.is_empty());
+    assert_eq!(page.notices, vec![HistoryNotice::BaseRecreated]);
+}
+
+/// Строки ответа `PRAGMA <pragma>` у независимого соединения только на чтение.
+fn pragma_rows(path: &Path, pragma: &str) -> Vec<String> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("база открывается на чтение");
+    let mut statement = conn
+        .prepare(&format!("PRAGMA {pragma}"))
+        .expect("прагма готовится");
+    let rows = statement
+        .query_map([], |row| row.get(0))
+        .expect("прагма выполняется")
+        .collect::<Result<Vec<String>, _>>()
+        .expect("строки прагмы");
+    rows
+}
+
+fn index_sql(path: &Path) -> String {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("база открывается на чтение");
+    conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE name = 'history_newest_first'",
+        [],
+        |row| row.get(0),
+    )
+    .expect("текст индекса читается")
+}
+
+/// Переписывает текст объявления индекса в `sqlite_schema`, не трогая его
+/// дерево. Новое соединение разбирает схему заново и видит новый текст.
+fn rewrite_index_sql(path: &Path, sql: &str) {
+    let conn = Connection::open(path).expect("база открывается");
+    conn.execute_batch("PRAGMA writable_schema = ON")
+        .expect("схема открыта на запись");
+    let changed = conn
+        .execute(
+            "UPDATE sqlite_schema SET sql = ?1 WHERE name = 'history_newest_first'",
+            [sql],
+        )
+        .expect("текст индекса переписан");
+    assert_eq!(changed, 1, "объявление индекса не найдено");
+}
+
+/// Наша база, у которой индекс `history_newest_first` разошёлся с таблицей,
+/// а каждая страница цела. Возвращает число строк таблицы.
+///
+/// Способ — штатные операции SQLite, без правки байтов. На время одного
+/// `UPDATE` схема утверждает, что индекс построен по `size_bytes`: SQLite
+/// обновляет только индексы, в которых есть изменённый столбец, и новое
+/// время в дерево индекса не попадает. Затем текст объявления возвращается
+/// дословно. Итог: схема та же, что пишет [`SCHEMA_V1`], дерево индекса
+/// упорядочено и структурно цело, но его ключи — старые времена.
+fn make_index_out_of_sync_with_table(data: &Path, folder: &Path) -> usize {
+    let rows = 50;
+    let store = open(data);
+    let records: Vec<NewHistoryRecord> = (1..=rows).map(|n| record(folder, n, n)).collect();
+    store.insert_all(&records);
+    drop(store);
+
+    let path = db_path(data);
+    let original = index_sql(&path);
+    rewrite_index_sql(
+        &path,
+        "CREATE INDEX history_newest_first ON history (size_bytes DESC, id DESC)",
+    );
+    let conn = Connection::open(&path).expect("база открывается");
+    let changed = conn
+        .execute(
+            "UPDATE history SET finished_at_unix_secs = finished_at_unix_secs + 1000",
+            [],
+        )
+        .expect("время строк сдвинуто");
+    assert_eq!(changed, 50);
+    drop(conn);
+    rewrite_index_sql(&path, &original);
+    assert_eq!(
+        index_sql(&path),
+        original,
+        "объявление индекса не вернулось"
+    );
+    usize::try_from(rows).expect("число строк")
+}
+
+/// Решение ревью TL-85 (issue #92, п. 4; TL-99): проверка открытия —
+/// `integrity_check`, а не `quick_check`. Индекс, разошедшийся с таблицей
+/// при целых страницах, — порча: база отложена, заведена новая, пометка
+/// `baseRecreated`.
+///
+/// Фикстура сама доказывает, что различает прагмы: `quick_check` отвечает
+/// `ok`, `integrity_check` называет индекс. Без этого тест мог бы краснеть
+/// на мутации по другой причине или не краснеть вовсе.
+///
+/// Мутация, которую тест обязан ловить: `integrity_check` → `quick_check` в
+/// [`integrity_check`].
+#[test]
+fn a_base_whose_index_disagrees_with_the_table_is_set_aside() {
+    let dirs = dirs();
+    let data = dirs.data.path();
+    let rows = make_index_out_of_sync_with_table(data, dirs.downloads.path());
+
+    let path = db_path(data);
+    assert_eq!(
+        pragma_rows(&path, "quick_check"),
+        vec!["ok".to_owned()],
+        "фикстура не та: quick_check видит порчу, тест не отличит прагмы"
+    );
+    let verdicts = pragma_rows(&path, "integrity_check");
+    assert!(
+        verdicts != ["ok"] && verdicts.iter().all(|v| v.contains("history_newest_first")),
+        "фикстура не та: integrity_check должен назвать только индекс: {verdicts:?}"
+    );
+    assert_eq!(
+        inspect_header(&path).expect("заголовок читается"),
+        Header::Sqlite {
+            user_version: 1,
+            format: FileFormat::JOURNAL,
+        }
+    );
+    let bytes = fs::read(&path).expect("база читается");
+    assert_eq!(
+        names_in(data),
+        vec![HISTORY_FILE_NAME.to_owned()],
+        "спутники у фикстуры"
+    );
+
+    let store = open(data);
+
+    let copies = broken_copies(data);
+    assert_eq!(copies.len(), 1, "отложенных копий: {copies:?}");
+    assert_eq!(
+        fs::read(&copies[0]).expect("копия читается"),
+        bytes,
+        "отложенная копия — не та база"
+    );
+    let copied_rows: i64 =
+        Connection::open_with_flags(&copies[0], OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("копия открывается на чтение")
+            .query_row("SELECT count(*) FROM history", [], |row| row.get(0))
+            .expect("строки копии считаются");
+    assert_eq!(
+        usize::try_from(copied_rows).ok(),
+        Some(rows),
+        "в отложенной копии не те записи"
+    );
+    let page = store.page(None).expect("страница новой базы");
+    assert!(page.records.is_empty(), "новая база унаследовала записи");
     assert_eq!(page.notices, vec![HistoryNotice::BaseRecreated]);
 }
 
@@ -457,9 +608,13 @@ fn wal_pair(scratch: &Path, header_version: i64, wal_version: i64) -> (Vec<u8>, 
     (main, wal)
 }
 
-/// Отказ из-за WAL: `NewerVersion` с признаком журнала, каталог данных
+/// Отказ из-за WAL: `NewerVersion` с причиной-журналом, каталог данных
 /// байт в байт тот же, включая `-wal`.
-fn assert_refused_as_wal_and_untouched(data: &Path, expected_found: i64) {
+///
+/// Текст для лога называет причину точно (TL-99): рядом журнал `-wal`,
+/// заголовок в режиме WAL или оба. Экран при этом говорит «база новее» —
+/// причина в контракте одна.
+fn assert_refused_as_wal_and_untouched(data: &Path, expected_found: i64, expected: WalSign) {
     let before = snapshot(data);
 
     let result = HistoryStore::open_isolated(data);
@@ -469,13 +624,31 @@ fn assert_refused_as_wal_and_untouched(data: &Path, expected_found: i64) {
             err @ HistoryOpenError::NewerVersion {
                 found,
                 supported,
-                wal: true,
+                cause,
                 ..
             },
         ) => {
             assert_eq!(*found, expected_found);
             assert_eq!(*supported, SCHEMA_VERSION);
+            assert_eq!(*cause, NewerCause::Wal(expected));
             assert_eq!(err.reason(), HistoryUnavailableReason::NewerVersion);
+            let message = err.to_string();
+            let names_file = message.contains("history.sqlite-wal");
+            let names_header = message.contains("заголовок файла объявляет режим");
+            let expected_names = match expected {
+                WalSign::File => (true, false),
+                WalSign::Header => (false, true),
+                WalSign::FileAndHeader => (true, true),
+            };
+            assert_eq!(
+                (names_file, names_header),
+                expected_names,
+                "текст для лога не называет причину WAL точно: {message}"
+            );
+            assert!(
+                !message.contains("чужой версии схемы"),
+                "отказ по WAL назван отказом по версии: {message}"
+            );
         }
         other => panic!("база с признаком WAL открыта как {other:?}"),
     }
@@ -501,12 +674,12 @@ fn a_version_1_header_with_a_version_2_wal_is_refused_untouched() {
         inspect_header(&db_path(data)).expect("заголовок читается"),
         Header::Sqlite {
             user_version: 1,
-            wal: true
+            format: FileFormat { write: 2, read: 2 },
         },
         "фикстура не та: в заголовке должна быть версия 1 в режиме WAL"
     );
 
-    assert_refused_as_wal_and_untouched(data, 1);
+    assert_refused_as_wal_and_untouched(data, 1, WalSign::FileAndHeader);
 }
 
 /// Сценарий ревью (б): наша база в режиме DELETE с записями и чужой `-wal`
@@ -532,12 +705,12 @@ fn a_delete_mode_base_with_a_foreign_wal_is_refused_untouched() {
         inspect_header(&db_path(data)).expect("заголовок читается"),
         Header::Sqlite {
             user_version: 1,
-            wal: false
+            format: FileFormat::JOURNAL,
         },
         "фикстура не та: заголовок должен быть в режиме DELETE"
     );
 
-    assert_refused_as_wal_and_untouched(data, 1);
+    assert_refused_as_wal_and_untouched(data, 1, WalSign::File);
 }
 
 /// Заголовок объявляет WAL, а `-wal` рядом нет (журнал был перенесён и
@@ -552,7 +725,68 @@ fn a_wal_mode_header_without_a_wal_file_is_refused_untouched() {
     let (main, _) = wal_pair(dirs.downloads.path(), 1, 1);
     fs::write(db_path(data), &main).expect("фикстура");
 
-    assert_refused_as_wal_and_untouched(data, 1);
+    assert_refused_as_wal_and_untouched(data, 1, WalSign::Header);
+}
+
+/// TL-99: байт 18 или 19 заголовка больше 2 — формат записи или чтения
+/// новее того, что знает эта сборка. Отказ `NewerVersion` до SQLite, каталог
+/// данных байт в байт тот же.
+///
+/// Без проверки SQLite открывает базу с байтом 18 > 2 только на чтение,
+/// `open` проходит, а отказ случается на первой записи (`noAccess` и пометка).
+/// Базу с байтом 19 > 2 SQLite не читает вовсе (`SQLITE_NOTADB`), и она
+/// отложилась бы как порча с пометкой `baseRecreated`.
+///
+/// Мутация, которую тест обязан ловить: убрать проверку формата в заголовке.
+#[test]
+fn a_newer_file_format_in_the_header_is_refused_untouched() {
+    let mut failures = Vec::new();
+    for (offset, value) in [(18_usize, 3_u8), (18, 255), (19, 3), (19, 255)] {
+        let dirs = dirs();
+        let data = dirs.data.path();
+        let store = open(data);
+        store
+            .insert(&record(dirs.downloads.path(), 1, 1))
+            .expect("вставка");
+        drop(store);
+        let mut bytes = fs::read(db_path(data)).expect("база читается");
+        assert_eq!(bytes[18..20], [1, 1], "фикстура не в режиме DELETE");
+        bytes[offset] = value;
+        fs::write(db_path(data), &bytes).expect("фикстура");
+        let (write, read) = (bytes[18], bytes[19]);
+        let before = snapshot(data);
+
+        let result = HistoryStore::open_isolated(data);
+
+        let refused_as_newer_format = match &result {
+            Err(
+                err @ HistoryOpenError::NewerVersion {
+                    found: 1,
+                    supported,
+                    cause,
+                    ..
+                },
+            ) => {
+                *supported == SCHEMA_VERSION
+                    && *cause == NewerCause::FileFormat { write, read }
+                    && err.reason() == HistoryUnavailableReason::NewerVersion
+                    && err.to_string().contains("формат файла SQLite новее")
+            }
+            _ => false,
+        };
+        if !refused_as_newer_format {
+            failures.push(format!("байт {offset} = {value}: открыто как {result:?}"));
+        }
+        drop(result);
+        if snapshot(data) != before {
+            failures.push(format!("байт {offset} = {value}: каталог данных изменился"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "новый формат не отвергнут до SQLite:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// Чужой `-wal` рядом с пустым или отсутствующим файлом SQLite удалил бы.
@@ -563,7 +797,7 @@ fn a_wal_beside_a_missing_base_is_refused_untouched() {
     let (_, wal) = wal_pair(dirs.downloads.path(), 1, 2);
     fs::write(with_suffix(&db_path(data), WAL_SUFFIX), &wal).expect("фикстура");
 
-    assert_refused_as_wal_and_untouched(data, 0);
+    assert_refused_as_wal_and_untouched(data, 0, WalSign::File);
 }
 
 /// Вторая порча с той же меткой не затирает первую отложенную копию.
