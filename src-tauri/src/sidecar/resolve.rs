@@ -1,12 +1,13 @@
 //! Разрешение пути к sidecar-бинарнику (Ф-5 эпика E1).
 //!
-//! После TL-12 sidecar остался один — ffmpeg. yt-dlp резолвится иначе, в
+//! Sidecar этим модулем резолвятся два: ffmpeg и, с TL-108, deno —
+//! JavaScript-рантайм yt-dlp. yt-dlp после TL-12 резолвится иначе, в
 //! каталоге данных приложения (см. `crate::ytdlp`), потому что его
 //! onedir-дерево туда распаковывается при первом запуске; этот модуль про
 //! него ничего не знает.
 //!
 //! `tauri.conf.json` объявляет sidecar-бинарники через `bundle.externalBin`
-//! (`binaries/ffmpeg`); физические файлы лежат в
+//! (`binaries/ffmpeg`, `binaries/deno`); физические файлы лежат в
 //! `src-tauri/binaries/<name>-<target-triple>[.exe]` (см. `binaries.lock.json`,
 //! задача TL-6). На этапе `cargo build`/`cargo test` `tauri-build` находит
 //! файл, соответствующий текущей target triple, отрезает суффикс триплета
@@ -31,9 +32,9 @@ use std::path::PathBuf;
 use super::error::SidecarError;
 use crate::types::LaunchFailedReason;
 
-/// Возвращает путь к sidecar-бинарнику `name` — после TL-12 это `"ffmpeg"`
-/// и только он (см. шапку модуля), без суффикса target triple: он уже
-/// учтён на этапе сборки.
+/// Возвращает путь к sidecar-бинарнику `name` — `"ffmpeg"` или `"deno"`
+/// (см. шапку модуля), без суффикса target triple: он уже учтён на этапе
+/// сборки.
 ///
 /// Существование файла по возвращённому пути не проверяется здесь: это
 /// делает попытка запуска (`crate::sidecar::process::run`), которая
@@ -113,6 +114,17 @@ mod tests {
             path.exists(),
             "expected tauri-build to have copied the ffmpeg sidecar to {path:?} \
              (see src-tauri/binaries/ffmpeg-<target-triple>)"
+        );
+    }
+
+    #[test]
+    fn resolves_an_existing_deno_sidecar_copied_by_tauri_build() {
+        let path = resolve_sidecar_path("deno").expect("resolution must not fail");
+
+        assert!(
+            path.exists(),
+            "expected tauri-build to have copied the deno sidecar to {path:?} \
+             (see src-tauri/binaries/deno-<target-triple>)"
         );
     }
 }

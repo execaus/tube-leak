@@ -1,7 +1,8 @@
 //! Разбор строки версии sidecar-бинарника в чистую строку версии (Ф-7 эпика E1).
 //!
 //! Оперирует уже захваченным stdout (см. `crate::sidecar::process::run`) —
-//! сам запуск `yt-dlp --version` / `ffmpeg -version` этому модулю не нужен,
+//! сам запуск `yt-dlp --version` / `ffmpeg -version` / `deno --version`
+//! этому модулю не нужен,
 //! что позволяет проверять разбор фикстурами без запуска процессов.
 //!
 //! Разбор возвращает [`SidecarVersion`] — пару «что показываем» и «что
@@ -78,6 +79,46 @@ pub fn parse_ffmpeg_version(raw: &str) -> Option<SidecarVersion> {
 
     let token = tokens.next()?;
     if token.is_empty() {
+        return None;
+    }
+
+    Some(SidecarVersion {
+        display: normalize_version(token),
+        raw: token.to_string(),
+    })
+}
+
+/// Разбирает вывод `deno --version` (TL-110).
+///
+/// Вывод трёхстрочный, версия deno — в первой строке:
+///
+/// ```text
+/// deno 2.9.6 (stable, release, aarch64-apple-darwin)
+/// v8 15.0.245.2-rusty
+/// typescript 6.0.3
+/// ```
+///
+/// Разбор тот же, каким yt-dlp сам опознаёт рантайм (`^deno (\S+)`), плюс
+/// требование, чтобы токен начинался с цифры: иначе строка вида
+/// `deno (stable, …)` без номера отдала бы на экран `(stable,`.
+///
+/// Нормализация — общая с ffmpeg ([`normalize_version`]): у релизной
+/// сборки токен уже чистый (`2.9.6`), а canary-сборки дописывают хэш
+/// коммита через `+` (`2.9.6+0a1b2c3`) — на экран уходит `2.9.6`, полный
+/// токен остаётся в `raw` для лога.
+///
+/// `None` — вывод не похож на deno вовсе. В отличие от yt-dlp и ffmpeg,
+/// у deno это не «показать как есть», а отказ — см.
+/// `crate::commands::sidecar`.
+pub fn parse_deno_version(raw: &str) -> Option<SidecarVersion> {
+    let mut tokens = raw.lines().next()?.split_whitespace();
+
+    if tokens.next()? != "deno" {
+        return None;
+    }
+
+    let token = tokens.next()?;
+    if !token.starts_with(|c: char| c.is_ascii_digit()) {
         return None;
     }
 
@@ -300,5 +341,75 @@ mod tests {
         assert_eq!(parse_ffmpeg_version(""), None);
         assert_eq!(parse_ffmpeg_version("not ffmpeg output at all\n"), None);
         assert_eq!(parse_ffmpeg_version("ffmpeg\n"), None);
+    }
+
+    /// ПРОВЕРЕНО ЖИВЬЁМ: дословный вывод
+    /// `src-tauri/binaries/deno-aarch64-apple-darwin --version` (пин 2.9.6,
+    /// TL-108), запущенного с `DENO_NO_UPDATE_CHECK=1` и `DENO_DIR` во
+    /// временном каталоге — ровно то окружение, с которым его зовёт
+    /// служебный экран.
+    const REAL_DENO_VERSION_OUTPUT: &str = "deno 2.9.6 (stable, release, aarch64-apple-darwin)\n\
+                                            v8 15.0.245.2-rusty\n\
+                                            typescript 6.0.3\n";
+
+    #[test]
+    fn parses_deno_version_from_real_output_of_the_pinned_binary() {
+        let parsed = parse_deno_version(REAL_DENO_VERSION_OUTPUT).expect("version");
+
+        assert_eq!(parsed.display, "2.9.6");
+        assert_eq!(parsed.raw, "2.9.6");
+        assert!(!parsed.is_normalized());
+    }
+
+    #[test]
+    fn takes_the_deno_version_not_the_v8_or_typescript_one() {
+        // Строки v8 и typescript тоже «имя плюс номер»; разбор обязан
+        // брать первую строку, а не первую попавшуюся версию.
+        let parsed = parse_deno_version(REAL_DENO_VERSION_OUTPUT).expect("version");
+
+        assert_ne!(parsed.display, "15.0.245.2");
+        assert_ne!(parsed.display, "6.0.3");
+    }
+
+    #[test]
+    fn normalizes_deno_canary_build_metadata() {
+        // ФОРМАТ ПО ДОКУМЕНТАЦИИ, НЕ ПРОВЕРЕН ЖИВЬЁМ: canary-сборки deno
+        // дописывают хэш коммита через `+`. Мы canary не поставляем, но
+        // подменённый бинарник не должен ломать строку на экране.
+        let raw = "deno 2.9.6+0a1b2c3 (canary, release, aarch64-apple-darwin)\n";
+
+        let parsed = parse_deno_version(raw).expect("version");
+
+        assert_eq!(parsed.display, "2.9.6");
+        assert_eq!(parsed.raw, "2.9.6+0a1b2c3");
+        assert!(parsed.is_normalized());
+    }
+
+    #[test]
+    fn returns_none_when_output_does_not_look_like_deno_version() {
+        assert_eq!(parse_deno_version(""), None);
+        assert_eq!(parse_deno_version("\n"), None);
+        assert_eq!(parse_deno_version("deno\n"), None);
+        assert_eq!(
+            parse_deno_version("deno (stable, release, aarch64-apple-darwin)\n"),
+            None
+        );
+        assert_eq!(
+            parse_deno_version("tube-leak CI stub, not a real binary\n"),
+            None
+        );
+        // Чужой sidecar под именем deno: версия есть, но не его.
+        assert_eq!(
+            parse_deno_version(
+                "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers\n"
+            ),
+            None
+        );
+        assert_eq!(parse_deno_version("2026.08.19\n"), None);
+        // «Имя плюс номер», но имя не deno. Без проверки первого слова
+        // эти строки разобрались бы как версия: мутация, отменившая
+        // проверку префикса, пережила остальные случаи этого теста.
+        assert_eq!(parse_deno_version("v8 15.0.245.2-rusty\n"), None);
+        assert_eq!(parse_deno_version("node 22.1.0\n"), None);
     }
 }

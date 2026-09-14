@@ -1,26 +1,34 @@
 //! `#[tauri::command]` для служебного экрана: проверка исполняемых
-//! файлов yt-dlp и ffmpeg (Ф-9, Н-6 эпика E1).
+//! файлов yt-dlp, ffmpeg и deno (Ф-9, Н-6 эпика E1; deno — TL-110).
 //!
 //! Тонкий слой над `crate::sidecar`: резолвит путь к каждому бинарнику,
 //! запускает его с аргументом версии и конвертирует
 //! [`crate::sidecar::SidecarError`] в контрактный
-//! [`crate::types::SidecarCheckResult`]. Обе проверки (yt-dlp, ffmpeg)
-//! идут параллельно (`tokio::join!`, Н-6 «Экономия вызовов» — общее время
-//! ожидания близко к максимуму из двух проверок, а не к их сумме).
+//! [`crate::types::SidecarCheckResult`]. Все три проверки идут параллельно
+//! (`tokio::join!`, Н-6 «Экономия вызовов» — общее время ожидания близко к
+//! максимуму из проверок, а не к их сумме).
 //!
-//! Резолв у бинарников разный (TL-12): ffmpeg — sidecar рядом с
+//! Резолв у бинарников разный (TL-12): ffmpeg и deno — sidecar рядом с
 //! исполняемым файлом приложения, yt-dlp — распакованное дерево в каталоге
 //! данных, см. [`crate::ytdlp`]. Отсюда предусловие: команда `prepare_ytdlp`
 //! должна отработать раньше, иначе yt-dlp честно окажется `notFound` —
 //! дерева ещё нет.
+//!
+//! Проверка deno — заодно и его прогрев на старте: служебный экран зовёт
+//! команду при каждом запуске приложения, и холодную надбавку первой
+//! загрузки 77-МиБ бинарника платит эта проверка, а не первый разбор ролика
+//! внутри его таймаута. deno запускается с окружением [`DenoEnv`]: без
+//! проверки обновлений (сети проверка версии не касается) и с кэшем в
+//! каталоге данных приложения, а не в домашнем каталоге пользователя.
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager, State};
 
 use crate::clock::now_iso8601;
-use crate::sidecar::{self, stderr_tail, ChildRegistry, SidecarError};
+use crate::sidecar::{self, stderr_tail, ChildRegistry, DenoEnv, SidecarError};
 use crate::types::{LaunchFailedReason, SidecarCheckReport, SidecarCheckResult, SidecarStatus};
 use crate::ytdlp::{self, InUse, InUseGuard};
 
@@ -96,7 +104,18 @@ const YT_DLP_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
 /// были взяты из дизайна, а не из него.
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
 
-/// Возвращает результат проверки обоих sidecar-бинарников (yt-dlp, ffmpeg).
+/// Таймаут проверки deno (TL-110). Замер на вложенном бинарнике пина
+/// 2.9.6 (Apple Silicon, `/usr/bin/time -p`, `real`, окружение
+/// [`DenoEnv`]): первый запуск только что доставленного файла 1,74 с,
+/// копия с новым inode 1,51 с, повторный 0,01 с. Природа надбавки та же,
+/// что у ffmpeg: платится один раз на файл.
+///
+/// В `.app` холодный старт не мерился (исследование TL-107, B4); значение
+/// — то же [`CHECK_TIMEOUT_SECS`], обоснование единой величины — у
+/// [`YT_DLP_TIMEOUT`]. К худшему замеру это запас 5×.
+const DENO_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
+
+/// Возвращает результат проверки sidecar-бинарников (yt-dlp, ffmpeg, deno).
 ///
 /// `registry` — реестр PID выполняющихся процессов (TL-10), внедряется
 /// Tauri автоматически из состояния, управляемого в `main.rs`
@@ -129,9 +148,41 @@ pub async fn check_sidecar(
     Ok(check_report(
         yt_dlp_path,
         sidecar::resolve_sidecar_path("ffmpeg"),
+        resolve_deno(&app),
         &registry,
     )
     .await)
+}
+
+/// Всё, что нужно для запуска deno: путь к sidecar и окружение.
+///
+/// Путь и окружение едут вместе, чтобы запустить deno без окружения было
+/// нельзя по построению: нет каталога данных — нет и запуска.
+struct DenoLaunch {
+    path: PathBuf,
+    env: DenoEnv,
+}
+
+/// Резолвит deno (TL-110): sidecar рядом с приложением плюс окружение с
+/// кэшем в каталоге данных.
+///
+/// Каталог данных, который не определяется, — отказ запуска
+/// ([`LaunchFailedReason::Other`]), а не запуск с кэшем «где-нибудь»:
+/// иначе deno без `DENO_DIR` писал бы в домашний каталог пользователя.
+/// Причина уходит в `stderr` и доезжает до «Подробнее» на экране.
+fn resolve_deno(app: &AppHandle) -> Result<DenoLaunch, SidecarError> {
+    let data_dir = app.path().app_data_dir().map_err(|err| {
+        eprintln!("deno: каталог данных приложения не определяется: {err}");
+        SidecarError::LaunchFailed {
+            reason: LaunchFailedReason::Other,
+            stderr: format!("каталог данных приложения не определяется: {err}"),
+        }
+    })?;
+
+    Ok(DenoLaunch {
+        path: sidecar::resolve_sidecar_path("deno")?,
+        env: DenoEnv::in_data_dir(&data_dir),
+    })
 }
 
 /// Путь к yt-dlp — в каталоге данных, а не рядом с приложением (TL-12),
@@ -183,9 +234,24 @@ pub(super) fn resolve_ytdlp_path(
 async fn check_report(
     yt_dlp_path: Result<PathBuf, SidecarError>,
     ffmpeg_path: Result<PathBuf, SidecarError>,
+    deno: Result<DenoLaunch, SidecarError>,
     registry: &ChildRegistry,
 ) -> SidecarCheckReport {
-    let (yt_dlp, ffmpeg) = tokio::join!(
+    let (deno_path, deno_env) = match deno {
+        Ok(launch) => (Ok(launch.path), Some(launch.env)),
+        Err(error) => (Err(error), None),
+    };
+    let deno_vars = deno_env.as_ref().map(DenoEnv::vars);
+    let deno_check = VersionCheck {
+        name: "deno",
+        args: &["--version"],
+        env: deno_vars.as_ref().map_or(&[][..], |vars| &vars[..]),
+        timeout: DENO_TIMEOUT,
+        parse_version: sidecar::parse_deno_version,
+        unrecognized: UnrecognizedOutput::Refuse,
+    };
+
+    let (yt_dlp, ffmpeg, deno) = tokio::join!(
         check_binary(
             "yt-dlp",
             yt_dlp_path,
@@ -202,9 +268,14 @@ async fn check_report(
             sidecar::parse_ffmpeg_version,
             registry,
         ),
+        run_check(&deno_check, deno_path, registry),
     );
 
-    SidecarCheckReport { yt_dlp, ffmpeg }
+    SidecarCheckReport {
+        yt_dlp,
+        ffmpeg,
+        deno,
+    }
 }
 
 /// Проверяет один sidecar-бинарник: запускает `program` с аргументом
@@ -217,6 +288,10 @@ async fn check_report(
 /// напрямую, а `path` в результате — сам запрошенный `name` (место, где
 /// физически не смогли даже начать искать, единственное осмысленное «здесь
 /// искали» в этом случае).
+///
+/// Запускается без добавочного окружения, а вывод без версии показывается
+/// как есть — поведение yt-dlp и ffmpeg со времён E1. Проверка с
+/// окружением и отказом на нераспознанный вывод — [`run_check`].
 async fn check_binary(
     name: &str,
     resolved_path: Result<PathBuf, SidecarError>,
@@ -225,6 +300,50 @@ async fn check_binary(
     parse_version: fn(&str) -> Option<sidecar::SidecarVersion>,
     registry: &ChildRegistry,
 ) -> SidecarCheckResult {
+    let check = VersionCheck {
+        name,
+        args,
+        env: &[],
+        timeout,
+        parse_version,
+        unrecognized: UnrecognizedOutput::ShowAsIs,
+    };
+    run_check(&check, resolved_path, registry).await
+}
+
+/// Что делать, если бинарник завершился успешно, а версии в выводе нет.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnrecognizedOutput {
+    /// Показать вывод вместо версии со статусом `ok` — поведение yt-dlp и
+    /// ffmpeg со времён E1.
+    ShowAsIs,
+    /// Отказ [`LaunchFailedReason::Other`] с нераспознанным выводом в
+    /// `stderrTail` — поведение deno (TL-110). Под именем deno может
+    /// оказаться что угодно исполняемое; yt-dlp требует deno не ниже 2.3.0,
+    /// и `ok` с чужой строкой на экране прятал бы ровно ту поломку, ради
+    /// которой строка на экране существует.
+    Refuse,
+}
+
+/// Описание проверки одного бинарника для [`run_check`].
+struct VersionCheck<'a> {
+    name: &'a str,
+    args: &'a [&'a str],
+    /// Добавочное окружение процесса (см. `crate::sidecar::run_with_env`).
+    env: &'a [(&'a str, &'a OsStr)],
+    timeout: Duration,
+    parse_version: fn(&str) -> Option<sidecar::SidecarVersion>,
+    unrecognized: UnrecognizedOutput,
+}
+
+/// Тело [`check_binary`] — см. её doc; `check` несёт ещё окружение и
+/// политику нераспознанного вывода.
+async fn run_check(
+    check: &VersionCheck<'_>,
+    resolved_path: Result<PathBuf, SidecarError>,
+    registry: &ChildRegistry,
+) -> SidecarCheckResult {
+    let name = check.name;
     let checked_at = now_iso8601();
     let started = Instant::now();
 
@@ -238,12 +357,12 @@ async fn check_binary(
     let path_string = path.display().to_string();
 
     let run_result: Result<sidecar::RunOutput, SidecarError> =
-        sidecar::run(&path, args, timeout, registry).await;
+        sidecar::run_with_env(&path, check.args, check.env, check.timeout, registry).await;
     let duration_ms = elapsed_ms(started);
 
     match run_result {
         Ok(output) => {
-            let version = match parse_version(&output.stdout) {
+            let version = match (check.parse_version)(&output.stdout) {
                 Some(parsed) => {
                     // Полная строка сборки в DTO не уходит: `version` в
                     // контракте один, и новое поле потянуло бы за собой
@@ -260,7 +379,20 @@ async fn check_binary(
                     }
                     parsed.display
                 }
-                None => output.stdout.trim().to_string(),
+                None => match check.unrecognized {
+                    UnrecognizedOutput::ShowAsIs => output.stdout.trim().to_string(),
+                    UnrecognizedOutput::Refuse => {
+                        eprintln!(
+                            "sidecar {name}: версия в выводе не найдена, stdout: {stdout:?}",
+                            stdout = output.stdout,
+                        );
+                        let error = SidecarError::LaunchFailed {
+                            reason: LaunchFailedReason::Other,
+                            stderr: format!("{}\n{}", output.stdout.trim(), output.stderr.trim()),
+                        };
+                        return error_to_result(name, path_string, checked_at, duration_ms, error);
+                    }
+                },
             };
 
             SidecarCheckResult {
@@ -654,12 +786,17 @@ mod tests {
     /// Пока в `dir` нет файла `armed`, скрипт печатает версию и выходит,
     /// не ожидая никого, — этот режим нужен прогреву ([`warm_up`]), где
     /// фикстура запускается в одиночку.
-    fn rendezvous_script(dir: &std::path::Path, own: &str, peer: &str) -> String {
+    fn rendezvous_script(
+        dir: &std::path::Path,
+        own: &str,
+        peer: &str,
+        version_line: &str,
+    ) -> String {
         let dir = dir.display();
         format!(
             "#!/bin/sh\n\
              if [ ! -f \"{dir}/armed\" ]; then\n\
-             \x20 echo 2026.08.19\n\
+             \x20 echo \"{version_line}\"\n\
              \x20 exit 0\n\
              fi\n\
              : > \"{dir}/{own}.started\"\n\
@@ -672,56 +809,333 @@ mod tests {
              \x20 waited=$((waited + 1))\n\
              \x20 sleep {step}\n\
              done\n\
-             echo 2026.08.19\n\
+             echo \"{version_line}\"\n\
              exit 0\n",
             limit = RENDEZVOUS_POLL_LIMIT,
             step = RENDEZVOUS_POLL_STEP_SECS,
         )
     }
 
+    /// Первая строка настоящего `deno --version` пина 2.9.6 (проверено
+    /// живьём, см. тест разбора в `crate::sidecar::version`).
+    const DENO_VERSION_LINE: &str = "deno 2.9.6 (stable, release, aarch64-apple-darwin)";
+
+    const YT_DLP_VERSION_LINE: &str = "2026.08.19";
+
+    const FFMPEG_VERSION_LINE: &str =
+        "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers";
+
+    /// Запуск deno из фикстурного скрипта с окружением, построенным от
+    /// `data_dir`, — то, что в продакшене собирает `resolve_deno`.
+    fn deno_launch(path: PathBuf, data_dir: &std::path::Path) -> Result<DenoLaunch, SidecarError> {
+        Ok(DenoLaunch {
+            path,
+            env: DenoEnv::in_data_dir(data_dir),
+        })
+    }
+
+    /// Скрипт, который печатает строку версии и выходит успешно.
+    fn version_script(dir: &tempfile::TempDir, name: &str, line: &str) -> PathBuf {
+        write_script(
+            dir,
+            name,
+            &format!("#!/bin/sh\necho \"{line}\"\nexit 0\n"),
+            0o755,
+        )
+    }
+
+    /// Отчёт, где yt-dlp и ffmpeg в порядке, а deno — то, что дали.
+    async fn report_with_deno(
+        dir: &tempfile::TempDir,
+        deno: Result<DenoLaunch, SidecarError>,
+    ) -> SidecarCheckReport {
+        let yt_dlp = version_script(dir, "yt-dlp.sh", YT_DLP_VERSION_LINE);
+        let ffmpeg = version_script(dir, "ffmpeg.sh", FFMPEG_VERSION_LINE);
+        let registry = ChildRegistry::new();
+        let report = check_report(Ok(yt_dlp), Ok(ffmpeg), deno, &registry).await;
+        assert!(
+            registry.is_empty(),
+            "проверка не должна оставлять pid в реестре"
+        );
+        report
+    }
+
     #[tokio::test]
-    async fn checks_yt_dlp_and_ffmpeg_concurrently_not_sequentially() {
+    async fn reports_the_deno_version_next_to_yt_dlp_and_ffmpeg() {
         let dir = tempdir().expect("failed to create temp dir");
+        // Весь трёхстрочный вывод, а не одна строка: разбор обязан взять
+        // версию deno, а не v8 или typescript.
+        let deno = write_script(
+            &dir,
+            "deno.sh",
+            &format!(
+                "#!/bin/sh\necho \"{DENO_VERSION_LINE}\"\necho 'v8 15.0.245.2-rusty'\n\
+                 echo 'typescript 6.0.3'\nexit 0\n"
+            ),
+            0o755,
+        );
+
+        let report = report_with_deno(&dir, deno_launch(deno.clone(), dir.path())).await;
+
+        assert_eq!(report.deno.name, "deno");
+        assert_eq!(report.deno.path, deno.display().to_string());
+        assert_eq!(report.deno.status, SidecarStatus::Ok);
+        assert_eq!(report.deno.version.as_deref(), Some("2.9.6"));
+        assert!(report.deno.reason.is_none());
+        assert!(report.deno.stderr_tail.is_none());
+        // Соседние строки не пострадали от третьей проверки.
+        assert_eq!(report.yt_dlp.version.as_deref(), Some("2026.08.19"));
+        assert_eq!(report.ffmpeg.version.as_deref(), Some("9.0.1"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_deno_is_a_typed_not_found() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let missing = dir.path().join("deno-does-not-exist");
+
+        let report = report_with_deno(&dir, deno_launch(missing.clone(), dir.path())).await;
+
+        assert_eq!(report.deno.status, SidecarStatus::NotFound);
+        assert_eq!(report.deno.os_error_code.as_deref(), Some("ENOENT"));
+        assert_eq!(report.deno.path, missing.display().to_string());
+        assert!(report.deno.version.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_non_executable_deno_is_a_typed_permission_denied() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let deno = write_script(
+            &dir,
+            "deno.sh",
+            &format!("#!/bin/sh\necho \"{DENO_VERSION_LINE}\"\n"),
+            0o644,
+        );
+
+        let report = report_with_deno(&dir, deno_launch(deno, dir.path())).await;
+
+        assert_eq!(report.deno.status, SidecarStatus::LaunchFailed);
+        assert_eq!(
+            report.deno.reason,
+            Some(LaunchFailedReason::PermissionDenied)
+        );
+        assert_eq!(report.deno.os_error_code.as_deref(), Some("EACCES"));
+        assert!(report.deno.version.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_ci_stub_under_the_deno_name_is_a_typed_non_zero_exit() {
+        // Ровно то, что кладёт `scripts/ci/stub-binaries.mjs`: текст без
+        // shebang с правом на исполнение.
+        //
+        // ИЗМЕРЕНО (TL-110), а не предположено: в тексте заглушки нет
+        // NUL-байтов, поэтому exec откатывается на `/bin/sh`, тот читает
+        // файл как скрипт и падает на скобке с кодом 2 — это `nonZeroExit`,
+        // а не `corrupted` (код 126 даёт только файл с NUL-байтами, см.
+        // `converts_a_corrupted_binary_into_launch_failed_status_with_enoexec`).
+        let dir = tempdir().expect("failed to create temp dir");
+        let deno = write_script(
+            &dir,
+            "deno",
+            "tube-leak CI stub, not a real binary (scripts/ci/stub-binaries.mjs)\n",
+            0o755,
+        );
+
+        let report = report_with_deno(&dir, deno_launch(deno, dir.path())).await;
+
+        assert_eq!(report.deno.status, SidecarStatus::NonZeroExit);
+        assert_eq!(report.deno.exit_code, Some(2));
+        assert!(report.deno.version.is_none());
+        assert!(
+            report
+                .deno
+                .stderr_tail
+                .as_deref()
+                .is_some_and(|tail| tail.contains("syntax error")),
+            "причина обязана доехать до «Подробнее»: {:?}",
+            report.deno.stderr_tail
+        );
+    }
+
+    #[tokio::test]
+    async fn deno_output_without_a_version_is_a_typed_launch_failure_not_ok() {
+        let dir = tempdir().expect("failed to create temp dir");
+        // Исполняемое, отвечает кодом 0, но это не deno: у yt-dlp и ffmpeg
+        // такой вывод ушёл бы на экран как «версия» со статусом ok.
+        let deno = write_script(
+            &dir,
+            "deno.sh",
+            "#!/bin/sh\necho 'hello from something else'\nexit 0\n",
+            0o755,
+        );
+
+        let report = report_with_deno(&dir, deno_launch(deno, dir.path())).await;
+
+        assert_eq!(report.deno.status, SidecarStatus::LaunchFailed);
+        assert_eq!(report.deno.reason, Some(LaunchFailedReason::Other));
+        assert!(report.deno.os_error_code.is_none());
+        assert!(report.deno.version.is_none());
+        assert_eq!(
+            report.deno.stderr_tail.as_deref(),
+            Some("hello from something else"),
+            "нераспознанный вывод обязан доехать до «Подробнее»"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deno_resolve_failure_names_the_binary_and_carries_the_reason() {
+        let dir = tempdir().expect("failed to create temp dir");
+
+        let report = report_with_deno(
+            &dir,
+            Err(SidecarError::LaunchFailed {
+                reason: LaunchFailedReason::Other,
+                stderr: "каталог данных приложения не определяется: test".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(report.deno.status, SidecarStatus::LaunchFailed);
+        assert_eq!(report.deno.path, "deno");
+        assert_eq!(
+            report.deno.stderr_tail.as_deref(),
+            Some("каталог данных приложения не определяется: test")
+        );
+    }
+
+    #[tokio::test]
+    async fn deno_is_checked_without_update_check_and_with_its_cache_in_the_data_dir() {
+        // Скрипт-заглушка deno записывает своё окружение в файл и печатает
+        // версию. Файл, а не stdout: из вывода в отчёт уходит только
+        // версия.
+        let dir = tempdir().expect("failed to create temp dir");
+        let data_dir = dir.path().join("app-data");
+        let seen = dir.path().join("deno-env.txt");
+        let deno = write_script(
+            &dir,
+            "deno.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 printf 'DENO_NO_UPDATE_CHECK=%s\\nDENO_DIR=%s\\n' \
+                 \"$DENO_NO_UPDATE_CHECK\" \"$DENO_DIR\" > \"{seen}\"\n\
+                 echo \"{DENO_VERSION_LINE}\"\n\
+                 exit 0\n",
+                seen = seen.display(),
+            ),
+            0o755,
+        );
+
+        let report = report_with_deno(&dir, deno_launch(deno, &data_dir)).await;
+        assert_eq!(report.deno.status, SidecarStatus::Ok);
+
+        let recorded = fs::read_to_string(&seen).expect("deno stub must record its environment");
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(lines.len(), 2, "unexpected record: {recorded:?}");
+        assert_eq!(lines[0], "DENO_NO_UPDATE_CHECK=1");
+
+        let deno_dir = std::path::Path::new(
+            lines[1]
+                .strip_prefix("DENO_DIR=")
+                .expect("second line is DENO_DIR"),
+        );
+        assert!(
+            deno_dir.starts_with(&data_dir) && deno_dir != data_dir,
+            "DENO_DIR обязан быть подкаталогом каталога данных {data_dir:?}, а не {deno_dir:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn yt_dlp_and_ffmpeg_are_not_given_the_deno_environment() {
+        // Окружение deno добавляется только его проверке: у yt-dlp его
+        // выставит TL-109 в своих запусках, а служебному экрану ffmpeg
+        // оно ни к чему.
+        let dir = tempdir().expect("failed to create temp dir");
+        let seen = dir.path().join("yt-dlp-env.txt");
+        let yt_dlp = write_script(
+            &dir,
+            "yt-dlp.sh",
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"$DENO_DIR\" > \"{seen}\"\necho {YT_DLP_VERSION_LINE}\nexit 0\n",
+                seen = seen.display(),
+            ),
+            0o755,
+        );
+        let ffmpeg = version_script(&dir, "ffmpeg.sh", FFMPEG_VERSION_LINE);
+        let deno = version_script(&dir, "deno.sh", DENO_VERSION_LINE);
+        let data_dir = dir.path().join("app-data");
+
+        let registry = ChildRegistry::new();
+        let report = check_report(
+            Ok(yt_dlp),
+            Ok(ffmpeg),
+            deno_launch(deno, &data_dir),
+            &registry,
+        )
+        .await;
+        assert_eq!(report.yt_dlp.status, SidecarStatus::Ok);
+
+        let recorded = fs::read_to_string(&seen).expect("yt-dlp stub must record DENO_DIR");
+        assert!(
+            !recorded.contains(&data_dir.display().to_string()),
+            "yt-dlp получил DENO_DIR проверки deno: {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checks_all_three_sidecars_concurrently_not_sequentially() {
+        let dir = tempdir().expect("failed to create temp dir");
+        // Рандеву по кругу: yt-dlp ждёт ffmpeg, ffmpeg ждёт deno, deno ждёт
+        // yt-dlp. Успех всех трёх возможен, только если все три процесса
+        // были живы одновременно: при любом порядке, где хоть одна
+        // проверка идёт после завершения другой, первая из них ждёт
+        // соседа, которого ещё не запускали.
         let yt_dlp_script = write_script(
             &dir,
             "rendezvous-yt-dlp.sh",
-            &rendezvous_script(dir.path(), "yt-dlp", "ffmpeg"),
+            &rendezvous_script(dir.path(), "yt-dlp", "ffmpeg", YT_DLP_VERSION_LINE),
             0o755,
         );
         let ffmpeg_script = write_script(
             &dir,
             "rendezvous-ffmpeg.sh",
-            &rendezvous_script(dir.path(), "ffmpeg", "yt-dlp"),
+            &rendezvous_script(dir.path(), "ffmpeg", "deno", FFMPEG_VERSION_LINE),
+            0o755,
+        );
+        let deno_script = write_script(
+            &dir,
+            "rendezvous-deno.sh",
+            &rendezvous_script(dir.path(), "deno", "yt-dlp", DENO_VERSION_LINE),
             0o755,
         );
 
         warm_up(&yt_dlp_script).await;
         warm_up(&ffmpeg_script).await;
+        warm_up(&deno_script).await;
 
         // Вооружает рандеву: до этой строки фикстуры отрабатывали в
         // одиночном режиме (прогрев), после — каждая завершится успехом
-        // только увидев маркер второй.
+        // только увидев маркер соседа.
         fs::write(dir.path().join("armed"), "").expect("failed to arm the rendezvous");
 
         let registry = ChildRegistry::new();
-        let report = check_report(Ok(yt_dlp_script), Ok(ffmpeg_script), &registry).await;
+        let report = check_report(
+            Ok(yt_dlp_script),
+            Ok(ffmpeg_script),
+            deno_launch(deno_script, dir.path()),
+            &registry,
+        )
+        .await;
 
-        // Обе `Ok` — и есть доказательство параллельности: успех означает,
-        // что каждая фикстура дождалась маркера второй, то есть процессы
-        // пересеклись во времени. При последовательном `check_report`
-        // первая ждала бы вторую, которую ещё не запускали, и вышла бы с
-        // ненулевым кодом — независимо от скорости машины.
-        assert_eq!(
-            report.yt_dlp.status,
-            SidecarStatus::Ok,
-            "рандеву не состоялось со стороны yt-dlp: проверки идут не параллельно; stderr: {:?}",
-            report.yt_dlp.stderr_tail
-        );
-        assert_eq!(
-            report.ffmpeg.status,
-            SidecarStatus::Ok,
-            "рандеву не состоялось со стороны ffmpeg: проверки идут не параллельно; stderr: {:?}",
-            report.ffmpeg.stderr_tail
-        );
+        for (name, result) in [
+            ("yt-dlp", &report.yt_dlp),
+            ("ffmpeg", &report.ffmpeg),
+            ("deno", &report.deno),
+        ] {
+            assert_eq!(
+                result.status,
+                SidecarStatus::Ok,
+                "рандеву не состоялось со стороны {name}: проверки идут не параллельно; stderr: {:?}",
+                result.stderr_tail
+            );
+        }
     }
 }

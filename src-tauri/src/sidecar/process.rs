@@ -6,6 +6,7 @@
 //! позволяет тестировать запуск/таймаут/классификацию ошибок на временных
 //! фикстурных скриптах (`tempfile`) без резолва настоящих sidecar-путей.
 
+use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -135,17 +136,43 @@ pub async fn run_cancellable(
     registry: &ChildRegistry,
     handle: &RunHandle,
 ) -> Result<RunOutput, SidecarError> {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
+    run_cancellable_with_env(program, args, &[], timeout, registry, handle).await
+}
 
-    let mut child = command.spawn().map_err(classify_spawn_error)?;
+/// То же, что [`run`], плюс переменные окружения `env`, которые
+/// **добавляются** к унаследованному окружению приложения (TL-110).
+///
+/// Добавляются, а не заменяют: окружение приложения несёт системные
+/// настройки прокси (`HTTP_PROXY` и родня), а CLAUDE.md требует их
+/// уважать; очищенное окружение молча отрезало бы пользователя за
+/// корпоративным прокси.
+///
+/// Первый потребитель — проверка версии deno на служебном экране
+/// (`crate::sidecar::DenoEnv`); тот же механизм нужен запуску yt-dlp
+/// (TL-109), чей потомок deno наследует окружение. Сами переменные
+/// ставятся в одном месте — [`sidecar_command`].
+pub async fn run_with_env(
+    program: &Path,
+    args: &[&str],
+    env: &[(&str, &OsStr)],
+    timeout: Duration,
+    registry: &ChildRegistry,
+) -> Result<RunOutput, SidecarError> {
+    run_cancellable_with_env(program, args, env, timeout, registry, &RunHandle::new()).await
+}
+
+/// Тело [`run_cancellable`] с окружением — см. doc [`run_with_env`].
+async fn run_cancellable_with_env(
+    program: &Path,
+    args: &[&str],
+    env: &[(&str, &OsStr)],
+    timeout: Duration,
+    registry: &ChildRegistry,
+    handle: &RunHandle,
+) -> Result<RunOutput, SidecarError> {
+    let mut child = sidecar_command(program, args, env)
+        .spawn()
+        .map_err(classify_spawn_error)?;
     let pid = child.id();
     if let Some(pid) = pid {
         registry.register(pid);
@@ -232,6 +259,24 @@ pub async fn run_cancellable(
     }
 }
 
+/// Собирает команду запуска sidecar — единственное место, где задаются
+/// общие для всех запусков свойства процесса: пайпы, `kill_on_drop`,
+/// собственная группа процессов на Unix (см. doc [`run`]) и добавочное
+/// окружение (см. doc [`run_with_env`]).
+fn sidecar_command(program: &Path, args: &[&str], env: &[(&str, &OsStr)]) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .envs(env.iter().copied())
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    command
+}
+
 /// Исход запуска, чей stdout читался построчно ([`run_streaming`]).
 ///
 /// Не `RunOutput`, и разница не косметическая: у долгого процесса stdout
@@ -297,17 +342,9 @@ pub async fn run_streaming(
     first_deadline: Instant,
     on_line: &mut (dyn FnMut(&str) -> Option<Instant> + Send),
 ) -> Result<StreamedRun, SidecarError> {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let mut child = command.spawn().map_err(classify_spawn_error)?;
+    let mut child = sidecar_command(program, args, &[])
+        .spawn()
+        .map_err(classify_spawn_error)?;
     let pid = child.id();
     if let Some(pid) = pid {
         registry.register(pid);
@@ -1062,6 +1099,36 @@ mod tests {
             .expect("script must succeed");
 
         assert_eq!(output.stdout.trim(), "--version");
+    }
+
+    #[tokio::test]
+    async fn passes_extra_environment_on_top_of_the_inherited_one() {
+        // Скрипт печатает добавленную переменную и унаследованную `HOME`:
+        // первая проверяет, что окружение доходит до процесса, вторая —
+        // что оно добавляется, а не заменяет окружение приложения (иначе
+        // пропали бы и системные настройки прокси).
+        let dir = tempdir().expect("failed to create temp dir");
+        let script = write_script(
+            &dir,
+            "print-env.sh",
+            "#!/bin/sh\nprintf '%s\\n%s\\n' \"$TUBE_LEAK_TEST_EXTRA\" \"$HOME\"\nexit 0\n",
+            0o755,
+        );
+        let registry = ChildRegistry::new();
+
+        let output = run_with_env(
+            &script,
+            &[],
+            &[("TUBE_LEAK_TEST_EXTRA", OsStr::new("passed"))],
+            Duration::from_secs(20),
+            &registry,
+        )
+        .await
+        .expect("script must succeed");
+
+        let inherited_home = std::env::var("HOME").unwrap_or_default();
+        let lines: Vec<&str> = output.stdout.lines().collect();
+        assert_eq!(lines, ["passed", inherited_home.as_str()]);
     }
 
     #[tokio::test]

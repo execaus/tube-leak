@@ -1,5 +1,5 @@
 //! Типы, пересекающие границу Rust↔TS: результат проверки sidecar-бинарников
-//! (yt-dlp, ffmpeg), ход подготовки yt-dlp при первом запуске (TL-12),
+//! (yt-dlp, ffmpeg, deno), ход подготовки yt-dlp при первом запуске (TL-12),
 //! результат разбора ссылки на ролик (TL-27, эпик E2) и задача скачивания —
 //! фазы, прогресс, классы отказа, формы команд (TL-38, эпик E3).
 //! Объявлены здесь один раз; TS-зеркало в `src/types/` поддерживает точное
@@ -44,7 +44,7 @@ pub enum LaunchFailedReason {
     Other,
 }
 
-/// Результат проверки одного sidecar-бинарника (yt-dlp или ffmpeg).
+/// Результат проверки одного sidecar-бинарника (yt-dlp, ffmpeg или deno).
 ///
 /// Поля, специфичные для конкретного `status`, сериализуются только когда
 /// заполнены (`version` — при `ok`, `reason` — при `launchFailed`,
@@ -75,14 +75,23 @@ pub struct SidecarCheckResult {
     pub duration_ms: Option<u64>,
 }
 
-/// Агрегат результатов проверки обоих sidecar-бинарников, возвращаемый
-/// командой `check_sidecar` (Ф-9 эпика E1).
+/// Агрегат результатов проверки sidecar-бинарников, возвращаемый командой
+/// `check_sidecar` (Ф-9 эпика E1): yt-dlp, ffmpeg и deno — JavaScript-рантайм,
+/// который yt-dlp запускает для YouTube-извлечения (TL-110, #114).
+///
+/// `deno.version` — нормализованная версия из первой строки `deno --version`
+/// (`deno 2.9.6 (stable, …)` даёт `2.9.6`). Одно отличие deno от двух других
+/// строк: если бинарник ответил, но версии в выводе не нашлось, приходит не
+/// `ok` с выводом вместо версии, а `launchFailed` с причиной `other`, и
+/// нераспознанный вывод лежит в `stderrTail`. У yt-dlp и ffmpeg в этом
+/// случае по-прежнему `ok`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "sidecar.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct SidecarCheckReport {
     pub yt_dlp: SidecarCheckResult,
     pub ffmpeg: SidecarCheckResult,
+    pub deno: SidecarCheckResult,
 }
 
 // ───────────────────────── подготовка yt-dlp (TL-12) ─────────────────────────
@@ -2733,6 +2742,7 @@ pub fn stub_report() -> SidecarCheckReport {
     SidecarCheckReport {
         yt_dlp: ok("yt-dlp", "yt-dlp"),
         ffmpeg: ok("ffmpeg", "ffmpeg"),
+        deno: ok("deno", "deno"),
     }
 }
 
@@ -2944,6 +2954,7 @@ mod tests {
 
         assert!(object.contains_key("ytDlp"));
         assert!(object.contains_key("ffmpeg"));
+        assert!(object.contains_key("deno"));
     }
 
     // ───────────────── разбор ссылки на ролик (TL-27) ─────────────────
