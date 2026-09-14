@@ -406,6 +406,9 @@ struct ScriptedFfmpeg {
     /// Содержимое тех же входов в момент склейки (TL-104): по нему видно,
     /// чей поток ушёл в готовый файл, — после склейки входы подчищены.
     input_bytes: StdMutex<Vec<(Vec<u8>, Vec<u8>)>>,
+    /// Что сделать с диском, пока ffmpeg работает, — после чтения входов и до
+    /// записи результата (TL-106: файл потока пропал во время склейки).
+    during: Option<Hook>,
 }
 
 impl ScriptedFfmpeg {
@@ -416,7 +419,13 @@ impl ScriptedFfmpeg {
             calls: AtomicUsize::new(0),
             inputs: StdMutex::new(Vec::new()),
             input_bytes: StdMutex::new(Vec::new()),
+            during: None,
         }
+    }
+
+    fn during(mut self, action: impl Fn() + Send + Sync + 'static) -> Self {
+        self.during = Some(Hook(Arc::new(action)));
+        self
     }
 
     fn merging() -> Self {
@@ -489,6 +498,9 @@ impl FfmpegLauncher for ScriptedFfmpeg {
                     .push((read(video), read(audio)));
             }
 
+            if let Some(hook) = &self.during {
+                (hook.0)();
+            }
             if self.hangs {
                 handle.cancelled().await;
             }
@@ -1094,8 +1106,8 @@ async fn a_title_with_a_percent_and_a_dollar_reaches_a_file_inside_the_destinati
 
 #[tokio::test]
 async fn a_hostile_title_is_still_cleaned_up_after_a_cancel() {
-    // Третье последствие дыры было самым тихим: подчистка ищет по
-    // префиксу в папке назначения, а раскрытое имя лежит в другом месте —
+    // Третье последствие дыры было самым тихим: подчистка ищет рабочие
+    // имена в папке назначения, а раскрытое имя лежит в другом месте —
     // файл остаётся, а панель честно говорит «данные удалены». Сторож
     // именно на это: имя частичного файла обязано быть тем, которое
     // подчистка потом ищет.
@@ -3071,8 +3083,9 @@ fn the_partial_name_is_derived_from_the_title_and_the_link_and_nothing_else() {
 #[test]
 fn a_stream_prefix_cannot_swallow_a_neighbouring_file() {
     // Без точки после идентификатора формата префикс «Название.f» совпал
-    // бы с посторонним «Название.flv» — то есть подчистка удаляла бы
-    // чужой файл.
+    // бы с посторонним «Название.flv», и атрибуция приписывала бы потоку
+    // чужое имя. Подчистку префикс с TL-106 не решает — её держит белый
+    // список рабочих имён (`is_working_name_of`).
     let prefix = stream_prefix("Название", "137");
 
     assert!(!"Название.flv".starts_with(&prefix));
@@ -4016,8 +4029,8 @@ async fn no_hostile_template_or_title_puts_a_file_outside_the_folder_or_into_a_s
         "{title}.part",
         "{title}:{id}*?",
         // Финальное имя под префиксом частичного файла и склейки (B1; с
-        // TL-104 в префиксе id ролика): подчистка на `Done` обязана пощадить
-        // готовый файл.
+        // TL-104 в префиксе id ролика): подчистка на `Done` обязана не
+        // тронуть готовый файл — с TL-106 он не рабочее имя.
         "{id}.{title}.f140.{id}",
         "{id}.{title}.tl-merging.{id}",
     ];
@@ -4407,9 +4420,10 @@ async fn a_template_change_between_starts_does_not_stop_the_resume() {
 #[tokio::test]
 async fn a_final_name_under_a_partial_prefix_survives_the_cleanup_on_done() {
     // Следствие B1: финальное имя строит шаблон независимо от рабочего, и
-    // оно может начинаться с префикса потока или склейки. Подчистка на
-    // `Done` щадит готовый файл — иначе такая настройка удаляла бы каждую
-    // готовую загрузку.
+    // оно может начинаться с префикса потока или склейки. С TL-106 подчистка
+    // удаляет только точные рабочие имена, и такое имя в них не входит;
+    // пощада своего файла (`Cleanup::apply_sparing`) здесь уже не нужна — её
+    // держит `a_finished_file_that_took_the_name_of_a_vanished_stream_survives_the_cleanup_on_done`.
     for (template, video, audio, expected) in [
         (
             "{id}.{title}.f140.{id}",
@@ -5001,8 +5015,8 @@ async fn a_title_carrying_another_videos_stream_prefix_keeps_its_partials() {
 
 #[test]
 fn a_partial_id_never_carries_a_dot_so_its_prefix_is_unambiguous() {
-    // Однозначность префиксов подчистки держится на алфавите id (doc
-    // `remove_by_prefix`). Константная проверка стоит у самого алфавита; здесь —
+    // Однозначность рабочих имён между роликами держится на алфавите id (doc
+    // `PartialId`). Константная проверка стоит у самого алфавита; здесь —
     // что ни одна ссылка не проводит в id ничего вне него, включая точку в
     // позиции id и формы, которые белый список отвергает.
     for byte in 0..=u8::MAX {
@@ -5159,7 +5173,13 @@ fn no_generated_title_puts_another_videos_file_under_our_prefixes() {
                         checks += 1;
                         assert!(
                             !name.starts_with(&stream_prefix(&first, format))
-                                && !name.starts_with(&merge_prefix(&first))
+                                && !is_stream_working_name(
+                                    &first,
+                                    format,
+                                    &UNNAMED_STREAM_EXTENSIONS,
+                                    &name
+                                )
+                                && !is_merge_working_name(&first, &ALL_MERGE_CONTAINERS, &name)
                                 && !is_file_of_stream(&first, format, Path::new(&name)),
                             "имя {name:?} другого ролика под префиксом основы {first:?}, \
                              поток {format}"
@@ -5408,4 +5428,398 @@ async fn a_stream_file_gone_between_the_download_and_the_merge_is_not_merged_and
         sink.last()
     );
     assert_eq!(dir_listing(dir.path()), ["Big Buck Bunny.mp4"]);
+}
+
+// ─────────── Подчистка по точным рабочим именам (TL-106) ───────────
+
+/// Имена, которые yt-dlp пишет для файла потока `<основа>.f<формат>.<расширение>`,
+/// — все формы из замера TL-106 (doc `is_ytdlp_tail`), по одной на форму.
+fn measured_working_names(format_id: &str, extension: &str) -> Vec<String> {
+    let file = stream_name(format_id, extension);
+    vec![
+        file.clone(),
+        format!("{file}.part"),
+        format!("{file}.ytdl"),
+        format!("{file}.part-Frag3"),
+        format!("{file}.part-Frag17.part"),
+        format!("{BASE}.f{format_id}.temp.{extension}"),
+    ]
+}
+
+#[tokio::test]
+async fn a_finished_file_of_another_task_under_a_stream_prefix_survives_the_cleanup_on_done() {
+    // TL-106 (воспроизведение исполнителя TL-105). Шаблон `{id}.{title}.f139`
+    // кладёт готовый файл склейки под префикс потока `<основа>.f139.`. Первая
+    // задача доходит до `Done`; затем тот же ролик качается ещё дважды — в
+    // другом качестве (`134+139`) и в том же (`133+139`). Готовый файл первой
+    // обязан пережить `Done` обеих байт в байт, а каждая запись истории —
+    // ссылаться на существующий файл. Проверка обходом папки.
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let history_data = tempfile::tempdir().unwrap();
+    let history = history_in(history_data.path());
+    let env = env_with(
+        Some(settings_with(data.path(), None, "{id}.{title}.f139", 1)),
+        Some(Arc::clone(&history)),
+        Some(dir.path()),
+    );
+    let first_name = format!("{BASE}.f139.mp4");
+    assert!(
+        first_name.starts_with(&stream_prefix(BASE, "139")),
+        "сценарий обязан класть готовый файл под префикс потока"
+    );
+
+    let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+    let sink = RecordingSink::new();
+    super::run_task(
+        &new_task(request(streams(Some("133"), Some("139")))),
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &env,
+    )
+    .await;
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: first_name.clone(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
+        }
+    );
+    assert_eq!(dir_listing(dir.path()), std::slice::from_ref(&first_name));
+    // Своё содержимое у готового файла первой: подмена другим файлом под тем
+    // же именем была бы видна.
+    const FIRST_BYTES: &[u8] = b"finished file of the first task";
+    std::fs::write(dir.path().join(&first_name), FIRST_BYTES).unwrap();
+
+    let mut expected = vec![(first_name.clone(), FIRST_BYTES.to_vec())];
+    for (video, suffix) in [("134", "(2)"), ("133", "(3)")] {
+        let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+        let sink = RecordingSink::new();
+        super::run_task(
+            &new_task(request(streams(Some(video), Some("139")))),
+            &launcher,
+            &ScriptedFfmpeg::merging(),
+            &sink,
+            &env,
+        )
+        .await;
+        assert_eq!(launcher.formats_asked(), [format!("{video},139")]);
+        let name = format!("{BASE}.f139 {suffix}.mp4");
+        assert_eq!(
+            sink.last(),
+            DownloadProgress::Done {
+                file_name: name.clone(),
+                folder_display: crate::types::FolderDisplay::SystemDownloads,
+            },
+            "видео {video}"
+        );
+        expected.push((name, b"merged bytes".to_vec()));
+        expected.sort();
+        assert_eq!(
+            contents(dir.path()),
+            expected,
+            "после `Done` задачи с видео {video} готовый файл первой на месте и не переписан"
+        );
+    }
+
+    let recorded = records(&history);
+    assert_eq!(recorded.len(), 3);
+    for record in &recorded {
+        let path = record.file_path().expect("у записи есть путь");
+        assert!(
+            path.is_file(),
+            "запись «{}» ссылается на отсутствующий файл",
+            record.file_name
+        );
+    }
+    assert!(recorded.iter().any(|record| record.file_name == first_name));
+}
+
+#[tokio::test]
+async fn a_users_file_under_the_working_stem_survives_the_cleanup_on_cancel_failure_and_done() {
+    // TL-106. Имена, лишь начинающиеся с рабочей основы, — не рабочие.
+    // Подчистка не удаляет их ни на одном исходе, а `Keep` не выдаёт их за
+    // частичное. Среди них — почти-хвосты: номер фрагмента не числом, лишнее
+    // после `.part` и `.ytdl`, `.temp.` с другим расширением, почти-имя склейки.
+    let foreign: Vec<String> = [
+        "f140.заметки.txt",
+        "f140.m4a.bak",
+        "f140.m4a.part.old",
+        "f140.m4a.part-Frag",
+        "f140.m4a.part-Frag3x",
+        "f140.m4a.part-Frag3.part.part",
+        "f140.m4a.ytdl.txt",
+        "f140.temp.txt",
+        "f140.m4a (2).m4a",
+        "f133.заметки.txt",
+        "f139.m4a.part-Frag-1",
+        "tl-merging.заметки.txt",
+        "tl-merging.mp4.part",
+    ]
+    .iter()
+    .map(|tail| format!("{BASE}.{tail}"))
+    .collect();
+    let mut sorted_foreign = foreign.clone();
+    sorted_foreign.sort();
+
+    // (исход, запрос, сценарий, отмена через мс)
+    let cancel_after_naming = |dir: &Path| {
+        Script::ok()
+            .line(&destination_line(dir, &stream_name("140", "m4a")))
+            .creates(&format!("{}.part", stream_name("140", "m4a")))
+            .hangs()
+    };
+    let stale_before_naming = |_: &Path| {
+        Script::failing(1, &fixtures::outcome("stale-format.json").stderr)
+            .creates(&format!("{}.part", stream_name("140", "m4a")))
+    };
+    let lost_without_files = |_: &Path| Script::failing(1, &connection_lost_stderr());
+    let merged = |_: &Path| Script::ok().emulate();
+    type Scenario<'a> = (
+        &'a str,
+        QualityStreams,
+        &'a dyn Fn(&Path) -> Script,
+        Option<u64>,
+    );
+    let scenarios: [Scenario<'_>; 4] = [
+        (
+            "отмена",
+            streams(None, Some("140")),
+            &cancel_after_naming,
+            Some(50),
+        ),
+        (
+            "отказ с удалением",
+            streams(None, Some("140")),
+            &stale_before_naming,
+            None,
+        ),
+        (
+            "отказ с сохранением",
+            streams(None, Some("140")),
+            &lost_without_files,
+            None,
+        ),
+        ("готово", streams(Some("133"), Some("139")), &merged, None),
+    ];
+
+    for (outcome, quality_streams, script, cancel_after) in scenarios {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let env = env_with(
+            Some(settings_with(data.path(), None, "{title}", 1)),
+            None,
+            Some(dir.path()),
+        );
+        for name in &foreign {
+            std::fs::write(dir.path().join(name), b"user bytes").unwrap();
+        }
+        let task = new_task(request(quality_streams));
+        let launcher = ScriptedLauncher::new(dir.path(), vec![script(dir.path())]);
+        if let Some(millis) = cancel_after {
+            let canceller = Arc::clone(&task);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(millis)).await;
+                canceller.cancel().await;
+            });
+        }
+        let sink = RecordingSink::new();
+        super::run_task(&task, &launcher, &ScriptedFfmpeg::merging(), &sink, &env).await;
+
+        let (answer, mut expected) = match sink.last() {
+            DownloadProgress::Cancelled { partial_data } => (partial_data, sorted_foreign.clone()),
+            DownloadProgress::Failed { error } => (error.partial_data, sorted_foreign.clone()),
+            DownloadProgress::Done { file_name, .. } => {
+                let mut names = sorted_foreign.clone();
+                names.push(file_name);
+                (PartialData::Removed, names)
+            }
+            other => panic!("{outcome}: {other:?}"),
+        };
+        expected.sort();
+        let expected_answer = match outcome {
+            "отмена" | "отказ с удалением" | "готово" => {
+                PartialData::Removed
+            }
+            _ => PartialData::NothingCreated,
+        };
+        assert_eq!(
+            answer, expected_answer,
+            "{outcome}: чужое не считается частичным"
+        );
+        assert_eq!(
+            dir_listing(dir.path()),
+            expected,
+            "{outcome}: подчистка тронула имя, которое не рабочее"
+        );
+        for name in &foreign {
+            assert_eq!(
+                std::fs::read(dir.path().join(name)).unwrap(),
+                b"user bytes",
+                "{outcome}: {name} переписан"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_measured_working_name_is_removed_on_cancel_and_on_a_removing_failure() {
+    // TL-106. Все формы имён из замера yt-dlp (doc `is_ytdlp_tail`) и файлы
+    // склейки удаляются: на отмене, когда оба потока названы (расширение —
+    // фактическое, контейнер склейки — точный), и на отказе класса «удалить»
+    // до строки `Destination` (расширения — `UNNAMED_STREAM_EXTENSIONS`, все
+    // контейнеры склейки). Тест намеренно перечисляет каждую форму: убрать
+    // любую из белого списка — и в папке останется её файл.
+    // ── Отмена: потоки названы ──
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let mut script = Script::ok().line(&destination_line(dir.path(), &stream_name("133", "mp4")));
+    for name in measured_working_names("133", "mp4") {
+        script = script.creates(&name);
+    }
+    script = script.line(&destination_line(dir.path(), &stream_name("139", "m4a")));
+    for name in measured_working_names("139", "m4a") {
+        script = script.creates(&name);
+    }
+    let script = script
+        .creates(&working_file_name(BASE, MergeContainer::Mp4))
+        .hangs();
+    assert_eq!(dir_listing(dir.path()), Vec::<String>::new());
+    let launcher = ScriptedLauncher::new(dir.path(), vec![script]);
+    let canceller = Arc::clone(&task);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        canceller.cancel().await;
+    });
+    let sink = RecordingSink::new();
+    run_task(
+        &task,
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        dir.path(),
+    )
+    .await;
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Cancelled {
+            partial_data: PartialData::Removed
+        }
+    );
+    assert_eq!(
+        dir_listing(dir.path()),
+        Vec::<String>::new(),
+        "отмена: осталась рабочая форма, которой нет в белом списке"
+    );
+
+    // ── Отказ с удалением: потоки не названы ──
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let mut script = Script::failing(1, &fixtures::outcome("stale-format.json").stderr);
+    let mut created = 0;
+    for extension in UNNAMED_STREAM_EXTENSIONS {
+        for format_id in ["133", "139"] {
+            for name in measured_working_names(format_id, extension) {
+                script = script.creates(&name);
+                created += 1;
+            }
+        }
+    }
+    for container in ALL_MERGE_CONTAINERS {
+        script = script.creates(&working_file_name(BASE, container));
+        created += 1;
+    }
+    let launcher = ScriptedLauncher::new(dir.path(), vec![script]);
+    let sink = RecordingSink::new();
+    run_task(
+        &task,
+        &launcher,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        dir.path(),
+    )
+    .await;
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("устаревший формат — отказ: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::StaleFormat);
+    assert_eq!(error.partial_data, PartialData::Removed);
+    assert_eq!(created, 3 * 2 * 6 + 3, "корпус имён выродился");
+    assert_eq!(
+        dir_listing(dir.path()),
+        Vec::<String>::new(),
+        "отказ с удалением: осталась рабочая форма, которой нет в белом списке"
+    );
+}
+
+#[tokio::test]
+async fn a_finished_file_that_took_the_name_of_a_vanished_stream_survives_the_cleanup_on_done() {
+    // TL-106, пояс `Cleanup::apply_sparing`. Шаблон `{id}.{title}.f133` у
+    // склейки в mp4 даёт финальное имя `<основа>.f133.mp4` — точное рабочее
+    // имя видеопотока. Файл потока удаляют, пока идёт склейка (ffmpeg его уже
+    // прочёл), финализация занимает освободившееся имя, и подчистка без пощады
+    // удалила бы готовый файл, о котором задача только что сказала «готово».
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let env = env_with(
+        Some(settings_with(data.path(), None, "{id}.{title}.f133", 1)),
+        None,
+        Some(dir.path()),
+    );
+    let video = stream_name("133", "mp4");
+    let video_path = dir.path().join(&video);
+    let ffmpeg =
+        ScriptedFfmpeg::merging().during(move || std::fs::remove_file(&video_path).unwrap());
+    let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+    let sink = RecordingSink::new();
+
+    super::run_task(
+        &new_task(request(streams(Some("133"), Some("139")))),
+        &launcher,
+        &ffmpeg,
+        &sink,
+        &env,
+    )
+    .await;
+
+    assert_eq!(ffmpeg.calls(), 1);
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: video.clone(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
+        },
+        "финализация заняла рабочее имя пропавшего потока"
+    );
+    assert_eq!(
+        contents(dir.path()),
+        [(video, b"merged bytes".to_vec())],
+        "готовый файл на месте, рабочих файлов нет"
+    );
+}
+
+#[test]
+fn every_merge_container_is_a_working_name_of_an_unnamed_merge() {
+    // Состав `ALL_MERGE_CONTAINERS` — все варианты `MergeContainer`. `match`
+    // без `_`: с новым вариантом тест не соберётся, пока его не впишут сюда и
+    // в список.
+    for container in [
+        MergeContainer::Mp4,
+        MergeContainer::Webm,
+        MergeContainer::Mkv,
+    ] {
+        let listed = match container {
+            MergeContainer::Mp4 | MergeContainer::Webm | MergeContainer::Mkv => {
+                ALL_MERGE_CONTAINERS.contains(&container)
+            }
+        };
+        assert!(listed, "{container:?} нет в ALL_MERGE_CONTAINERS");
+        assert!(is_merge_working_name(
+            BASE,
+            &ALL_MERGE_CONTAINERS,
+            &working_file_name(BASE, container)
+        ));
+    }
+    assert_eq!(ALL_MERGE_CONTAINERS.len(), 3);
 }

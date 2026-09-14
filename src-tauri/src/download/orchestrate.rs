@@ -147,10 +147,13 @@
 //!
 //! Раз основы независимы, финальное имя может начинаться с префикса
 //! частичного файла: шаблон `{id}.{title}.f140.{id}` даёт
-//! `<id>.Название.f140.<id>.m4a` под префиксом потока `<id>.Название.f140.`.
-//! Поэтому подчистка на `Done` щадит
-//! только что финализированный файл ([`Cleanup::apply_sparing`]); без этого
-//! такая настройка удаляла бы каждую готовую загрузку.
+//! `<id>.Название.f140.<id>.m4a` под префиксом потока `<id>.Название.f140.`,
+//! а `{id}.{title}.f139` — готовый файл одной задачи под префиксом потока
+//! другой задачи того же ролика. Поэтому подчистка удаляет не всё под
+//! префиксом, а только точные рабочие имена своей задачи — белый список из
+//! кода и замера yt-dlp ([`is_working_name_of`], TL-106). Свой готовый файл
+//! на `Done` она ещё и щадит по имени ([`Cleanup::apply_sparing`]) — на
+//! случай, когда он занял рабочее имя пропавшего потока.
 //!
 //! # Запись в историю (TL-89, Р-1 эпика E5)
 //!
@@ -185,7 +188,10 @@ use super::aggregate::{ProgressAggregator, SampleOutcome};
 use super::classify::{classify_attempt, AttemptOutcome, AttemptVerdict};
 use super::error::{DownloadCommandRejection, DownloadFailure};
 use super::filename::{finalize_in_dir, sanitized_stem};
-use super::merge::{merge_streams, FfmpegLauncher, MergeRequest, MergeVerdict};
+use super::merge::{
+    container_for, merge_streams, working_file_name, FfmpegLauncher, MergeContainer, MergeRequest,
+    MergeVerdict,
+};
 use super::progress::{SampleStatus, StdoutLine, PROGRESS_TEMPLATE};
 use super::retry::{RetryDecision, RetryPolicy};
 use super::PROGRESS_EVENT;
@@ -408,17 +414,17 @@ fn output_template(download_stem: &str) -> String {
     format!("{download_stem}.f%(format_id)s.%(ext)s")
 }
 
-/// Префикс всех файлов одного потока в папке назначения.
+/// Начало имён одного потока в папке назначения: `<основа>.f<формат>.`.
 ///
-/// По нему и подчищается, и проверяется наличие частичного: под этим
-/// префиксом лежат и сам файл (`.mp4`), и незаконченный (`.mp4.part`), и
-/// служебные хвосты фрагментного протокола (`.ytdl`, `.part-Frag17`).
+/// От него строятся атрибуция файла потоку ([`is_file_of_stream`]) и рабочие
+/// имена подчистки ([`is_stream_working_name`]). Само по себе оно ничего не
+/// разрешает удалить: под ним может лежать и чужое — готовый файл с шаблоном
+/// `{id}.{title}.f139`, заметки пользователя (TL-106).
 ///
-/// Точка после идентификатора формата обязательна: без неё префикс
-/// `<id>.Название.f` совпал бы с посторонним `<id>.Название.flv` — то есть
-/// подчистка удаляла бы чужой файл. С ней совпадение требует id ролика,
-/// названия, идентификатора формата и точки подряд. Почему id впереди —
-/// doc [`download_stem`].
+/// Точка после идентификатора формата обязательна: без неё начало
+/// `<id>.Название.f` совпало бы с посторонним `<id>.Название.flv`. С ней
+/// совпадение требует id ролика, названия, идентификатора формата и точки
+/// подряд. Почему id впереди — doc [`download_stem`].
 fn stream_prefix(download_stem: &str, format_id: &str) -> String {
     format!("{download_stem}.f{format_id}.")
 }
@@ -457,16 +463,6 @@ fn is_file_of_stream(download_stem: &str, format_id: &str, path: &Path) -> bool 
     };
     name.strip_prefix(stream_prefix(download_stem, format_id).as_str())
         .is_some_and(|extension| !extension.is_empty() && !extension.contains('.'))
-}
-
-/// Префикс рабочего файла склейки — см. [`crate::download::merge`].
-///
-/// Строится от той же рабочей основы, что и префиксы потоков
-/// ([`download_stem`]): она начинается с id ролика (TL-104), и файл склейки
-/// другого ролика под этот префикс не попадает — ни с тем же названием, ни
-/// с названием, несущим наш id.
-fn merge_prefix(download_stem: &str) -> String {
-    format!("{download_stem}.tl-merging.")
 }
 
 // ─────────────────────── Имя частичного файла ───────────────────────
@@ -560,9 +556,10 @@ const _: () = assert!(PARTIAL_ID_HASH_HEX != 11 && PARTIAL_ID_HASH_HEX % 2 == 0)
 ///
 /// Каждый байт id проходит [`partial_id_byte`] — `[A-Za-z0-9_-]`, — и
 /// точки в этом алфавите нет (проверка при компиляции). На этом стоит
-/// однозначность префиксов подчистки ([`remove_by_prefix`]): рабочая основа
-/// начинается с `<id>.`, и первая точка имени отделяет id целиком. Проверка
-/// стоит здесь, а не только в [`crate::queue::video_id`]: гарантию подчистки
+/// однозначность рабочих имён между роликами ([`is_file_of_stream`],
+/// [`is_working_name_of`]): рабочая основа начинается с `<id>.`, и первая
+/// точка имени отделяет id целиком. Проверка стоит здесь, а не только в
+/// [`crate::queue::video_id`]: гарантию подчистки
 /// не должна отменять правка чужого модуля. Id, который её не прошёл бы,
 /// уходит в запасной вариант, а не в имя.
 struct PartialId(String);
@@ -1015,9 +1012,10 @@ struct TaskWork {
     aggregator: ProgressAggregator,
     jobs: Vec<StreamJob>,
     /// Рабочая основа — [`download_stem`]: `<id ролика>.<название>`. От неё —
-    /// имена частичных файлов потоков, рабочий файл склейки и все префиксы
-    /// подчистки. Строится из запроса при создании задачи и не зависит ни от
-    /// шаблона, ни от даты (doc модуля, «Две основы имени»).
+    /// имена частичных файлов потоков, рабочий файл склейки и белый список
+    /// подчистки ([`is_working_name_of`]). Строится из запроса при создании
+    /// задачи и не зависит ни от шаблона, ни от даты (doc модуля, «Две основы
+    /// имени»).
     download_stem: String,
     /// Папка назначения последнего старта. `None` — задача ещё не
     /// стартовала: имён нет, подчищать нечего.
@@ -1576,13 +1574,14 @@ async fn run_task_with(
     let mut finished = None;
     let progress = match end {
         TaskEnd::Done { file_name } => {
-            // Готовый файл лежит под финальным именем; всё, что от задачи
-            // могло остаться рядом (потоки после склейки, хвосты
-            // фрагментов), — мусор, а Н-4 требует, чтобы штатные исходы
-            // его не оставляли. Сам готовый файл щадится: финальное имя
-            // строит шаблон, и оно может лечь под префикс частичного (doc
-            // модуля, «Две основы имени»). Потоки, принятые как «уже
-            // скачан» у другой задачи того же ролика, удаляются тоже:
+            // Готовый файл лежит под финальным именем; рабочие файлы задачи
+            // рядом (потоки после склейки, хвосты фрагментов) — мусор, а Н-4
+            // требует, чтобы штатные исходы его не оставляли. Удаляются
+            // только точные рабочие имена (TL-106): готовый файл другой
+            // задачи того же ролика под префиксом потока не трогается. Свой
+            // готовый файл щадится на случай точного совпадения с рабочим
+            // именем (doc [`Cleanup::apply_sparing`]). Потоки, принятые как
+            // «уже скачан» у другой задачи того же ролика, удаляются тоже:
             // её повтор перекачает их (TL-105, doc
             // [`forget_streams_missing_on_disk`]).
             Cleanup::Remove.apply_sparing(destination, &work, Some(&file_name));
@@ -2340,7 +2339,8 @@ async fn wait_before_retry(
 /// Что делать с частично скачанным на терминальном переходе.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cleanup {
-    /// Удалить всё, что задача оставила в папке назначения.
+    /// Удалить рабочие файлы задачи в папке назначения — по точным именам
+    /// ([`is_working_name_of`]), не по префиксу (TL-106).
     Remove,
     /// Оставить как есть: повтор продолжит с места.
     Keep,
@@ -2381,21 +2381,27 @@ impl Cleanup {
 
     /// То же, но файл с именем `spare` не трогается и не считается.
     ///
-    /// Нужно одному месту — `Done`: готовый файл лежит в той же папке, а его
-    /// имя строит шаблон независимо от рабочего, и `{id}.{title}.f140.{id}`
-    /// кладёт его под префикс потока `<id>.Название.f140.` (doc модуля).
-    /// Сравнивается имя целиком, не префикс.
+    /// Нужно одному месту — `Done`, и после TL-106 уже не ради префиксов:
+    /// готовый файл, чьё имя лишь начинается с префикса потока
+    /// (`{id}.{title}.f140.{id}`), белый список рабочих имён и так не узнаёт.
+    /// Остаётся точное совпадение. Финальное имя строит шаблон, и
+    /// `{id}.{title}.f133` у склейки в mp4 даёт `<основа>.f133.mp4` — ровно
+    /// рабочее имя видеопотока. Пока файл потока лежит, финализация такое имя
+    /// не займёт (`finalize_in_dir` берёт только свободное) и выберет
+    /// `… (2).mp4`. Но если файл потока пропал за время склейки (его удалили,
+    /// ffmpeg уже держал его открытым), имя свободно, готовый файл ложится
+    /// под рабочее имя, и без пощады подчистка удалила бы только что
+    /// показанный пользователю результат. Сторож —
+    /// `a_finished_file_that_took_the_name_of_a_vanished_stream_survives_the_cleanup_on_done`.
     fn apply_sparing(
         self,
         destination: &Path,
         work: &TaskWork,
         spare: Option<&str>,
     ) -> PartialData {
-        let prefixes = prefixes_of(work);
-
         match self {
             Self::Remove => {
-                let removed = remove_by_prefix(destination, &prefixes, spare);
+                let removed = remove_working_files(destination, work, spare);
                 if removed == 0 {
                     PartialData::NothingCreated
                 } else {
@@ -2403,7 +2409,7 @@ impl Cleanup {
                 }
             }
             Self::Keep => {
-                if exists_by_prefix(destination, &prefixes, spare) {
+                if working_files_exist(destination, work, spare) {
                     PartialData::Kept
                 } else {
                     PartialData::NothingCreated
@@ -2528,55 +2534,186 @@ fn is_file_on_disk(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
-/// Все префиксы, под которыми задача могла оставить файлы.
+/// Расширения файла потока, которого yt-dlp этой задаче не называл (TL-106).
 ///
-/// Строятся от рабочей основы ([`TaskWork::download_stem`]), которая не
-/// зависит ни от шаблона, ни от даты (B1): задача, стартовавшая вчера под
-/// другим шаблоном, узнаёт свои частичные файлы и сегодня. Id ролика в её
-/// начале (TL-104) не даёт узнать своими файлы другого ролика — ни с тем же
-/// названием, ни с названием, в котором стоит наш префикс
-/// ([`remove_by_prefix`]).
-fn prefixes_of(work: &TaskWork) -> Vec<String> {
-    // До первого старта папки нет: подчищать негде и нечего.
-    if work.destination.is_none() {
-        return Vec::new();
+/// Имя известно не всегда, а подчищать надо и тогда: задача, восстановленная
+/// после перезапуска, не помнит имён прошлого сеанса, а классы с решением
+/// «удалить» (`staleFormat`, `videoUnavailable`, `signInRequired`,
+/// `regionBlocked`) всплывают на извлечении — до строки `Destination`.
+/// Вместо фактического расширения тогда берётся этот набор — контейнеры
+/// потоков YouTube по снятым живьём фикстурам разбора
+/// (`tests/fixtures/ytdlp-probe/`, все семь): `mp4` — https-видео и HLS
+/// (видео и звук: разбор считает звуком формат без `acodec`), `m4a` —
+/// https-звук, `webm` — https-видео и звук. `mhtml` там тоже есть, но это
+/// раскадровки: ни видео, ни звука, потоком задачи они не становятся.
+///
+/// Цена набора названа: пока имя не названо, файл
+/// `<id>.<название>.f<формат>.<mp4|m4a|webm>` считается рабочим. Шаблон,
+/// дающий готовому файлу **ровно** такое имя (`{id}.{title}.f139` у склейки
+/// в mp4), теряет его, если другую задачу того же ролика со звуком 139
+/// отменят или она откажет с удалением до того, как yt-dlp назовёт файл.
+/// Имя, лишь начинающееся так же, не трогается.
+const UNNAMED_STREAM_EXTENSIONS: [&str; 3] = ["mp4", "m4a", "webm"];
+
+/// Контейнеры склейки, когда файлы обоих потоков не названы.
+///
+/// Полный список [`MergeContainer`]. Состав сторожит
+/// `every_merge_container_is_a_working_name_of_an_unnamed_merge`: в нём
+/// `match` по вариантам без `_`, и новый вариант не соберётся, пока его не
+/// впишут туда и сюда.
+const ALL_MERGE_CONTAINERS: [MergeContainer; 3] = [
+    MergeContainer::Mp4,
+    MergeContainer::Webm,
+    MergeContainer::Mkv,
+];
+
+/// Служебный хвост yt-dlp после имени файла потока — белый список из замера
+/// (TL-106).
+///
+/// # Замер
+///
+/// Вложенный yt-dlp 2026.08.19 (`binaries/yt-dlp-aarch64-apple-darwin.zip`,
+/// sha256 из `binaries.lock.json`), macOS, 2026-09-14, без обращения к
+/// YouTube: argv — [`DOWNLOAD_ARGS`], `-f`, `-P home:<папка>`, `-o` из
+/// [`output_template`], вместо ссылки — `--load-info-json` с форматами
+/// фикстуры `4k-full-ladder.json`, адреса которых указывают на локальный
+/// сервер; процесс под `sandbox-exec` с запретом исходящей сети, кроме
+/// `localhost`. Листинг папки снимался каждые 20 мс, в итог шло **всё**, что
+/// появлялось за прогон: отмена убивает процесс в любой момент и может
+/// оставить любое промежуточное имя. Для файла потока `N` =
+/// `<основа>.f<формат>.<расширение>`:
+///
+/// | Протокол, исход | Имена за прогон |
+/// |---|---|
+/// | https (и с `http_chunk_size`), успех, `SIGKILL` группы, отказ после 10 повторов | `N.part`, `N` |
+/// | HLS `m3u8_native` и DASH-фрагменты, успех, `SIGKILL` на фрагменте, отказ фрагмента | `N.part`, `N.ytdl`, `N.part-Frag<k>.part`, `N.part-Frag<k>`, `N` |
+/// | ffmpeg в `PATH`, постпроцессор `FixupM4a` (успех и `SIGKILL`) | вдобавок `<основа>.f<формат>.temp.<расширение>` |
+///
+/// Других имён не было ни в одном из 21 прогона. После `SIGKILL` на фрагменте
+/// в папке оставались `N.part`, `N.part-Frag3.part` и `N.ytdl`; после
+/// `SIGKILL` постпроцессора — `N` и `….temp.m4a`. `<k>` — номер фрагмента
+/// десятичными цифрами с единицы.
+///
+/// Хвост `.temp.<расширение>` стоит не после `N`, а внутри, и проверяется в
+/// [`is_stream_working_name`].
+fn is_ytdlp_tail(tail: &str) -> bool {
+    match tail {
+        ".part" | ".ytdl" => true,
+        _ => tail
+            .strip_prefix(".part-Frag")
+            .map(|rest| rest.strip_suffix(".part").unwrap_or(rest))
+            .is_some_and(|index| {
+                !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+            }),
     }
-    let mut prefixes: Vec<String> = work
-        .jobs
-        .iter()
-        .map(|job| stream_prefix(&work.download_stem, &job.format_id))
-        .collect();
-    prefixes.push(merge_prefix(&work.download_stem));
-    prefixes
 }
 
-/// Удаляет из папки всё, что начинается с одного из префиксов, и
+/// Рабочее ли это имя потока `format_id` при одном из расширений
+/// `extensions` (TL-106): сам файл, его хвосты ([`is_ytdlp_tail`]) или
+/// рабочий файл постпроцессора `<основа>.f<формат>.temp.<расширение>`.
+///
+/// Совпадение — имя целиком, а не начало: посторонний
+/// `<основа>.f140.заметки.txt` и готовый файл, чей шаблон начинается с
+/// префикса потока, сюда не проходят.
+fn is_stream_working_name(
+    download_stem: &str,
+    format_id: &str,
+    extensions: &[&str],
+    name: &str,
+) -> bool {
+    let Some(rest) = name.strip_prefix(stream_prefix(download_stem, format_id).as_str()) else {
+        return false;
+    };
+    extensions.iter().any(|extension| {
+        rest.strip_prefix(extension)
+            .is_some_and(|tail| tail.is_empty() || is_ytdlp_tail(tail))
+            || rest.strip_prefix("temp.") == Some(extension)
+    })
+}
+
+/// Рабочее ли это имя файла склейки при одном из контейнеров — точное имя
+/// [`working_file_name`].
+fn is_merge_working_name(download_stem: &str, containers: &[MergeContainer], name: &str) -> bool {
+    containers
+        .iter()
+        .any(|&container| name == working_file_name(download_stem, container))
+}
+
+/// Рабочее ли это имя **этой** задачи — единственное, что подчистка вправе
+/// удалить и что `Keep` считает частичным (TL-106).
+///
+/// Белый список, а не префикс. До TL-106 удалялось всё, что начинается с
+/// `<основа>.f<формат>.` или `<основа>.tl-merging.`, и шаблон
+/// `{id}.{title}.f139` клал готовый файл одной задачи под префикс потока
+/// другой задачи того же ролика: её `Done` удалял его, хотя история на него
+/// ссылалась. Префикс однозначен между роликами (в алфавите id нет точки,
+/// [`partial_id_byte`]), но не отделяет рабочие имена от прочих имён того же
+/// ролика.
+///
+/// Имена строятся от рабочей основы ([`TaskWork::download_stem`]), которая не
+/// зависит ни от шаблона, ни от даты (B1):
+///
+/// - **потоки** — [`is_stream_working_name`] для каждого потока задачи, с
+///   фактическим расширением из имени, которое назвал yt-dlp (`Destination`
+///   или `has already been downloaded`), а без него — с
+///   [`UNNAMED_STREAM_EXTENSIONS`];
+/// - **склейка** — только у задачи с двумя потоками: точное имя при
+///   контейнере, который [`container_for`] даёт названным файлам (им и
+///   склеивали), а пока хоть один не назван — при любом из
+///   [`ALL_MERGE_CONTAINERS`]. У задачи с одним потоком склейки не бывает, и
+///   `{id}.{title}.tl-merging` с её `.webm` рабочим именем не считается.
+fn is_working_name_of(work: &TaskWork, name: &str) -> bool {
+    let stem = work.download_stem.as_str();
+    let stream = work.jobs.iter().any(|job| {
+        match job
+            .file
+            .as_deref()
+            .and_then(|file| named_extension(stem, &job.format_id, file))
+        {
+            Some(extension) => is_stream_working_name(stem, &job.format_id, &[extension], name),
+            None => is_stream_working_name(stem, &job.format_id, &UNNAMED_STREAM_EXTENSIONS, name),
+        }
+    });
+    if stream {
+        return true;
+    }
+
+    let file_of = |kind: DownloadStream| work.jobs.iter().find(|job| job.stream == kind);
+    let (Some(video), Some(audio)) = (
+        file_of(DownloadStream::Video),
+        file_of(DownloadStream::Audio),
+    ) else {
+        return false;
+    };
+    match (&video.file, &audio.file) {
+        (Some(video), Some(audio)) => {
+            is_merge_working_name(stem, &[container_for(video, audio)], name)
+        }
+        _ => is_merge_working_name(stem, &ALL_MERGE_CONTAINERS, name),
+    }
+}
+
+/// Расширение из имени файла потока, которое назвал yt-dlp: то, что стоит
+/// после префикса потока. Приписанный файл его имеет по построению
+/// ([`is_file_of_stream`]); не совпавший — `None`.
+fn named_extension<'a>(download_stem: &str, format_id: &str, file: &'a Path) -> Option<&'a str> {
+    if !is_file_of_stream(download_stem, format_id, file) {
+        return None;
+    }
+    file.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(stream_prefix(download_stem, format_id).as_str()))
+}
+
+/// Удаляет из папки рабочие файлы задачи ([`is_working_name_of`]) и
 /// возвращает число удалённого.
 ///
-/// Обходом каталога, а не перечислением известных путей: yt-dlp
-/// дописывает к имени `.part`, `.ytdl` и хвосты фрагментов, и держать их
-/// список у себя значило бы отставать от него на каждую его правку.
-///
-/// # Что гарантирует префикс, а что нет
-///
-/// Префикс — `<id>.<название>.f<формат>.` или `<id>.<название>.tl-merging.`
-/// ([`prefixes_of`]). Гарантия одна и держится на одном свойстве: **в
-/// алфавите id нет точки** ([`partial_id_byte`], проверка при компиляции).
-/// Всякое имя, которое приложение строит для ролика, начинается с
-/// `<его id>.`, и первая точка отделяет id целиком. Значит имя другого
-/// ролика начинается с этого префикса, только если id совпали, то есть это
-/// тот же ролик, — что бы ни стояло в названии. Название точку содержать
-/// может, и до ревью TL-104 (S1), когда id стоял после названия, ролик с
-/// названием `Трейлер.aqz-KE-bpKQ.f139` терял частичные файлы на подчистке
-/// ролика «Трейлер».
-///
-/// Чего префикс не гарантирует: файлы, которые положило в папку не
-/// приложение, и файлы того же ролика, построенные под другим названием,
-/// под префикс попасть могут.
-fn remove_by_prefix(destination: &Path, prefixes: &[String], spare: Option<&str>) -> usize {
+/// Обходом каталога: хвосты фрагментов нумерованы, и их имена заранее не
+/// перечислить. Удаляется только то, что совпало с рабочей формой целиком.
+fn remove_working_files(destination: &Path, work: &TaskWork, spare: Option<&str>) -> usize {
     let mut removed = 0;
 
-    for path in entries_by_prefix(destination, prefixes, spare) {
+    for path in working_entries(destination, work, spare) {
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 removed += 1;
@@ -2594,11 +2731,19 @@ fn remove_by_prefix(destination: &Path, prefixes: &[String], spare: Option<&str>
     removed
 }
 
-fn exists_by_prefix(destination: &Path, prefixes: &[String], spare: Option<&str>) -> bool {
-    !entries_by_prefix(destination, prefixes, spare).is_empty()
+fn working_files_exist(destination: &Path, work: &TaskWork, spare: Option<&str>) -> bool {
+    !working_entries(destination, work, spare).is_empty()
 }
 
-fn entries_by_prefix(destination: &Path, prefixes: &[String], spare: Option<&str>) -> Vec<PathBuf> {
+/// Рабочие файлы задачи в папке, кроме `spare`.
+///
+/// Имя, не представимое в UTF-8, рабочим не бывает: рабочие имена строятся
+/// из строк. Каталог — тоже: yt-dlp и склейка пишут только файлы.
+fn working_entries(destination: &Path, work: &TaskWork, spare: Option<&str>) -> Vec<PathBuf> {
+    // До первого старта папки нет: подчищать негде и нечего.
+    if work.destination.is_none() {
+        return Vec::new();
+    }
     let Ok(entries) = std::fs::read_dir(destination) else {
         // Папка исчезла или недоступна: удалять и нечего, и нечем.
         return Vec::new();
@@ -2608,11 +2753,12 @@ fn entries_by_prefix(destination: &Path, prefixes: &[String], spare: Option<&str
         .flatten()
         .filter(|entry| {
             let name = entry.file_name();
-            let name = name.to_string_lossy();
-            spare != Some(name.as_ref())
-                && prefixes
-                    .iter()
-                    .any(|prefix| name.starts_with(prefix.as_str()))
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            spare != Some(name)
+                && is_working_name_of(work, name)
+                && entry.file_type().is_ok_and(|kind| !kind.is_dir())
         })
         .map(|entry| entry.path())
         .collect()
