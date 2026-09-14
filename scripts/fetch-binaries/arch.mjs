@@ -39,6 +39,9 @@ const FAT_ARCH_64_SIZE = 32
  */
 const MAX_FAT_ARCHS = 32
 const CPU_ARCH_ABI64 = 0x01000000
+/** Длина mach_header (32-битный magic) и mach_header_64. */
+const MACH_HEADER_SIZE = 28
+const MACH_HEADER_64_SIZE = 32
 
 /** @type {ReadonlyMap<number, string>} cputype → имя архитектуры в терминах троек */
 const MACHO_CPU_TYPES = new Map([
@@ -110,14 +113,17 @@ export async function readExecutableHeader(filePath) {
     throw new Error(`reading executable header of ${filePath}: ${err.message}`, { cause: err })
   })
   try {
-    const head = Buffer.alloc(HEAD_BYTES)
-    const { bytesRead } = await handle.read(head, 0, HEAD_BYTES, 0)
-    const bytes = head.subarray(0, bytesRead)
+    // Ошибка чтения тоже называет путь: `open` на каталоге удаётся, и
+    // голое «EISDIR: illegal operation on a directory, read» не сказало бы,
+    // какой из трёх sidecar оказался каталогом.
     const readAt = async (position, length) => {
       const buffer = Buffer.alloc(length)
-      const { bytesRead: got } = await handle.read(buffer, 0, length, position)
+      const { bytesRead: got } = await handle.read(buffer, 0, length, position).catch((err) => {
+        throw new Error(`reading executable header of ${filePath}: ${err.message}`, { cause: err })
+      })
       return buffer.subarray(0, got)
     }
+    const bytes = await readAt(0, HEAD_BYTES)
     return await parseHeader(bytes, readAt, filePath)
   } finally {
     await handle.close()
@@ -190,11 +196,15 @@ async function parseHeader(bytes, readAt, filePath) {
       // Срез сверяется со своей записью в fat-заголовке: заголовок, который
       // обещает arm64, а указывает на x86_64-срез, — не universal-файл, а
       // битый, и доверять его оглавлению нельзя.
-      const slice = parseThinMachO(await readAt(offset, 8))
+      const sliceBytes = await readAt(offset, MACH_HEADER_64_SIZE)
+      const slice = parseThinMachO(sliceBytes)
       if (slice === null || slice.cputype !== cputype) {
         throw unrecognised(
           `fat slice ${i} at offset ${offset} does not match its header entry (cputype 0x${cputype.toString(16)})`,
         )
+      }
+      if (sliceBytes.length < slice.headerSize) {
+        throw unrecognised(`fat slice ${i} at offset ${offset} has a truncated Mach-O header`)
       }
       archs.push(slice.arch)
     }
@@ -202,14 +212,24 @@ async function parseHeader(bytes, readAt, filePath) {
   }
 
   const thin = parseThinMachO(bytes)
-  if (thin !== null) return { format: 'mach-o', archs: [thin.arch] }
+  if (thin !== null) {
+    // Magic и cputype умещаются в 8 байт, но файл такой длины — не
+    // исполняемый, а обрывок: без полного mach_header его не загрузит ни
+    // один загрузчик.
+    if (bytes.length < thin.headerSize) {
+      throw unrecognised(`truncated Mach-O header (${bytes.length} of ${thin.headerSize} bytes)`)
+    }
+    return { format: 'mach-o', archs: [thin.arch] }
+  }
 
   throw unrecognised('unknown magic')
 }
 
 /**
- * @param {Buffer} bytes не меньше 8 байт начала среза
- * @returns {{ cputype: number; arch: string } | null}
+ * @param {Buffer} bytes начало среза (magic и cputype — первые 8 байт)
+ * @returns {{ cputype: number; arch: string; headerSize: number } | null}
+ *   `headerSize` — длина полного mach_header для этого magic; сверять её с
+ *   длиной файла — дело вызывающего.
  */
 function parseThinMachO(bytes) {
   if (bytes.length < 8) return null
@@ -227,7 +247,7 @@ function parseThinMachO(bytes) {
   }
   let arch = MACHO_CPU_TYPES.get(cputype) ?? `unknown (cputype 0x${cputype.toString(16)})`
   if ((cputype & CPU_ARCH_ABI64) !== 0 && !is64Header) arch = `${arch} (32-bit header)`
-  return { cputype, arch }
+  return { cputype, arch, headerSize: is64Header ? MACH_HEADER_64_SIZE : MACH_HEADER_SIZE }
 }
 
 /**
@@ -236,6 +256,10 @@ function parseThinMachO(bytes) {
  *
  * У fat Mach-O достаточно, чтобы среди срезов была нужная архитектура:
  * universal2-сборка (yt-dlp_macos) законно обслуживает обе macOS-тройки.
+ *
+ * О судьбе файла сообщение не говорит ничего: функция его не удаляет и не
+ * знает, кто её зовёт. «no file left in place» дописывает `installBinary`,
+ * которая за это отвечает.
  *
  * @param {string} filePath
  * @param {string} target
@@ -248,7 +272,7 @@ export async function verifyExecutableArch(filePath, target, label = filePath) {
   if (actual.format !== expected.format || !actual.archs.includes(expected.arch)) {
     throw new Error(
       `architecture mismatch for ${label}: target ${target} expects ${expected.format} ${expected.arch}, ` +
-        `got ${actual.format} ${actual.archs.join(' + ')} — aborting, no file left in place`,
+        `got ${actual.format} ${actual.archs.join(' + ')}`,
     )
   }
   return actual

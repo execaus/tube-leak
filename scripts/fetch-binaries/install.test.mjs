@@ -130,7 +130,7 @@ describe('installBinary — direct binary entries (no archive)', () => {
     const fetchImpl = async () => new Response(content)
 
     await expect(installBinary(entry, outDir, TARGET, { fetchImpl })).rejects.toThrow(
-      /architecture mismatch for deno-x86_64-apple-darwin: target x86_64-apple-darwin expects mach-o x86_64, got mach-o aarch64/,
+      /architecture mismatch for deno-x86_64-apple-darwin: target x86_64-apple-darwin expects mach-o x86_64, got mach-o aarch64 — aborting, no file left in place$/,
     )
     expect(await readdir(outDir)).toStrictEqual([])
   })
@@ -275,5 +275,47 @@ describe('installBinary — archive entries', () => {
 
     const entries = await readdir(outDir)
     expect(entries).toStrictEqual([])
+  })
+})
+
+// TL-112: у deno `sha256` пина — сумма архива; извлечённый бинарник
+// сверяется отдельным полем с суммой, которую апстрим публикует для него.
+describe('installBinary — binarySha256 of the file that is placed', () => {
+  async function denoEntry(member, binarySha256) {
+    const archiveBytes = await buildZipFixture({ deno: member })
+    return {
+      entry: {
+        url: 'https://example.invalid/deno.zip',
+        sha256: sha256Of(archiveBytes),
+        binarySha256,
+        binaryName: 'deno-x86_64-apple-darwin',
+        archive: { type: 'zip', member: 'deno' },
+      },
+      fetchImpl: async () => new Response(archiveBytes),
+    }
+  }
+
+  it('places the extracted binary when its sum matches binarySha256', async () => {
+    const member = machoThin('x86_64')
+    const { entry, fetchImpl } = await denoEntry(member, sha256Of(member))
+
+    const finalPath = await installBinary(entry, outDir, TARGET, { fetchImpl })
+
+    await expect(readFile(finalPath)).resolves.toStrictEqual(member)
+  })
+
+  it('refuses an extracted binary that differs from binarySha256 although the archive sum matches, leaving nothing', async () => {
+    // Архив совпал с пином, а внутри не тот бинарник (другая сборка той же
+    // архитектуры): до TL-112 такое проходило обе прежние проверки.
+    const member = machoThin('x86_64')
+    const pinned = 'e'.repeat(64)
+    const { entry, fetchImpl } = await denoEntry(member, pinned)
+
+    await expect(installBinary(entry, outDir, TARGET, { fetchImpl })).rejects.toThrow(
+      new RegExp(
+        `binarySha256 mismatch for deno-x86_64-apple-darwin .*expected ${pinned}, got ${sha256Of(member)} — aborting, no file left in place`,
+      ),
+    )
+    expect(await readdir(outDir)).toStrictEqual([])
   })
 })

@@ -3,8 +3,16 @@
 // разбор, плюс немного хвоста. Не тест сам по себе — vitest подхватывает
 // только *.test.mjs.
 
-const MACHO_CPU = { x86: 7, arm: 12, x86_64: 0x01000007, aarch64: 0x0100000c }
-const ELF_MACHINE = { x86: 3, arm: 40, x86_64: 62, aarch64: 183 }
+const MACHO_CPU = {
+  x86: 7,
+  arm: 12,
+  x86_64: 0x01000007,
+  aarch64: 0x0100000c,
+  arm64_32: 0x0200000c,
+  powerpc: 18,
+  powerpc64: 0x01000012,
+}
+const ELF_MACHINE = { x86: 3, arm: 40, x86_64: 62, aarch64: 183, powerpc: 20, powerpc64: 21 }
 const PE_MACHINE = { x86: 0x014c, arm: 0x01c4, x86_64: 0x8664, aarch64: 0xaa64 }
 
 function known(table, arch) {
@@ -13,11 +21,25 @@ function known(table, arch) {
   return value
 }
 
-/** Thin 64-битный little-endian Mach-O. */
-export function machoThin(arch) {
+/**
+ * Thin Mach-O. По умолчанию 64-битный little-endian — как у всех
+ * настоящих macOS-бинарников под наши тройки.
+ *
+ * @param {string} arch
+ * @param {{ bits?: 32 | 64; endian?: 'little' | 'big' }} [options]
+ *   `bits` — magic MH_MAGIC (32) или MH_MAGIC_64; `endian` — порядок байт
+ *   всего заголовка (big — MH_CIGAM*, как у PowerPC-сборок).
+ */
+export function machoThin(arch, { bits = 64, endian = 'little' } = {}) {
   const bytes = Buffer.alloc(64)
-  bytes.writeUInt32LE(0xfeedfacf, 0)
-  bytes.writeUInt32LE(known(MACHO_CPU, arch), 4)
+  const magic = bits === 32 ? 0xfeedface : 0xfeedfacf
+  if (endian === 'big') {
+    bytes.writeUInt32BE(magic, 0)
+    bytes.writeUInt32BE(known(MACHO_CPU, arch), 4)
+  } else {
+    bytes.writeUInt32LE(magic, 0)
+    bytes.writeUInt32LE(known(MACHO_CPU, arch), 4)
+  }
   return bytes
 }
 
@@ -48,12 +70,24 @@ export function machoFat(archs, { lie } = {}) {
   return bytes
 }
 
-/** ELF, little-endian; `elfClass` 2 — 64 бит, 1 — 32 бит. */
-export function elf(arch, { elfClass = 2 } = {}) {
+/**
+ * ELF; `elfClass` 2 — 64 бит, 1 — 32 бит; `endian` — EI_DATA и порядок байт
+ * полей заголовка.
+ *
+ * @param {string} arch
+ * @param {{ elfClass?: 1 | 2; endian?: 'little' | 'big' }} [options]
+ */
+export function elf(arch, { elfClass = 2, endian = 'little' } = {}) {
   const bytes = Buffer.alloc(64)
-  bytes.set([0x7f, 0x45, 0x4c, 0x46, elfClass, 1, 1], 0)
-  bytes.writeUInt16LE(2, 16) // e_type ET_EXEC
-  bytes.writeUInt16LE(known(ELF_MACHINE, arch), 18)
+  const big = endian === 'big'
+  bytes.set([0x7f, 0x45, 0x4c, 0x46, elfClass, big ? 2 : 1, 1], 0)
+  if (big) {
+    bytes.writeUInt16BE(2, 16) // e_type ET_EXEC
+    bytes.writeUInt16BE(known(ELF_MACHINE, arch), 18)
+  } else {
+    bytes.writeUInt16LE(2, 16)
+    bytes.writeUInt16LE(known(ELF_MACHINE, arch), 18)
+  }
   return bytes
 }
 

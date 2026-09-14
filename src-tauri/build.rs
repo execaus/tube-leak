@@ -66,12 +66,27 @@
 //! класс дефектов («видно только на собранном бандле») дважды провалил
 //! приёмку E1, поэтому проверка стоит на сборке.
 //!
-//! Сверяется только yt-dlp. У ffmpeg sha256 в пине — это сумма скачанного
-//! архива, из которого извлекается один файл (см. `scripts/fetch-binaries`),
-//! то есть сравнивать её с тем, что лежит в `binaries/`, нечем; его
-//! резолвит и копирует `externalBin` мимо этого скрипта.
+//! # Сверка deno
 //!
-//! У сверки есть ровно одна форточка: `TUBE_LEAK_ALLOW_STUB_YTDLP=1`. Она
+//! Тем же порядком сверяется распакованный deno (TL-112). Его резолвит и
+//! копирует `externalBin` мимо этого скрипта, и без сверки при настоящих
+//! yt-dlp и ffmpeg и заглушке на месте deno `.dmg` собрался бы с текстовым
+//! файлом на 68 байт в `Contents/MacOS/deno`. У записи deno `sha256` — сумма
+//! zip-архива апстрима, из которого бинарник извлекается, поэтому с файлом
+//! в `binaries/` сравнивается отдельное поле `binarySha256`: сумма самого
+//! бинарника, которую апстрим публикует ассетом `deno-<тройка>.sha256sum`.
+//!
+//! Решение «совпал / нет / можно ли продолжать» у обоих файлов общее и
+//! лежит в `build_support/pinned_file.rs`: билд-скрипт `cargo test` не
+//! видит, а тот же файл, подключённый в `tests/build_pinned_file.rs`, —
+//! видит. Здесь только проводка: откуда путь и сумма, паника или
+//! предупреждение.
+//!
+//! ffmpeg не сверяется: его сборщики публикуют только суммы архивов, из
+//! которых извлекается один файл (см. `scripts/fetch-binaries`), и
+//! сравнивать с тем, что лежит в `binaries/`, нечем.
+//!
+//! У обеих сверок одна форточка: `TUBE_LEAK_ALLOW_STUB_YTDLP=1`. Она
 //! нужна затем, что `cargo test` в свежем клоне без настоящего архива не
 //! собирается вовсе (`tauri_build::build()` падает на отсутствующем
 //! ресурсе), а качать 150 МиБ ассетов ради тестов, которые yt-dlp не
@@ -82,21 +97,27 @@
 //! случай, ради которого проверка и заводилась, и переменная, забытая в
 //! профиле оболочки, не должна его открывать.
 
+#[path = "build_support/pinned_file.rs"]
+mod pinned_file;
+
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
-use sha2::{Digest, Sha256};
+use pinned_file::{PinnedFile, StubPolicy, Verdict, ALLOW_STUB_ENV};
 
 /// Имя, под которым onedir-архив yt-dlp кладётся в ресурсы бандла.
 /// Должно совпадать с `bundle.resources` в `tauri.conf.json` и с
 /// `crate::ytdlp::BUNDLED_ARCHIVE_RESOURCE`.
 const RESOURCE_RELATIVE_PATH: &str = "resources/yt-dlp.zip";
 
-/// Переменная, разрешающая собрать НЕ релизный профиль с архивом, не
-/// совпадающим с пином, — см. doc модуля.
-const ALLOW_STUB_ENV: &str = "TUBE_LEAK_ALLOW_STUB_YTDLP";
+/// Чем оборачивается не тот архив yt-dlp у пользователя — для текста отказа.
+const YTDLP_CONSEQUENCE: &str =
+    "Собрался бы бандл, который развалится у пользователя на распаковке yt-dlp";
+
+/// Чем оборачивается не тот deno у пользователя — для текста отказа.
+const DENO_CONSEQUENCE: &str = "Собрался бы бандл, в котором под именем deno лежит этот файл: \
+     yt-dlp не сможет решать JS-челленджи YouTube, и у пользователя пропадёт часть форматов";
 
 fn main() {
     println!("cargo:rerun-if-changed=binaries.lock.json");
@@ -107,7 +128,18 @@ fn main() {
     );
     let target = env::var("TARGET").expect("TARGET is always set by cargo for build scripts");
 
-    let pin = YtDlpPin::load(&manifest_dir.join("binaries.lock.json"), &target);
+    let pin_path = manifest_dir.join("binaries.lock.json");
+    let raw_pin = fs::read_to_string(&pin_path).unwrap_or_else(|err| {
+        panic!("failed to read {}: {err}", pin_path.display());
+    });
+    let pin = YtDlpPin::load(&pin_path, &raw_pin, &target);
+
+    // `PROFILE` — `release` у всех профилей, наследующих release, то есть
+    // у `tauri build`; форточка там не действует (см. doc модуля).
+    let policy = StubPolicy {
+        release: env::var("PROFILE").as_deref() == Ok("release"),
+        stub_allowed: env::var(ALLOW_STUB_ENV).as_deref() == Ok("1"),
+    };
 
     println!("cargo:rustc-env=TUBE_LEAK_YTDLP_VERSION={}", pin.version);
     println!("cargo:rustc-env=TUBE_LEAK_YTDLP_SHA256={}", pin.sha256);
@@ -130,9 +162,43 @@ fn main() {
     let destination = manifest_dir.join(RESOURCE_RELATIVE_PATH);
     println!("cargo:rerun-if-changed={}", destination.display());
 
-    place_archive(&source, &destination, &pin.sha256);
+    place_archive(&source, &destination, &pin.sha256, policy);
+
+    // deno — sidecar из `externalBin`, его кладёт в бандл сама Tauri, так
+    // что здесь только сверка, без копирования (см. «Сверка deno»).
+    let deno = pinned_file::pinned_binary(&raw_pin, "deno", &target)
+        .unwrap_or_else(|err| panic!("{}: {err}", pin_path.display()));
+    let deno_path = manifest_dir.join("binaries").join(&deno.binary_name);
+    println!("cargo:rerun-if-changed={}", deno_path.display());
+    check_pinned_file(
+        &PinnedFile {
+            tool: "deno",
+            path: &deno_path,
+            expected_sha256: &deno.binary_sha256,
+            consequence: DENO_CONSEQUENCE,
+        },
+        policy,
+    );
 
     tauri_build::build()
+}
+
+/// Проводит решение [`pinned_file::verify_pinned_file`] в сборку: отказ —
+/// паника билд-скрипта, предупреждения — `cargo:warning`. Возвращает, есть
+/// ли файл, с которым можно работать дальше.
+fn check_pinned_file(file: &PinnedFile<'_>, policy: StubPolicy) -> bool {
+    match pinned_file::verify_pinned_file(file, policy) {
+        Ok(Verdict::Verified) => true,
+        Ok(Verdict::StubTolerated { warning }) => {
+            println!("cargo:warning={}", warning.replace('\n', " "));
+            true
+        }
+        Ok(Verdict::Missing { warning }) => {
+            println!("cargo:warning={}", warning.replace('\n', " "));
+            false
+        }
+        Err(refusal) => panic!("{refusal}"),
+    }
 }
 
 /// Начало адреса, которым обязан быть пин yt-dlp (Н-1 эпика E6).
@@ -164,11 +230,8 @@ struct YtDlpPin {
 }
 
 impl YtDlpPin {
-    fn load(pin_path: &Path, target: &str) -> Self {
-        let raw = fs::read_to_string(pin_path).unwrap_or_else(|err| {
-            panic!("failed to read {}: {err}", pin_path.display());
-        });
-        let pin: Pin = serde_json::from_str(&raw).unwrap_or_else(|err| {
+    fn load(pin_path: &Path, raw: &str, target: &str) -> Self {
+        let pin: Pin = serde_json::from_str(raw).unwrap_or_else(|err| {
             panic!("failed to parse {}: {err}", pin_path.display());
         });
 
@@ -261,51 +324,24 @@ struct PinEntry {
 /// А вот исходник, который есть, но не тот — обрывает: см. «Сверка архива
 /// с пином» в doc модуля. Отсутствие файла ещё поймает бандлер, подмену
 /// содержимого не поймает никто.
-fn place_archive(source: &Path, destination: &Path, expected_sha256: &str) {
+fn place_archive(source: &Path, destination: &Path, expected_sha256: &str, policy: StubPolicy) {
     let _ = fs::remove_file(destination);
-
-    let Ok(source_metadata) = fs::metadata(source) else {
-        println!(
-            "cargo:warning=yt-dlp archive {} not found — run `npm run fetch-binaries` before building the bundle",
-            source.display()
-        );
-        return;
-    };
 
     // Сверка с пином заодно закрывает и пустой, и обрезанный архив: ни
     // один из них по сумме не пройдёт, отдельной проверки на непустоту не
     // нужно.
-    let actual_sha256 = sha256_file(source).unwrap_or_else(|err| {
-        panic!("failed to read {} for sha256: {err}", source.display());
-    });
-    if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
-        let release = env::var("PROFILE").as_deref() == Ok("release");
-        let stub_allowed = env::var(ALLOW_STUB_ENV).as_deref() == Ok("1");
-
-        assert!(
-            stub_allowed && !release,
-            "{path} не соответствует пину binaries.lock.json:\n  \
-             ожидалось sha256 {expected_sha256}\n  \
-             получено   {actual_sha256} ({size} байт)\n\
-             Под этим именем лежит не тот архив: заглушка \
-             `node scripts/ci/stub-binaries.mjs`, недокачанный файл или архив \
-             от другой версии пина. Собрался бы бандл, который развалится у \
-             пользователя на распаковке yt-dlp, поэтому сборка остановлена.\n\
-             Что делать: удалить файл и запустить доставку — \
-             `npm run fetch-binaries`. Если это заглушка и нужен только \
-             `cargo test`/`cargo clippy` — {ALLOW_STUB_ENV}=1 (в профиле \
-             release не действует).",
-            path = source.display(),
-            size = source_metadata.len(),
-        );
-
-        println!(
-            "cargo:warning={} не соответствует пину binaries.lock.json ({} байт вместо архива yt-dlp); \
-             продолжаю, потому что задано {ALLOW_STUB_ENV}=1. Собранный так бандл нерабочий.",
-            source.display(),
-            source_metadata.len(),
-        );
+    let archive = PinnedFile {
+        tool: "yt-dlp",
+        path: source,
+        expected_sha256,
+        consequence: YTDLP_CONSEQUENCE,
+    };
+    if !check_pinned_file(&archive, policy) {
+        return;
     }
+    let source_len = fs::metadata(source)
+        .map(|metadata| metadata.len())
+        .unwrap_or_else(|err| panic!("failed to stat {}: {err}", source.display()));
 
     let parent = destination
         .parent()
@@ -334,34 +370,9 @@ fn place_archive(source: &Path, destination: &Path, expected_sha256: &str) {
         .unwrap_or_default();
     assert_eq!(
         placed,
-        source_metadata.len(),
+        source_len,
         "{} получился другого размера, чем {} — копирование не состоялось",
         destination.display(),
         source.display()
     );
-}
-
-/// Считает sha256 файла потоково.
-///
-/// Потоково, а не `fs::read`: архив yt-dlp — 54 МиБ, и держать его целиком
-/// в памяти билд-скрипта незачем. Буфер 64 КиБ — обычный компромисс между
-/// числом системных вызовов и размером стековой/кучевой памяти.
-fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 64 * 1024];
-
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
 }
