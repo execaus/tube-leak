@@ -1247,6 +1247,41 @@ mod tests {
         assert_eq!(row.status, SidecarStatus::Ok);
     }
 
+    #[tokio::test]
+    async fn a_check_that_finds_no_path_does_not_make_the_session_forget() {
+        // TL-66: сброс памяти — только после **своего** запуска по
+        // найденному пути (`launched_itself`). «Пути нет» бывает законно —
+        // проверка экрана пришла раньше конца первой подготовки, — и сброс
+        // на нём заставил бы подготовку пробовать дерево второй раз (TL-23).
+        let start = warm_start().await;
+        let session = Session::new();
+        start.prepare(&session).await;
+        let before = start.control.launches();
+
+        let report = check_report_in_session(
+            &session,
+            Err(SidecarError::NotFound),
+            Err(SidecarError::NotFound),
+            Err(SidecarError::NotFound),
+            &start.registry,
+        )
+        .await;
+        assert_eq!(report.yt_dlp.status, SidecarStatus::NotFound);
+        assert!(
+            session.remembers_anything(),
+            "«пути нет» не повод забывать подготовку"
+        );
+
+        // Следующая дверь в подготовку — тёплый старт без второй пробы.
+        let again = start.prepare(&session).await;
+        assert!(!again.prepared, "подготовка отвечает из памяти");
+        assert_eq!(
+            start.control.launches() - before,
+            0,
+            "«пути нет» не должно давать второй пробы дерева"
+        );
+    }
+
     #[test]
     fn the_log_of_unrecognized_output_is_bounded_by_the_tail_limit() {
         // Остаток ревью TL-110: в лог уходил весь stdout.
