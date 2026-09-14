@@ -539,8 +539,8 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
       name: 'deno',
       path: '/opt/tube-leak/bin/deno',
       status: 'launchFailed',
-      reason: 'other',
-      stderrTail: 'deno: command not found in PATH shim',
+      reason: 'unrecognizedOutput',
+      stderrTail: 'Deno 1.0\n',
     }
     routeInvoke({
       prepare_ytdlp: () => Promise.resolve(preparedWarm),
@@ -550,7 +550,7 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     const wrapper = mount(App)
     await flushPromises()
 
-    expect(wrapper.text()).toContain('не удалось запустить')
+    expect(wrapper.text()).toContain('неожиданный ответ')
 
     // `stderrTail` живёт в свёрнутом по умолчанию блоке «Подробнее»
     // (`SidecarStatusRow`, doc `details`) — раскрываем его тем же приёмом,
@@ -558,7 +558,7 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
     const detailsButton = wrapper.findAll('button').find((b) => b.text().includes('Подробнее'))
     expect(detailsButton).toBeDefined()
     await detailsButton?.trigger('click')
-    expect(wrapper.text()).toContain('deno: command not found in PATH shim')
+    expect(wrapper.text()).toContain('Deno 1.0')
 
     const retryButton = wrapper.findAll('button').find((b) => b.text().includes('Повторить проверку'))
     expect(retryButton).toBeDefined()
