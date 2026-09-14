@@ -174,9 +174,13 @@ impl InstallState {
     /// Читает запись. Файла нет, он не разбирается или он от другой
     /// версии формата — состояние пустое: это в точности «ещё ни разу не
     /// переключались», и подготовка первого запуска восстановит его сама.
+    /// Порча, в отличие от отсутствия, оставляет строку в логе (TL-80).
     pub fn load(layout: &Layout) -> Self {
         let path = layout.state_path();
-        let Some(raw) = layout::read_json::<RawState>(&path) else {
+        let Some(raw) = layout::absent_if_unreadable(
+            layout::read_json::<RawState>(&path),
+            "запись об установках",
+        ) else {
             return Self::default();
         };
 

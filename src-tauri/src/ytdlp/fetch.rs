@@ -1489,6 +1489,7 @@ mod tests {
         let manifest = super::super::layout::Manifest::read(
             &fixture.layout().manifest_path(&prepared.build_id),
         )
+        .expect("манифест читается")
         .expect("манифест написан");
 
         assert_eq!(manifest.yt_dlp_version, CANDIDATE_VERSION);

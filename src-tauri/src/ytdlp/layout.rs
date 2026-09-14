@@ -676,10 +676,14 @@ impl Manifest {
         write_json_atomic(path, self, "манифеста")
     }
 
-    /// Читает манифест. `None` — файла нет либо он не разбирается: и то,
-    /// и другое означает «готовой установки нет», разница между ними
-    /// ни на что не влияет.
-    pub fn read(path: &Path) -> Option<Self> {
+    /// Читает манифест. `Ok(None)` — файла нет, `Err` — файл есть, но не
+    /// читается или не разбирается.
+    ///
+    /// Для [`validate`] оба исхода означают одно — «готовой установки
+    /// нет», — но различаются здесь (TL-80): порченый манифест оставляет
+    /// след в логе, отсутствующий — нет, потому что на первом запуске его
+    /// и не должно быть.
+    pub fn read(path: &Path) -> Result<Option<Self>, JsonReadError> {
         read_json(path)
     }
 }
@@ -727,9 +731,11 @@ impl RepairLog {
 
     /// Читает историю. Нечитаемая или чужая по версии формата запись —
     /// то же самое, что её отсутствие: счётчик не то состояние, ради
-    /// которого стоит отказывать в работе.
+    /// которого стоит отказывать в работе. Нечитаемая при этом оставляет
+    /// строку в логе (TL-80): история попыток — первое, что смотрят, когда
+    /// обновление «молча не встало».
     pub fn read(path: &Path) -> Self {
-        read_json(path)
+        absent_if_unreadable(read_json(path), "журнал попыток")
             .filter(|log: &Self| log.schema_version == MANIFEST_SCHEMA_VERSION)
             .unwrap_or_else(Self::empty)
     }
@@ -795,17 +801,18 @@ impl SlowWarmupMark {
     /// причину вызывающий обязан записать в лог. Отличать «нет» от «испорчен»
     /// здесь, а не в вызывающем, потому что только здесь видно, что файл
     /// всё-таки был.
+    ///
+    /// Правило «нет» против «испорчен» — то же [`read_json`], что у
+    /// манифеста и журналов: второй реализации различения не заводится.
+    /// Причина называет путь сама.
     pub fn read(path: &Path) -> Result<Option<Self>, String> {
-        let raw = match fs::read(path) {
-            Ok(raw) => raw,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(format!("не читается: {err}")),
+        let Some(mark) = read_json::<Self>(path).map_err(|err| err.to_string())? else {
+            return Ok(None);
         };
-        let mark: Self =
-            serde_json::from_slice(&raw).map_err(|err| format!("не разбирается: {err}"))?;
         if mark.schema_version != MANIFEST_SCHEMA_VERSION {
             return Err(format!(
-                "версия формата {} (поддерживается {MANIFEST_SCHEMA_VERSION})",
+                "{}: версия формата {} (поддерживается {MANIFEST_SCHEMA_VERSION})",
+                path.display(),
                 mark.schema_version
             ));
         }
@@ -862,10 +869,74 @@ pub(super) fn write_json_atomic<T: Serialize>(
     })
 }
 
-/// Читает JSON. `None` — файла нет либо он не разбирается.
-pub(super) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    let raw = fs::read(path).ok()?;
-    serde_json::from_slice(&raw).ok()
+/// Файл служебной записи есть, но прочитать его нельзя (TL-80).
+///
+/// Отдельно от «файла нет» намеренно. Отсутствие — законное пустое
+/// состояние: установку ещё не делали, чинить было нечего. Порча — след
+/// того, что запись **была**, и именно он нужен, когда разбираешь жалобу
+/// «обновление молча не встало». Пока оба исхода сводились в один `None`,
+/// этот след терялся до лога.
+#[derive(Debug, thiserror::Error)]
+pub enum JsonReadError {
+    /// Файл есть, но не читается: нет прав, на его месте каталог, отказ
+    /// файловой системы.
+    #[error("{} не читается: {source}", .path.display())]
+    Unreadable {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// Прочитался, но это не JSON ожидаемой формы: оборванная запись,
+    /// чужой файл под тем же именем.
+    #[error("{} не разбирается: {source}", .path.display())]
+    Malformed {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// Читает JSON.
+///
+/// `Ok(None)` — файла нет. Всё прочее, что мешает получить значение, —
+/// типизированный [`JsonReadError`] с путём и причиной. Где вызывающему
+/// достаточно «нет значения», отказ сводит к нему
+/// [`absent_if_unreadable`], и сводит не молча.
+pub(super) fn read_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<Option<T>, JsonReadError> {
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(JsonReadError::Unreadable {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+
+    serde_json::from_slice(&raw)
+        .map(Some)
+        .map_err(|source| JsonReadError::Malformed {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Сводит отказ чтения к отсутствию — с одной строкой в лог.
+///
+/// Для записей, чья порча на поведение не влияет (следующий шаг всё равно
+/// поступит как без них), но должна оставить след: `what` называет запись
+/// по-человечески, путь и причину несёт сам отказ.
+pub(super) fn absent_if_unreadable<T>(
+    read: Result<Option<T>, JsonReadError>,
+    what: &str,
+) -> Option<T> {
+    read.unwrap_or_else(|err| {
+        eprintln!("yt-dlp: {what}: {err} — считаю, что записи нет");
+        None
+    })
 }
 
 /// Готовая к запуску установка yt-dlp.
@@ -895,7 +966,10 @@ pub struct Installed {
 /// [`super::unpack`]).
 pub fn validate(layout: &Layout, build_id: &BuildId) -> Result<Installed, InvalidInstall> {
     let manifest_path = layout.manifest_path(build_id);
-    let Some(manifest) = Manifest::read(&manifest_path) else {
+    // Порченый манифест — та же «установки нет», что отсутствующий, и
+    // ведёт к тому же действию; разница остаётся строкой в логе (TL-80).
+    let Some(manifest) = absent_if_unreadable(Manifest::read(&manifest_path), "манифест установки")
+    else {
         return Err(InvalidInstall::NoManifest);
     };
 
@@ -1490,7 +1564,9 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let (layout, build_id) = install_fixture(dir.path());
         let path = layout.manifest_path(&build_id);
-        let mut manifest = Manifest::read(&path).expect("manifest must be readable");
+        let mut manifest = Manifest::read(&path)
+            .expect("manifest must be readable")
+            .expect("manifest must exist");
         manifest.schema_version = MANIFEST_SCHEMA_VERSION + 1;
         manifest
             .write_atomic(&path)
@@ -1505,12 +1581,68 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_record_is_told_apart_from_a_damaged_one() {
+        // TL-80: «файла нет» — законное пустое состояние, «файл есть, но
+        // не читается или не разбирается» — отказ с путём и причиной. Пока
+        // оба исхода были одним `None`, порча не оставляла следа.
+        let dir = tempdir().expect("tempdir");
+        let (layout, build_id) = install_fixture(dir.path());
+        let path = layout.manifest_path(&build_id);
+
+        assert!(
+            matches!(Manifest::read(&path), Ok(Some(_))),
+            "целый манифест читается"
+        );
+
+        let missing = dir.path().join("absent.json");
+        assert!(
+            matches!(Manifest::read(&missing), Ok(None)),
+            "отсутствие — не отказ"
+        );
+
+        fs::write(&path, b"{ not json").expect("испортить манифест");
+        match Manifest::read(&path) {
+            Err(err @ JsonReadError::Malformed { .. }) => assert!(
+                err.to_string().contains(&path.display().to_string()),
+                "отказ называет файл: {err}"
+            ),
+            Err(err) => panic!("не тот отказ: {err}"),
+            Ok(found) => panic!("порча не отличена от отсутствия: {}", found.is_some()),
+        }
+        // Поведение вызывающего прежнее: установки нет.
+        assert_eq!(
+            validate(&layout, &build_id),
+            Err(InvalidInstall::NoManifest)
+        );
+
+        // На месте файла каталог — файл «есть», но не читается.
+        fs::remove_file(&path).expect("убрать манифест");
+        fs::create_dir(&path).expect("каталог на месте манифеста");
+        match read_json::<Manifest>(&path) {
+            Err(err @ JsonReadError::Unreadable { .. }) => assert!(
+                err.to_string().contains(&path.display().to_string()),
+                "отказ называет файл: {err}"
+            ),
+            Err(err) => panic!("не тот отказ: {err}"),
+            Ok(found) => panic!("нечитаемое не отличено от отсутствия: {}", found.is_some()),
+        }
+        assert_eq!(
+            validate(&layout, &build_id),
+            Err(InvalidInstall::NoManifest)
+        );
+        // Счётчик тоже не отказывает в работе: нечитаемый — пустой.
+        assert_eq!(RepairLog::read(&path), RepairLog::empty());
+    }
+
+    #[test]
     fn manifest_round_trips_through_disk() {
         let dir = tempdir().expect("tempdir");
         let (layout, build_id) = install_fixture(dir.path());
         let path = layout.manifest_path(&build_id);
 
-        let manifest = Manifest::read(&path).expect("manifest must be readable");
+        let manifest = Manifest::read(&path)
+            .expect("manifest must be readable")
+            .expect("manifest must exist");
         assert_eq!(manifest.schema_version, MANIFEST_SCHEMA_VERSION);
         assert_eq!(manifest.archive_sha256, BUNDLED_SHA256);
         assert_eq!(manifest.file_count, 2);
