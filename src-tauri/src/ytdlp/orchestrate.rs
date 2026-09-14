@@ -84,18 +84,20 @@ use super::update::{UpdateAsset, UpdateCheck};
 /// Через сколько после старта приложения контур впервые смотрит на
 /// апстрим.
 ///
-/// Не «сразу», и причин две, обе измеренные. Первая — подготовка
-/// первого запуска (TL-12) в этот момент может распаковывать и греть
-/// дерево: 24–36 с дисковой работы, и вклиниваться в них проверкой,
-/// которая может кончиться скачиванием шестидесяти мегабайт, значит
-/// соревноваться с самим собой за диск (Н-3). Вторая — та же подготовка
-/// убирает на старте остатки `.staging-*` и `.download-*`
-/// (`prepare_inner`), и начатая параллельно установка потеряла бы свой
-/// каталог.
+/// Не «сразу»: подготовка первого запуска (TL-12) в этот момент может
+/// распаковывать и греть дерево — 24–36 с дисковой работы, и вклиниваться
+/// в них проверкой, которая может кончиться скачиванием шестидесяти
+/// мегабайт, значит соревноваться с самим собой за диск (Н-3).
 ///
-/// Две минуты — с запасом больше и того и другого: подготовка
-/// укладывается в 35 с даже в худшем замере TL-12 (36,37 с), а обычный
-/// тёплый старт стоит доли секунды.
+/// Сохранность файлов задержка **не** обеспечивает: уборку остатков
+/// `.staging-*` и `.download-*` в подготовке и прогон конвейера разводит
+/// замок сеанса ([`Session::hold_root_for_update`], TL-66), а не время. До
+/// TL-66 это была вторая причина задержки, и она не держала ни ручную
+/// проверку, ни повтор подготовки посреди сеанса.
+///
+/// Две минуты — с запасом больше подготовки: она укладывается в 35 с даже
+/// в худшем замере TL-12 (36,37 с), а обычный тёплый старт стоит доли
+/// секунды.
 pub const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(2 * 60);
 
 /// Как часто контур проверяет апстрим сам.
@@ -244,6 +246,11 @@ pub enum CheckTrigger {
     /// Скачивание ролика упало классом `ytDlpFailure` (С-13).
     BrokenExtraction,
 }
+
+/// Куда откат отдаёт первый ответ команды `roll_back_ytdlp` (TL-66): строку
+/// 14, если ждать придётся, иначе исход (см.
+/// [`UpdateController::run_rollback`]).
+pub type RollbackReply = tokio::sync::oneshot::Sender<YtDlpUpdateSnapshot>;
 
 /// Состояние контура в памяти процесса.
 struct ControllerState {
@@ -428,16 +435,20 @@ impl UpdateController {
     /// фронтенд не рисует, но защита на стороне ядра обязана быть
     /// настоящей (тот же довод, что у `DownloadCommandErrorKind`).
     ///
-    /// Возвращает [`YtDlpUpdateStatus::RollbackWaiting`] всегда, даже
-    /// когда ждать нечего. Цена названа прямо: если задачи скачивания
-    /// нет, а известно-хорошее дерево тёплое, строка «применится, когда
-    /// закончится текущая загрузка» живёт доли секунды — ровно до
-    /// события с исходом. Взамен получено то, что дизайн требует
-    /// буквально: обе кнопки блока неактивны, **пока откат идёт**. Отдай
-    /// команда терминальный исход сразу — она ждала бы в промисе
-    /// проверку запуска (до 24 с на холодном дереве), и всё это время
-    /// кнопки оставались бы живыми.
-    pub fn begin_rollback(&self) -> Result<YtDlpUpdateSnapshot, YtDlpUpdateCommandError> {
+    /// Снимка не возвращает (TL-66): первый ответ команды — исход, который
+    /// становится известен только внутри отката, под замком конвейера
+    /// ([`Self::run_rollback`], «Первый ответ команды»). До TL-66 здесь
+    /// возвращалась строка 14 всегда, и там, где загрузки нет, она
+    /// вспыхивала на доли секунды до события с исходом.
+    ///
+    /// Статус при этом ставится [`YtDlpUpdateStatus::RollbackWaiting`] —
+    /// единственный занятый статус отката в контракте. Он нужен ядру с
+    /// этой самой секунды: гасит команды (`busy`) и держит границу задач
+    /// для очереди ([`Self::holds_task_boundary`]). Наружу событием он
+    /// уходит, только если ждать действительно придётся; снимок
+    /// `ytdlp_update_state`, запрошенный посреди мгновенного отката, его
+    /// покажет — экран, нажавший кнопку, снимок в это время не запрашивает.
+    pub fn begin_rollback(&self) -> Result<(), YtDlpUpdateCommandError> {
         let target = {
             let state = self.lock();
             match state.rollback_target.clone() {
@@ -454,6 +465,7 @@ impl UpdateController {
         };
 
         self.begin(YtDlpUpdateStatus::RollbackWaiting { version: target })
+            .map(|_| ())
             .map_err(|_| busy_error())
     }
 
@@ -547,6 +559,11 @@ impl UpdateController {
     /// ничего не блокирует).
     pub async fn run_check(&self, env: &Pipeline<'_>, trigger: CheckTrigger, now: Instant) {
         let _queue = self.pipeline.lock().await;
+        // Весь прогон — под замком временных объектов корня: уборка
+        // подготовки не должна снести `.download-*`/`.staging-*` этого
+        // прогона (TL-66). Берётся после замка конвейера, а подготовка его
+        // не ждёт — взаимной блокировке неоткуда взяться.
+        let _root = env.session.hold_root_for_update().await;
 
         self.refresh_rollback_target(env.layout);
         self.emit_current(env.sink);
@@ -622,6 +639,11 @@ impl UpdateController {
     /// когда установка действительно начинается.
     pub async fn run_bundled_pin(&self, env: &Pipeline<'_>) {
         let _queue = self.pipeline.lock().await;
+        // Весь прогон — под замком временных объектов корня: уборка
+        // подготовки не должна снести `.download-*`/`.staging-*` этого
+        // прогона (TL-66). Берётся после замка конвейера, а подготовка его
+        // не ждёт — взаимной блокировке неоткуда взяться.
+        let _root = env.session.hold_root_for_update().await;
 
         self.refresh_rollback_target(env.layout);
 
@@ -694,10 +716,42 @@ impl UpdateController {
     /// Вызывается после [`Self::begin_rollback`]. Цель одна по
     /// построению (Ф-8), поэтому параметра-версии нет: её читает та же
     /// запись Ф-5, которая только что нарисовала кнопку.
-    pub async fn run_rollback(&self, env: &Pipeline<'_>) {
-        let _queue = self.pipeline.lock().await;
+    ///
+    /// # Первый ответ команды (TL-66)
+    ///
+    /// `reply` получает ровно один снимок — тот, что команда отката
+    /// вернёт фронтенду. Решение о нём принимается здесь, где исход
+    /// известен, а не в команде заранее:
+    ///
+    /// - идёт загрузка — строка 14 (`rollbackWaiting`) сразу, до ожидания
+    ///   границы; исход приходит событием;
+    /// - загрузки нет — ответ ждёт конца отката и несёт исход (строка 13
+    ///   или отказ). Строки 14 нет ни в ответе, ни в событиях: объявлять
+    ///   ожидание загрузки, которой нет, — та самая вспышка.
+    ///
+    /// Цена второго случая: промис команды живёт, пока идёт проверка
+    /// запуска цели (на тёплом дереве — доли секунды, на холодном — до
+    /// 24 с), и фронтенд всё это время не получает `busy`. Кнопки
+    /// выглядят живыми, хотя ядро отклонит нажатие классом `busy`.
+    ///
+    /// Ветка выхода, не ответившая сама, получает ответ текущим снимком в
+    /// конце: забыть про ответ нечем.
+    pub async fn run_rollback(&self, env: &Pipeline<'_>, reply: RollbackReply) {
+        let mut reply = Some(reply);
+        self.roll_back(env, &mut reply).await;
+        if let Some(reply) = reply {
+            // Получатель мог уйти (окно закрыто) — исход уже ушёл событием.
+            let _ = reply.send(self.snapshot());
+        }
+    }
 
-        self.emit_current(env.sink);
+    async fn roll_back(&self, env: &Pipeline<'_>, reply: &mut Option<RollbackReply>) {
+        let _queue = self.pipeline.lock().await;
+        // Весь прогон — под замком временных объектов корня: уборка
+        // подготовки не должна снести `.download-*`/`.staging-*` этого
+        // прогона (TL-66). Берётся после замка конвейера, а подготовка его
+        // не ждёт — взаимной блокировке неоткуда взяться.
+        let _root = env.session.hold_root_for_update().await;
 
         let install_state = InstallState::load(env.layout);
         let Some(target) = install_state.known_good().cloned() else {
@@ -714,8 +768,19 @@ impl UpdateController {
             .unwrap_or_default();
 
         // Граница задач — та же, что у обычного переключения (Ф-7, единый
-        // механизм, не вторая реализация).
-        self.wait_for_boundary(env).await;
+        // механизм, не вторая реализация). Занятость спрашивается один
+        // раз: ответ «ждём» и само ожидание обязаны опираться на одно
+        // наблюдение. Спроси их порознь — и загрузка, начавшаяся между
+        // вопросами, оставила бы промис команды висеть до её конца без
+        // объявленной строки 14.
+        if env.boundary.is_busy() {
+            let waiting = self.snapshot();
+            env.sink.emit(waiting.clone());
+            if let Some(reply) = reply.take() {
+                let _ = reply.send(waiting);
+            }
+            env.boundary.wait().await;
+        }
 
         // Годность цели проверяет тот, кто откатывается, и проверяет
         // запуском. Дешевле нельзя: в резерв уезжает **вытесненная
@@ -1016,9 +1081,8 @@ impl UpdateController {
         let waiting = {
             let state = self.lock();
             match &state.status {
-                // Откат уже объявил, чего ждёт (строка 14), — второй раз
-                // говорить о том же не надо.
-                YtDlpUpdateStatus::RollbackWaiting { .. } => None,
+                // Откат сюда не приходит: границу он спрашивает сам, вместе
+                // с первым ответом команды (`roll_back`).
                 YtDlpUpdateStatus::Downloading { version, .. }
                 | YtDlpUpdateStatus::Preparing { version }
                 | YtDlpUpdateStatus::ReadyWaiting { version } => Some(version.clone()),
@@ -1395,10 +1459,13 @@ impl<'a> UpdateJob<'a> {
         controller.run_bundled_pin(&self.pipeline(&archives)).await;
     }
 
-    /// Ручной возврат на известно-хорошую установку (Р-3).
-    pub async fn rollback(&self, controller: &UpdateController) {
+    /// Ручной возврат на известно-хорошую установку (Р-3); `reply` — первый
+    /// ответ команды (см. [`UpdateController::run_rollback`]).
+    pub async fn rollback(&self, controller: &UpdateController, reply: RollbackReply) {
         let archives = self.archives();
-        controller.run_rollback(&self.pipeline(&archives)).await;
+        controller
+            .run_rollback(&self.pipeline(&archives), reply)
+            .await;
     }
 
     fn archives(&self) -> Archives<'a> {
@@ -1429,6 +1496,7 @@ mod tests {
     use std::io::{Cursor, Read, Write};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::{tempdir, TempDir};
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
@@ -1550,6 +1618,44 @@ mod tests {
         }
     }
 
+    /// Граница, занятая до тех пор, пока её не отпустит сам тест (TL-66).
+    ///
+    /// Нужна там, где предмет — что происходит **во время** ожидания:
+    /// [`Boundary`] отпускает себя сама в момент, когда её начали ждать.
+    /// Порядок наблюдается рандеву, без часов: `entered` — конвейер уже
+    /// ждёт, `release` — загрузка кончилась.
+    struct GatedBoundary {
+        busy: AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl GatedBoundary {
+        fn busy() -> Self {
+            Self {
+                busy: AtomicBool::new(true),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl TaskBoundary for GatedBoundary {
+        fn is_busy(&self) -> bool {
+            self.busy.load(Ordering::SeqCst)
+        }
+
+        fn wait(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                // `notify_one` без ждущего оставляет разрешение: тест,
+                // подписавшийся позже, всё равно проснётся.
+                self.entered.notify_one();
+                self.release.notified().await;
+                self.busy.store(false, Ordering::SeqCst);
+            })
+        }
+    }
+
     /// Источник метаданных на снятых фикстурах формы, а не на живых
     /// ответах: форму разбирает и проверяет TL-55, здесь предмет — что
     /// конвейер с этой формой делает.
@@ -1664,6 +1770,84 @@ mod tests {
         }
     }
 
+    /// Рандеву источника, который замирает посреди потока (TL-66).
+    #[derive(Default)]
+    struct Stall {
+        parked: tokio::sync::Notify,
+        released: Mutex<bool>,
+        wake: std::sync::Condvar,
+    }
+
+    impl Stall {
+        fn release(&self) {
+            *self.released.lock().expect("замок рандеву") = true;
+            self.wake.notify_all();
+        }
+    }
+
+    /// Источник архива, который отдаёт половину тела и ждёт, пока тест его
+    /// не отпустит: так на диске лежит `.download-*` идущего обновления.
+    ///
+    /// Приём архива синхронный (`blocking`), поэтому и ожидание здесь
+    /// синхронное; о том, что поток замер, тест узнаёт через `Notify`.
+    struct StalledSupply {
+        body: Vec<u8>,
+        stall: Arc<Stall>,
+    }
+
+    struct StallingReader {
+        body: Vec<u8>,
+        offset: usize,
+        stalled: bool,
+        stall: Arc<Stall>,
+    }
+
+    impl Read for StallingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let half = self.body.len() / 2;
+            if self.offset == half && !self.stalled {
+                self.stalled = true;
+                // `notify_one` без ждущего оставляет разрешение.
+                self.stall.parked.notify_one();
+                let mut released = self.stall.released.lock().expect("замок рандеву");
+                while !*released {
+                    released = self.stall.wake.wait(released).expect("замок рандеву");
+                }
+            }
+            let end = if self.offset < half {
+                half
+            } else {
+                self.body.len()
+            };
+            let n = buf.len().min(end - self.offset);
+            buf[..n].copy_from_slice(&self.body[self.offset..self.offset + n]);
+            self.offset += n;
+            Ok(n)
+        }
+    }
+
+    impl ArchiveSupply for StalledSupply {
+        fn network<'a>(&'a self, asset: &UpdateAsset) -> Box<dyn ArchiveSource + Send + Sync + 'a> {
+            Box::new(StreamArchive::new(
+                Origin::Network,
+                asset.url.clone(),
+                asset.size_bytes,
+                move || {
+                    Ok(Box::new(StallingReader {
+                        body: self.body.clone(),
+                        offset: 0,
+                        stalled: false,
+                        stall: Arc::clone(&self.stall),
+                    }) as Box<dyn Read>)
+                },
+            ))
+        }
+
+        fn bundled(&self) -> Option<Box<dyn ArchiveSource + Send + Sync + '_>> {
+            None
+        }
+    }
+
     /// Каталог данных с раскладкой, реестром процессов и контуром.
     struct Fixture {
         _dir: TempDir,
@@ -1744,6 +1928,19 @@ mod tests {
 
         fn state(&self) -> InstallState {
             InstallState::load(&self.layout)
+        }
+
+        /// Каталог данных, из которого собрана [`Self::layout`], — вход
+        /// подготовки.
+        fn data_dir(&self) -> PathBuf {
+            self._dir.path().join("app-data")
+        }
+
+        /// Путь вложенного архива для подготовки. Файла нет: активная
+        /// установка фикстуры готовится без него, а до резерва дело не
+        /// доходит.
+        fn bundled_archive(&self) -> PathBuf {
+            self._dir.path().join("bundled-yt-dlp.zip")
         }
 
         fn active_version(&self) -> Option<String> {
@@ -2650,7 +2847,10 @@ mod tests {
             .expect("возвращаться есть куда");
         fixture
             .controller
-            .run_rollback(&fixture.pipeline(&Offline, &supply, &sink, &boundary))
+            .run_rollback(
+                &fixture.pipeline(&Offline, &supply, &sink, &boundary),
+                tokio::sync::oneshot::channel().0,
+            )
             .await;
 
         match sink.last() {
@@ -2697,7 +2897,10 @@ mod tests {
             .expect("возвращаться есть куда");
         fixture
             .controller
-            .run_rollback(&fixture.pipeline(&Offline, &supply, &sink, &boundary))
+            .run_rollback(
+                &fixture.pipeline(&Offline, &supply, &sink, &boundary),
+                tokio::sync::oneshot::channel().0,
+            )
             .await;
 
         assert_eq!(stage_name(&sink.last()), "rolledBack");
@@ -2805,7 +3008,10 @@ mod tests {
         fixture.controller.begin_rollback().expect("цель есть");
         fixture
             .controller
-            .run_rollback(&fixture.pipeline(&Offline, &supply, &sink, &boundary))
+            .run_rollback(
+                &fixture.pipeline(&Offline, &supply, &sink, &boundary),
+                tokio::sync::oneshot::channel().0,
+            )
             .await;
 
         match sink.last() {
@@ -2839,7 +3045,10 @@ mod tests {
         fixture.controller.begin_rollback().expect("цель есть");
         fixture
             .controller
-            .run_rollback(&fixture.pipeline(&Offline, &supply, &sink, &boundary))
+            .run_rollback(
+                &fixture.pipeline(&Offline, &supply, &sink, &boundary),
+                tokio::sync::oneshot::channel().0,
+            )
             .await;
 
         let waits = boundary.waits();
@@ -2854,6 +3063,186 @@ mod tests {
             "пока задача идёт, активной обязана оставаться прежняя версия"
         );
         assert_eq!(fixture.active_version().as_deref(), Some(OLDER));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rollback_without_a_download_answers_with_its_outcome_and_never_with_row_14() {
+        // TL-66, критерий 1: загрузки нет — ждать нечего, и первый ответ
+        // команды обязан быть исходом (строка 13). Строки 14 «применится,
+        // когда закончится текущая загрузка» нет ни в ответе, ни в событиях.
+        let fixture = fixture();
+        let older = fixture.install(OLDER, &"a1".repeat(32));
+        let newer = fixture.install(CANDIDATE, &"b2".repeat(32));
+        fixture.record(&[older, newer]);
+
+        let sink = RecordingSink::default();
+        let boundary = Boundary::idle(&fixture.layout);
+        let supply = Supply::of(b"");
+
+        fixture.controller.refresh_rollback_target(&fixture.layout);
+        fixture.controller.begin_rollback().expect("цель есть");
+        let (reply, mut first) = tokio::sync::oneshot::channel();
+        fixture
+            .controller
+            .run_rollback(
+                &fixture.pipeline(&Offline, &supply, &sink, &boundary),
+                reply,
+            )
+            .await;
+
+        let first = first.try_recv().expect("ответ команды обязан прийти");
+        match &first.status {
+            YtDlpUpdateStatus::RolledBack { active, .. } => assert_eq!(active, OLDER),
+            other => panic!("первый ответ без загрузки — исход, а не {other:?}"),
+        }
+        assert_eq!(
+            sink.stages(),
+            vec!["rolledBack"],
+            "строки 14 не должно быть и в событиях"
+        );
+        assert!(boundary.waits().is_empty(), "ждать было нечего");
+        assert_eq!(fixture.active_version().as_deref(), Some(OLDER));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rollback_during_a_download_answers_row_14_first_and_the_outcome_by_event() {
+        // TL-66, критерий 2: загрузка идёт — первый ответ строка 14, и он
+        // обязан прийти **до** конца загрузки, а исход — событием после.
+        let fixture = fixture();
+        let older = fixture.install(OLDER, &"a1".repeat(32));
+        let newer = fixture.install(CANDIDATE, &"b2".repeat(32));
+        fixture.record(&[older, newer]);
+
+        let sink = RecordingSink::default();
+        let boundary = GatedBoundary::busy();
+        let supply = Supply::of(b"");
+
+        fixture.controller.refresh_rollback_target(&fixture.layout);
+        fixture.controller.begin_rollback().expect("цель есть");
+        let (reply, mut first) = tokio::sync::oneshot::channel();
+        let pipeline = fixture.pipeline(&Offline, &supply, &sink, &boundary);
+
+        tokio::join!(fixture.controller.run_rollback(&pipeline, reply), async {
+            boundary.entered.notified().await;
+
+            // Конвейер уже ждёт границы: ответ обязан быть отдан раньше.
+            let first = first
+                .try_recv()
+                .expect("ответ команды обязан прийти до конца загрузки");
+            assert_eq!(stage_name(&first.status), "rollbackWaiting");
+            assert_eq!(sink.stages(), vec!["rollbackWaiting"]);
+            assert_eq!(
+                fixture.active_version().as_deref(),
+                Some(CANDIDATE),
+                "пока загрузка идёт, переключения нет"
+            );
+
+            boundary.release.notify_one();
+        });
+
+        assert_eq!(sink.stages(), vec!["rollbackWaiting", "rolledBack"]);
+        assert_eq!(fixture.active_version().as_deref(), Some(OLDER));
+    }
+
+    // ─────────────── уборка подготовки против обновления ───────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_preparation_does_not_clean_away_the_download_of_a_running_update() {
+        // TL-66: подготовка после сброса памяти сеанса (повтор проверки,
+        // отказ фонового прогрева) случается посреди сеанса. Её уборка
+        // `.download-*` не должна снести временный файл идущего обновления.
+        let fixture = Arc::new(fixture());
+        let active = fixture.install(ACTIVE, &"a1".repeat(32));
+        fixture.record(&[active]);
+
+        let body = onedir_zip(CANDIDATE);
+        let stall = Arc::new(Stall::default());
+        // Упавшее утверждение не должно оставить приём замершим навсегда:
+        // рантайм теста на выходе ждал бы его поток.
+        struct ReleaseOnDrop(Arc<Stall>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+        let _release = ReleaseOnDrop(Arc::clone(&stall));
+        let upstream = Arc::new(Upstream::offering(CANDIDATE, &body));
+        let supply = Arc::new(StalledSupply {
+            body,
+            stall: Arc::clone(&stall),
+        });
+        let sink = Arc::new(RecordingSink::default());
+        let boundary = Arc::new(Boundary::idle(&fixture.layout));
+
+        fixture.controller.begin_manual_check().expect("свободен");
+        // Отдельная задача рантайма: приём архива идёт в `block_in_place`,
+        // и в одной задаче с проверкой он не дал бы ей выполниться.
+        let update = tokio::spawn({
+            let fixture = Arc::clone(&fixture);
+            let (upstream, supply, sink, boundary) = (
+                Arc::clone(&upstream),
+                Arc::clone(&supply),
+                Arc::clone(&sink),
+                Arc::clone(&boundary),
+            );
+            async move {
+                let pipeline = fixture.pipeline(&*upstream, &*supply, &*sink, &*boundary);
+                fixture
+                    .controller
+                    .run_check(&pipeline, CheckTrigger::Manual, Instant::now())
+                    .await;
+            }
+        });
+
+        stall.parked.notified().await;
+        let downloads = fixture.layout.stale_downloads();
+        assert_eq!(
+            downloads.len(),
+            1,
+            "предусловие: временный файл идущего обновления на диске"
+        );
+
+        fixture.session.invalidate();
+        let _ = fixture
+            .session
+            .prepare(
+                &fixture.bundled_archive(),
+                &fixture.data_dir(),
+                &fixture.registry,
+                &crate::ytdlp::testing::SilentSink,
+            )
+            .await;
+        assert!(
+            downloads[0].exists(),
+            "уборка подготовки снесла временный файл идущего обновления"
+        );
+
+        stall.release();
+        update.await.expect("конвейер не паникует");
+        assert_eq!(stage_name(&sink.last()), "updated");
+
+        // Контроль: без идущего обновления та же подготовка остаток убирает —
+        // иначе тест выше проходил бы и у сломанной уборки.
+        let leftover_id = BuildId::new(OLDER, &"c3".repeat(32)).expect("идентификатор");
+        let (leftover, file) = fixture
+            .layout
+            .create_download_file(&leftover_id)
+            .expect("файл приёма");
+        drop(file);
+        fixture.session.invalidate();
+        let _ = fixture
+            .session
+            .prepare(
+                &fixture.bundled_archive(),
+                &fixture.data_dir(),
+                &fixture.registry,
+                &crate::ytdlp::testing::SilentSink,
+            )
+            .await;
+        assert!(
+            !leftover.exists(),
+            "без обновления подготовка обязана убрать недокачанный архив"
+        );
     }
 
     // ─────────────────── С-10: пин бандла ───────────────────

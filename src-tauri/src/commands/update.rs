@@ -12,10 +12,15 @@
 //! (TL-59, TL-60) на замоканном `invoke`: `ytdlp_update_state` —
 //! разовый снимок при открытии служебного экрана, `check_ytdlp_update` —
 //! «Проверить сейчас» (С-12), `roll_back_ytdlp` — «Вернуться к …»
-//! (Р-3). Ни одна из них не ждёт конца конвейера: он идёт минуты, а
-//! исход приезжает событием `ytdlp://update` (Н-3 — ничего не
+//! (Р-3). Ни одна из них не ждёт того, что идёт минуты: проверка и
+//! скачивание приезжают событием `ytdlp://update` (Н-3 — ничего не
 //! блокирует). Отсюда форма «занять контур, вернуть снимок, работать
 //! дальше самим».
+//!
+//! Откат отличается одним (TL-66): его первый ответ — исход, известный
+//! на месте. Если ждать конца загрузки не нужно, команда дожидается
+//! переключения (проверка запуска цели и запись) и возвращает строку 13,
+//! а не строку 14, которая через долю секунды сменилась бы событием.
 //!
 //! # Где живёт связь с эпиком E3
 //!
@@ -77,14 +82,25 @@ pub async fn check_ytdlp_update(
 /// «Вернуться к известно-хорошей» (Р-3). Без параметра-версии: цель одна
 /// по построению (Ф-8), и принимать её от фронтенда значило бы принимать
 /// выбор, которого он не делает.
+///
+/// Возвращает исход, который известен на месте отката (TL-66): во время
+/// загрузки — строку 14 сразу, без загрузки — строку 13 (или отказ) по
+/// окончании. Решает не команда, а конвейер, под своим замком
+/// ([`UpdateController::run_rollback`]).
+///
+/// Сам откат идёт отдельной задачей рантайма, а команда только ждёт
+/// первого ответа: брошенный future команды не должен обрывать откат на
+/// середине. Ответа нет, только если конвейер не запустился вовсе (каталог
+/// данных не определился) — тогда отдаётся то, что стоит в контуре.
 #[tauri::command]
 pub async fn roll_back_ytdlp(
     app: AppHandle,
     controller: State<'_, Arc<UpdateController>>,
 ) -> Result<YtDlpUpdateSnapshot, YtDlpUpdateCommandError> {
-    let snapshot = controller.begin_rollback()?;
-    spawn(app, Action::Rollback);
-    Ok(snapshot)
+    controller.begin_rollback()?;
+    let (reply, first) = tokio::sync::oneshot::channel();
+    spawn(app, Action::Rollback(reply));
+    Ok(first.await.unwrap_or_else(|_| controller.snapshot()))
 }
 
 /// Запускает расписание контура: проверка при старте, дальше —
@@ -103,9 +119,8 @@ pub fn start_ytdlp_update_schedule(app: &AppHandle) {
 
     tauri::async_runtime::spawn(async move {
         // Задержка перед первым обращением: подготовка первого запуска
-        // в этот момент может распаковывать и греть дерево, а её уборка
-        // остатков `.staging-*` снесла бы каталог начатой параллельно
-        // установки (обоснование — у `STARTUP_CHECK_DELAY`).
+        // в этот момент может распаковывать и греть дерево, и спорить с
+        // ней за диск незачем (обоснование — у `STARTUP_CHECK_DELAY`).
         tokio::time::sleep(STARTUP_CHECK_DELAY).await;
 
         // Вторая половина С-10: пин нового релиза приложения новее
@@ -165,11 +180,11 @@ pub fn trigger_broken_extraction_check(app: &AppHandle) {
 /// Одно перечисление вместо трёх почти одинаковых функций: собирается
 /// окружение одинаково, и различие в одну строку не стоит трёх копий
 /// сборки, которые разойдутся на первой же новой зависимости.
-#[derive(Debug, Clone, Copy)]
 enum Action {
     Check(CheckTrigger),
     BundledPin,
-    Rollback,
+    /// Несёт, куда отдать первый ответ команды отката (TL-66).
+    Rollback(ytdlp::RollbackReply),
 }
 
 fn spawn(app: AppHandle, action: Action) {
@@ -214,7 +229,7 @@ async fn run(app: AppHandle, action: Action) {
     match action {
         Action::Check(trigger) => job.check(&controller, trigger).await,
         Action::BundledPin => job.bundled_pin(&controller).await,
-        Action::Rollback => job.rollback(&controller).await,
+        Action::Rollback(reply) => job.rollback(&controller, reply).await,
     }
 }
 

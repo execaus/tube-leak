@@ -93,8 +93,8 @@ pub use layout::BUNDLED_ARCHIVE_RESOURCE;
 // (`crate::commands::update`), потому что домен `ytdlp` не знает ни о
 // Tauri-событиях, ни о том, что у канала есть подписчик.
 pub use orchestrate::{
-    CheckTrigger, TaskBoundary, UpdateController, UpdateJob, UpdateSink, PLANNED_CHECK_INTERVAL,
-    STARTUP_CHECK_DELAY,
+    CheckTrigger, RollbackReply, TaskBoundary, UpdateController, UpdateJob, UpdateSink,
+    PLANNED_CHECK_INTERVAL, STARTUP_CHECK_DELAY,
 };
 pub use prepare::{installed_executable, AppSink, BackgroundWarmup, WarmLaunch, PROBE_TIMEOUT};
 pub use session::Session;

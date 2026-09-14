@@ -41,6 +41,13 @@
 //! запусками приложения его всё равно проверяет проба (см.
 //! `super::prepare`, «Почему проверка запуском на каждом старте»).
 //!
+//! # Уборка остатков и обновление
+//!
+//! Подготовка убирает `.staging-*` и `.download-*` прерванных установок, а
+//! контур обновления создаёт такие же объекты для своих. Разводит их замок
+//! сеанса, а не момент запуска: конвейер держит его весь прогон, уборка
+//! берёт его без ожидания или пропускается (TL-66).
+//!
 //! # Фоновый прогрев
 //!
 //! Если подготовка вернула прогрев, который продолжится в фоне (TL-21),
@@ -64,6 +71,21 @@ use crate::types::YtDlpPrepared;
 #[derive(Debug, Default)]
 pub struct Session {
     state: Mutex<State>,
+    /// Право на временные объекты корня установок (`.staging-*`,
+    /// `.download-*`) — и писать их, и убирать (TL-66).
+    ///
+    /// Конвейер обновления держит его весь прогон
+    /// ([`Self::hold_root_for_update`]); подготовка убирает остатки,
+    /// только если застала его свободным, и **не ждёт** — прогон длится
+    /// минуты, а остаток мешает месту на диске, а не работе. Живёт здесь,
+    /// потому что сеанс — единственное состояние, которое есть и у обеих
+    /// дверей в подготовку, и у конвейера (`Pipeline::session`).
+    ///
+    /// До TL-66 уборка полагалась на то, что идёт «на старте, когда никто
+    /// не пишет», а подготовка после сброса памяти (повтор проверки,
+    /// отказ фонового прогрева) случалась посреди сеанса и могла удалить
+    /// временный файл идущего обновления.
+    root_work: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Default)]
@@ -120,7 +142,17 @@ impl Session {
             state.generation
         };
 
-        let outcome = prepare::prepare(archive_path, data_dir, registry, sink).await?;
+        let leftovers = match self.root_work.try_lock() {
+            Ok(right) => prepare::Leftovers::Remove(right),
+            Err(_) => {
+                eprintln!(
+                    "yt-dlp: идёт обновление — остатки прерванных установок не убираю, \
+                     в каталоге сейчас его временные файлы"
+                );
+                prepare::Leftovers::Keep
+            }
+        };
+        let outcome = prepare::prepare(archive_path, data_dir, registry, sink, leftovers).await?;
 
         let mut state = self.lock();
         if state.generation == generation {
@@ -161,6 +193,14 @@ impl Session {
             );
             None
         }
+    }
+
+    /// Занимает временные объекты корня установок под прогон конвейера
+    /// обновления (TL-66): пока guard жив, подготовка их не убирает.
+    ///
+    /// Ждёт, если прямо сейчас идёт уборка, — она короткая и синхронная.
+    pub async fn hold_root_for_update(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.root_work.lock().await
     }
 
     /// Забывает всё, что сеанс помнил о подготовке: корень установок
@@ -522,6 +562,54 @@ mod tests {
             broken.resize(size, b'#');
             std::fs::write(&path, broken).expect("сломать, сохранив размер");
         }
+    }
+
+    /// Приёмник, который в момент события смотрит на сеанс так, как его
+    /// увидел бы экран, позвавший по событию подготовку.
+    struct ObservingWarmup<'a> {
+        session: &'a Session,
+        in_flight_at_event: Mutex<Vec<bool>>,
+    }
+
+    impl WarmupSink for ObservingWarmup<'_> {
+        fn warmup_finished(&self, _event: YtDlpWarmupEvent) {
+            self.in_flight_at_event
+                .lock()
+                .expect("mutex")
+                .push(self.session.lock().background_in_flight);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_warm_up_event_is_sent_after_the_in_flight_mark_is_cleared() {
+        // TL-66: порядок «сначала снять отметку, потом событие» doc
+        // `run_background` называет несущим. Экран по событию зовёт
+        // подготовку, и та, застав отметку, отказала бы в новом прогреве
+        // («фоновый прогрев уже идёт») — хотя он уже кончился.
+        let fixture = installed().await;
+        let session = Session::new();
+        fixture.write_mark();
+
+        let (_, background) = fixture.prepare(&session).await;
+        let sink = ObservingWarmup {
+            session: &session,
+            in_flight_at_event: Mutex::new(Vec::new()),
+        };
+
+        let outcome = session
+            .run_background(
+                background.expect("отметка есть — прогрев в фоне"),
+                &fixture.registry,
+                &sink,
+            )
+            .await;
+
+        assert_eq!(outcome, BackgroundOutcome::Warmed);
+        assert_eq!(
+            *sink.in_flight_at_event.lock().expect("mutex"),
+            vec![false],
+            "обработчик события обязан застать сеанс уже без прогрева"
+        );
     }
 
     #[tokio::test]

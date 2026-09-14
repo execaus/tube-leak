@@ -3,7 +3,8 @@
 //!
 //! # Порядок действий
 //!
-//! 1. Убрать мусор `.staging-*` от прерванных подготовок.
+//! 1. Убрать мусор `.staging-*` и `.download-*` от прерванных установок —
+//!    если контур обновления сейчас не пишет в корень (замок сеанса, TL-66).
 //! 2. Проверить установку ([`super::layout::validate`]). Нет или не
 //!    сходится — распаковать заново.
 //! 3. Если дерево уже было на месте — **проверить его запуском**
@@ -536,8 +537,29 @@ pub async fn prepare(
     data_dir: &Path,
     registry: &ChildRegistry,
     sink: &dyn ProgressSink,
+    leftovers: Leftovers<'_>,
 ) -> Result<PrepareOutcome, PrepareError> {
-    prepare_with(archive_path, data_dir, registry, sink, Timeouts::DEFAULT).await
+    prepare_with(
+        archive_path,
+        data_dir,
+        registry,
+        sink,
+        leftovers,
+        Timeouts::DEFAULT,
+    )
+    .await
+}
+
+/// Убирать ли остатки прерванных установок (`.staging-*`, `.download-*`)
+/// перед подготовкой (TL-66).
+///
+/// Убирать разрешено только с доказательством, что контур обновления в
+/// корень сейчас не пишет: guard замка, который конвейер держит весь
+/// прогон (`super::session::Session`). Отдельный тип, а не `bool`, —
+/// чтобы «уберу» нельзя было сказать, не заняв замок.
+pub enum Leftovers<'a> {
+    Remove(tokio::sync::MutexGuard<'a, ()>),
+    Keep,
 }
 
 async fn prepare_with(
@@ -545,10 +567,20 @@ async fn prepare_with(
     data_dir: &Path,
     registry: &ChildRegistry,
     sink: &dyn ProgressSink,
+    leftovers: Leftovers<'_>,
     timeouts: Timeouts,
 ) -> Result<PrepareOutcome, PrepareError> {
     let started = Instant::now();
-    let result = prepare_inner(archive_path, data_dir, registry, sink, started, timeouts).await;
+    let result = prepare_inner(
+        archive_path,
+        data_dir,
+        registry,
+        sink,
+        leftovers,
+        started,
+        timeouts,
+    )
+    .await;
 
     match &result {
         Ok(outcome) if outcome.prepared.prepared => sink.emit(YtDlpPrepareEvent {
@@ -576,6 +608,7 @@ async fn prepare_inner(
     data_dir: &Path,
     registry: &ChildRegistry,
     sink: &dyn ProgressSink,
+    leftovers: Leftovers<'_>,
     started: Instant,
     timeouts: Timeouts,
 ) -> Result<PrepareOutcome, PrepareError> {
@@ -586,32 +619,12 @@ async fn prepare_inner(
     let pinned = InstallEntry::for_identity(layout::ArchiveIdentity::bundled())?;
     let build_id = pinned.build_id().clone();
 
-    // Мусор от подготовок, прерванных на середине: полураспакованное
-    // дерево под именем `.staging-*`. Оно никогда не считается установкой
-    // (установка появляется только переименованием), но занимает до
-    // 124 МиБ и должно уйти.
-    for stale in unpack::stale_staging_dirs(layout.root()) {
-        eprintln!(
-            "yt-dlp: убираю остаток прерванной подготовки {}",
-            stale.display()
-        );
-        unpack::remove_dir_if_exists(&stale)?;
-    }
-
-    // То же самое для недокачанного архива обновления (С-7): прерванное
-    // скачивание оставляет `.download-*` до шестидесяти мегабайт, и
-    // убирать его надо там же, где убирается `.staging-*`, — на старте,
-    // единственном моменте, когда заведомо никто не пишет в каталог
-    // данных. Отказ уборки здесь не роняет подготовку: остаток мешает
-    // месту на диске, а не работе.
-    for stale in layout.stale_downloads() {
-        eprintln!(
-            "yt-dlp: убираю недокачанный архив обновления {}",
-            stale.display()
-        );
-        if let Err(err) = std::fs::remove_file(&stale) {
-            eprintln!("yt-dlp: не удалось убрать {}: {err}", stale.display());
-        }
+    // Уборка — только под замком, который конвейер обновления держит весь
+    // прогон (TL-66): тогда в каталоге заведомо нет его временных файлов.
+    // Guard живёт до конца блока, то есть ровно на время уборки, — дальше
+    // подготовка идёт без замка и конвейер не ждёт её прогрева.
+    if let Leftovers::Remove(_right) = leftovers {
+        remove_leftovers(&layout)?;
     }
 
     // Кого готовить, решает запись Ф-5, а не константа пина: контур
@@ -653,6 +666,42 @@ async fn prepare_inner(
     }
 
     Ok(outcome)
+}
+
+/// Убирает остатки прерванных установок.
+///
+/// Вызывающий доказывает [`Leftovers::Remove`], что контур обновления в
+/// корень сейчас не пишет: иначе `.download-*` и `.staging-*` здесь могли бы
+/// оказаться не остатками, а файлами идущего обновления.
+fn remove_leftovers(layout: &Layout) -> Result<(), PrepareError> {
+    // Мусор от подготовок, прерванных на середине: полураспакованное
+    // дерево под именем `.staging-*`. Оно никогда не считается установкой
+    // (установка появляется только переименованием), но занимает до
+    // 124 МиБ и должно уйти.
+    for stale in unpack::stale_staging_dirs(layout.root()) {
+        eprintln!(
+            "yt-dlp: убираю остаток прерванной подготовки {}",
+            stale.display()
+        );
+        unpack::remove_dir_if_exists(&stale)?;
+    }
+
+    // То же самое для недокачанного архива обновления (С-7): прерванное
+    // скачивание оставляет `.download-*` до шестидесяти мегабайт, и
+    // убирать его надо там же, где убирается `.staging-*`. Отказ уборки
+    // здесь не роняет подготовку: остаток мешает месту на диске, а не
+    // работе.
+    for stale in layout.stale_downloads() {
+        eprintln!(
+            "yt-dlp: убираю недокачанный архив обновления {}",
+            stale.display()
+        );
+        if let Err(err) = std::fs::remove_file(&stale) {
+            eprintln!("yt-dlp: не удалось убрать {}: {err}", stale.display());
+        }
+    }
+
+    Ok(())
 }
 
 /// Готовит установку, которую называет активной запись Ф-5, — но только
@@ -1550,11 +1599,14 @@ mod tests {
             sink: &RecordingSink,
             timeouts: Timeouts,
         ) -> Result<PrepareOutcome, PrepareError> {
+            // Контура обновления в этих тестах нет: замок свободен всегда.
+            let root_work = tokio::sync::Mutex::new(());
             prepare_with(
                 &self.archive,
                 &self.data_dir,
                 &self.registry,
                 sink,
+                Leftovers::Remove(root_work.lock().await),
                 timeouts,
             )
             .await
