@@ -2551,6 +2551,11 @@ fn the_single_launch_fixtures_were_shot_with_the_arguments_of_the_app() {
     // argv съёмки обязан совпасть с тем, что строит `download_args`, кроме
     // хвоста — вместо `-- <ссылка>` у съёмки `--load-info-json <файл>`.
     // Сменят аргументы запуска — этот тест покраснеет, и набор переснимут.
+    //
+    // Аргументы JS-рантайма (TL-109) ставит запускатель, а не
+    // `download_args`, и набор снят без них — известное расхождение до
+    // переснятия после v0.1. Что их получает настоящий процесс, проверяют
+    // тесты `the_production_downloader_*` в конце файла.
     const TAIL: &str = ".f%(format_id)s.%(ext)s";
 
     for name in SINGLE_LAUNCH_FIXTURES {
@@ -6114,4 +6119,135 @@ fn every_merge_container_is_a_working_name_of_an_unnamed_merge() {
         ));
     }
     assert_eq!(ALL_MERGE_CONTAINERS.len(), 3);
+}
+
+// ───────────────── JS-рантайм у настоящего запуска (TL-109) ─────────────────
+
+/// argv одной попытки, как его строит `download_attempt`.
+fn attempt_args() -> Vec<&'static str> {
+    download_args(
+        "137+140",
+        "home:/downloads",
+        "x.f%(format_id)s.%(ext)s",
+        URL,
+    )
+}
+
+/// Запускает `launcher` с [`attempt_args`] и ждёт конца заглушки.
+async fn launch_once(launcher: &SidecarDownloader<'_>) -> StreamedRun {
+    let args = attempt_args();
+    let mut on_line = |_: &str| -> Option<Instant> { None };
+    launcher
+        .launch(
+            &args,
+            &RunHandle::new(),
+            Instant::now() + Duration::from_secs(60),
+            &mut on_line,
+        )
+        .await
+        .expect("заглушка запускается")
+}
+
+#[tokio::test]
+async fn the_production_downloader_hands_deno_and_its_environment_to_yt_dlp() {
+    use crate::sidecar::deno_testing::{recording_ytdlp, LaunchRecord};
+    use crate::sidecar::DenoLaunch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (script, record) = recording_ytdlp(dir.path());
+    let data_dir = dir.path().join("app-data");
+    let deno = dir.path().join("bin").join("deno");
+
+    let registry = ChildRegistry::new();
+    let launcher = SidecarDownloader::new(
+        Some(script),
+        YtDlpJsRuntime::from_deno(Ok(DenoLaunch::new(deno.clone(), &data_dir))),
+        &registry,
+    );
+    let run = launch_once(&launcher).await;
+    assert_eq!(run.exit_code, Some(0));
+
+    let seen = LaunchRecord::read(&record);
+    let before = seen.args_before_separator();
+    let flag = before
+        .iter()
+        .position(|arg| arg == "--js-runtimes")
+        .unwrap_or_else(|| panic!("--js-runtimes до `--`: {:?}", seen.args));
+    assert_eq!(
+        before.get(flag + 1),
+        Some(&format!("deno:{}", deno.display())),
+        "значение флага — абсолютный путь deno, до `--`"
+    );
+    assert!(deno.is_absolute());
+    assert!(!seen.args.iter().any(|arg| arg == "--no-js-runtimes"));
+
+    let own = attempt_args();
+    assert_eq!(
+        seen.args[seen.args.len() - own.len()..],
+        own,
+        "argv попытки цел, ссылка — последней после `--`"
+    );
+
+    assert_eq!(seen.deno_no_update_check.as_deref(), Some("1"));
+    assert_eq!(
+        seen.deno_dir.map(PathBuf::from),
+        Some(data_dir.join("deno"))
+    );
+    assert_eq!(
+        seen.path,
+        std::env::var("PATH").ok(),
+        "окружение унаследовано"
+    );
+    assert!(registry.is_empty());
+}
+
+#[tokio::test]
+async fn without_deno_or_a_data_dir_the_downloader_disables_runtimes_and_adds_no_deno_env() {
+    use crate::sidecar::deno_testing::{recording_ytdlp, LaunchRecord};
+    use crate::sidecar::DenoLaunch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (script, record) = recording_ytdlp(dir.path());
+    let deno = dir.path().join("bin").join("deno");
+
+    for (case, deno) in [
+        ("sidecar deno не резолвится", Err(SidecarError::NotFound)),
+        (
+            "каталог данных не определяется",
+            DenoLaunch::resolve(Err("нет каталога данных"), |_| {
+                Ok(deno.clone())
+            }),
+        ),
+    ] {
+        let registry = ChildRegistry::new();
+        let launcher = SidecarDownloader::new(
+            Some(script.clone()),
+            YtDlpJsRuntime::from_deno(deno),
+            &registry,
+        );
+        let run = launch_once(&launcher).await;
+        assert_eq!(run.exit_code, Some(0), "{case}");
+
+        let seen = LaunchRecord::read(&record);
+        assert_eq!(
+            seen.args_before_separator().first().map(String::as_str),
+            Some("--no-js-runtimes"),
+            "{case}: {:?}",
+            seen.args
+        );
+        assert!(
+            !seen
+                .args
+                .iter()
+                .any(|arg| arg == "--js-runtimes" || arg.starts_with("deno:")),
+            "{case}: {:?}",
+            seen.args
+        );
+        assert_eq!(
+            seen.deno_no_update_check,
+            std::env::var("DENO_NO_UPDATE_CHECK").ok(),
+            "{case}"
+        );
+        assert_eq!(seen.deno_dir, std::env::var("DENO_DIR").ok(), "{case}");
+    }
 }

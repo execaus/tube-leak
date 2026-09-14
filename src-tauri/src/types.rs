@@ -42,6 +42,12 @@ pub enum LaunchFailedReason {
     PermissionDenied,
     Corrupted,
     Other,
+    /// Бинарник запустился и завершился успешно, но в выводе нет строки
+    /// версии — вероятно, под этим именем лежит не тот файл; вывод — в
+    /// `stderrTail`. Кода ОС у этого отказа нет (`osErrorCode` не
+    /// заполняется): процесс стартовал. Сейчас его отдаёт только проверка
+    /// deno (TL-109).
+    UnrecognizedOutput,
 }
 
 /// Результат проверки одного sidecar-бинарника (yt-dlp, ffmpeg или deno).
@@ -82,9 +88,11 @@ pub struct SidecarCheckResult {
 /// `deno.version` — нормализованная версия из первой строки `deno --version`
 /// (`deno 2.9.6 (stable, …)` даёт `2.9.6`). Одно отличие deno от двух других
 /// строк: если бинарник ответил, но версии в выводе не нашлось, приходит не
-/// `ok` с выводом вместо версии, а `launchFailed` с причиной `other`, и
-/// нераспознанный вывод лежит в `stderrTail`. У yt-dlp и ffmpeg в этом
-/// случае по-прежнему `ok`.
+/// `ok` с выводом вместо версии, а `launchFailed` с причиной
+/// `unrecognizedOutput`, и нераспознанный вывод лежит в `stderrTail`. У
+/// yt-dlp и ffmpeg в этом случае по-прежнему `ok`. Причина `other` у deno
+/// остаётся за отказом до запуска — например, когда не определяется
+/// каталог данных приложения для его кэша.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(TS), ts(export_to = "sidecar.ts", optional_fields))]
 #[serde(rename_all = "camelCase")]

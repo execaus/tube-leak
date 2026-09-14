@@ -36,6 +36,15 @@
 //!   a valid URL»). Второй пояс поверх [`validate_url`], который такой
 //!   ввод и так не пропускает.
 //!
+//! Перед этим набором запускатель ([`SidecarLauncher`]) ставит аргументы
+//! JavaScript-рантайма (TL-109): `--js-runtimes deno:<путь к sidecar>` или
+//! `--no-js-runtimes`, а в окружение процесса — окружение deno. Их строит
+//! [`crate::sidecar::YtDlpJsRuntime`], один на разбор и скачивание; почему
+//! флаг не опускается никогда — в его модуле. В [`METADATA_ARGS`] они не
+//! входят, потому что путь известен только на рантайме, а фикстуры ниже
+//! сняты **без** рантайма (в их stderr — предупреждение о его отсутствии);
+//! переснятие с рантаймом — после v0.1, когда живой разбор снова возможен.
+//!
 //! Форма ссылки на набор аргументов не влияет — это осознанный выбор
 //! против ветвления «по виду ссылки»: ветвление означало бы, что реальный
 //! набор аргументов зависит от того, распознали ли мы форму адреса
@@ -122,7 +131,7 @@ use super::classify::{classify, YtDlpOutcome};
 use super::error::ProbeFailure;
 use super::quality::build_quality_ladder;
 use crate::sidecar::{
-    run_cancellable, stderr_tail, ChildRegistry, RunHandle, RunOutput, SidecarError,
+    run_cancellable, stderr_tail, ChildRegistry, RunHandle, RunOutput, SidecarError, YtDlpJsRuntime,
 };
 use crate::types::{ProbeErrorDetails, ProbeResult, YtDlpFailureReason};
 
@@ -279,17 +288,29 @@ pub trait YtDlpLauncher: Send + Sync {
 /// Продакшен-реализация [`YtDlpLauncher`]: запуск через домен `sidecar`
 /// (E1) — резолв пути делает вызывающая команда, реестр процессов и
 /// таймаут живут в [`crate::sidecar::run_cancellable`].
+///
+/// JS-рантайм yt-dlp (TL-109) — часть запускателя, а не аргументов
+/// оркестрации: и его аргументы, и окружение deno берутся из одного
+/// [`YtDlpJsRuntime`] в одной точке запуска, поэтому путь к deno без его
+/// окружения в процесс не попадает.
 pub struct SidecarLauncher<'a> {
     executable: PathBuf,
+    js_runtime: YtDlpJsRuntime,
     registry: &'a ChildRegistry,
 }
 
 impl<'a> SidecarLauncher<'a> {
     /// `executable` — путь к готовому yt-dlp (каталог данных, см.
-    /// [`crate::ytdlp`]); `registry` — реестр PID из состояния приложения.
-    pub fn new(executable: PathBuf, registry: &'a ChildRegistry) -> Self {
+    /// [`crate::ytdlp`]); `js_runtime` — рантайм, который получит yt-dlp;
+    /// `registry` — реестр PID из состояния приложения.
+    pub fn new(
+        executable: PathBuf,
+        js_runtime: YtDlpJsRuntime,
+        registry: &'a ChildRegistry,
+    ) -> Self {
         Self {
             executable,
+            js_runtime,
             registry,
         }
     }
@@ -302,13 +323,19 @@ impl YtDlpLauncher for SidecarLauncher<'_> {
         timeout: Duration,
         handle: &'a RunHandle,
     ) -> Pin<Box<dyn Future<Output = Result<RunOutput, SidecarError>> + Send + 'a>> {
-        Box::pin(run_cancellable(
-            &self.executable,
-            args,
-            timeout,
-            self.registry,
-            handle,
-        ))
+        Box::pin(async move {
+            let argv = self.js_runtime.argv(args);
+            let env = self.js_runtime.env();
+            run_cancellable(
+                &self.executable,
+                &argv,
+                &env,
+                timeout,
+                self.registry,
+                handle,
+            )
+            .await
+        })
     }
 }
 
@@ -637,6 +664,8 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use crate::sidecar::deno_testing::{self, LaunchRecord};
+    use crate::sidecar::DenoLaunch;
     use crate::types::{QualityItem, QualityKind, QualitySize};
 
     // ───────────────────────── подменяемый запускатель ─────────────────
@@ -954,6 +983,11 @@ mod tests {
         // «плейлист» достижим только с `--flat-playlist`, а лестница
         // строится по выводу того же запуска (обязанность TL-32 из
         // ревью TL-31).
+        //
+        // Аргументы JS-рантайма (TL-109) сверкой не покрыты намеренно:
+        // фикстуры сняты без рантайма, и это известное расхождение, а не
+        // упущение, — переснятие после v0.1 (см. doc модуля). Их ставит
+        // запускатель, а проверяет тест настоящего запуска ниже.
         for name in CAPTURES {
             let capture = Capture::load(name);
             let argv = capture.argv();
@@ -1265,7 +1299,11 @@ mod tests {
         }
 
         let registry = ChildRegistry::new();
-        let launcher = SidecarLauncher::new(script, &registry);
+        let launcher = SidecarLauncher::new(
+            script,
+            YtDlpJsRuntime::from_deno(Err(SidecarError::NotFound)),
+            &registry,
+        );
         let session = ProbeSession::with_timeout(Duration::from_millis(300));
 
         let failure = probe(&session, &launcher, URL)
@@ -1280,6 +1318,107 @@ mod tests {
             registry.is_empty(),
             "убитый по таймауту процесс снимается с реестра (TL-10)"
         );
+    }
+
+    // ───────────────── JS-рантайм у настоящего запуска (TL-109) ─────────
+
+    #[tokio::test]
+    async fn the_production_launcher_hands_deno_and_its_environment_to_yt_dlp() {
+        // Заглушка yt-dlp записывает argv и окружение настоящего процесса:
+        // проверяется то, что получил процесс, а не то, что собрал код.
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let (script, record) = deno_testing::recording_ytdlp(dir.path());
+        let data_dir = dir.path().join("app-data");
+        let deno = dir.path().join("bin").join("deno");
+
+        let registry = ChildRegistry::new();
+        let launcher = SidecarLauncher::new(
+            script,
+            YtDlpJsRuntime::from_deno(Ok(DenoLaunch::new(deno.clone(), &data_dir))),
+            &registry,
+        );
+        launcher
+            .launch(&probe_args(URL), PROBE_TIMEOUT, &RunHandle::new())
+            .await
+            .expect("заглушка выходит успешно");
+
+        let seen = LaunchRecord::read(&record);
+        let before = seen.args_before_separator();
+        let flag = before
+            .iter()
+            .position(|arg| arg == "--js-runtimes")
+            .unwrap_or_else(|| panic!("--js-runtimes до `--`: {:?}", seen.args));
+        let spec = before.get(flag + 1).expect("значение флага — до `--`");
+        assert_eq!(spec, &format!("deno:{}", deno.display()));
+        assert!(deno.is_absolute(), "путь к deno абсолютный");
+        assert!(!seen.args.iter().any(|arg| arg == "--no-js-runtimes"));
+
+        let own = probe_args(URL);
+        assert_eq!(
+            seen.args[seen.args.len() - own.len()..],
+            own,
+            "набор разбора цел, ссылка — последней после `--`"
+        );
+
+        assert_eq!(seen.deno_no_update_check.as_deref(), Some("1"));
+        assert_eq!(
+            seen.deno_dir.map(PathBuf::from),
+            Some(data_dir.join("deno"))
+        );
+        assert_eq!(
+            seen.path,
+            std::env::var("PATH").ok(),
+            "окружение унаследовано"
+        );
+        assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_deno_or_a_data_dir_the_launcher_disables_runtimes_and_adds_no_deno_env() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let (script, record) = deno_testing::recording_ytdlp(dir.path());
+        let deno = dir.path().join("bin").join("deno");
+
+        for (case, deno) in [
+            ("sidecar deno не резолвится", Err(SidecarError::NotFound)),
+            (
+                "каталог данных не определяется",
+                DenoLaunch::resolve(Err("нет каталога данных"), |_| {
+                    Ok(deno.clone())
+                }),
+            ),
+        ] {
+            let registry = ChildRegistry::new();
+            let launcher =
+                SidecarLauncher::new(script.clone(), YtDlpJsRuntime::from_deno(deno), &registry);
+            launcher
+                .launch(&probe_args(URL), PROBE_TIMEOUT, &RunHandle::new())
+                .await
+                .expect("заглушка выходит успешно");
+
+            let seen = LaunchRecord::read(&record);
+            assert_eq!(
+                seen.args_before_separator().first().map(String::as_str),
+                Some("--no-js-runtimes"),
+                "{case}: {:?}",
+                seen.args
+            );
+            assert!(
+                !seen
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--js-runtimes" || arg.starts_with("deno:")),
+                "{case}: {:?}",
+                seen.args
+            );
+            // Добавочного окружения нет: у процесса ровно то, что у родителя.
+            assert_eq!(
+                seen.deno_no_update_check,
+                std::env::var("DENO_NO_UPDATE_CHECK").ok(),
+                "{case}"
+            );
+            assert_eq!(seen.deno_dir, std::env::var("DENO_DIR").ok(), "{case}");
+        }
     }
 
     #[tokio::test]

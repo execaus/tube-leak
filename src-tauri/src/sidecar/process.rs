@@ -113,7 +113,30 @@ pub async fn run(
 ) -> Result<RunOutput, SidecarError> {
     // Собственный одноразовый дескриптор: отменять этот запуск снаружи
     // некому, и `handle` остаётся пустышкой, которая ничего не стоит.
-    run_cancellable(program, args, timeout, registry, &RunHandle::new()).await
+    run_cancellable(program, args, &[], timeout, registry, &RunHandle::new()).await
+}
+
+/// То же, что [`run`], плюс переменные окружения `env`, которые
+/// **добавляются** к унаследованному окружению приложения (TL-110).
+///
+/// Добавляются, а не заменяют: окружение приложения несёт системные
+/// настройки прокси (`HTTP_PROXY` и родня), а CLAUDE.md требует их
+/// уважать; очищенное окружение молча отрезало бы пользователя за
+/// корпоративным прокси.
+///
+/// Потребители — проверка версии deno на служебном экране
+/// (`crate::sidecar::DenoEnv`) и оба запуска yt-dlp, чей потомок deno
+/// наследует окружение (TL-109): разбор через [`run_cancellable`],
+/// скачивание через [`run_streaming`]. Сами переменные ставятся в одном
+/// месте — [`sidecar_command`].
+pub async fn run_with_env(
+    program: &Path,
+    args: &[&str],
+    env: &[(&str, &OsStr)],
+    timeout: Duration,
+    registry: &ChildRegistry,
+) -> Result<RunOutput, SidecarError> {
+    run_cancellable(program, args, env, timeout, registry, &RunHandle::new()).await
 }
 
 /// То же, что [`run`], плюс отмена снаружи через [`RunHandle`] (Ф-8 эпика
@@ -129,40 +152,11 @@ pub async fn run(
 /// [`LaunchFailedReason::Corrupted`] — кода завершения у убитого сигналом
 /// процесса нет), а отличить отмену от честного отказа вызывающий может по
 /// [`RunHandle::was_cancelled`].
+///
+/// `env` — добавочное окружение, см. doc [`run_with_env`]. Разбор ссылки
+/// передаёт сюда окружение deno ([`crate::sidecar::YtDlpJsRuntime`],
+/// TL-109): deno — потомок yt-dlp и наследует его окружение.
 pub async fn run_cancellable(
-    program: &Path,
-    args: &[&str],
-    timeout: Duration,
-    registry: &ChildRegistry,
-    handle: &RunHandle,
-) -> Result<RunOutput, SidecarError> {
-    run_cancellable_with_env(program, args, &[], timeout, registry, handle).await
-}
-
-/// То же, что [`run`], плюс переменные окружения `env`, которые
-/// **добавляются** к унаследованному окружению приложения (TL-110).
-///
-/// Добавляются, а не заменяют: окружение приложения несёт системные
-/// настройки прокси (`HTTP_PROXY` и родня), а CLAUDE.md требует их
-/// уважать; очищенное окружение молча отрезало бы пользователя за
-/// корпоративным прокси.
-///
-/// Первый потребитель — проверка версии deno на служебном экране
-/// (`crate::sidecar::DenoEnv`); тот же механизм нужен запуску yt-dlp
-/// (TL-109), чей потомок deno наследует окружение. Сами переменные
-/// ставятся в одном месте — [`sidecar_command`].
-pub async fn run_with_env(
-    program: &Path,
-    args: &[&str],
-    env: &[(&str, &OsStr)],
-    timeout: Duration,
-    registry: &ChildRegistry,
-) -> Result<RunOutput, SidecarError> {
-    run_cancellable_with_env(program, args, env, timeout, registry, &RunHandle::new()).await
-}
-
-/// Тело [`run_cancellable`] с окружением — см. doc [`run_with_env`].
-async fn run_cancellable_with_env(
     program: &Path,
     args: &[&str],
     env: &[(&str, &OsStr)],
@@ -334,15 +328,24 @@ pub struct StreamedRun {
 /// возвращает обычный исход убитого процесса. Отдельной ветки на отмену
 /// внутри нет намеренно — она была бы вторым источником правды рядом с
 /// уже проверенным механизмом.
+///
+/// Убивается именно группа, поэтому вместе с yt-dlp уходит и его потомок
+/// deno (TL-109): yt-dlp порождает его без новой сессии и группы.
+///
+/// # Окружение
+///
+/// `env` добавляется к унаследованному, как у [`run_with_env`]; скачивание
+/// передаёт сюда окружение deno ([`crate::sidecar::YtDlpJsRuntime`]).
 pub async fn run_streaming(
     program: &Path,
     args: &[&str],
+    env: &[(&str, &OsStr)],
     registry: &ChildRegistry,
     handle: &RunHandle,
     first_deadline: Instant,
     on_line: &mut (dyn FnMut(&str) -> Option<Instant> + Send),
 ) -> Result<StreamedRun, SidecarError> {
-    let mut child = sidecar_command(program, args, &[])
+    let mut child = sidecar_command(program, args, env)
         .spawn()
         .map_err(classify_spawn_error)?;
     let pid = child.id();
@@ -854,6 +857,7 @@ mod tests {
         let run = run_streaming(
             &script,
             &[],
+            &[],
             &registry,
             &handle,
             Instant::now() + SPAWN_ALLOWANCE,
@@ -904,6 +908,7 @@ mod tests {
         let run = run_streaming(
             &script,
             &[],
+            &[],
             &registry,
             &handle,
             Instant::now() + SPAWN_ALLOWANCE,
@@ -952,6 +957,7 @@ mod tests {
         let run = run_streaming(
             &script,
             &[],
+            &[],
             &registry,
             &handle,
             Instant::now() + SPAWN_ALLOWANCE,
@@ -993,6 +999,7 @@ mod tests {
         let run = run_streaming(
             &script,
             &[],
+            &[],
             &registry,
             &handle,
             Instant::now() + SPAWN_ALLOWANCE,
@@ -1027,6 +1034,7 @@ mod tests {
         let run = run_streaming(
             &script,
             &[],
+            &[],
             &registry,
             &handle,
             Instant::now() + SPAWN_ALLOWANCE,
@@ -1049,6 +1057,7 @@ mod tests {
 
         let error = run_streaming(
             &dir.path().join("does-not-exist"),
+            &[],
             &[],
             &registry,
             &handle,
@@ -1423,7 +1432,14 @@ mod tests {
             // Таймаут заведомо больше, чем живёт скрипт: если бы отмена не
             // работала, тест ждал бы полминуты и упал по времени, а не
             // прошёл бы «за компанию» с таймаутом.
-            run_cancellable(&script, &[], Duration::from_secs(30), &registry, &handle),
+            run_cancellable(
+                &script,
+                &[],
+                &[],
+                Duration::from_secs(30),
+                &registry,
+                &handle
+            ),
             async {
                 let grandchild = pid_written_by_the_script(&pid_file).await;
                 assert!(
@@ -1469,6 +1485,145 @@ mod tests {
         );
     }
 
+    /// Скрипт, печатающий унаследованные `HOME` и `PATH` построчно.
+    ///
+    /// Переменные родителя, а не выставленные тестом: `std::env::set_var`
+    /// в параллельном наборе меняет окружение всех потоков разом (а
+    /// `HTTPS_PROXY` — ещё и соседним тестам контура обновления), тогда
+    /// как `HOME` и `PATH` у `cargo test` есть всегда. Системные настройки
+    /// прокси доходят до процесса тем же наследованием.
+    fn inherited_env_script(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        write_script(
+            dir,
+            "print-inherited.sh",
+            "#!/bin/sh\nprintf '%s\\n%s\\n' \"$HOME\" \"$PATH\"\nexit 0\n",
+            0o755,
+        )
+    }
+
+    /// `HOME` и `PATH` этого процесса — то, что обязан унаследовать потомок.
+    fn parent_home_and_path() -> Vec<String> {
+        let home = std::env::var("HOME").expect("у cargo test задан HOME");
+        let path = std::env::var("PATH").expect("у cargo test задан PATH");
+        assert!(!path.is_empty(), "пустой PATH ничего не доказывает");
+        vec![home, path]
+    }
+
+    #[tokio::test]
+    async fn a_cancellable_run_without_extra_env_inherits_the_parent_environment() {
+        // Остаток ревью TL-110: окружение добавляется к унаследованному, а
+        // не заменяет его, и на пути разбора тоже. Мутация `env_clear()` в
+        // `sidecar_command` обязана это ронять.
+        let dir = tempdir().expect("failed to create temp dir");
+        let script = inherited_env_script(&dir);
+        let registry = ChildRegistry::new();
+
+        let output = run_cancellable(
+            &script,
+            &[],
+            &[],
+            Duration::from_secs(20),
+            &registry,
+            &RunHandle::new(),
+        )
+        .await
+        .expect("script must succeed");
+
+        let lines: Vec<String> = output.stdout.lines().map(str::to_string).collect();
+        assert_eq!(lines, parent_home_and_path());
+    }
+
+    #[tokio::test]
+    async fn a_streaming_run_without_extra_env_inherits_the_parent_environment() {
+        // То же для пути скачивания.
+        let dir = tempdir().expect("failed to create temp dir");
+        let script = inherited_env_script(&dir);
+        let registry = ChildRegistry::new();
+        let handle = RunHandle::new();
+
+        let mut seen = Vec::new();
+        let run = run_streaming(
+            &script,
+            &[],
+            &[],
+            &registry,
+            &handle,
+            Instant::now() + SPAWN_ALLOWANCE,
+            &mut collector(&mut seen, SPAWN_ALLOWANCE),
+        )
+        .await
+        .expect("script must spawn");
+
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(seen, parent_home_and_path());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_streaming_run_kills_the_forked_grandchild_too() {
+        // TL-109: так yt-dlp держит deno — потомок в той же группе
+        // процессов (yt-dlp порождает его без новой сессии) и со своими
+        // пайпами, а не с нашим stdout. Отмена скачивания обязана убить и
+        // его, а не только прямого потомка.
+        //
+        // `exec sleep`: прямой потомок сам не держит ничего, кроме
+        // собственного stdout, поэтому убийство одного PID вместо группы
+        // даёт EOF и тест доходит до проверки внука, а не висит. Если
+        // отмена не убьёт ничего, процесс снимет срок бездействия — и тест
+        // покраснеет на `deadline_expired`, а не будет ждать `sleep 300`.
+        let dir = tempdir().expect("failed to create temp dir");
+        let pid_file = dir.path().join("grandchild.pid");
+        let script = write_script(
+            &dir,
+            "streams-and-forks.sh",
+            &format!(
+                "#!/bin/sh\nsleep 300 >/dev/null 2>&1 &\necho $! > '{}'\n{ECHO} started\nexec sleep 300\n",
+                pid_file.display()
+            ),
+            0o755,
+        );
+        let registry = ChildRegistry::new();
+        let handle = RunHandle::new();
+
+        let mut seen = Vec::new();
+        let mut on_line = collector(&mut seen, SPAWN_ALLOWANCE);
+        let (run, grandchild) = tokio::join!(
+            run_streaming(
+                &script,
+                &[],
+                &[],
+                &registry,
+                &handle,
+                Instant::now() + SPAWN_ALLOWANCE,
+                &mut on_line,
+            ),
+            async {
+                let grandchild = pid_written_by_the_script(&pid_file).await;
+                assert!(
+                    process_is_alive(grandchild),
+                    "внук должен быть жив до отмены — иначе тест ничего не проверяет"
+                );
+                handle.cancel().await;
+                grandchild
+            }
+        );
+        let run = run.expect("script must spawn");
+
+        assert!(handle.was_cancelled());
+        assert!(
+            !run.deadline_expired,
+            "процесс снят сроком, а не отменой — отмена не убила ничего"
+        );
+        assert_eq!(
+            run.exit_code, None,
+            "убитый сигналом процесс кода не оставляет"
+        );
+        assert!(
+            wait_until_dead(grandchild).await,
+            "внук {grandchild} пережил отмену скачивания — так пережил бы её и deno"
+        );
+        assert!(registry.is_empty());
+    }
+
     #[tokio::test]
     async fn a_cancellation_that_arrives_before_the_spawn_kills_the_process_at_once() {
         // Единственная ветка отмены, порядок в которой держится ручным
@@ -1491,8 +1646,15 @@ mod tests {
         handle.cancel().await;
 
         let started = Instant::now();
-        let result =
-            run_cancellable(&script, &[], Duration::from_secs(30), &registry, &handle).await;
+        let result = run_cancellable(
+            &script,
+            &[],
+            &[],
+            Duration::from_secs(30),
+            &registry,
+            &handle,
+        )
+        .await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -1529,9 +1691,16 @@ mod tests {
         let registry = ChildRegistry::new();
         let handle = RunHandle::new();
 
-        run_cancellable(&script, &[], Duration::from_secs(20), &registry, &handle)
-            .await
-            .expect("скрипт завершается сам и успешно");
+        run_cancellable(
+            &script,
+            &[],
+            &[],
+            Duration::from_secs(20),
+            &registry,
+            &handle,
+        )
+        .await
+        .expect("скрипт завершается сам и успешно");
 
         // Не виснет, не паникует и никого не убивает: убивать уже нечего.
         handle.cancel().await;
