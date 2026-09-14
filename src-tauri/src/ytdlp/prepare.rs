@@ -995,11 +995,44 @@ async fn install_and_warm(
 /// пик расхода — на одну установку (около 124 МиБ) больше прежнего.
 /// Н-4 этот пик уже закладывает («активная + известно-хорошая +
 /// подготавливаемая + архив»).
+///
+/// # Уборка при отказе — свойство конструкции (TL-64)
+///
+/// Каталог, который эта функция создала, живёт в [`Leftover`] и уходит
+/// при **любом** раннем выходе: отказ распаковки, сноса прежнего дерева,
+/// `rename`, записи манифеста. До TL-64 уборка висела `inspect_err` на
+/// двух шагах из четырёх, и провал `rename` оставлял `.staging-*` до
+/// следующего старта — в контуре обновления (E6), где установка идёт
+/// регулярно и в фоне, это десятки мегабайт на каждую неудачу.
+///
+/// Трогает уборка только то, что создано этим вызовом: `.staging-*` со
+/// случайным суффиксом (его имени не знает никто, кроме нас) и — после
+/// `rename` и до записи манифеста — тот же каталог на рабочем пути.
+/// Каталог без манифеста не установка ([`layout::validate`] отвечает
+/// `NoManifest`), и прежнего дерева этого build id к тому моменту уже нет
+/// (см. «Порядок шагов»), поэтому терять там нечего. Дерево другой
+/// установки — активной, известно-хорошей, прогреваемой в фоне (TL-21) —
+/// уборке недостижимо по построению: его пути она не держит никогда.
 pub(super) fn install(
     archive_path: &Path,
     layout: &Layout,
     identity: layout::ArchiveIdentity<'_>,
     on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Installed, PrepareError> {
+    install_with(archive_path, layout, identity, on_progress, unpack::promote)
+}
+
+/// Тело [`install`] с подставляемым шагом `rename`.
+///
+/// Шаг вынесен ровно ради одного теста: провал `rename` в пределах
+/// одного каталога не воспроизводится файловой системой, не сломав
+/// заодно уборку (нет прав на каталог — нет прав и удалить из него).
+fn install_with(
+    archive_path: &Path,
+    layout: &Layout,
+    identity: layout::ArchiveIdentity<'_>,
+    on_progress: &mut dyn FnMut(u64, u64),
+    promote: fn(&Path, &Path) -> Result<(), PrepareError>,
 ) -> Result<Installed, PrepareError> {
     let build_id = identity.build_id()?;
     let install_dir = layout.install_dir(&build_id);
@@ -1008,37 +1041,77 @@ pub(super) fn install(
     // Каталог распаковки создаётся здесь и под непредсказуемым именем
     // (см. doc `super::layout`), поэтому «убрать прежний staging» не
     // требуется: своего у нас ещё нет, а чужой — не наш.
-    let staging = layout.create_staging_dir(&build_id)?;
+    let mut leftover = Leftover::new(layout.create_staging_dir(&build_id)?);
 
-    let unpacked = unpack::unpack(archive_path, &staging, on_progress).inspect_err(|_| {
-        // Полураспакованное дерево не должно пережить неудачу — иначе
-        // следующий запуск найдёт мусор на 124 МиБ и будет чистить его
-        // «за прошлый раз».
-        let _ = unpack::remove_dir_if_exists(&staging);
-    })?;
+    let unpacked = unpack::unpack(archive_path, leftover.path(), on_progress)?;
+
+    // Манифест собирается по дереву в `.staging-*`, до `rename`: обход —
+    // тоже шаг, который может отказать, и отказ его должен прийти, пока
+    // прежнее дерево ещё не снесено. Содержимое после `rename` то же
+    // самое — переименование не трогает ни одного файла внутри.
+    let manifest = layout::manifest_for(leftover.path(), &unpacked.executable, identity)?;
 
     // Прежняя установка этого же build id могла остаться непригодной
     // (`validate` уже сказала, что она не годится) — переименование в
     // занятый путь не пройдёт, поэтому её надо убрать. Убирается она
     // **после** распаковки, и порядок здесь несущий — см. «Порядок
-    // шагов» в doc функции. Отказ сноса оставляет `.staging-*` на диске:
-    // его уберёт следующий запуск (`prepare_inner` чистит остатки), а
-    // рабочее дерево при этом цело.
-    unpack::remove_dir_if_exists(&install_dir).inspect_err(|_| {
-        let _ = unpack::remove_dir_if_exists(&staging);
-    })?;
+    // шагов» в doc функции.
+    unpack::remove_dir_if_exists(&install_dir)?;
     let _ = std::fs::remove_file(&manifest_path);
 
-    unpack::promote(&staging, &install_dir)?;
+    promote(leftover.path(), &install_dir)?;
+    leftover.moved_to(install_dir.clone());
 
-    let manifest = layout::manifest_for(&install_dir, &unpacked.executable, identity)?;
     manifest.write_atomic(&manifest_path)?;
+    leftover.keep();
 
     Ok(Installed {
         dir: install_dir.clone(),
         executable: install_dir.join(&unpacked.executable),
         version: manifest.yt_dlp_version,
     })
+}
+
+/// Каталог, созданный установкой и ещё не ставший установкой (TL-64).
+///
+/// Убирается в `Drop`, если его не отпустили [`Self::keep`], — то есть на
+/// любом `?` в [`install_with`], включая те шаги, которых там ещё нет.
+/// Неудача уборки не меняет исхода установки, но видна в логе: иначе
+/// оставшиеся мегабайты не объяснит ничто.
+struct Leftover {
+    path: Option<PathBuf>,
+}
+
+impl Leftover {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().unwrap_or_else(|| Path::new(""))
+    }
+
+    /// Каталог переехал `rename` и убирать теперь надо его новый путь.
+    fn moved_to(&mut self, path: PathBuf) {
+        self.path = Some(path);
+    }
+
+    /// Установка дошла до конца: убирать нечего.
+    fn keep(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for Leftover {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        eprintln!("yt-dlp: установка не удалась — убираю {}", path.display());
+        if let Err(err) = unpack::remove_dir_if_exists(&path) {
+            eprintln!("yt-dlp: не удалось убрать остаток установки: {err}");
+        }
+    }
 }
 
 /// Исход проверки «дерево уже тёплое?».
@@ -2149,6 +2222,102 @@ mod tests {
                 "остался каталог распаковки {name:?}"
             );
         }
+    }
+
+    /// Корень установок с рабочей установкой пина — той, которую отказ
+    /// установки **другого** build id не имеет права тронуть. Возвращает её
+    /// идентификатор и байты исполняемого файла для сверки.
+    fn root_with_a_working_installation(dir: &Path) -> (Layout, layout::BuildId, Vec<u8>) {
+        let layout = Layout::new(&dir.join("app-data"));
+        layout.create_root().expect("корень обязан создаваться");
+        let good = dir.join("good.zip");
+        write_fake_ytdlp_zip(&good, PRINTS_VERSION);
+        let installed = install(
+            &good,
+            &layout,
+            layout::ArchiveIdentity::bundled(),
+            &mut |_, _| {},
+        )
+        .expect("рабочая установка");
+        let bytes = fs::read(&installed.executable).expect("файл читается");
+        (layout, pinned_build_id(), bytes)
+    }
+
+    fn assert_no_staging(layout: &Layout) {
+        let left = unpack::stale_staging_dirs(layout.root());
+        assert!(left.is_empty(), "остались каталоги распаковки: {left:?}");
+    }
+
+    fn assert_still_working(layout: &Layout, build_id: &layout::BuildId, bytes: &[u8]) {
+        assert!(
+            layout::validate(layout, build_id).is_ok(),
+            "прежняя установка обязана остаться пригодной"
+        );
+        assert_eq!(
+            fs::read(layout.install_dir(build_id).join(EXECUTABLE_NAME)).expect("файл читается"),
+            bytes,
+            "прежняя установка обязана остаться той же байт в байт"
+        );
+    }
+
+    #[test]
+    fn a_failed_promote_leaves_no_staging_and_the_working_installation_alone() {
+        // TL-64: уборка висела `inspect_err` на распаковке и сносе, и провал
+        // `rename` оставлял `.staging-*` до следующего старта.
+        let dir = tempdir().expect("tempdir");
+        let (layout, working, bytes) = root_with_a_working_installation(dir.path());
+        let candidate = updated_identity();
+        let candidate_id = candidate.build_id().expect("кандидат проходит проверку");
+        let archive = dir.path().join("candidate.zip");
+        write_fake_ytdlp_zip(&archive, PRINTS_VERSION);
+
+        let error = install_with(&archive, &layout, candidate, &mut |_, _| {}, |_, _| {
+            Err(PrepareError::UnpackFailed {
+                reason: "перенос отказал".to_string(),
+            })
+        })
+        .expect_err("отказ переноса обязан дойти до вызывающего");
+
+        assert!(error.to_string().contains("перенос отказал"), "{error}");
+        assert_no_staging(&layout);
+        assert!(!layout.install_dir(&candidate_id).exists());
+        assert!(!layout.manifest_path(&candidate_id).exists());
+        assert_still_working(&layout, &working, &bytes);
+    }
+
+    #[test]
+    fn a_real_failure_at_a_later_step_of_install_leaves_no_staging_either() {
+        // Те же гарантии на настоящих отказах файловой системы, без подмены
+        // шага: уборка — свойство конструкции, а не одного пути отказа.
+        let dir = tempdir().expect("tempdir");
+        let (layout, working, bytes) = root_with_a_working_installation(dir.path());
+        let candidate = updated_identity();
+        let candidate_id = candidate.build_id().expect("кандидат проходит проверку");
+        let archive = dir.path().join("candidate.zip");
+        write_fake_ytdlp_zip(&archive, PRINTS_VERSION);
+        let install_dir = layout.install_dir(&candidate_id);
+        let manifest_path = layout.manifest_path(&candidate_id);
+
+        // Снос прежнего дерева: на месте каталога установки лежит файл.
+        fs::write(&install_dir, b"not a directory").expect("занять путь файлом");
+        let error = install(&archive, &layout, candidate, &mut |_, _| {})
+            .expect_err("снос занятого файлом пути обязан отказать");
+        assert_no_staging(&layout);
+        assert_still_working(&layout, &working, &bytes);
+        fs::remove_file(&install_dir).unwrap_or_else(|err| panic!("{error}; {err}"));
+
+        // Запись манифеста: на месте манифеста каталог. Отказ приходит уже
+        // после `rename`, и дерево без манифеста уходит вместе с ним — это
+        // не установка.
+        fs::create_dir(&manifest_path).expect("занять путь манифеста каталогом");
+        let error = install(&archive, &layout, candidate, &mut |_, _| {})
+            .expect_err("запись манифеста поверх каталога обязана отказать");
+        assert_no_staging(&layout);
+        assert!(
+            !install_dir.exists(),
+            "дерево без манифеста не переживает отказ ({error})"
+        );
+        assert_still_working(&layout, &working, &bytes);
     }
 
     #[tokio::test]
