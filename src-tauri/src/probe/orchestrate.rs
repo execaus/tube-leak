@@ -119,6 +119,7 @@
 //! опознана». Различаются они только строкой лога — `message` контракта
 //! берётся из `Display` варианта и один на класс.
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -234,7 +235,27 @@ fn probe_args(url: &str) -> Vec<&str> {
 /// Внутренние пробелы и управляющие символы отвергаются: валидная ссылка
 /// их не содержит, а ввод с ними — это точно не то, что пользователь
 /// скопировал из адресной строки.
-pub fn validate_url(input: &str) -> Result<&str, ProbeFailure> {
+///
+/// # Регистр схемы и хоста (TL-81)
+///
+/// Возвращённая ссылка — **нормализованная**: схема и хост переведены в
+/// нижний регистр ([`lower_case_scheme_and_host`]). Это не косметика:
+/// yt-dlp сопоставляет ссылку со своими extractor'ами с учётом регистра,
+/// и `HTTPS://WWW.YOUTUBE.COM/watch?v=ID` уходил у него в `generic`, то
+/// есть разбирался как «страница в интернете», а не как ролик (замер —
+/// у теста `upper_case_scheme_and_host_reach_yt_dlp_as_lower_case`).
+/// RFC 3986 (3.1, 3.2.2) называет схему и хост регистронезависимыми,
+/// поэтому это та же самая ссылка, а не догадка о ней.
+///
+/// Путь, query и фрагмент не трогаются: идентификатор ролика и ключ `v=`
+/// регистрозависимы. Userinfo тоже (RFC 3986, 3.2.1); порт — цифры.
+///
+/// Нормализованную ссылку получают все потребители одинаково: разбор
+/// ([`probe`]) и постановка задачи ([`crate::download::build_task`]),
+/// которая кладёт её обратно в запрос, — а оттуда её берут argv
+/// скачивания, сравнение дублей очереди, рабочее имя частичных файлов,
+/// снимок очереди на диске и запись истории.
+pub fn validate_url(input: &str) -> Result<Cow<'_, str>, ProbeFailure> {
     let url = input.trim();
 
     let rest = strip_scheme(url).ok_or(ProbeFailure::NotAUrl)?;
@@ -254,7 +275,43 @@ pub fn validate_url(input: &str) -> Result<&str, ProbeFailure> {
         return Err(ProbeFailure::NotAUrl);
     }
 
-    Ok(url)
+    Ok(lower_case_scheme_and_host(url, url.len() - rest.len()))
+}
+
+/// Ссылка со схемой и хостом в нижнем регистре; всё остальное — байт в
+/// байт.
+///
+/// `scheme_len` — длина `http://`/`https://` вместе с `//`: её уже
+/// нашла [`strip_scheme`]. Authority кончается первым `/`, `?` или `#`
+/// (RFC 3986, 3.2); userinfo — всё до **последнего** `@` в нём, и оно
+/// остаётся как есть. Остаток authority — хост и порт: порт состоит из
+/// цифр, и нижний регистр его не меняет.
+///
+/// Меняются только ASCII-буквы: регистр не-ASCII хоста (IDN) — дело
+/// punycode, а не этой функции. Ссылка, которой менять нечего, не
+/// копируется.
+fn lower_case_scheme_and_host(url: &str, scheme_len: usize) -> Cow<'_, str> {
+    let (scheme, rest) = url.split_at(scheme_len);
+    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_len);
+    let (userinfo, host) = authority
+        .rfind('@')
+        .map_or(authority.split_at(0), |at| authority.split_at(at + 1));
+
+    if !scheme
+        .bytes()
+        .chain(host.bytes())
+        .any(|byte| byte.is_ascii_uppercase())
+    {
+        return Cow::Borrowed(url);
+    }
+
+    let mut normalized = String::with_capacity(url.len());
+    normalized.push_str(&scheme.to_ascii_lowercase());
+    normalized.push_str(userinfo);
+    normalized.push_str(&host.to_ascii_lowercase());
+    normalized.push_str(tail);
+    Cow::Owned(normalized)
 }
 
 /// Остаток ссылки после `http://`/`https://`, если схема именно такая.
@@ -479,7 +536,7 @@ where
         return Err(preempted());
     }
 
-    let args = probe_args(url);
+    let args = probe_args(&url);
     eprintln!("probe: запуск yt-dlp {}", args.join(" "));
 
     let started = Instant::now();
@@ -937,20 +994,193 @@ mod tests {
 
     #[tokio::test]
     async fn an_http_url_passes_validation_in_any_case_and_with_stray_spaces() {
-        for input in [
-            "https://www.youtube.com/watch?v=x",
-            "http://youtu.be/x",
-            "HTTPS://WWW.YOUTUBE.COM/watch?v=x",
-            "  https://youtu.be/x  ",
+        // Не «запуск состоялся», а «запуск получил вот эту ссылку»: факт
+        // запуска верхний регистр проходил и тогда, когда уводил yt-dlp в
+        // `generic` (TL-81).
+        for (input, argv_url) in [
+            (URL, URL),
+            ("http://youtu.be/aqz-KE-bpKQ", "http://youtu.be/aqz-KE-bpKQ"),
+            ("HTTPS://WWW.YOUTUBE.COM/watch?v=aqz-KE-bpKQ", URL),
+            (
+                "  https://youtu.be/aqz-KE-bpKQ  ",
+                "https://youtu.be/aqz-KE-bpKQ",
+            ),
+            (
+                "\tHTTPS://YouTu.be/aqz-KE-bpKQ \n",
+                "https://youtu.be/aqz-KE-bpKQ",
+            ),
         ] {
             let launcher = FakeLauncher::succeeding("{}");
-            // Результат неважен: `{}` — не карточка. Важно, что запуск
-            // состоялся, то есть валидация ввод пропустила.
+            // Исход неважен: `{}` — не карточка. Важен argv.
             let _ = probe(&session(), &launcher, input).await;
+            let calls = launcher.calls();
+            assert_eq!(calls.len(), 1, "ввод «{input}» — валидная http(s)-ссылка");
             assert_eq!(
-                launcher.calls().len(),
-                1,
-                "ввод «{input}» — валидная http(s)-ссылка"
+                calls[0],
+                probe_args(argv_url),
+                "ввод «{input}» обязан дойти до yt-dlp как «{argv_url}»"
+            );
+        }
+    }
+
+    /// Замер TL-81 (офлайн, 2026-09-14): extractor, которому yt-dlp отдаёт
+    /// ссылку **до** всякого сетевого обмена.
+    ///
+    /// Пин 2026.08.19 (`yt-dlp_macos`), macOS 26.6, запуск
+    /// `--ignore-config -v --proxy http://127.0.0.1:1 --simulate
+    /// --no-playlist -- <url>`; extractor — первая строка
+    /// `[<extractor>] Extracting URL`. Сеть не нужна: прокси заведомо мёртв,
+    /// а выбор extractor'а происходит раньше подключения.
+    ///
+    /// ```text
+    /// ссылка (ID = aqz-KE-bpKQ)                    сырая        в argv после TL-81
+    /// https://www.youtube.com/watch?v=ID           [youtube]    [youtube]
+    /// HTTPS://WWW.YOUTUBE.COM/watch?v=ID           [generic]    [youtube]
+    /// HTTP://youtube.com/watch?v=ID (только схема) [generic]    [youtube]
+    /// https://youtu.be/ID                          [youtube]    [youtube]
+    /// https://YouTu.be/ID, HTTPS://YOUTU.BE/ID     [generic]    [youtube]
+    /// Https://YouTu.Be/ID?si=AbC                   [generic]    [youtube]
+    /// https://M.YOUTUBE.COM/shorts/ID              [generic]    [youtube]
+    /// 6 хостов × 5 форм (watch?v=, shorts/, embed/, v/, live/) матрицы
+    /// TL-72, хост и схема в верхнем регистре       [generic]    [youtube]
+    ///   — все 30 ячеек; в нижнем регистре все 30 — [youtube]
+    /// https://www.youtube.com:443/watch?v=ID       [generic]    [generic]
+    /// https://WWW.YOUTUBE.COM:443/watch?v=ID       [generic]    [generic]
+    /// https://User@www.youtube.com/watch?v=ID      [generic]    [generic]
+    /// https://User@WWW.YOUTUBE.COM/watch?v=ID      [generic]    [generic]
+    /// https://www.youtube.com/WATCH?v=ID (путь)    [youtube:tab] не трогается
+    /// https://www.youtube.com/watch?v=AQZ-KE-BPKQ  [youtube] — другой id, не трогается
+    /// ```
+    ///
+    /// «После» — это нижний регистр той же строки, снятый тем же прогоном:
+    /// именно такую строку функция отдаёт в argv. Порт и userinfo уводят
+    /// в `generic` в любом регистре — нормализация их не чинит и не
+    /// ломает. Путь в верхнем регистре меняет смысл (`WATCH` — вкладка,
+    /// `AQZ-…` — другой ролик), поэтому путь и query не трогаются.
+    #[tokio::test]
+    async fn upper_case_scheme_and_host_reach_yt_dlp_as_lower_case() {
+        const ID: &str = "aqz-KE-bpKQ";
+        let mut pairs = Vec::new();
+        for host in [
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "music.youtube.com",
+            "youtube-nocookie.com",
+            "www.youtube-nocookie.com",
+        ] {
+            for path in [
+                format!("watch?v={ID}"),
+                format!("shorts/{ID}"),
+                format!("embed/{ID}"),
+                format!("v/{ID}"),
+                format!("live/{ID}"),
+            ] {
+                let lower = format!("https://{host}/{path}");
+                pairs.push((format!("HTTPS://{}/{path}", host.to_uppercase()), lower));
+            }
+        }
+        for (input, lower) in [
+            (
+                "HTTPS://YOUTU.BE/aqz-KE-bpKQ",
+                "https://youtu.be/aqz-KE-bpKQ",
+            ),
+            (
+                "https://YouTu.be/aqz-KE-bpKQ",
+                "https://youtu.be/aqz-KE-bpKQ",
+            ),
+            (
+                "Https://YouTu.Be/aqz-KE-bpKQ?si=AbC",
+                "https://youtu.be/aqz-KE-bpKQ?si=AbC",
+            ),
+            (
+                "HTTP://youtube.com/watch?v=aqz-KE-bpKQ",
+                "http://youtube.com/watch?v=aqz-KE-bpKQ",
+            ),
+            (
+                "https://M.YOUTUBE.COM/shorts/aqz-KE-bpKQ",
+                "https://m.youtube.com/shorts/aqz-KE-bpKQ",
+            ),
+            // Чужой хост нормализуется так же: правило RFC, а не список доменов.
+            (
+                "HTTPS://EXAMPLE.COM/Video/ABC",
+                "https://example.com/Video/ABC",
+            ),
+            // Authority без пути: хост кончается концом строки, `?` или `#`.
+            ("HTTPS://EXAMPLE.COM", "https://example.com"),
+            ("HTTPS://YOUTU.BE?V=X", "https://youtu.be?V=X"),
+            ("HTTPS://YOUTU.BE#T=10", "https://youtu.be#T=10"),
+        ] {
+            pairs.push((input.to_owned(), lower.to_owned()));
+        }
+
+        for (input, lower) in &pairs {
+            let upper = FakeLauncher::succeeding("{}");
+            let _ = probe(&session(), &upper, input).await;
+            let plain = FakeLauncher::succeeding("{}");
+            let _ = probe(&session(), &plain, lower).await;
+
+            assert_eq!(upper.calls().len(), 1, "«{input}»");
+            assert_eq!(
+                upper.calls(),
+                plain.calls(),
+                "«{input}» обязан дать yt-dlp тот же argv, что «{lower}»"
+            );
+            assert_eq!(upper.calls()[0], probe_args(lower));
+        }
+        assert_eq!(pairs.len(), 39, "перебор обязан быть полным");
+    }
+
+    #[test]
+    fn path_query_fragment_userinfo_and_port_keep_their_case() {
+        // Идентификатор и ключ `v=` регистрозависимы: замер TL-81 —
+        // `…/WATCH?v=ID` уходит в `youtube:tab`, `v=AQZ-KE-BPKQ` — другой
+        // ролик. Userinfo регистрозависим по RFC 3986 (3.2.1).
+        for (input, expected) in [
+            (
+                "HTTPS://WWW.YOUTUBE.COM/WATCH?V=AQZ-KE-BPKQ#T=10",
+                "https://www.youtube.com/WATCH?V=AQZ-KE-BPKQ#T=10",
+            ),
+            (
+                "https://www.youtube.com/watch?v=aqz-KE-bpKQ&LIST=PLbpi6ZahtOH6",
+                "https://www.youtube.com/watch?v=aqz-KE-bpKQ&LIST=PLbpi6ZahtOH6",
+            ),
+            (
+                "HTTPS://YOUTU.BE/aqz-KE-bpKQ?si=Kx1yQ7wSomething",
+                "https://youtu.be/aqz-KE-bpKQ?si=Kx1yQ7wSomething",
+            ),
+            (
+                "HTTPS://WWW.YOUTUBE.COM:443/watch?v=aqz-KE-bpKQ",
+                "https://www.youtube.com:443/watch?v=aqz-KE-bpKQ",
+            ),
+            (
+                "HTTPS://User:PaSs@WWW.YOUTUBE.COM:8443/Shorts/aqz-KE-bpKQ",
+                "https://User:PaSs@www.youtube.com:8443/Shorts/aqz-KE-bpKQ",
+            ),
+            // `@` в пути или query — не userinfo: authority кончается раньше.
+            (
+                "HTTPS://EXAMPLE.COM/@Channel?Q=A@B",
+                "https://example.com/@Channel?Q=A@B",
+            ),
+            (
+                "HTTPS://User@Name@EXAMPLE.COM/P",
+                "https://User@Name@example.com/P",
+            ),
+        ] {
+            assert_eq!(validate_url(input).as_deref(), Ok(expected), "«{input}»");
+        }
+    }
+
+    #[test]
+    fn a_link_with_nothing_to_normalize_is_not_copied() {
+        for url in [
+            URL,
+            "https://User@www.youtube.com/WATCH?V=AQZ",
+            "  http://youtu.be/x  ",
+        ] {
+            assert!(
+                matches!(validate_url(url), Ok(Cow::Borrowed(_))),
+                "«{url}»: нормализовать нечего — копии быть не должно"
             );
         }
     }

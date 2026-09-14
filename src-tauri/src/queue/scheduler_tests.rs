@@ -585,6 +585,49 @@ async fn a_terminal_task_does_not_block_the_same_video_again() {
 }
 
 #[tokio::test]
+async fn an_upper_case_scheme_and_host_is_the_same_link_for_the_queue_and_its_snapshot() {
+    // TL-81: ссылка в верхнем регистре схемы и хоста — та же ссылка (RFC
+    // 3986), и очередь обязана хранить её в том виде, в каком она уйдёт в
+    // yt-dlp. Сравнение дублей идёт по id ролика и регистр хоста не видело
+    // и раньше — эта часть проверки держит обратное направление: второй
+    // записи того же ролика не появляется ни в каком порядке регистров.
+    let queue = Harness::with_disk();
+    let first = queue.start_ok(request_for(
+        "HTTPS://WWW.YOUTUBE.COM/watch?v=aqz-KE-bpKQ",
+        streams(Some("137"), Some("140")),
+    ));
+
+    assert_eq!(
+        queue.env.started(0).request().url,
+        URL,
+        "задача хранит нормализованную ссылку"
+    );
+    let dir = queue.dir.as_ref().expect("очередь с диском");
+    let on_disk: Vec<String> = SnapshotStore::new(dir.path())
+        .load()
+        .expect("снимок читается")
+        .into_iter()
+        .map(|entry| entry.request.url)
+        .collect();
+    assert_eq!(
+        on_disk,
+        [URL],
+        "снимок на диске хранит нормализованную ссылку"
+    );
+
+    for again in [URL, "https://WWW.YouTube.COM/watch?v=aqz-KE-bpKQ"] {
+        let rejection = queue
+            .start(request_for(again, streams(Some("137"), Some("140"))))
+            .expect_err("тот же ролик в другом регистре хоста — дубль");
+        assert!(
+            matches!(rejection, DownloadCommandRejection::DuplicateTask { .. }),
+            "«{again}»: {rejection:?}"
+        );
+    }
+    assert_eq!(queue.ids(), [first]);
+}
+
+#[tokio::test]
 async fn a_link_whose_form_is_not_recognised_is_never_a_duplicate() {
     // Требование, которое легко прочесть наоборот: `None` от канонизации
     // означает «дублем не считать», а не «считать одним роликом».
