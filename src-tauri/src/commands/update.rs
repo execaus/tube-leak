@@ -194,6 +194,7 @@ async fn run(app: AppHandle, action: Action) {
     let transport = app.state::<GithubTransport>();
     let registry = app.state::<ChildRegistry>();
     let in_use = app.state::<InUse>();
+    let session = app.state::<ytdlp::Session>();
     let scheduler = app.state::<Arc<QueueScheduler>>().inner().clone();
 
     let sink = AppUpdateSink(app.clone());
@@ -205,6 +206,7 @@ async fn run(app: AppHandle, action: Action) {
         transport.inner(),
         registry.inner(),
         in_use.inner(),
+        session.inner(),
         &sink,
         &boundary,
     );

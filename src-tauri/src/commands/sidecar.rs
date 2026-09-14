@@ -30,7 +30,7 @@ use tauri::{AppHandle, Manager, State};
 use crate::clock::now_iso8601;
 use crate::sidecar::{self, stderr_tail, ChildRegistry, DenoEnv, DenoLaunch, SidecarError};
 use crate::types::{LaunchFailedReason, SidecarCheckReport, SidecarCheckResult, SidecarStatus};
-use crate::ytdlp::{self, InUse, InUseGuard};
+use crate::ytdlp::{self, InUse, InUseGuard, Session, WarmLaunch};
 
 /// Верхняя граница времени служебного экрана по Н-2: версия должна
 /// появиться не позже, чем через 10 секунд после старта. Обе проверки идут
@@ -92,6 +92,14 @@ const _: () = assert!(CHECK_TIMEOUT_SECS > 0 && CHECK_TIMEOUT_SECS <= SERVICE_SC
 /// эталонной добавил бы ложное «не отвечает».
 const YT_DLP_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
 
+// Строку yt-dlp на обычном старте собирает запуск пробы подготовки, а не
+// свой (TL-23). Подменять один запуск другим честно, только пока проба не
+// дольше проверки: проба, признавшая дерево тёплым, уложилась в
+// `PROBE_TIMEOUT`, значит и собственный запуск экрана уложился бы в свой
+// таймаут. Разойдись они — экран показал бы `ok` там, где его запуск
+// ответил бы «не отвечает».
+const _: () = assert!(ytdlp::PROBE_TIMEOUT.as_secs() < YT_DLP_TIMEOUT.as_secs());
+
 /// Таймаут проверки ffmpeg. Калибровка К-4 по фактическим замерам TL-12 на
 /// нативной arm64-сборке, поставленной в TL-11 (единый файл 66 МиБ):
 /// холодный запуск (файл только что создан, inode новый) 1,58–2,52 с,
@@ -129,13 +137,60 @@ const DENO_TIMEOUT: Duration = Duration::from_secs(CHECK_TIMEOUT_SECS);
 /// может весить мегабайт, а уходит она через IPC прямо в «Подробнее».
 const VERSION_RAW_MAX_CHARS: usize = 200;
 
-/// Строка для `versionRaw`: без краевых пробелов и не длиннее
-/// [`VERSION_RAW_MAX_CHARS`] символов, при обрезке — с `…` в конце. Режет
-/// по символам, а не по байтам: срез UTF-8 посередине символа — паника.
+/// Невидимые символы, которые меняют отрисовку или разбивку текста, не
+/// будучи управляющими: `char::is_control` ловит только категорию `Cc`, а
+/// эти — `Cf`, `Zl` и `Zp`.
+///
+/// - bidi: ALM U+061C, LRM и RLM U+200E–U+200F, встраивания и
+///   переопределения U+202A–U+202E, изоляты U+2066–U+2069 — меняют порядок
+///   отрисовки;
+/// - нулевой ширины: ZWSP, ZWNJ, ZWJ U+200B–U+200D и BOM U+FEFF — прячут
+///   символы внутри видимого текста;
+/// - разделители строки и абзаца U+2028–U+2029 — переносят строку там, где
+///   переноса быть не должно.
+///
+/// Список перечисляет символы поимённо, диапазонами только там, где они
+/// сплошные (U+200B–U+200F, U+2028–U+202E).
+fn is_invisible_formatting(symbol: char) -> bool {
+    matches!(
+        symbol,
+        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+    )
+}
+
+/// Заменяет управляющие и невидимые форматирующие символы на U+FFFD.
+///
+/// Строка приходит из вывода бинарника, подменённого под именем sidecar, и
+/// уходит через IPC прямо в текст экрана: ESC-последовательность, NUL или
+/// RLO (`deno 2.9.6 \x1b[31m\u{202E}lave\x07\0x` — воспроизведение ревью
+/// TL-15) иначе доехали бы до пользователя как есть — RLO разворачивает
+/// отрисовку всего, что стоит за ним. Замена, а не удаление: «здесь был
+/// непечатаемый символ» — сведение, которое «Подробнее» обязано показать.
+fn replace_unprintable(line: &str) -> String {
+    line.chars()
+        .map(|symbol| {
+            if symbol.is_control() || is_invisible_formatting(symbol) {
+                char::REPLACEMENT_CHARACTER
+            } else {
+                symbol
+            }
+        })
+        .collect()
+}
+
+/// Строка для `versionRaw` и `version`: без краевых пробелов, непечатаемые
+/// символы заменены ([`replace_unprintable`]), не длиннее
+/// [`VERSION_RAW_MAX_CHARS`] символов, при обрезке — с `…` в конце. Режет по
+/// символам, а не по байтам: срез UTF-8 посередине символа — паника.
+///
+/// Порядок «сначала края, потом замена» несущий (заметка 1 ревью TL-21):
+/// `\t`, `\r`, `\v` одновременно управляющие и пробельные, и при обратном
+/// порядке краевой `\r` из вывода Windows-сборки становился U+FFFD, который
+/// `trim` уже не срезал. Внутри строки те же символы по-прежнему заменяются.
 fn clip_version_raw(line: &str) -> String {
-    let line = line.trim();
+    let line = replace_unprintable(line.trim());
     if line.chars().count() <= VERSION_RAW_MAX_CHARS {
-        return line.to_string();
+        return line;
     }
 
     let head: String = line.chars().take(VERSION_RAW_MAX_CHARS).collect();
@@ -179,13 +234,98 @@ pub async fn check_sidecar(
         );
     });
 
-    Ok(check_report(
+    Ok(check_report_in_session(
+        app.state::<Session>().inner(),
         yt_dlp_path,
         sidecar::resolve_sidecar_path("ffmpeg"),
         deno,
         &registry,
     )
     .await)
+}
+
+/// Отчёт так, как его собирает [`check_sidecar`] в сеансе приложения:
+/// строка yt-dlp — из запуска пробы подготовки или из своего запуска
+/// ([`yt_dlp_input`]), и сброс памяти сеанса, если свой запуск показал, что
+/// дерево не работает.
+///
+/// # Почему сброс (Д-1 ревью TL-23)
+///
+/// «Повторить проверку» зовёт подготовку и проверку снова. Подготовка
+/// отвечает из памяти сеанса, поэтому дерево, сломанное посреди сеанса,
+/// повтор не чинил: память говорила «готово», проверка — «не запускается»,
+/// и так на каждом нажатии до перезапуска приложения. Сброшенная память
+/// отправляет следующую подготовку к пробе, а та при негодном дереве — к
+/// переустановке.
+///
+/// Сбрасывает только **свой** запуск по найденному пути. Строка из
+/// запуска пробы не может быть отказом по построению, а «пути нет» бывает
+/// законно — до конца первой подготовки, — и сброс на нём заставил бы
+/// эту подготовку пробовать дерево второй раз (TL-23).
+async fn check_report_in_session(
+    session: &Session,
+    yt_dlp_path: Result<PathBuf, SidecarError>,
+    ffmpeg_path: Result<PathBuf, SidecarError>,
+    deno: Result<DenoLaunch, SidecarError>,
+    registry: &ChildRegistry,
+) -> SidecarCheckReport {
+    let yt_dlp = yt_dlp_input(session, yt_dlp_path);
+    let launched_itself = matches!(yt_dlp, YtDlpCheck::Launch(Ok(_)));
+
+    let report = check_report_with(yt_dlp, ffmpeg_path, deno, registry).await;
+
+    if launched_itself && report.yt_dlp.status != SidecarStatus::Ok {
+        eprintln!(
+            "yt-dlp: проверка экрана запустила {} и получила {:?} — забываю подготовку \
+             сеанса, повтор проверит дерево пробой",
+            report.yt_dlp.path, report.yt_dlp.status
+        );
+        session.invalidate();
+    }
+
+    report
+}
+
+/// Откуда берётся строка yt-dlp (TL-23).
+enum YtDlpCheck {
+    /// Запустить бинарник по резолвленному пути — или сообщить, почему пути
+    /// нет.
+    Launch(Result<PathBuf, SidecarError>),
+    /// Собрать строку из запуска, которым проба подготовки уже застала
+    /// дерево тёплым.
+    Remembered(WarmLaunch),
+}
+
+/// Строка yt-dlp на обычном старте берётся из запуска пробы подготовки, а
+/// любая следующая проверка запускает бинарник сама.
+///
+/// Распорядок — у [`Session`]: запуск пробы отдаётся один раз и только
+/// проверке того же пути. Отсюда поведение «Повторить проверку»: подготовка
+/// отвечает из памяти сеанса, запуск пробы уже отдан, и yt-dlp запускается
+/// заново — иначе повтор ничего не проверял бы. ffmpeg и deno проверяются
+/// своим запуском всегда.
+fn yt_dlp_input(session: &Session, resolved: Result<PathBuf, SidecarError>) -> YtDlpCheck {
+    match resolved {
+        Ok(path) => match session.take_warm_launch(&path) {
+            Some(launch) => YtDlpCheck::Remembered(launch),
+            None => YtDlpCheck::Launch(Ok(path)),
+        },
+        Err(error) => YtDlpCheck::Launch(Err(error)),
+    }
+}
+
+/// Проверка yt-dlp: аргументы, таймаут и политика вывода. Одна на оба
+/// источника строки, поэтому строка из запуска пробы и строка из своего
+/// запуска собираются одними и теми же правилами.
+fn yt_dlp_version_check() -> VersionCheck<'static> {
+    VersionCheck {
+        name: "yt-dlp",
+        args: &["--version"],
+        env: &[],
+        timeout: YT_DLP_TIMEOUT,
+        parse_version: sidecar::parse_ytdlp_version,
+        unrecognized: UnrecognizedOutput::ShowAsIs,
+    }
 }
 
 /// Путь к yt-dlp — в каталоге данных, а не рядом с приложением (TL-12),
@@ -234,8 +374,22 @@ pub(super) fn resolve_ytdlp_path(
 /// вынесено из [`check_sidecar`] отдельно от резолва, чтобы тесты могли
 /// подставлять пути к фикстурным скриптам вместо реальных sidecar-бинарников
 /// (см. `crate::sidecar::process` тесты TL-4).
+// Боевой путь зовёт `check_report_with` (TL-23); эта форма осталась тестам,
+// где строка yt-dlp всегда из своего запуска.
+#[cfg(test)]
 async fn check_report(
     yt_dlp_path: Result<PathBuf, SidecarError>,
+    ffmpeg_path: Result<PathBuf, SidecarError>,
+    deno: Result<DenoLaunch, SidecarError>,
+    registry: &ChildRegistry,
+) -> SidecarCheckReport {
+    check_report_with(YtDlpCheck::Launch(yt_dlp_path), ffmpeg_path, deno, registry).await
+}
+
+/// [`check_report`], у которого строка yt-dlp может прийти из запуска
+/// пробы подготовки ([`YtDlpCheck::Remembered`], TL-23).
+async fn check_report_with(
+    yt_dlp: YtDlpCheck,
     ffmpeg_path: Result<PathBuf, SidecarError>,
     deno: Result<DenoLaunch, SidecarError>,
     registry: &ChildRegistry,
@@ -254,15 +408,22 @@ async fn check_report(
         unrecognized: UnrecognizedOutput::Refuse,
     };
 
+    let yt_dlp_check = yt_dlp_version_check();
+    let yt_dlp_row = async {
+        match yt_dlp {
+            YtDlpCheck::Launch(path) => run_check(&yt_dlp_check, path, registry).await,
+            YtDlpCheck::Remembered(launch) => completed_run_result(
+                &yt_dlp_check,
+                launch.executable.display().to_string(),
+                launch.checked_at,
+                launch.duration_ms,
+                launch.output,
+            ),
+        }
+    };
+
     let (yt_dlp, ffmpeg, deno) = tokio::join!(
-        check_binary(
-            "yt-dlp",
-            yt_dlp_path,
-            &["--version"],
-            YT_DLP_TIMEOUT,
-            sidecar::parse_ytdlp_version,
-            registry,
-        ),
+        yt_dlp_row,
         check_binary(
             "ffmpeg",
             ffmpeg_path,
@@ -369,58 +530,91 @@ async fn run_check(
     let duration_ms = elapsed_ms(started);
 
     match run_result {
-        Ok(output) => {
-            let (version, version_raw) = match (check.parse_version)(&output.stdout) {
-                Some(parsed) => {
-                    // На экране — нормализованный semver (`version`), полная
-                    // первая строка вывода уходит в `versionRaw` для
-                    // «Подробнее» (TL-15): у собранного `.app` stderr не
-                    // виден, и лог ниже доступен только разработчику.
-                    if parsed.is_normalized() {
-                        eprintln!(
+        Ok(output) => completed_run_result(check, path_string, checked_at, duration_ms, output),
+        Err(error) => error_to_result(name, path_string, checked_at, duration_ms, error),
+    }
+}
+
+/// Строка отчёта по завершившемуся с кодом 0 запуску — чьему угодно: своему
+/// ([`run_check`]) или пробы подготовки ([`YtDlpCheck::Remembered`]). Одна
+/// функция на оба, чтобы строки не могли разойтись ни в одном поле.
+fn completed_run_result(
+    check: &VersionCheck<'_>,
+    path_string: String,
+    checked_at: String,
+    duration_ms: u64,
+    output: sidecar::RunOutput,
+) -> SidecarCheckResult {
+    let name = check.name;
+    let (version, version_raw) = match (check.parse_version)(&output.stdout) {
+        Some(parsed) => {
+            // На экране — нормализованный semver (`version`), полная
+            // первая строка вывода уходит в `versionRaw` для
+            // «Подробнее» (TL-15): у собранного `.app` stderr не
+            // виден, и лог ниже доступен только разработчику.
+            if parsed.is_normalized() {
+                eprintln!(
                             "sidecar {name}: версия сборки {raw}, на служебном экране показывается {display}",
                             name = name,
                             raw = parsed.raw,
                             display = parsed.display,
                         );
-                    }
-                    (parsed.display, clip_version_raw(&parsed.line))
-                }
-                None => match check.unrecognized {
-                    // Разобрать нечего, но `versionRaw` приходит с `version`
-                    // всегда: первая строка того, что показано вместо версии.
-                    UnrecognizedOutput::ShowAsIs => (
-                        output.stdout.trim().to_string(),
-                        clip_version_raw(output.stdout.trim().lines().next().unwrap_or_default()),
-                    ),
-                    UnrecognizedOutput::Refuse => {
-                        eprintln!("{}", unrecognized_output_log_line(name, &output.stdout));
-                        let error = SidecarError::LaunchFailed {
-                            reason: LaunchFailedReason::UnrecognizedOutput,
-                            stderr: format!("{}\n{}", output.stdout.trim(), output.stderr.trim()),
-                        };
-                        return error_to_result(name, path_string, checked_at, duration_ms, error);
-                    }
-                },
-            };
-
-            SidecarCheckResult {
-                name: name.to_string(),
-                path: path_string,
-                status: SidecarStatus::Ok,
-                version: Some(version),
-                version_raw: Some(version_raw),
-                reason: None,
-                exit_code: None,
-                os_error_code: None,
-                stderr_tail: None,
-                timeout_ms: None,
-                checked_at: Some(checked_at),
-                duration_ms: Some(duration_ms),
             }
+            // `display` — тоже вывод чужого бинарника: у yt-dlp это первый
+            // токен строки как есть, без нормализации, и ESC или RLO внутри
+            // него доезжали до заголовка строки экрана. Фильтр и предел те
+            // же, что у `versionRaw`; настоящий токен версии они не меняют.
+            (
+                clip_version_raw(&parsed.display),
+                clip_version_raw(&parsed.line),
+            )
         }
-        Err(error) => error_to_result(name, path_string, checked_at, duration_ms, error),
+        None => match check.unrecognized {
+            // Разобрать нечего: вместо версии показывается первая
+            // непустая строка вывода, и `versionRaw` приходит с
+            // `version` всегда — это та же строка. Не весь stdout:
+            // `version` — заголовок строки экрана, и мегабайт с
+            // внутренними `\r\n` от подменённого бинарника уехал бы
+            // туда целиком (остаток ревью TL-15).
+            UnrecognizedOutput::ShowAsIs => {
+                let shown = clip_version_raw(first_non_empty_line(&output.stdout));
+                (shown.clone(), shown)
+            }
+            UnrecognizedOutput::Refuse => {
+                eprintln!("{}", unrecognized_output_log_line(name, &output.stdout));
+                let error = SidecarError::LaunchFailed {
+                    reason: LaunchFailedReason::UnrecognizedOutput,
+                    stderr: format!("{}\n{}", output.stdout.trim(), output.stderr.trim()),
+                };
+                return error_to_result(name, path_string, checked_at, duration_ms, error);
+            }
+        },
+    };
+
+    SidecarCheckResult {
+        name: name.to_string(),
+        path: path_string,
+        status: SidecarStatus::Ok,
+        version: Some(version),
+        version_raw: Some(version_raw),
+        reason: None,
+        exit_code: None,
+        os_error_code: None,
+        stderr_tail: None,
+        timeout_ms: None,
+        checked_at: Some(checked_at),
+        duration_ms: Some(duration_ms),
     }
+}
+
+/// Первая строка вывода, в которой есть что-то кроме пробелов; пустая
+/// строка — если такой нет.
+fn first_non_empty_line(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
 }
 
 /// Строка лога для вывода без версии: хвост stdout в пределе
@@ -851,6 +1045,206 @@ mod tests {
     /// `data_dir`, — то, что в продакшене собирает `DenoLaunch::for_app`.
     fn deno_launch(path: PathBuf, data_dir: &std::path::Path) -> Result<DenoLaunch, SidecarError> {
         Ok(DenoLaunch::new(path, data_dir))
+    }
+
+    // ────────────── один запуск yt-dlp на тёплом старте (TL-23) ──────────────
+
+    use crate::ytdlp::testing::{Control, SilentSink, EXECUTABLE};
+    use crate::ytdlp::Session;
+
+    /// Каталог данных, в котором «прошлый запуск приложения» уже распаковал
+    /// и прогрел yt-dlp, считающий свои запуски.
+    struct WarmStart {
+        _dir: tempfile::TempDir,
+        archive: PathBuf,
+        data_dir: PathBuf,
+        control: Control,
+        registry: ChildRegistry,
+        in_use: InUse,
+    }
+
+    async fn warm_start() -> WarmStart {
+        let dir = tempdir().expect("failed to create temp dir");
+        let control = Control::new(&dir.path().join("control"));
+        let archive = dir.path().join("yt-dlp.zip");
+        crate::ytdlp::testing::write_onedir_zip(
+            &archive,
+            EXECUTABLE,
+            &control.script(YT_DLP_VERSION_LINE),
+        );
+        let data_dir = dir.path().join("app-data");
+        let registry = ChildRegistry::new();
+
+        Session::new()
+            .prepare(&archive, &data_dir, &registry, &SilentSink)
+            .await
+            .expect("первый запуск приложения обязан подготовить yt-dlp");
+
+        WarmStart {
+            _dir: dir,
+            archive,
+            data_dir,
+            control,
+            registry,
+            in_use: InUse::new(),
+        }
+    }
+
+    impl WarmStart {
+        /// Одна дверь в подготовку — то, что делает `prepare_now` под
+        /// мьютексом.
+        async fn prepare(&self, session: &Session) -> crate::types::YtDlpPrepared {
+            let (prepared, background) = session
+                .prepare(&self.archive, &self.data_dir, &self.registry, &SilentSink)
+                .await
+                .expect("подготовка обязана пройти");
+            assert!(
+                background.is_none(),
+                "у тёплого дерева фонового прогрева нет"
+            );
+            prepared
+        }
+
+        /// Строка yt-dlp так, как её собирает `check_sidecar`: резолв,
+        /// память сеанса, отчёт. ffmpeg и deno не запускаются — предмет
+        /// здесь yt-dlp.
+        async fn check(&self, session: &Session) -> SidecarCheckResult {
+            let (path, _guard) = ytdlp::installed_executable(&self.data_dir, &self.in_use)
+                .expect("путь к установке обязан находиться");
+            check_report_in_session(
+                session,
+                Ok(path),
+                Err(SidecarError::NotFound),
+                Err(SidecarError::NotFound),
+                &self.registry,
+            )
+            .await
+            .yt_dlp
+        }
+    }
+
+    #[tokio::test]
+    async fn retrying_in_the_same_session_repairs_a_tree_broken_mid_session() {
+        // Д-1 ревью TL-23: подготовка отвечала из памяти сеанса, и дерево,
+        // сломанное после неё, «Повторить проверку» не чинила ни разу — два
+        // повтора подряд давали отказ запуска до перезапуска приложения.
+        let start = warm_start().await;
+        let session = Session::new();
+        start.prepare(&session).await;
+        assert_eq!(start.check(&session).await.status, SidecarStatus::Ok);
+
+        let (path, guard) =
+            ytdlp::installed_executable(&start.data_dir, &start.in_use).expect("путь");
+        drop(guard);
+        let size =
+            usize::try_from(fs::metadata(&path).expect("размер").len()).expect("размер помещается");
+        let mut broken = b"#!/bin/sh\nexit 3\n".to_vec();
+        broken.resize(size, b'#');
+        fs::write(&path, &broken).expect("сломать, сохранив размер");
+
+        // Первый повтор: подготовка ещё отвечает из памяти, но свой запуск
+        // проверки видит, что дерево не работает.
+        let first = start.prepare(&session).await;
+        assert!(!first.prepared, "память сеанса ещё цела");
+        let row = start.check(&session).await;
+        assert_ne!(row.status, SidecarStatus::Ok, "{row:?}");
+
+        // Второй повтор: память сброшена — проба, переустановка, рабочее
+        // дерево.
+        let second = start.prepare(&session).await;
+        assert!(
+            second.prepared,
+            "повтор обязан дойти до пробы и переустановки, а не ответить из памяти"
+        );
+        let row = start.check(&session).await;
+        assert_eq!(row.status, SidecarStatus::Ok, "{row:?}");
+    }
+
+    /// Результат так, как его видит фронтенд, без полей времени: они
+    /// принадлежат конкретному запуску и совпасть у двух запусков не
+    /// обязаны.
+    fn without_timing(result: &SidecarCheckResult) -> serde_json::Value {
+        let mut value = serde_json::to_value(result).expect("результат сериализуется");
+        let object = value.as_object_mut().expect("результат — объект");
+        assert!(object.remove("checkedAt").is_some(), "{object:?}");
+        assert!(object.remove("durationMs").is_some(), "{object:?}");
+        value
+    }
+
+    #[tokio::test]
+    async fn a_warm_start_launches_yt_dlp_once_and_reports_what_a_launch_would() {
+        let start = warm_start().await;
+        let before = start.control.launches();
+        // Новый процесс приложения — новый сеанс.
+        let session = Session::new();
+
+        let setup = start.prepare(&session).await;
+        let frontend = start.prepare(&session).await;
+        let remembered = start.check(&session).await;
+
+        assert_eq!(
+            start.control.launches() - before,
+            1,
+            "тёплый старт — один запуск yt-dlp на обе двери подготовки и проверку экрана"
+        );
+        assert!(!setup.prepared && !frontend.prepared);
+
+        // Тот же путь, проверенный отдельным запуском, — эталон строки.
+        let (path, _guard) =
+            ytdlp::installed_executable(&start.data_dir, &start.in_use).expect("путь");
+        let launched = run_check(&yt_dlp_version_check(), Ok(path), &start.registry).await;
+        assert_eq!(start.control.launches() - before, 2);
+
+        assert_eq!(
+            without_timing(&remembered),
+            without_timing(&launched),
+            "строка из запуска пробы обязана совпадать с отдельным запуском во всех полях"
+        );
+        assert_eq!(remembered.status, SidecarStatus::Ok);
+        assert_eq!(remembered.version.as_deref(), Some(YT_DLP_VERSION_LINE));
+        assert_eq!(remembered.version_raw.as_deref(), Some(YT_DLP_VERSION_LINE));
+        assert_eq!(remembered.path, setup.path);
+        assert!(remembered.checked_at.is_some() && remembered.duration_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn repeating_the_check_launches_yt_dlp_again() {
+        let start = warm_start().await;
+        let session = Session::new();
+        start.prepare(&session).await;
+        start.check(&session).await;
+        let before = start.control.launches();
+
+        // «Повторить проверку»: фронтенд зовёт подготовку и проверку снова.
+        start.prepare(&session).await;
+        let again = start.check(&session).await;
+
+        assert_eq!(
+            start.control.launches() - before,
+            1,
+            "повтор обязан запустить yt-dlp — иначе он ничего не проверяет"
+        );
+        assert_eq!(again.status, SidecarStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn after_the_session_is_forgotten_the_check_launches_yt_dlp_itself() {
+        // Сброс делает контур обновления (установка, переключение, откат);
+        // сам сброс в оркестрации проверен в `crate::ytdlp::orchestrate`.
+        let start = warm_start().await;
+        let session = Session::new();
+        start.prepare(&session).await;
+        let before = start.control.launches();
+
+        session.invalidate();
+        let row = start.check(&session).await;
+
+        assert_eq!(
+            start.control.launches() - before,
+            1,
+            "после сброса строка yt-dlp — только из своего запуска"
+        );
+        assert_eq!(row.status, SidecarStatus::Ok);
     }
 
     #[test]
@@ -1337,6 +1731,257 @@ mod tests {
         // Ровно на пределе — не обрезается, хотя байтов вдвое больше.
         let at_limit = "ё".repeat(VERSION_RAW_MAX_CHARS);
         assert_eq!(clip_version_raw(&at_limit), at_limit);
+    }
+
+    #[test]
+    fn unprintable_symbols_of_a_version_line_are_replaced_not_passed_through() {
+        // Воспроизведение ревью TL-15: подменённый deno печатает ESC, RLO,
+        // BEL и NUL внутри строки версии.
+        let line = "deno 2.9.6 \u{1b}[31m\u{202E}lave\u{7}\u{0}x";
+
+        let clipped = clip_version_raw(line);
+
+        assert_eq!(
+            clipped,
+            "deno 2.9.6 \u{FFFD}[31m\u{FFFD}lave\u{FFFD}\u{FFFD}x"
+        );
+        for invisible in [
+            // bidi
+            '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+            '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+            // нулевой ширины и BOM, разделители строки и абзаца (заметка 2
+            // ревью TL-21)
+            '\u{200B}', '\u{200C}', '\u{200D}', '\u{FEFF}', '\u{2028}', '\u{2029}',
+        ] {
+            assert_eq!(
+                clip_version_raw(&format!("a{invisible}b")),
+                "a\u{FFFD}b",
+                "U+{:04X} обязан быть заменён",
+                u32::from(invisible)
+            );
+        }
+        // Обычный текст фильтр не трогает — ни кириллицу, ни символы вне BMP.
+        assert_eq!(clip_version_raw("ёж 🦔 2.9.6"), "ёж 🦔 2.9.6");
+        // И соседей диапазонов тоже: границы списка стоят там, где сказано.
+        for neighbour in ['\u{200A}', '\u{2027}', '\u{202F}', '\u{206A}'] {
+            let line = format!("a{neighbour}b");
+            assert_eq!(
+                clip_version_raw(&line),
+                line,
+                "U+{:04X} не из списка",
+                u32::from(neighbour)
+            );
+        }
+    }
+
+    #[test]
+    fn edge_whitespace_is_trimmed_before_unprintable_symbols_are_replaced() {
+        // Заметка 1 ревью TL-21: при замене до `trim` краевые `\t`, `\r`, `\v`
+        // становились U+FFFD и оставались в строке.
+        for (raw, shown) in [
+            ("2026.08.19\t", "2026.08.19"),
+            ("\t2026.08.19", "2026.08.19"),
+            ("2026.08.19\r", "2026.08.19"),
+            ("2026.08.19\u{0B}", "2026.08.19"),
+            (" 2026.08.19 ", "2026.08.19"),
+            ("\u{2028}2026.08.19\u{2029}", "2026.08.19"),
+        ] {
+            assert_eq!(clip_version_raw(raw), shown, "{raw:?}");
+        }
+        // Внутри строки те же символы по-прежнему заменяются.
+        assert_eq!(clip_version_raw("2026\t08\r19"), "2026\u{FFFD}08\u{FFFD}19");
+    }
+
+    #[tokio::test]
+    async fn a_recognized_version_token_passes_the_same_filter_as_its_line() {
+        // Разобранная версия — тоже вывод бинарника под именем sidecar. У
+        // yt-dlp это первый токен первой строки как есть: ESC и RLO не
+        // пробельные символы и остаются внутри токена, а `version` — это
+        // заголовок строки служебного экрана.
+        let dir = tempdir().expect("failed to create temp dir");
+        let registry = ChildRegistry::new();
+        let hostile = write_script(
+            &dir,
+            "hostile.sh",
+            "#!/bin/sh\nprintf '2026.08.19\\033[31m\\342\\200\\256x\\n'\nexit 0\n",
+            0o755,
+        );
+        let result = check_binary(
+            "yt-dlp",
+            Ok(hostile),
+            &["--version"],
+            Duration::from_secs(5),
+            sidecar::parse_ytdlp_version,
+            &registry,
+        )
+        .await;
+        assert_eq!(result.status, SidecarStatus::Ok, "{result:?}");
+        assert_eq!(
+            result.version.as_deref(),
+            Some("2026.08.19\u{FFFD}[31m\u{FFFD}x"),
+            "{result:?}"
+        );
+
+        // Мегабайт в одном токене — тот же предел, что у `versionRaw`.
+        let long = write_script(
+            &dir,
+            "long.sh",
+            "#!/bin/sh\nprintf '%0999d\\n' 0\nexit 0\n",
+            0o755,
+        );
+        let result = check_binary(
+            "yt-dlp",
+            Ok(long),
+            &["--version"],
+            Duration::from_secs(5),
+            sidecar::parse_ytdlp_version,
+            &registry,
+        )
+        .await;
+        let shown = result.version.expect("версия разобрана");
+        assert_eq!(shown.chars().count(), VERSION_RAW_MAX_CHARS + 1, "{shown}");
+        assert!(shown.ends_with('…'), "{shown}");
+
+        // Настоящие версии фильтр не меняет ни на символ.
+        for (name, line, parse, expected) in [
+            (
+                "yt-dlp",
+                "2026.08.19",
+                sidecar::parse_ytdlp_version as fn(&str) -> Option<sidecar::SidecarVersion>,
+                "2026.08.19",
+            ),
+            (
+                "ffmpeg",
+                "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+                sidecar::parse_ffmpeg_version,
+                "9.0.1",
+            ),
+            (
+                "deno",
+                "deno 2.9.6 (stable, release, aarch64-apple-darwin)",
+                sidecar::parse_deno_version,
+                "2.9.6",
+            ),
+        ] {
+            let script = write_script(
+                &dir,
+                &format!("{name}.sh"),
+                &format!("#!/bin/sh\necho '{line}'\nexit 0\n"),
+                0o755,
+            );
+            let result = check_binary(
+                name,
+                Ok(script),
+                &["--version"],
+                Duration::from_secs(5),
+                parse,
+                &registry,
+            )
+            .await;
+            assert_eq!(result.version.as_deref(), Some(expected), "{result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unrecognized_output_of_yt_dlp_and_ffmpeg_shows_its_first_line_only() {
+        // Ветка `ShowAsIs`: код 0, версии в выводе нет. На экран уходит
+        // первая строка, а не весь поток с внутренними переводами строк.
+        let dir = tempdir().expect("failed to create temp dir");
+        let registry = ChildRegistry::new();
+        let garbage = write_script(
+            &dir,
+            "garbage.sh",
+            "#!/bin/sh\nprintf '\\n  \\ngarbage\\nsecond\\n'\nexit 0\n",
+            0o755,
+        );
+
+        for (name, args, parse) in [
+            (
+                "yt-dlp",
+                &["--version"][..],
+                sidecar::parse_ytdlp_version as fn(&str) -> Option<sidecar::SidecarVersion>,
+            ),
+            ("ffmpeg", &["-version"][..], sidecar::parse_ffmpeg_version),
+        ] {
+            let result = check_binary(
+                name,
+                Ok(garbage.clone()),
+                args,
+                Duration::from_secs(5),
+                parse,
+                &registry,
+            )
+            .await;
+
+            assert_eq!(result.status, SidecarStatus::Ok, "{result:?}");
+            assert_eq!(result.version_raw.as_deref(), Some("garbage"), "{result:?}");
+            assert_eq!(result.version.as_deref(), Some("garbage"), "{result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_megabyte_of_unrecognized_output_reaches_the_screen_clipped_and_filtered() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let registry = ChildRegistry::new();
+        let flood = write_script(
+            &dir,
+            "flood.sh",
+            "#!/bin/sh\nprintf 'x\\033'\ni=0\nwhile [ $i -lt 2000 ]; do \
+             printf 'ёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёё'; i=$((i + 1)); done\n\
+             printf '\\r\\nsecond\\n'\nexit 0\n",
+            0o755,
+        );
+
+        let result = check_binary(
+            "ffmpeg",
+            Ok(flood),
+            &["-version"],
+            Duration::from_secs(5),
+            sidecar::parse_ffmpeg_version,
+            &registry,
+        )
+        .await;
+
+        assert_eq!(result.status, SidecarStatus::Ok, "{result:?}");
+        let version = result.version.expect("version при ok");
+        assert_eq!(version.chars().count(), VERSION_RAW_MAX_CHARS + 1);
+        assert!(
+            version.starts_with("x\u{FFFD}ё") && version.ends_with('…'),
+            "{version:?}"
+        );
+        assert_eq!(result.version_raw.as_deref(), Some(version.as_str()));
+    }
+
+    #[tokio::test]
+    async fn recognized_versions_are_shown_unchanged_by_the_filter() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let registry = ChildRegistry::new();
+        let yt_dlp = version_script(&dir, "yt-dlp.sh", YT_DLP_VERSION_LINE);
+        let ffmpeg = version_script(&dir, "ffmpeg.sh", FFMPEG_VERSION_LINE);
+
+        let yt_dlp = check_binary(
+            "yt-dlp",
+            Ok(yt_dlp),
+            &["--version"],
+            Duration::from_secs(5),
+            sidecar::parse_ytdlp_version,
+            &registry,
+        )
+        .await;
+        let ffmpeg = check_binary(
+            "ffmpeg",
+            Ok(ffmpeg),
+            &["-version"],
+            Duration::from_secs(5),
+            sidecar::parse_ffmpeg_version,
+            &registry,
+        )
+        .await;
+
+        assert_eq!(yt_dlp.version.as_deref(), Some("2026.08.19"));
+        assert_eq!(yt_dlp.version_raw.as_deref(), Some("2026.08.19"));
+        assert_eq!(ffmpeg.version.as_deref(), Some("9.0.1"));
+        assert_eq!(ffmpeg.version_raw.as_deref(), Some(FFMPEG_VERSION_LINE));
     }
 
     #[tokio::test]

@@ -58,6 +58,38 @@
 //! yt-dlp не запускается», — и контракт с фронтендом не меняется, меняется
 //! только цена повторного выяснения этого факта.
 //!
+//! # Медленная машина — не отказ (TL-21)
+//!
+//! Обратный случай: дерево цело и запускается, но прогрев на этой машине
+//! не укладывается в [`WARMUP_TIMEOUT`] (очень медленный диск, антивирус,
+//! проверяющий каждый загружаемый файл). Отказом это не объявляется ни
+//! разу. Упёршийся в таймаут прогрев оставляет рядом с установкой отметку
+//! ([`SlowWarmupMark`]), подготовка отвечает успехом — дерево по манифесту
+//! цело и считается готовым, — а прогрев продолжается в фоне
+//! ([`BackgroundWarmup`]) с отдельным, более длинным таймаутом. Следующий
+//! старт, увидев отметку, не пробует дерево и не ждёт прогрева вовсе:
+//! сразу отвечает успехом и снова отдаёт прогрев в фон. Удачный прогрев —
+//! переднего плана или фоновый — отметку снимает.
+//!
+//! Цена названа. Пока фоновый прогрев идёт, первые запуски yt-dlp
+//! (проверка служебного экрана, разбор ссылки) тоже холодные и могут не
+//! уложиться в собственные таймауты — это видно пользователю строкой
+//! «не отвечает» с кнопкой повтора, а не экраном подготовки на две минуты
+//! при каждом запуске приложения. Фоновый прогрев, окончившийся не
+//! таймаутом, а отказом запуска, отметку тоже снимает: это уже не
+//! медленная машина, и следующий старт идёт обычным путём — с пробой и,
+//! если нужно, переустановкой.
+//!
+//! # Что подготовка отдаёт служебному экрану (TL-23)
+//!
+//! Проба тёплого дерева — это `--version`, ровно тот запуск, который
+//! служебный экран сделал бы секундой позже. Поэтому её вывод, штамп и
+//! длительность уходят в итог ([`PrepareOutcome::warm_launch`]), и
+//! `check_sidecar` строит из них строку yt-dlp вместо второго запуска
+//! (распорядок — `super::session`). Отдаётся только проба: прогрев тоже
+//! печатает версию, но длится десятки секунд, и `durationMs` на экране
+//! перестал бы значить то, что значит для отдельного запуска.
+//!
 //! # Замеры на собранном дистрибутиве
 //!
 //! Всё ниже снято на `.dmg`, смонтированном `hdiutil attach`, запуском
@@ -91,15 +123,25 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 use super::error::PrepareError;
-use super::layout::{self, Installed, Layout, RepairLog};
+use super::layout::{self, BuildId, Installed, Layout, RepairLog, SlowWarmupMark};
 use super::state::{self, InUse, InUseGuard, InstallEntry, InstallState};
 use super::unpack;
-use crate::sidecar::{self, ChildRegistry, SidecarError};
-use crate::types::{YtDlpPrepareEvent, YtDlpPrepareStage, YtDlpPrepared};
+use crate::sidecar::{self, ChildRegistry, RunOutput, SidecarError};
+use crate::types::{
+    YtDlpPrepareEvent, YtDlpPrepareStage, YtDlpPrepared, YtDlpWarmupEvent, YtDlpWarmupOutcome,
+};
 
 /// Имя Tauri-события с ходом подготовки. Полезная нагрузка —
 /// [`YtDlpPrepareEvent`].
 pub const PREPARE_EVENT: &str = "ytdlp://prepare";
+
+/// Имя Tauri-события с исходом фонового прогрева (TL-21). Полезная
+/// нагрузка — [`YtDlpWarmupEvent`].
+///
+/// Отдельный канал, а не терминальная стадия в [`PREPARE_EVENT`]: на том
+/// поднимается блокирующий экран подготовки, а фоновый прогрев по
+/// построению идёт тогда, когда этот экран уже закрыт.
+pub const WARMUP_EVENT: &str = "ytdlp://warmup";
 
 /// Аргументы прогона, которым дерево прогревается и одновременно
 /// сообщает свою версию.
@@ -130,7 +172,12 @@ const WARMUP_ARGS: &[&str] = &["--version"];
 /// меньше любого холодного. Промахнуться в сторону «решили, что холодное»
 /// стоит одного лишнего прогрева; промахнуться в другую сторону
 /// невозможно: холодное дерево не отвечает и за 20 с.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Публичен ради одного сторожа: запуск пробы заменяет запуск служебного
+/// экрана (TL-23), и `crate::commands::sidecar` на этапе компиляции
+/// проверяет, что проба не дольше его таймаута — иначе экран показал бы
+/// `ok` там, где его собственный запуск упёрся бы в «не отвечает».
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Таймаут прогрева.
 ///
@@ -151,6 +198,41 @@ pub(super) const WARMUP_TIMEOUT: Duration = Duration::from_secs(120);
 // обязана быть заметно короче прогрева, иначе она перестаёт отличать одно
 // состояние от другого и превращается в удвоенный прогрев.
 const _: () = assert!(PROBE_TIMEOUT.as_secs() * 10 <= WARMUP_TIMEOUT.as_secs());
+
+/// Таймаут прогрева, продолжающегося в фоне (TL-21).
+///
+/// Фоновый прогрев никто не ждёт, поэтому таймаут здесь не бюджет
+/// ожидания, а граница, за которой зависший процесс снимается. Из замера
+/// значение не выведено и вывести его не из чего: машины, где прогрев не
+/// укладывается в [`WARMUP_TIMEOUT`], не измерял никто. Десять минут — 5×
+/// к таймауту переднего плана и ~16× к худшему измеренному прогреву
+/// (36,4 с). Упрётся фоновый прогрев и в них — отметка остаётся, и
+/// следующий старт снова отдаст прогрев в фон, но не больше
+/// [`MAX_BACKGROUND_TIMEOUTS`] раз подряд; сохраняет ли убитый процесс
+/// часть проверенных ОС подписей, не измерялось, и код на это не опирается.
+const BACKGROUND_WARMUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Сколько фоновых прогревов подряд могут упереться в таймаут, прежде чем
+/// отметка медленного прогрева снимается (заметка 5 ревью TL-21).
+///
+/// Без предела зависающий yt-dlp держал бы отметку вечно: каждый старт
+/// отдавал бы прогрев в фон, тот через десять минут упирался бы в таймаут
+/// и обновлял отметку, а до пробы дерева дело не доходило бы ни разу.
+/// Счётчик живёт в самой отметке и уходит вместе с ней при удачном прогреве.
+///
+/// Цена названа. Снятая отметка возвращает старт на обычный путь, но
+/// **зависающее** дерево переустановкой не лечится и там: проба упирается
+/// в свой таймаут и считает дерево холодным, прогрев переднего плана — в
+/// свой, и отметка появляется снова. Цикл становится конечным (три фоновых
+/// прогрева и один экран подготовки на [`WARMUP_TIMEOUT`]), а не вечным
+/// молчанием. Лечить зависание переустановкой значило бы объявить
+/// медленную машину сломанной, чего TL-21 не делает.
+const MAX_BACKGROUND_TIMEOUTS: u32 = 3;
+
+// Фоновый прогрев обязан быть не короче переднего плана: иначе отметка,
+// записанная как раз потому, что прогрев не уложился, заставляла бы
+// следующий старт пробовать то же самое с ещё меньшим шансом.
+const _: () = assert!(WARMUP_TIMEOUT.as_secs() < BACKGROUND_WARMUP_TIMEOUT.as_secs());
 
 /// Доля общего прогресса, отданная распаковке. Распаковка занимает
 /// 1,4–1,5 с против 25–36 с прогрева (замеры TL-12), то есть около 5 %
@@ -200,13 +282,186 @@ const REPAIR_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 struct Timeouts {
     probe: Duration,
     warmup: Duration,
+    background: Duration,
 }
 
 impl Timeouts {
     const DEFAULT: Self = Self {
         probe: PROBE_TIMEOUT,
         warmup: WARMUP_TIMEOUT,
+        background: BACKGROUND_WARMUP_TIMEOUT,
     };
+}
+
+/// Итог подготовки вместе с тем, что нужно сеансу (TL-23, TL-21).
+#[derive(Debug)]
+pub struct PrepareOutcome {
+    /// Итог для фронтенда — контракт команды `prepare_ytdlp`.
+    pub prepared: YtDlpPrepared,
+    /// Запуск, которым проба застала дерево тёплым; служебный экран
+    /// строит из него строку yt-dlp вместо своего запуска. `None` — пробы
+    /// не было или дерево пришлось греть.
+    pub warm_launch: Option<WarmLaunch>,
+    /// Прогрев, который подготовка не стала ждать и который вызывающий
+    /// обязан продолжить в фоне.
+    pub background: Option<BackgroundWarmup>,
+}
+
+impl PrepareOutcome {
+    /// Проба застала дерево тёплым: работы не было, запуск есть.
+    fn warm(installed: &Installed, launch: WarmLaunch, started: Instant) -> Self {
+        Self {
+            prepared: YtDlpPrepared {
+                version: parse_version(&launch.output.stdout, &installed.version),
+                path: installed.executable.display().to_string(),
+                prepared: false,
+                duration_ms: elapsed_ms(started),
+            },
+            warm_launch: Some(launch),
+            background: None,
+        }
+    }
+
+    /// Дерево распаковано и/или прогрето в переднем плане.
+    fn worked(installed: &Installed, version: String, started: Instant) -> Self {
+        Self {
+            prepared: YtDlpPrepared {
+                version,
+                path: installed.executable.display().to_string(),
+                prepared: true,
+                duration_ms: elapsed_ms(started),
+            },
+            warm_launch: None,
+            background: None,
+        }
+    }
+
+    /// Дерево цело по манифесту и считается готовым, прогрев уходит в фон
+    /// (TL-21).
+    ///
+    /// Версия — из манифеста: запуска, который её сообщил бы, ещё не было.
+    /// `worked` — показывал ли этот вызов ход работы событиями: тогда
+    /// экран подготовки уже поднят и обязан получить терминальное `ready`.
+    fn in_background(
+        installed: &Installed,
+        layout: &Layout,
+        build_id: &BuildId,
+        worked: bool,
+        started: Instant,
+        timeouts: Timeouts,
+    ) -> Self {
+        Self {
+            prepared: YtDlpPrepared {
+                version: installed.version.clone(),
+                path: installed.executable.display().to_string(),
+                prepared: worked,
+                duration_ms: elapsed_ms(started),
+            },
+            warm_launch: None,
+            background: Some(BackgroundWarmup {
+                build_id: build_id.clone(),
+                executable: installed.executable.clone(),
+                mark_path: layout.slow_warmup_path(build_id),
+                repair_path: layout.repair_path(build_id),
+                timeout: timeouts.background,
+            }),
+        }
+    }
+}
+
+/// Запуск `--version`, которым проба застала дерево тёплым (TL-23).
+///
+/// Поля — ровно то, из чего служебный экран собирает строку после своего
+/// запуска: путь, вывод, штамп начала и длительность самого запуска.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmLaunch {
+    pub executable: PathBuf,
+    pub output: RunOutput,
+    pub checked_at: String,
+    pub duration_ms: u64,
+}
+
+/// Прогрев, продолжающийся в фоне (TL-21).
+#[derive(Debug)]
+pub struct BackgroundWarmup {
+    build_id: BuildId,
+    executable: PathBuf,
+    mark_path: PathBuf,
+    repair_path: PathBuf,
+    timeout: Duration,
+}
+
+/// Чем кончился фоновый прогрев.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackgroundOutcome {
+    /// Уложился: отметка снята.
+    Warmed,
+    /// Снова не уложился: отметка обновлена, следующий старт тоже не ждёт.
+    TimedOut,
+    /// Не запустился либо упёрся в таймаут [`MAX_BACKGROUND_TIMEOUTS`] раз
+    /// подряд: отметка снята, следующий старт проверит дерево обычным путём.
+    Failed(String),
+}
+
+impl BackgroundWarmup {
+    /// Установка, которую греет прогрев, — её держат занятой на время
+    /// прогрева (Ф-7).
+    pub fn build_id(&self) -> &BuildId {
+        &self.build_id
+    }
+
+    /// Выполняет прогрев. Событий в `ytdlp://prepare` не шлёт: на этом
+    /// канале поднимается блокирующий экран подготовки.
+    pub async fn run(self, registry: &ChildRegistry) -> BackgroundOutcome {
+        match sidecar::run(&self.executable, WARMUP_ARGS, self.timeout, registry).await {
+            Ok(_) => {
+                SlowWarmupMark::clear(&self.mark_path);
+                // Удачный запуск обнуляет и счётчик починок — то же правило,
+                // что у пробы переднего плана.
+                RepairLog::clear(&self.repair_path);
+                eprintln!(
+                    "yt-dlp: фоновый прогрев {} завершился — отметка медленного прогрева снята",
+                    self.build_id
+                );
+                BackgroundOutcome::Warmed
+            }
+            Err(SidecarError::Timeout { ms, .. }) => {
+                let previous = SlowWarmupMark::read(&self.mark_path).ok().flatten();
+                let mark = SlowWarmupMark::recorded_in_background(
+                    previous.as_ref(),
+                    ms,
+                    crate::clock::now_unix_secs(),
+                );
+                // Зависающее дерево (заметка 5 ревью TL-21): без предела
+                // отметка обновлялась бы вечно, и старт ни разу не дошёл бы
+                // до пробы.
+                if mark.background_timeouts >= MAX_BACKGROUND_TIMEOUTS {
+                    SlowWarmupMark::clear(&self.mark_path);
+                    let reason = format!(
+                        "фоновый прогрев {} упёрся в таймаут {ms} мс {} раз(а) подряд",
+                        self.build_id, mark.background_timeouts
+                    );
+                    eprintln!(
+                        "yt-dlp: {reason} — отметка медленного прогрева снята, следующий старт \
+                         проверит дерево пробой"
+                    );
+                    return BackgroundOutcome::Failed(reason);
+                }
+                write_slow_warmup(&self.mark_path, &self.build_id, &mark);
+                BackgroundOutcome::TimedOut
+            }
+            Err(error) => {
+                SlowWarmupMark::clear(&self.mark_path);
+                eprintln!(
+                    "yt-dlp: фоновый прогрев {} не удался ({error}) — это не медленная машина, \
+                     отметка снята: следующий старт проверит дерево запуском и при нужде \
+                     переустановит",
+                    self.build_id
+                );
+                BackgroundOutcome::Failed(error.to_string())
+            }
+        }
+    }
 }
 
 /// Куда уходят события хода подготовки.
@@ -236,17 +491,52 @@ impl ProgressSink for AppSink<'_> {
     }
 }
 
+/// Куда уходит исход фонового прогрева (TL-21).
+///
+/// Отдельный трейт, а не ещё один метод [`ProgressSink`]: подготовка
+/// переднего плана о фоновом прогреве не знает, а фоновый прогрев не шлёт
+/// ничего в [`PREPARE_EVENT`] — на том канале поднимается блокирующий экран.
+pub trait WarmupSink: Send + Sync {
+    fn warmup_finished(&self, event: YtDlpWarmupEvent);
+}
+
+impl WarmupSink for AppSink<'_> {
+    fn warmup_finished(&self, event: YtDlpWarmupEvent) {
+        // Неотправленное событие не отменяет прогрева: дерево уже тёплое
+        // (или нет) независимо от того, узнал ли об этом экран, а ручной
+        // повтор проверки покажет то же самое.
+        if let Err(err) = self.0.emit(WARMUP_EVENT, event) {
+            eprintln!("yt-dlp: не удалось отправить событие конца фонового прогрева: {err}");
+        }
+    }
+}
+
+impl BackgroundOutcome {
+    /// Исход в форме контракта. Причина отказа остаётся в логе: экрану
+    /// нужен класс, по которому он решает, перепроверять ли строку.
+    pub fn event(&self) -> YtDlpWarmupEvent {
+        YtDlpWarmupEvent {
+            outcome: match self {
+                Self::Warmed => YtDlpWarmupOutcome::Warmed,
+                Self::TimedOut => YtDlpWarmupOutcome::TimedOut,
+                Self::Failed(_) => YtDlpWarmupOutcome::Failed,
+            },
+        }
+    }
+}
+
 /// Готовит yt-dlp к работе и возвращает итог.
 ///
 /// Идемпотентна: на уже подготовленном дереве только проверяет его
 /// запуском и возвращает `prepared = false`, не отправив ни одного
-/// события.
+/// события. Сеанс приложения зовёт её через `super::session::Session`,
+/// которая помнит итог и не пробует дерево второй раз.
 pub async fn prepare(
     archive_path: &Path,
     data_dir: &Path,
     registry: &ChildRegistry,
     sink: &dyn ProgressSink,
-) -> Result<YtDlpPrepared, PrepareError> {
+) -> Result<PrepareOutcome, PrepareError> {
     prepare_with(archive_path, data_dir, registry, sink, Timeouts::DEFAULT).await
 }
 
@@ -256,16 +546,16 @@ async fn prepare_with(
     registry: &ChildRegistry,
     sink: &dyn ProgressSink,
     timeouts: Timeouts,
-) -> Result<YtDlpPrepared, PrepareError> {
+) -> Result<PrepareOutcome, PrepareError> {
     let started = Instant::now();
     let result = prepare_inner(archive_path, data_dir, registry, sink, started, timeouts).await;
 
     match &result {
-        Ok(prepared) if prepared.prepared => sink.emit(YtDlpPrepareEvent {
+        Ok(outcome) if outcome.prepared.prepared => sink.emit(YtDlpPrepareEvent {
             stage: YtDlpPrepareStage::Ready,
             percent: 100,
             eta_secs: Some(0),
-            version: Some(prepared.version.clone()),
+            version: Some(outcome.prepared.version.clone()),
             error: None,
         }),
         Ok(_) => {}
@@ -288,7 +578,7 @@ async fn prepare_inner(
     sink: &dyn ProgressSink,
     started: Instant,
     timeouts: Timeouts,
-) -> Result<YtDlpPrepared, PrepareError> {
+) -> Result<PrepareOutcome, PrepareError> {
     let layout = Layout::new(data_dir);
     layout.create_root()?;
     // Пин сразу в форме записи Ф-5: из неё же берётся его build id, то
@@ -331,15 +621,15 @@ async fn prepare_inner(
     // диске две установки, и пина среди них может уже не быть) ещё и
     // распаковывать его заново на каждом старте.
     let mut state = InstallState::load(&layout);
-    if let Some(prepared) = prepare_active(
+    if let Some(outcome) = prepare_active(
         &layout, &state, &build_id, registry, sink, started, timeouts,
     )
     .await
     {
-        return Ok(prepared);
+        return Ok(outcome);
     }
 
-    let prepared = prepare_pinned(
+    let outcome = prepare_pinned(
         archive_path,
         &layout,
         &build_id,
@@ -362,7 +652,7 @@ async fn prepare_inner(
         Err(err) => eprintln!("yt-dlp: не удалось записать активную установку: {err}"),
     }
 
-    Ok(prepared)
+    Ok(outcome)
 }
 
 /// Готовит установку, которую называет активной запись Ф-5, — но только
@@ -386,7 +676,7 @@ async fn prepare_active(
     sink: &dyn ProgressSink,
     started: Instant,
     timeouts: Timeouts,
-) -> Option<YtDlpPrepared> {
+) -> Option<PrepareOutcome> {
     let active = state.active()?;
     if active.build_id() == pinned {
         return None;
@@ -404,23 +694,25 @@ async fn prepare_active(
         }
     };
 
+    // Медленная активная установка — не негодная: на пин она не меняется
+    // (TL-21).
+    if slow_warmup_recorded(layout, build_id) {
+        return Some(PrepareOutcome::in_background(
+            &installed, layout, build_id, false, started, timeouts,
+        ));
+    }
+
     match probe(&installed, registry, timeouts.probe).await {
-        Probe::Warm(version) => Some(YtDlpPrepared {
-            version,
-            path: installed.executable.display().to_string(),
-            prepared: false,
-            duration_ms: elapsed_ms(started),
-        }),
+        Probe::Warm(launch) => {
+            SlowWarmupMark::clear(&layout.slow_warmup_path(build_id));
+            Some(PrepareOutcome::warm(&installed, launch, started))
+        }
         Probe::Cold => {
             // Дерево цело, но ОС забыла результат проверки подписей.
             let file_count = count_tree_files(&installed);
-            match warm_up(&installed, registry, sink, file_count, 0, timeouts.warmup).await {
-                Ok(version) => Some(YtDlpPrepared {
-                    version,
-                    path: installed.executable.display().to_string(),
-                    prepared: true,
-                    duration_ms: elapsed_ms(started),
-                }),
+            let warmed = warm_up(&installed, registry, sink, file_count, 0, timeouts.warmup).await;
+            match after_warm_up(warmed, &installed, layout, build_id, started, timeouts) {
+                Ok(outcome) => Some(outcome),
                 Err(err) => {
                     eprintln!(
                         "yt-dlp: активная установка {build_id} не прогрелась ({err}), \
@@ -452,26 +744,30 @@ async fn prepare_pinned(
     sink: &dyn ProgressSink,
     started: Instant,
     timeouts: Timeouts,
-) -> Result<YtDlpPrepared, PrepareError> {
+) -> Result<PrepareOutcome, PrepareError> {
     let repair_path = layout.repair_path(build_id);
 
     match layout::validate(layout, build_id) {
         Ok(installed) => {
+            // Прогрев этого дерева уже упирался в таймаут: не пробуем и не
+            // ждём, дерево цело по манифесту (TL-21).
+            if slow_warmup_recorded(layout, build_id) {
+                return Ok(PrepareOutcome::in_background(
+                    &installed, layout, build_id, false, started, timeouts,
+                ));
+            }
+
             match probe(&installed, registry, timeouts.probe).await {
-                Probe::Warm(version) => {
+                Probe::Warm(launch) => {
                     RepairLog::clear(&repair_path);
-                    Ok(YtDlpPrepared {
-                        version,
-                        path: installed.executable.display().to_string(),
-                        prepared: false,
-                        duration_ms: elapsed_ms(started),
-                    })
+                    SlowWarmupMark::clear(&layout.slow_warmup_path(build_id));
+                    Ok(PrepareOutcome::warm(&installed, launch, started))
                 }
                 Probe::Cold => {
                     // Дерево на месте и цело, но ОС забыла результат
                     // проверки подписей — распаковывать заново незачем,
                     // достаточно прогреть.
-                    let version = warm_up(
+                    let warmed = warm_up(
                         &installed,
                         registry,
                         sink,
@@ -479,14 +775,13 @@ async fn prepare_pinned(
                         0,
                         timeouts.warmup,
                     )
-                    .await?;
-                    RepairLog::clear(&repair_path);
-                    Ok(YtDlpPrepared {
-                        version,
-                        path: installed.executable.display().to_string(),
-                        prepared: true,
-                        duration_ms: elapsed_ms(started),
-                    })
+                    .await;
+                    let outcome =
+                        after_warm_up(warmed, &installed, layout, build_id, started, timeouts)?;
+                    if outcome.background.is_none() {
+                        RepairLog::clear(&repair_path);
+                    }
+                    Ok(outcome)
                 }
                 Probe::Broken(reason) => {
                     // Дерево прошло сверку с манифестом, но не
@@ -511,10 +806,20 @@ async fn prepare_pinned(
         }
         Err(invalid) => {
             eprintln!("yt-dlp: установка непригодна ({invalid}), распаковываю заново");
-            let prepared =
-                install_and_warm(archive_path, layout, registry, sink, started, timeouts).await?;
-            RepairLog::clear(&repair_path);
-            Ok(prepared)
+            let outcome = install_and_warm(
+                archive_path,
+                layout,
+                build_id,
+                registry,
+                sink,
+                started,
+                timeouts,
+            )
+            .await?;
+            if outcome.background.is_none() {
+                RepairLog::clear(&repair_path);
+            }
+            Ok(outcome)
         }
     }
 }
@@ -545,7 +850,7 @@ async fn repair(
     sink: &dyn ProgressSink,
     started: Instant,
     timeouts: Timeouts,
-) -> Result<YtDlpPrepared, PrepareError> {
+) -> Result<PrepareOutcome, PrepareError> {
     let repair_path = layout.repair_path(build_id);
     let history = RepairLog::read(&repair_path);
     let now = crate::clock::now_unix_secs();
@@ -576,11 +881,23 @@ async fn repair(
         eprintln!("yt-dlp: не удалось записать историю починки: {err}");
     }
 
-    let outcome = install_and_warm(archive_path, layout, registry, sink, started, timeouts).await;
+    let outcome = install_and_warm(
+        archive_path,
+        layout,
+        build_id,
+        registry,
+        sink,
+        started,
+        timeouts,
+    )
+    .await;
 
     match &outcome {
-        Ok(_) => RepairLog::clear(&repair_path),
-        Err(PrepareError::WarmupFailed { .. }) => {}
+        Ok(done) if done.background.is_none() => RepairLog::clear(&repair_path),
+        // Переустановка прошла, а прогрев ушёл в фон (TL-21): запускается ли
+        // дерево, ещё не известно, и попытка остаётся засчитанной — снимет
+        // её удачный фоновый прогрев.
+        Ok(_) | Err(PrepareError::WarmupFailed { .. }) => {}
         Err(_) => {
             if history.attempts == 0 {
                 RepairLog::clear(&repair_path);
@@ -611,11 +928,12 @@ fn repair_exhausted(history: &RepairLog, now_unix: u64) -> bool {
 async fn install_and_warm(
     archive_path: &Path,
     layout: &Layout,
+    build_id: &BuildId,
     registry: &ChildRegistry,
     sink: &dyn ProgressSink,
     started: Instant,
     timeouts: Timeouts,
-) -> Result<YtDlpPrepared, PrepareError> {
+) -> Result<PrepareOutcome, PrepareError> {
     let unpack_started = Instant::now();
     let installed = install(
         archive_path,
@@ -624,7 +942,7 @@ async fn install_and_warm(
         &mut |done, total| sink.emit(unpacking_event(done, total, unpack_started)),
     )?;
     let file_count = count_tree_files(&installed);
-    let version = warm_up(
+    let warmed = warm_up(
         &installed,
         registry,
         sink,
@@ -632,14 +950,9 @@ async fn install_and_warm(
         UNPACK_PERCENT_SHARE,
         timeouts.warmup,
     )
-    .await?;
+    .await;
 
-    Ok(YtDlpPrepared {
-        version,
-        path: installed.executable.display().to_string(),
-        prepared: true,
-        duration_ms: elapsed_ms(started),
-    })
+    after_warm_up(warmed, &installed, layout, build_id, started, timeouts)
 }
 
 /// Распаковка в `.staging-*`, атомарный перенос, запись манифеста.
@@ -682,11 +995,44 @@ async fn install_and_warm(
 /// пик расхода — на одну установку (около 124 МиБ) больше прежнего.
 /// Н-4 этот пик уже закладывает («активная + известно-хорошая +
 /// подготавливаемая + архив»).
+///
+/// # Уборка при отказе — свойство конструкции (TL-64)
+///
+/// Каталог, который эта функция создала, живёт в [`Leftover`] и уходит
+/// при **любом** раннем выходе: отказ распаковки, сноса прежнего дерева,
+/// `rename`, записи манифеста. До TL-64 уборка висела `inspect_err` на
+/// двух шагах из четырёх, и провал `rename` оставлял `.staging-*` до
+/// следующего старта — в контуре обновления (E6), где установка идёт
+/// регулярно и в фоне, это десятки мегабайт на каждую неудачу.
+///
+/// Трогает уборка только то, что создано этим вызовом: `.staging-*` со
+/// случайным суффиксом (его имени не знает никто, кроме нас) и — после
+/// `rename` и до записи манифеста — тот же каталог на рабочем пути.
+/// Каталог без манифеста не установка ([`layout::validate`] отвечает
+/// `NoManifest`), и прежнего дерева этого build id к тому моменту уже нет
+/// (см. «Порядок шагов»), поэтому терять там нечего. Дерево другой
+/// установки — активной, известно-хорошей, прогреваемой в фоне (TL-21) —
+/// уборке недостижимо по построению: его пути она не держит никогда.
 pub(super) fn install(
     archive_path: &Path,
     layout: &Layout,
     identity: layout::ArchiveIdentity<'_>,
     on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Installed, PrepareError> {
+    install_with(archive_path, layout, identity, on_progress, unpack::promote)
+}
+
+/// Тело [`install`] с подставляемым шагом `rename`.
+///
+/// Шаг вынесен ровно ради одного теста: провал `rename` в пределах
+/// одного каталога не воспроизводится файловой системой, не сломав
+/// заодно уборку (нет прав на каталог — нет прав и удалить из него).
+fn install_with(
+    archive_path: &Path,
+    layout: &Layout,
+    identity: layout::ArchiveIdentity<'_>,
+    on_progress: &mut dyn FnMut(u64, u64),
+    promote: fn(&Path, &Path) -> Result<(), PrepareError>,
 ) -> Result<Installed, PrepareError> {
     let build_id = identity.build_id()?;
     let install_dir = layout.install_dir(&build_id);
@@ -695,31 +1041,29 @@ pub(super) fn install(
     // Каталог распаковки создаётся здесь и под непредсказуемым именем
     // (см. doc `super::layout`), поэтому «убрать прежний staging» не
     // требуется: своего у нас ещё нет, а чужой — не наш.
-    let staging = layout.create_staging_dir(&build_id)?;
+    let mut leftover = Leftover::new(layout.create_staging_dir(&build_id)?);
 
-    let unpacked = unpack::unpack(archive_path, &staging, on_progress).inspect_err(|_| {
-        // Полураспакованное дерево не должно пережить неудачу — иначе
-        // следующий запуск найдёт мусор на 124 МиБ и будет чистить его
-        // «за прошлый раз».
-        let _ = unpack::remove_dir_if_exists(&staging);
-    })?;
+    let unpacked = unpack::unpack(archive_path, leftover.path(), on_progress)?;
+
+    // Манифест собирается по дереву в `.staging-*`, до `rename`: обход —
+    // тоже шаг, который может отказать, и отказ его должен прийти, пока
+    // прежнее дерево ещё не снесено. Содержимое после `rename` то же
+    // самое — переименование не трогает ни одного файла внутри.
+    let manifest = layout::manifest_for(leftover.path(), &unpacked.executable, identity)?;
 
     // Прежняя установка этого же build id могла остаться непригодной
     // (`validate` уже сказала, что она не годится) — переименование в
     // занятый путь не пройдёт, поэтому её надо убрать. Убирается она
     // **после** распаковки, и порядок здесь несущий — см. «Порядок
-    // шагов» в doc функции. Отказ сноса оставляет `.staging-*` на диске:
-    // его уберёт следующий запуск (`prepare_inner` чистит остатки), а
-    // рабочее дерево при этом цело.
-    unpack::remove_dir_if_exists(&install_dir).inspect_err(|_| {
-        let _ = unpack::remove_dir_if_exists(&staging);
-    })?;
+    // шагов» в doc функции.
+    unpack::remove_dir_if_exists(&install_dir)?;
     let _ = std::fs::remove_file(&manifest_path);
 
-    unpack::promote(&staging, &install_dir)?;
+    promote(leftover.path(), &install_dir)?;
+    leftover.moved_to(install_dir.clone());
 
-    let manifest = layout::manifest_for(&install_dir, &unpacked.executable, identity)?;
     manifest.write_atomic(&manifest_path)?;
+    leftover.keep();
 
     Ok(Installed {
         dir: install_dir.clone(),
@@ -728,10 +1072,52 @@ pub(super) fn install(
     })
 }
 
+/// Каталог, созданный установкой и ещё не ставший установкой (TL-64).
+///
+/// Убирается в `Drop`, если его не отпустили [`Self::keep`], — то есть на
+/// любом `?` в [`install_with`], включая те шаги, которых там ещё нет.
+/// Неудача уборки не меняет исхода установки, но видна в логе: иначе
+/// оставшиеся мегабайты не объяснит ничто.
+struct Leftover {
+    path: Option<PathBuf>,
+}
+
+impl Leftover {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().unwrap_or_else(|| Path::new(""))
+    }
+
+    /// Каталог переехал `rename` и убирать теперь надо его новый путь.
+    fn moved_to(&mut self, path: PathBuf) {
+        self.path = Some(path);
+    }
+
+    /// Установка дошла до конца: убирать нечего.
+    fn keep(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for Leftover {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        eprintln!("yt-dlp: установка не удалась — убираю {}", path.display());
+        if let Err(err) = unpack::remove_dir_if_exists(&path) {
+            eprintln!("yt-dlp: не удалось убрать остаток установки: {err}");
+        }
+    }
+}
+
 /// Исход проверки «дерево уже тёплое?».
 enum Probe {
-    /// Отозвалось быстро; строка — разобранная версия.
-    Warm(String),
+    /// Отозвалось быстро; запуск уходит служебному экрану (TL-23).
+    Warm(WarmLaunch),
     /// Не уложилось в [`PROBE_TIMEOUT`] — нужен прогрев.
     Cold,
     /// Не запускается или завершается с ошибкой.
@@ -739,8 +1125,18 @@ enum Probe {
 }
 
 async fn probe(installed: &Installed, registry: &ChildRegistry, timeout: Duration) -> Probe {
+    // Штамп — до запуска, длительность — самого запуска: так же их берёт
+    // проверка служебного экрана, и в «Подробнее» они обязаны значить то
+    // же самое, чей бы запуск ни был.
+    let checked_at = crate::clock::now_iso8601();
+    let launched = Instant::now();
     match sidecar::run(&installed.executable, WARMUP_ARGS, timeout, registry).await {
-        Ok(output) => Probe::Warm(parse_version(&output.stdout, &installed.version)),
+        Ok(output) => Probe::Warm(WarmLaunch {
+            executable: installed.executable.clone(),
+            output,
+            checked_at,
+            duration_ms: elapsed_ms(launched),
+        }),
         Err(SidecarError::Timeout { .. }) => Probe::Cold,
         Err(error) => Probe::Broken(error.to_string()),
     }
@@ -758,7 +1154,7 @@ async fn warm_up(
     file_count: u64,
     base_percent: u8,
     timeout: Duration,
-) -> Result<String, PrepareError> {
+) -> Result<String, SidecarError> {
     let expected = Duration::from_millis(file_count.saturating_mul(WARMUP_MS_PER_FILE));
     let started = Instant::now();
     sink.emit(warming_event(started, expected, base_percent));
@@ -776,11 +1172,88 @@ async fn warm_up(
         }
     };
 
-    match output {
-        Ok(output) => Ok(parse_version(&output.stdout, &installed.version)),
+    output.map(|output| parse_version(&output.stdout, &installed.version))
+}
+
+/// Исход прогрева переднего плана: удача, медленная машина или отказ.
+///
+/// Таймаут отказом не считается (TL-21): отметка записывается рядом с
+/// установкой, а прогрев уходит в фон. Отказом остаётся только то, что
+/// говорит о неработоспособности дерева, — ненулевой код, отказ запуска.
+fn after_warm_up(
+    warmed: Result<String, SidecarError>,
+    installed: &Installed,
+    layout: &Layout,
+    build_id: &BuildId,
+    started: Instant,
+    timeouts: Timeouts,
+) -> Result<PrepareOutcome, PrepareError> {
+    match warmed {
+        Ok(version) => {
+            SlowWarmupMark::clear(&layout.slow_warmup_path(build_id));
+            Ok(PrepareOutcome::worked(installed, version, started))
+        }
+        Err(SidecarError::Timeout { ms, .. }) => {
+            record_slow_warmup(&layout.slow_warmup_path(build_id), build_id, ms);
+            Ok(PrepareOutcome::in_background(
+                installed, layout, build_id, true, started, timeouts,
+            ))
+        }
         Err(error) => Err(PrepareError::WarmupFailed {
             reason: error.to_string(),
         }),
+    }
+}
+
+/// Упирался ли прогрев этой установки в таймаут (TL-21).
+///
+/// Испорченная отметка — то же, что отсутствующая (прогрев идёт как
+/// обычно: медленнее, но честно), и причина уходит в лог.
+fn slow_warmup_recorded(layout: &Layout, build_id: &BuildId) -> bool {
+    let path = layout.slow_warmup_path(build_id);
+    match SlowWarmupMark::read(&path) {
+        Ok(Some(mark)) => {
+            eprintln!(
+                "yt-dlp: прогрев {build_id} не укладывался в таймаут (подряд: {}, последний — \
+                 {}) — дерево цело по манифесту, экран его не ждёт, прогрев идёт в фоне",
+                mark.timeouts, mark.last_timeout_at
+            );
+            true
+        }
+        Ok(None) => false,
+        // Путь уже в причине: её строит чтение, которое знает, какой файл
+        // оказался испорчен.
+        Err(reason) => {
+            eprintln!(
+                "yt-dlp: отметка медленного прогрева: {reason} — считаю, что её нет, и \
+                 проверяю дерево обычным путём"
+            );
+            false
+        }
+    }
+}
+
+/// Записывает (или обновляет) отметку медленного прогрева.
+///
+/// Отказ записи не роняет подготовку: отметка — страховка от повторной
+/// оплаты таймаута, а не условие работы; не записалась — следующий старт
+/// просто подождёт ещё раз.
+fn record_slow_warmup(path: &Path, build_id: &BuildId, timeout_ms: u64) {
+    let previous = SlowWarmupMark::read(path).ok().flatten();
+    let mark =
+        SlowWarmupMark::recorded(previous.as_ref(), timeout_ms, crate::clock::now_unix_secs());
+    write_slow_warmup(path, build_id, &mark);
+}
+
+/// Пишет отметку и строку о ней в лог — общее у переднего плана и фона.
+fn write_slow_warmup(path: &Path, build_id: &BuildId, mark: &SlowWarmupMark) {
+    eprintln!(
+        "yt-dlp: прогрев {build_id} не уложился в {} мс (подряд: {}, из них в фоне: {}) — это \
+         медленная машина, а не отказ: экран этот прогрев больше не ждёт",
+        mark.timeout_ms, mark.timeouts, mark.background_timeouts
+    );
+    if let Err(err) = mark.write_atomic(path) {
+        eprintln!("yt-dlp: не удалось записать отметку медленного прогрева: {err}");
     }
 }
 
@@ -1067,6 +1540,16 @@ mod tests {
             sink: &RecordingSink,
             timeouts: Timeouts,
         ) -> Result<YtDlpPrepared, PrepareError> {
+            self.outcome_with(sink, timeouts)
+                .await
+                .map(|outcome| outcome.prepared)
+        }
+
+        async fn outcome_with(
+            &self,
+            sink: &RecordingSink,
+            timeouts: Timeouts,
+        ) -> Result<PrepareOutcome, PrepareError> {
             prepare_with(
                 &self.archive,
                 &self.data_dir,
@@ -1075,6 +1558,10 @@ mod tests {
                 timeouts,
             )
             .await
+        }
+
+        fn mark_path(&self) -> PathBuf {
+            self.layout().slow_warmup_path(&pinned_build_id())
         }
 
         /// Портит установленный исполняемый файл, сохраняя размер дерева.
@@ -1737,6 +2224,102 @@ mod tests {
         }
     }
 
+    /// Корень установок с рабочей установкой пина — той, которую отказ
+    /// установки **другого** build id не имеет права тронуть. Возвращает её
+    /// идентификатор и байты исполняемого файла для сверки.
+    fn root_with_a_working_installation(dir: &Path) -> (Layout, layout::BuildId, Vec<u8>) {
+        let layout = Layout::new(&dir.join("app-data"));
+        layout.create_root().expect("корень обязан создаваться");
+        let good = dir.join("good.zip");
+        write_fake_ytdlp_zip(&good, PRINTS_VERSION);
+        let installed = install(
+            &good,
+            &layout,
+            layout::ArchiveIdentity::bundled(),
+            &mut |_, _| {},
+        )
+        .expect("рабочая установка");
+        let bytes = fs::read(&installed.executable).expect("файл читается");
+        (layout, pinned_build_id(), bytes)
+    }
+
+    fn assert_no_staging(layout: &Layout) {
+        let left = unpack::stale_staging_dirs(layout.root());
+        assert!(left.is_empty(), "остались каталоги распаковки: {left:?}");
+    }
+
+    fn assert_still_working(layout: &Layout, build_id: &layout::BuildId, bytes: &[u8]) {
+        assert!(
+            layout::validate(layout, build_id).is_ok(),
+            "прежняя установка обязана остаться пригодной"
+        );
+        assert_eq!(
+            fs::read(layout.install_dir(build_id).join(EXECUTABLE_NAME)).expect("файл читается"),
+            bytes,
+            "прежняя установка обязана остаться той же байт в байт"
+        );
+    }
+
+    #[test]
+    fn a_failed_promote_leaves_no_staging_and_the_working_installation_alone() {
+        // TL-64: уборка висела `inspect_err` на распаковке и сносе, и провал
+        // `rename` оставлял `.staging-*` до следующего старта.
+        let dir = tempdir().expect("tempdir");
+        let (layout, working, bytes) = root_with_a_working_installation(dir.path());
+        let candidate = updated_identity();
+        let candidate_id = candidate.build_id().expect("кандидат проходит проверку");
+        let archive = dir.path().join("candidate.zip");
+        write_fake_ytdlp_zip(&archive, PRINTS_VERSION);
+
+        let error = install_with(&archive, &layout, candidate, &mut |_, _| {}, |_, _| {
+            Err(PrepareError::UnpackFailed {
+                reason: "перенос отказал".to_string(),
+            })
+        })
+        .expect_err("отказ переноса обязан дойти до вызывающего");
+
+        assert!(error.to_string().contains("перенос отказал"), "{error}");
+        assert_no_staging(&layout);
+        assert!(!layout.install_dir(&candidate_id).exists());
+        assert!(!layout.manifest_path(&candidate_id).exists());
+        assert_still_working(&layout, &working, &bytes);
+    }
+
+    #[test]
+    fn a_real_failure_at_a_later_step_of_install_leaves_no_staging_either() {
+        // Те же гарантии на настоящих отказах файловой системы, без подмены
+        // шага: уборка — свойство конструкции, а не одного пути отказа.
+        let dir = tempdir().expect("tempdir");
+        let (layout, working, bytes) = root_with_a_working_installation(dir.path());
+        let candidate = updated_identity();
+        let candidate_id = candidate.build_id().expect("кандидат проходит проверку");
+        let archive = dir.path().join("candidate.zip");
+        write_fake_ytdlp_zip(&archive, PRINTS_VERSION);
+        let install_dir = layout.install_dir(&candidate_id);
+        let manifest_path = layout.manifest_path(&candidate_id);
+
+        // Снос прежнего дерева: на месте каталога установки лежит файл.
+        fs::write(&install_dir, b"not a directory").expect("занять путь файлом");
+        let error = install(&archive, &layout, candidate, &mut |_, _| {})
+            .expect_err("снос занятого файлом пути обязан отказать");
+        assert_no_staging(&layout);
+        assert_still_working(&layout, &working, &bytes);
+        fs::remove_file(&install_dir).unwrap_or_else(|err| panic!("{error}; {err}"));
+
+        // Запись манифеста: на месте манифеста каталог. Отказ приходит уже
+        // после `rename`, и дерево без манифеста уходит вместе с ним — это
+        // не установка.
+        fs::create_dir(&manifest_path).expect("занять путь манифеста каталогом");
+        let error = install(&archive, &layout, candidate, &mut |_, _| {})
+            .expect_err("запись манифеста поверх каталога обязана отказать");
+        assert_no_staging(&layout);
+        assert!(
+            !install_dir.exists(),
+            "дерево без манифеста не переживает отказ ({error})"
+        );
+        assert_still_working(&layout, &working, &bytes);
+    }
+
     #[tokio::test]
     async fn resolving_the_executable_marks_the_installation_as_in_use() {
         // Ф-7: установка, из которой запущен процесс, не удаляется. Эта
@@ -1963,5 +2546,377 @@ mod tests {
     fn version_falls_back_to_the_pinned_one_when_the_run_prints_nothing() {
         assert_eq!(parse_version("2026.08.19\n", "pin"), "2026.08.19");
         assert_eq!(parse_version("   \n", "pin"), "pin");
+    }
+
+    // ─────────────── медленная машина — не отказ (TL-21) ───────────────
+
+    use crate::ytdlp::testing::Control;
+
+    /// «Прогрев не укладывается»: фикстура висит, пока её не отпустят, а
+    /// таймауты заведомо короткие. Исход от времени не зависит — висящий
+    /// процесс не завершится ни за 50 мс, ни за сколько угодно.
+    const HUNG: Timeouts = Timeouts {
+        probe: Duration::from_millis(1),
+        warmup: Duration::from_millis(50),
+        background: Duration::from_millis(50),
+    };
+
+    /// Таймауты прогрева, которых тест не дождётся: подготовка, которая
+    /// всё-таки ждёт прогрев, упрётся в страховку [`SAFETY_NET`].
+    const UNREACHABLE: Timeouts = Timeouts {
+        probe: PROBE_TIMEOUT,
+        warmup: Duration::from_secs(3600),
+        background: Duration::from_secs(3600),
+    };
+
+    /// Страховка от вечного зависания красного прогона, а не утверждение о
+    /// длительности: зелёный исход не зависит от неё никак.
+    const SAFETY_NET: Duration = Duration::from_secs(60);
+
+    /// Фикстура, чей yt-dlp считает запуски и зависает по команде.
+    fn controlled_fixture() -> (Fixture, Control) {
+        let dir = tempdir().expect("tempdir");
+        let control = Control::new(&dir.path().join("control"));
+        let archive = dir.path().join("yt-dlp.zip");
+        write_fake_ytdlp_zip(&archive, &control.script("2026.08.19"));
+        let data_dir = dir.path().join("app-data");
+
+        (
+            Fixture {
+                _dir: dir,
+                archive,
+                data_dir,
+                registry: ChildRegistry::new(),
+            },
+            control,
+        )
+    }
+
+    fn write_mark(path: &Path) {
+        SlowWarmupMark::recorded(None, 120_000, crate::clock::now_unix_secs())
+            .write_atomic(path)
+            .expect("отметка обязана записываться");
+    }
+
+    #[tokio::test]
+    async fn a_warm_up_that_hits_its_timeout_is_recorded_and_the_start_is_not_refused() {
+        let (fixture, control) = controlled_fixture();
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("первая подготовка");
+        control.hang();
+
+        let sink = RecordingSink::default();
+        let outcome = fixture
+            .outcome_with(&sink, HUNG)
+            .await
+            .expect("медленная машина — не отказ");
+        control.release();
+
+        assert!(
+            outcome.background.is_some(),
+            "прогрев обязан продолжиться в фоне"
+        );
+        assert!(
+            outcome.warm_launch.is_none(),
+            "у недошедшего прогрева нет запуска для экрана"
+        );
+        assert!(
+            outcome.prepared.prepared,
+            "экран подготовки показывал прогрев и обязан получить ready"
+        );
+        assert_eq!(outcome.prepared.version, layout::BUNDLED_VERSION);
+        let stages = sink.stages();
+        assert_eq!(stages.last(), Some(&YtDlpPrepareStage::Ready), "{stages:?}");
+        assert!(!stages.contains(&YtDlpPrepareStage::Failed), "{stages:?}");
+
+        let mark = SlowWarmupMark::read(&fixture.mark_path())
+            .expect("отметка читается")
+            .expect("отметка обязана быть записана рядом с установкой");
+        assert_eq!(mark.timeouts, 1);
+        assert_eq!(mark.timeout_ms, 50);
+    }
+
+    #[tokio::test]
+    async fn a_first_run_whose_warm_up_hits_its_timeout_is_not_refused_either() {
+        let (fixture, control) = controlled_fixture();
+        control.hang();
+
+        let sink = RecordingSink::default();
+        let outcome = fixture
+            .outcome_with(&sink, HUNG)
+            .await
+            .expect("распаковка прошла, прогрев медленный — это не отказ");
+        control.release();
+
+        assert!(outcome.background.is_some());
+        assert!(sink.stages().contains(&YtDlpPrepareStage::Unpacking));
+        assert_eq!(sink.stages().last(), Some(&YtDlpPrepareStage::Ready));
+        assert!(fixture.mark_path().exists());
+    }
+
+    #[tokio::test]
+    async fn the_next_start_with_the_mark_does_not_wait_and_a_finished_background_warm_up_clears_it(
+    ) {
+        let (fixture, control) = controlled_fixture();
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("первая подготовка");
+        control.hang();
+        fixture
+            .outcome_with(&RecordingSink::default(), HUNG)
+            .await
+            .expect("прогрев упёрся в таймаут");
+        assert!(fixture.mark_path().exists(), "предусловие: отметка есть");
+
+        // Следующий старт приложения.
+        control.hang();
+        let launches = control.launches();
+        let sink = RecordingSink::default();
+        let outcome = tokio::time::timeout(SAFETY_NET, fixture.outcome_with(&sink, UNREACHABLE))
+            .await
+            .expect("подготовка с отметкой обязана вернуться, не дожидаясь прогрева")
+            .expect("и вернуться успехом");
+
+        assert_eq!(
+            control.launches(),
+            launches,
+            "с отметкой подготовка сама ничего не запускает — ни пробы, ни прогрева"
+        );
+        assert!(!outcome.prepared.prepared);
+        assert!(
+            sink.events().is_empty(),
+            "экран подготовки на этом старте не поднимается: {:?}",
+            sink.stages()
+        );
+        let background = outcome.background.expect("прогрев уходит в фон");
+
+        let (result, ()) = tokio::join!(background.run(&fixture.registry), async {
+            control.wait_until_hanging().await;
+            assert!(
+                fixture.mark_path().exists(),
+                "пока прогрев идёт, отметка на месте"
+            );
+            control.release();
+        });
+
+        assert_eq!(result, BackgroundOutcome::Warmed);
+        assert!(
+            !fixture.mark_path().exists(),
+            "удачный фоновый прогрев снимает отметку"
+        );
+
+        let outcome = fixture
+            .outcome_with(&RecordingSink::default(), Timeouts::DEFAULT)
+            .await
+            .expect("дальше старт обычный");
+        assert!(outcome.background.is_none());
+        assert!(outcome.warm_launch.is_some(), "проба застаёт тёплое дерево");
+    }
+
+    #[tokio::test]
+    async fn a_background_warm_up_that_times_out_again_keeps_the_mark() {
+        let (fixture, control) = controlled_fixture();
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("первая подготовка");
+        control.hang();
+        fixture
+            .outcome_with(&RecordingSink::default(), HUNG)
+            .await
+            .expect("прогрев упёрся в таймаут");
+
+        control.hang();
+        let outcome = fixture
+            .outcome_with(&RecordingSink::default(), HUNG)
+            .await
+            .expect("с отметкой — успех");
+        let result = outcome
+            .background
+            .expect("прогрев уходит в фон")
+            .run(&fixture.registry)
+            .await;
+        control.release();
+
+        assert_eq!(result, BackgroundOutcome::TimedOut);
+        let mark = SlowWarmupMark::read(&fixture.mark_path())
+            .expect("читается")
+            .expect("отметка остаётся");
+        assert_eq!(mark.timeouts, 2, "второй таймаут подряд учтён");
+    }
+
+    #[tokio::test]
+    async fn a_tree_that_hangs_in_the_background_three_times_in_a_row_loses_its_mark() {
+        // Заметка 5 ревью TL-21: зависающий yt-dlp обновлял отметку каждые
+        // десять минут, и старт до пробы не доходил никогда.
+        let (fixture, control) = controlled_fixture();
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("первая подготовка");
+        control.hang();
+        fixture
+            .outcome_with(&RecordingSink::default(), HUNG)
+            .await
+            .expect("прогрев переднего плана упёрся в таймаут");
+        assert!(fixture.mark_path().exists(), "предусловие: отметка есть");
+
+        for round in 1..=MAX_BACKGROUND_TIMEOUTS {
+            control.hang();
+            let outcome = fixture
+                .outcome_with(&RecordingSink::default(), HUNG)
+                .await
+                .expect("с отметкой — успех");
+            let result = outcome
+                .background
+                .expect("с отметкой прогрев уходит в фон")
+                .run(&fixture.registry)
+                .await;
+
+            if round < MAX_BACKGROUND_TIMEOUTS {
+                assert_eq!(
+                    result,
+                    BackgroundOutcome::TimedOut,
+                    "таймаут в фоне №{round}"
+                );
+                let mark = SlowWarmupMark::read(&fixture.mark_path())
+                    .expect("читается")
+                    .expect("отметка остаётся");
+                assert_eq!(mark.background_timeouts, round);
+            } else {
+                assert!(
+                    matches!(result, BackgroundOutcome::Failed(_)),
+                    "таймаут в фоне №{round} — уже не медленная машина: {result:?}"
+                );
+                assert!(
+                    !fixture.mark_path().exists(),
+                    "после {MAX_BACKGROUND_TIMEOUTS} фоновых таймаутов подряд отметка снимается"
+                );
+            }
+        }
+        control.release();
+
+        // Следующий старт — обычным путём: проба, а не сразу фон.
+        let launches = control.launches();
+        let outcome = fixture
+            .outcome_with(&RecordingSink::default(), Timeouts::DEFAULT)
+            .await
+            .expect("обычный старт");
+        assert!(outcome.background.is_none(), "без отметки фон не выдаётся");
+        assert!(outcome.warm_launch.is_some(), "дерево проверено пробой");
+        assert_eq!(control.launches(), launches + 1);
+    }
+
+    #[tokio::test]
+    async fn a_background_warm_up_that_fails_outright_drops_the_mark_and_the_next_start_repairs() {
+        let fixture = fixture(PRINTS_VERSION);
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("первая подготовка");
+        write_mark(&fixture.mark_path());
+        fixture.break_installed_executable();
+
+        let outcome = fixture
+            .outcome_with(&RecordingSink::default(), Timeouts::DEFAULT)
+            .await
+            .expect("с отметкой дерево считается готовым");
+        let result = outcome
+            .background
+            .expect("прогрев уходит в фон")
+            .run(&fixture.registry)
+            .await;
+
+        assert!(matches!(result, BackgroundOutcome::Failed(_)), "{result:?}");
+        assert!(
+            !fixture.mark_path().exists(),
+            "отказ запуска — не медленная машина: отметка снимается"
+        );
+
+        let sink = RecordingSink::default();
+        let prepared = fixture
+            .prepare(&sink)
+            .await
+            .expect("следующий старт обязан вылечить дерево переустановкой");
+        assert!(prepared.prepared);
+        assert!(sink.stages().contains(&YtDlpPrepareStage::Unpacking));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_mark_is_treated_as_absent() {
+        let (fixture, control) = controlled_fixture();
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("первая подготовка");
+
+        let foreign_schema = br#"{"schemaVersion":99,"timeouts":1,"lastTimeoutUnix":0,"lastTimeoutAt":"","timeoutMs":1}"#;
+        for garbage in [b"{ not json".as_slice(), foreign_schema.as_slice()] {
+            fs::write(fixture.mark_path(), garbage).expect("испортить отметку");
+            assert!(
+                SlowWarmupMark::read(&fixture.mark_path()).is_err(),
+                "испорченная отметка отличается от отсутствующей — ради строки в логе"
+            );
+
+            let launches = control.launches();
+            let outcome = fixture
+                .outcome_with(&RecordingSink::default(), Timeouts::DEFAULT)
+                .await
+                .expect("испорченная отметка не мешает старту");
+
+            assert!(
+                outcome.background.is_none(),
+                "испорченная отметка — как отсутствующая: дерево проверяется пробой"
+            );
+            assert!(outcome.warm_launch.is_some());
+            assert_eq!(control.launches(), launches + 1);
+            assert!(
+                !fixture.mark_path().exists(),
+                "тёплое дерево снимает и испорченную отметку"
+            );
+        }
+
+        assert_eq!(
+            SlowWarmupMark::read(&fixture.data_dir.join("absent")),
+            Ok(None),
+            "отсутствие — не ошибка"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_active_installation_is_kept_and_not_replaced_by_the_pin() {
+        let (fixture, control) = controlled_fixture();
+        fixture.install_and_activate(updated_identity(), &control.script("2030.01.01"));
+        control.hang();
+
+        let outcome = fixture
+            .outcome_with(&RecordingSink::default(), HUNG)
+            .await
+            .expect("медленная активная установка — не отказ");
+        control.release();
+
+        let mark_path = fixture
+            .layout()
+            .slow_warmup_path(updated_entry().build_id());
+        assert!(outcome.background.is_some());
+        assert_eq!(outcome.prepared.version, "2030.01.01");
+        assert!(mark_path.exists(), "отметка — у активной установки");
+        assert!(
+            !fixture.install_dir().exists(),
+            "медленную активную установку пин не вытесняет"
+        );
+
+        // Следующий старт с отметкой — снова активная, без пробы.
+        let launches = control.launches();
+        let outcome = fixture
+            .outcome_with(&RecordingSink::default(), UNREACHABLE)
+            .await
+            .expect("успех");
+        assert_eq!(control.launches(), launches);
+        assert_eq!(outcome.prepared.version, "2030.01.01");
+        assert!(outcome.background.is_some());
     }
 }

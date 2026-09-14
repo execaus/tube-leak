@@ -10,6 +10,7 @@
 //!     _internal/…
 //!   2026.08.19-07e54b086530.json        манифест этой установки
 //!   2026.08.19-07e54b086530.repair.json счётчик безуспешных переустановок
+//!   2026.08.19-07e54b086530.slow-warmup.json прогрев не уложился в таймаут
 //!   .staging-2026.08.19-07e54b086530-1f3c…/ временный каталог распаковки
 //! ```
 //!
@@ -147,6 +148,18 @@ const UPDATE_ATTEMPT_SUFFIX: &str = ".update.json";
 /// то, что сохраняется **вместе с установкой**), а сохраняется уборкой
 /// безусловно — см. [`Layout::is_smoke_journal`] и `super::state::cleanup`.
 const SMOKE_SUFFIX: &str = ".smoke.json";
+
+/// Суффикс отметки «прогрев этой установки не уложился в таймаут» (TL-21,
+/// [`SlowWarmupMark`]).
+///
+/// Четвёртый файл рядом с установкой и снова отдельный, потому что смысл
+/// у него противоположный [`REPAIR_SUFFIX`]: тот помнит «дерево не
+/// запускается, не чинить без конца», этот — «дерево запускается, но
+/// медленно, не заставлять экран ждать». Слей их — и медленная машина
+/// копила бы попытки починки, пока не получила бы отказ, ровно то, чего
+/// TL-21 запрещает. В [`Layout::belongs_to`] он перечислен: живёт и
+/// уходит вместе со своей установкой, как манифест.
+const SLOW_WARMUP_SUFFIX: &str = ".slow-warmup.json";
 
 /// Сколько имён каталога распаковки пробовать, прежде чем сдаться.
 const STAGING_NAME_ATTEMPTS: u8 = 4;
@@ -439,6 +452,14 @@ impl Layout {
         self.root.join(format!("{build_id}{REPAIR_SUFFIX}"))
     }
 
+    /// Файл отметки «прогрев этой установки не уложился в таймаут» (TL-21).
+    ///
+    /// Рядом с манифестом по той же причине, что [`Self::repair_path`]:
+    /// переживает перезапуск приложения, а адресован конкретному build id.
+    pub fn slow_warmup_path(&self, build_id: &BuildId) -> PathBuf {
+        self.root.join(format!("{build_id}{SLOW_WARMUP_SUFFIX}"))
+    }
+
     /// Файл со счётчиком безуспешных попыток установить обновление до
     /// этого build id (TL-56).
     ///
@@ -613,7 +634,7 @@ impl Layout {
         };
         matches!(
             rest,
-            "" | MANIFEST_SUFFIX | REPAIR_SUFFIX | UPDATE_ATTEMPT_SUFFIX
+            "" | MANIFEST_SUFFIX | REPAIR_SUFFIX | UPDATE_ATTEMPT_SUFFIX | SLOW_WARMUP_SUFFIX
         )
     }
 
@@ -655,10 +676,14 @@ impl Manifest {
         write_json_atomic(path, self, "манифеста")
     }
 
-    /// Читает манифест. `None` — файла нет либо он не разбирается: и то,
-    /// и другое означает «готовой установки нет», разница между ними
-    /// ни на что не влияет.
-    pub fn read(path: &Path) -> Option<Self> {
+    /// Читает манифест. `Ok(None)` — файла нет, `Err` — файл есть, но не
+    /// читается или не разбирается.
+    ///
+    /// Для [`validate`] оба исхода означают одно — «готовой установки
+    /// нет», — но различаются здесь (TL-80): порченый манифест оставляет
+    /// след в логе, отсутствующий — нет, потому что на первом запуске его
+    /// и не должно быть.
+    pub fn read(path: &Path) -> Result<Option<Self>, JsonReadError> {
         read_json(path)
     }
 }
@@ -706,9 +731,11 @@ impl RepairLog {
 
     /// Читает историю. Нечитаемая или чужая по версии формата запись —
     /// то же самое, что её отсутствие: счётчик не то состояние, ради
-    /// которого стоит отказывать в работе.
+    /// которого стоит отказывать в работе. Нечитаемая при этом оставляет
+    /// строку в логе (TL-80): история попыток — первое, что смотрят, когда
+    /// обновление «молча не встало».
     pub fn read(path: &Path) -> Self {
-        read_json(path)
+        absent_if_unreadable(read_json(path), "журнал попыток")
             .filter(|log: &Self| log.schema_version == MANIFEST_SCHEMA_VERSION)
             .unwrap_or_else(Self::empty)
     }
@@ -733,6 +760,104 @@ impl RepairLog {
     ///
     /// Отсутствие файла — не ошибка и обычное дело: на исправной машине
     /// этот файл не появляется никогда.
+    pub fn clear(path: &Path) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Отметка «прогрев этой установки не уложился в таймаут» (TL-21).
+///
+/// Нужна против одного сценария: дерево цело по манифесту и запускается,
+/// но на этой машине первый запуск дольше
+/// [`super::prepare`]`::WARMUP_TIMEOUT` (очень медленный диск, агрессивный
+/// антивирус). Без отметки каждый старт приложения ждал бы весь таймаут
+/// заново. С ней следующий старт экран не задерживает: дерево считается
+/// готовым, прогрев идёт в фоне, а удачный прогрев отметку снимает.
+///
+/// Отказа отметка не означает и к нему не ведёт — счётчика, после
+/// которого подготовка отвечала бы «не работает», у неё нет намеренно.
+/// Число таймаутов подряд хранится только для лога.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlowWarmupMark {
+    pub schema_version: u32,
+    /// Сколько прогревов подряд упёрлись в таймаут — только для лога.
+    pub timeouts: u32,
+    /// Когда это случилось в последний раз, секунды с эпохи Unix.
+    pub last_timeout_unix: u64,
+    /// То же время в RFC 3339 — для чтения человеком.
+    pub last_timeout_at: String,
+    /// Таймаут, в который упёрся последний прогрев, миллисекунды.
+    pub timeout_ms: u64,
+    /// Сколько **фоновых** прогревов подряд упёрлись в свой таймаут.
+    ///
+    /// Отдельно от `timeouts`: тот учитывает и таймаут переднего плана,
+    /// которым отметка появилась. По этому счётчику отметка снимается
+    /// (`super::prepare`, «Зависающее дерево»), и удачный прогрев его
+    /// обнуляет вместе с самой отметкой. `default` — отметка, записанная до
+    /// появления поля, читается с нулём, а не как испорченная.
+    #[serde(default)]
+    pub background_timeouts: u32,
+}
+
+impl SlowWarmupMark {
+    /// Читает отметку.
+    ///
+    /// `Ok(None)` — файла нет, обычное дело. `Err` — файл есть, но не
+    /// читается, не разбирается или записан другой версией формата: для
+    /// подготовки это то же, что отсутствие (прогрев идёт как без отметки,
+    /// то есть медленнее, но честно), однако молча это не проходит —
+    /// причину вызывающий обязан записать в лог. Отличать «нет» от «испорчен»
+    /// здесь, а не в вызывающем, потому что только здесь видно, что файл
+    /// всё-таки был.
+    ///
+    /// Правило «нет» против «испорчен» — то же [`read_json`], что у
+    /// манифеста и журналов: второй реализации различения не заводится.
+    /// Причина называет путь сама.
+    pub fn read(path: &Path) -> Result<Option<Self>, String> {
+        let Some(mark) = read_json::<Self>(path).map_err(|err| err.to_string())? else {
+            return Ok(None);
+        };
+        if mark.schema_version != MANIFEST_SCHEMA_VERSION {
+            return Err(format!(
+                "{}: версия формата {} (поддерживается {MANIFEST_SCHEMA_VERSION})",
+                path.display(),
+                mark.schema_version
+            ));
+        }
+        Ok(Some(mark))
+    }
+
+    /// Отметка с ещё одним учтённым таймаутом переднего плана. Счётчик
+    /// фоновых таймаутов переносится из прежней отметки как есть.
+    pub fn recorded(previous: Option<&Self>, timeout_ms: u64, now_unix: u64) -> Self {
+        Self {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            timeouts: previous.map_or(0, |mark| mark.timeouts).saturating_add(1),
+            last_timeout_unix: now_unix,
+            last_timeout_at: crate::clock::now_iso8601(),
+            timeout_ms,
+            background_timeouts: previous.map_or(0, |mark| mark.background_timeouts),
+        }
+    }
+
+    /// Отметка с ещё одним учтённым таймаутом **фонового** прогрева: растут
+    /// оба счётчика.
+    pub fn recorded_in_background(previous: Option<&Self>, timeout_ms: u64, now_unix: u64) -> Self {
+        Self {
+            background_timeouts: previous
+                .map_or(0, |mark| mark.background_timeouts)
+                .saturating_add(1),
+            ..Self::recorded(previous, timeout_ms, now_unix)
+        }
+    }
+
+    /// Записывает отметку атомарно.
+    pub fn write_atomic(&self, path: &Path) -> Result<(), PrepareError> {
+        write_json_atomic(path, self, "отметки медленного прогрева")
+    }
+
+    /// Снимает отметку: прогрев уложился, помнить нечего.
     pub fn clear(path: &Path) {
         let _ = fs::remove_file(path);
     }
@@ -766,10 +891,74 @@ pub(super) fn write_json_atomic<T: Serialize>(
     })
 }
 
-/// Читает JSON. `None` — файла нет либо он не разбирается.
-pub(super) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    let raw = fs::read(path).ok()?;
-    serde_json::from_slice(&raw).ok()
+/// Файл служебной записи есть, но прочитать его нельзя (TL-80).
+///
+/// Отдельно от «файла нет» намеренно. Отсутствие — законное пустое
+/// состояние: установку ещё не делали, чинить было нечего. Порча — след
+/// того, что запись **была**, и именно он нужен, когда разбираешь жалобу
+/// «обновление молча не встало». Пока оба исхода сводились в один `None`,
+/// этот след терялся до лога.
+#[derive(Debug, thiserror::Error)]
+pub enum JsonReadError {
+    /// Файл есть, но не читается: нет прав, на его месте каталог, отказ
+    /// файловой системы.
+    #[error("{} не читается: {source}", .path.display())]
+    Unreadable {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// Прочитался, но это не JSON ожидаемой формы: оборванная запись,
+    /// чужой файл под тем же именем.
+    #[error("{} не разбирается: {source}", .path.display())]
+    Malformed {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// Читает JSON.
+///
+/// `Ok(None)` — файла нет. Всё прочее, что мешает получить значение, —
+/// типизированный [`JsonReadError`] с путём и причиной. Где вызывающему
+/// достаточно «нет значения», отказ сводит к нему
+/// [`absent_if_unreadable`], и сводит не молча.
+pub(super) fn read_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<Option<T>, JsonReadError> {
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(JsonReadError::Unreadable {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+
+    serde_json::from_slice(&raw)
+        .map(Some)
+        .map_err(|source| JsonReadError::Malformed {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Сводит отказ чтения к отсутствию — с одной строкой в лог.
+///
+/// Для записей, чья порча на поведение не влияет (следующий шаг всё равно
+/// поступит как без них), но должна оставить след: `what` называет запись
+/// по-человечески, путь и причину несёт сам отказ.
+pub(super) fn absent_if_unreadable<T>(
+    read: Result<Option<T>, JsonReadError>,
+    what: &str,
+) -> Option<T> {
+    read.unwrap_or_else(|err| {
+        eprintln!("yt-dlp: {what}: {err} — считаю, что записи нет");
+        None
+    })
 }
 
 /// Готовая к запуску установка yt-dlp.
@@ -799,7 +988,10 @@ pub struct Installed {
 /// [`super::unpack`]).
 pub fn validate(layout: &Layout, build_id: &BuildId) -> Result<Installed, InvalidInstall> {
     let manifest_path = layout.manifest_path(build_id);
-    let Some(manifest) = Manifest::read(&manifest_path) else {
+    // Порченый манифест — та же «установки нет», что отсутствующий, и
+    // ведёт к тому же действию; разница остаётся строкой в логе (TL-80).
+    let Some(manifest) = absent_if_unreadable(Manifest::read(&manifest_path), "манифест установки")
+    else {
         return Err(InvalidInstall::NoManifest);
     };
 
@@ -1394,7 +1586,9 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let (layout, build_id) = install_fixture(dir.path());
         let path = layout.manifest_path(&build_id);
-        let mut manifest = Manifest::read(&path).expect("manifest must be readable");
+        let mut manifest = Manifest::read(&path)
+            .expect("manifest must be readable")
+            .expect("manifest must exist");
         manifest.schema_version = MANIFEST_SCHEMA_VERSION + 1;
         manifest
             .write_atomic(&path)
@@ -1409,12 +1603,100 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_record_is_told_apart_from_a_damaged_one() {
+        // TL-80: «файла нет» — законное пустое состояние, «файл есть, но
+        // не читается или не разбирается» — отказ с путём и причиной. Пока
+        // оба исхода были одним `None`, порча не оставляла следа.
+        let dir = tempdir().expect("tempdir");
+        let (layout, build_id) = install_fixture(dir.path());
+        let path = layout.manifest_path(&build_id);
+
+        assert!(
+            matches!(Manifest::read(&path), Ok(Some(_))),
+            "целый манифест читается"
+        );
+
+        let missing = dir.path().join("absent.json");
+        assert!(
+            matches!(Manifest::read(&missing), Ok(None)),
+            "отсутствие — не отказ"
+        );
+
+        fs::write(&path, b"{ not json").expect("испортить манифест");
+        match Manifest::read(&path) {
+            Err(err @ JsonReadError::Malformed { .. }) => assert!(
+                err.to_string().contains(&path.display().to_string()),
+                "отказ называет файл: {err}"
+            ),
+            Err(err) => panic!("не тот отказ: {err}"),
+            Ok(found) => panic!("порча не отличена от отсутствия: {}", found.is_some()),
+        }
+        // Поведение вызывающего прежнее: установки нет.
+        assert_eq!(
+            validate(&layout, &build_id),
+            Err(InvalidInstall::NoManifest)
+        );
+
+        // На месте файла каталог — файл «есть», но не читается.
+        fs::remove_file(&path).expect("убрать манифест");
+        fs::create_dir(&path).expect("каталог на месте манифеста");
+        match read_json::<Manifest>(&path) {
+            Err(err @ JsonReadError::Unreadable { .. }) => assert!(
+                err.to_string().contains(&path.display().to_string()),
+                "отказ называет файл: {err}"
+            ),
+            Err(err) => panic!("не тот отказ: {err}"),
+            Ok(found) => panic!("нечитаемое не отличено от отсутствия: {}", found.is_some()),
+        }
+        assert_eq!(
+            validate(&layout, &build_id),
+            Err(InvalidInstall::NoManifest)
+        );
+        // Счётчик тоже не отказывает в работе: нечитаемый — пустой.
+        assert_eq!(RepairLog::read(&path), RepairLog::empty());
+    }
+
+    #[test]
+    fn a_slow_warmup_mark_counts_background_timeouts_apart_and_reads_old_marks_as_zero() {
+        // Отметка, записанная до появления счётчика фоновых таймаутов, —
+        // не порча: поле читается с нулём.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("mark.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"schemaVersion":{MANIFEST_SCHEMA_VERSION},"timeouts":2,"lastTimeoutUnix":1,"lastTimeoutAt":"","timeoutMs":120000}}"#
+            ),
+        )
+        .expect("записать отметку прежнего формата");
+        let old = SlowWarmupMark::read(&path)
+            .expect("читается")
+            .expect("отметка есть");
+        assert_eq!(old.background_timeouts, 0);
+
+        let background = SlowWarmupMark::recorded_in_background(Some(&old), 600_000, 2);
+        assert_eq!(
+            (background.timeouts, background.background_timeouts),
+            (3, 1)
+        );
+
+        // Таймаут переднего плана фоновый счётчик не трогает.
+        let foreground = SlowWarmupMark::recorded(Some(&background), 120_000, 3);
+        assert_eq!(
+            (foreground.timeouts, foreground.background_timeouts),
+            (4, 1)
+        );
+    }
+
+    #[test]
     fn manifest_round_trips_through_disk() {
         let dir = tempdir().expect("tempdir");
         let (layout, build_id) = install_fixture(dir.path());
         let path = layout.manifest_path(&build_id);
 
-        let manifest = Manifest::read(&path).expect("manifest must be readable");
+        let manifest = Manifest::read(&path)
+            .expect("manifest must be readable")
+            .expect("manifest must exist");
         assert_eq!(manifest.schema_version, MANIFEST_SCHEMA_VERSION);
         assert_eq!(manifest.archive_sha256, BUNDLED_SHA256);
         assert_eq!(manifest.file_count, 2);

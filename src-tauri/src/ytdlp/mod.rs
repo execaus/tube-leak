@@ -64,7 +64,9 @@
 //!   и откат: единственное место, где все перечисленные выше шаги
 //!   становятся обновлением (E6, TL-58);
 //! - [`transport`] — сам HTTP-клиент контура, единственная сеть, которую
-//!   инициирует приложение, а не yt-dlp (E6, TL-58, решение Р-7).
+//!   инициирует приложение, а не yt-dlp (E6, TL-58, решение Р-7);
+//! - [`session`] — память подготовки на время сеанса: один запуск yt-dlp на
+//!   тёплом старте и один фоновый прогрев за раз (TL-23, TL-21).
 
 mod error;
 mod fetch;
@@ -72,8 +74,11 @@ mod layout;
 mod orchestrate;
 mod prepare;
 mod release;
+mod session;
 mod smoke;
 mod state;
+#[cfg(test)]
+pub(crate) mod testing;
 mod transport;
 mod unpack;
 mod update;
@@ -91,7 +96,8 @@ pub use orchestrate::{
     CheckTrigger, TaskBoundary, UpdateController, UpdateJob, UpdateSink, PLANNED_CHECK_INTERVAL,
     STARTUP_CHECK_DELAY,
 };
-pub use prepare::{installed_executable, prepare, AppSink};
+pub use prepare::{installed_executable, AppSink, BackgroundWarmup, WarmLaunch, PROBE_TIMEOUT};
+pub use session::Session;
 pub use state::{InUse, InUseGuard};
 pub use transport::GithubTransport;
 pub use update::UPDATE_EVENT;

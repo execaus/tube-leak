@@ -10,8 +10,21 @@
 //! Подготовка запускается сама при старте приложения ([`start_ytdlp_preparation`]
 //! из `main.rs`) и, независимо от этого, доступна фронтенду командой
 //! [`prepare_ytdlp`]. Дублирования работы не происходит: обе двери ведут в
-//! [`prepare_now`], которая берёт один и тот же мьютекс и идемпотентна —
-//! второй вошедший дожидается первого и застаёт готовую установку.
+//! [`prepare_now`], которая берёт один и тот же мьютекс, а удачный итог
+//! помнит сеанс ([`crate::ytdlp::Session`], TL-23) — второй вошедший
+//! дожидается первого и получает его итог, не запуская yt-dlp ещё раз.
+//! До TL-23 он проверял готовую установку запуском заново, и тёплый старт
+//! стоил трёх запусков yt-dlp вместо одного.
+//!
+//! # Фоновый прогрев (TL-21)
+//!
+//! Если прогрев этой установки уже упирался в таймаут, подготовка его не
+//! ждёт: дерево по манифесту цело и считается готовым, а прогрев
+//! продолжается задачей рантайма, которую запускает [`prepare_now`]. Экран
+//! подготовки при этом не поднимается — события в `ytdlp://prepare` идут
+//! только из подготовки переднего плана. Служебный экран проверяет yt-dlp
+//! своим запуском, как до TL-23: версии от фонового прогрева на момент
+//! проверки ещё нет.
 //!
 //! Почему не только команда: приложение без yt-dlp неработоспособно, и
 //! готовить его — обязанность ядра, а не экрана. Почему не только
@@ -32,7 +45,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::sidecar::ChildRegistry;
 use crate::types::{YtDlpPrepareError, YtDlpPrepareErrorKind, YtDlpPrepared};
-use crate::ytdlp::{self, PrepareError};
+use crate::ytdlp::{self, InUse, PrepareError};
 
 /// Сериализует подготовку: автозапуск при старте и вызов команды с
 /// фронтенда не должны распаковывать одно и то же дерево параллельно.
@@ -112,13 +125,46 @@ async fn prepare_now(app: &AppHandle) -> Result<YtDlpPrepared, YtDlpPrepareError
     })?;
 
     let registry = app.state::<ChildRegistry>();
+    let session = app.state::<ytdlp::Session>();
 
-    ytdlp::prepare(&archive_path, &data_dir, &registry, &ytdlp::AppSink(app))
+    let (prepared, background) = session
+        .prepare(&archive_path, &data_dir, &registry, &ytdlp::AppSink(app))
         .await
         .map_err(|error: PrepareError| {
             // В лог — полная формулировка с путями; во фронтенд уходит она же,
             // но её место — «Подробнее», а решение принимается по `kind`.
             eprintln!("yt-dlp: подготовка не удалась: {error}");
             error.to_contract()
-        })
+        })?;
+
+    if let Some(warmup) = background {
+        continue_warm_up_in_background(app, warmup);
+    }
+
+    Ok(prepared)
+}
+
+/// Продолжает прогрев, который подготовка не стала ждать (TL-21).
+///
+/// Задача держит отметку занятости установки всё время прогрева: уборка
+/// контура обновления (Ф-7) не должна снести дерево из-под работающего
+/// процесса. Процесс регистрируется в [`ChildRegistry`], как любой запуск
+/// sidecar, поэтому выход из приложения его убивает.
+///
+/// Исход уходит фронтенду событием `ytdlp://warmup`
+/// ([`crate::types::YtDlpWarmupEvent`]) — иначе экран не узнал бы, что
+/// прогрев закончился, и строка yt-dlp осталась бы собранной по холодному
+/// дереву до ручного повтора.
+fn continue_warm_up_in_background(app: &AppHandle, warmup: ytdlp::BackgroundWarmup) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let session = app.state::<ytdlp::Session>();
+        let registry = app.state::<ChildRegistry>();
+        let in_use = app.state::<InUse>();
+        let _in_use = in_use.inner().mark(warmup.build_id());
+
+        session
+            .run_background(warmup, &registry, &ytdlp::AppSink(&app))
+            .await;
+    });
 }

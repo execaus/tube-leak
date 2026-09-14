@@ -164,6 +164,8 @@ macro_rules! with_contract_types {
             YtDlpPrepareError,
             YtDlpPrepareEvent,
             YtDlpPrepared,
+            YtDlpWarmupOutcome,
+            YtDlpWarmupEvent,
             // probe.ts
             QualityKind,
             QualitySize,
