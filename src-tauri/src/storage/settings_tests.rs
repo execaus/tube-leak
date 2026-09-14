@@ -6,8 +6,9 @@ use crate::download::name_template::validate_for_save;
 use crate::types::{QualityKind, SelectedQuality};
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Barrier, LazyLock, TryLockError};
-use std::time::{Duration, Instant};
+use std::sync::{mpsc, Arc, LazyLock, TryLockError};
+use std::thread::JoinHandle;
+use std::time::Duration;
 use tempfile::{tempdir, TempDir};
 
 /// Метка отложенной копии в тестах — постоянная, чтобы занятость имени
@@ -18,16 +19,20 @@ fn fixed_label() -> String {
     LABEL.to_owned()
 }
 
-fn real_rename(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)
-}
-
 fn failing_rename(_from: &Path, _to: &Path) -> io::Result<()> {
     Err(io::Error::other("подменённый отказ rename"))
 }
 
+/// Швы тестов: настоящая файловая система, постоянная метка.
+fn seams() -> FsSeams {
+    FsSeams {
+        label: fixed_label,
+        ..FsSeams::REAL
+    }
+}
+
 fn open(dir: &Path) -> SettingsStore {
-    SettingsStore::open_with(dir, real_rename, fixed_label)
+    SettingsStore::open_with(dir, seams())
 }
 
 fn settings_path(dir: &TempDir) -> PathBuf {
@@ -374,6 +379,184 @@ fn an_unreadable_file_that_could_not_be_set_aside_refuses_the_save() {
     assert_eq!(listing, vec![SETTINGS_FILE_NAME.to_owned()]);
     assert_eq!(store.current(), Settings::default());
     assert!(store.readout().whole_file_reset, "отказ снял пометку");
+}
+
+/// `EIO` — отказ ввода-вывода, типичный для отвалившегося сетевого тома. На
+/// Unix — настоящий код ОС (5 и на macOS, и на Linux); на Windows под номером
+/// 5 отказ в доступе, поэтому там отказ строится без кода.
+fn eio() -> io::Error {
+    #[cfg(unix)]
+    {
+        io::Error::from_raw_os_error(5)
+    }
+    #[cfg(not(unix))]
+    {
+        io::Error::other("Input/output error")
+    }
+}
+
+fn read_eio(_path: &Path) -> io::Result<Vec<u8>> {
+    Err(eio())
+}
+
+fn read_timed_out(_path: &Path) -> io::Result<Vec<u8>> {
+    Err(io::Error::from(io::ErrorKind::TimedOut))
+}
+
+fn read_stale_handle(_path: &Path) -> io::Result<Vec<u8>> {
+    Err(io::Error::from(io::ErrorKind::StaleNetworkFileHandle))
+}
+
+fn read_permission_denied(_path: &Path) -> io::Result<Vec<u8>> {
+    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+}
+
+fn read_is_a_directory(_path: &Path) -> io::Result<Vec<u8>> {
+    Err(io::Error::from(io::ErrorKind::IsADirectory))
+}
+
+/// Отказы чтения, которые могут пройти сами (TL-102).
+const TRANSIENT_READS: [(&str, ReadFn); 3] = [
+    ("EIO", read_eio),
+    ("таймаут", read_timed_out),
+    ("устаревший дескриптор NFS", read_stale_handle),
+];
+
+/// Временный отказ чтения: файл не откладывается — иначе следующий запуск
+/// взял бы умолчания уже без пометки, и целые на диске настройки пропали бы
+/// молча. Пометка держится на каждом запуске, пока держится отказ; первое
+/// сохранение после него откладывает копию байт и только потом пишет.
+#[test]
+fn a_transient_read_error_leaves_the_file_in_place_and_copies_it_before_the_first_save() {
+    for (name, read) in TRANSIENT_READS {
+        let kind = read(Path::new(SETTINGS_FILE_NAME)).expect_err(name).kind();
+        assert!(
+            !matches!(
+                kind,
+                io::ErrorKind::PermissionDenied | io::ErrorKind::IsADirectory
+            ),
+            "{name}: фикстура обязана быть вне белого списка, а даёт {kind:?}"
+        );
+
+        let dir = tempdir().expect("временный каталог");
+        write_object(&dir, &valid_object());
+        let before = fs::read(settings_path(&dir)).expect("файл");
+        let failing_read = FsSeams { read, ..seams() };
+
+        for launch in 1..=2 {
+            let store = SettingsStore::open_with(dir.path(), failing_read);
+            assert_defaults_whole_reset(&store);
+            assert!(
+                matches!(
+                    store.open_problem(),
+                    Some(WholeFileProblem::Unreadable {
+                        set_aside: Err(_),
+                        ..
+                    })
+                ),
+                "{name}, запуск {launch}: {:?}",
+                store.open_problem()
+            );
+            assert_eq!(
+                names(dir.path()),
+                vec![SETTINGS_FILE_NAME.to_owned()],
+                "{name}, запуск {launch}: файл отложен или скопирован при чтении"
+            );
+            assert_eq!(
+                fs::read(settings_path(&dir)).expect("файл"),
+                before,
+                "{name}, запуск {launch}: файл тронут"
+            );
+        }
+
+        // Отказ прошёл к первому сохранению того же сеанса.
+        let store = SettingsStore::open_with(dir.path(), failing_read);
+        let store = SettingsStore {
+            seams: FsSeams {
+                read: real_read,
+                ..store.seams
+            },
+            ..store
+        };
+        store
+            .set(&SettingsPatch::MaxAttempts(5))
+            .unwrap_or_else(|err| panic!("{name}: сохранение: {err}"));
+
+        assert_eq!(
+            fs::read(broken_path(&dir, ""))
+                .unwrap_or_else(|err| panic!("{name}: копии нет: {err}")),
+            before,
+            "{name}: копия отличается от исходных байт"
+        );
+        let reopened = open(dir.path());
+        assert_eq!(reopened.current().max_attempts(), 5, "{name}");
+        assert!(!reopened.readout().whole_file_reset, "{name}");
+    }
+}
+
+/// Отказ чтения держится и при сохранении: копия не удаётся, сохранение
+/// отказывает и файл не трогает.
+#[test]
+fn a_persistent_read_error_refuses_the_save_without_touching_the_file() {
+    let dir = tempdir().expect("временный каталог");
+    write_object(&dir, &valid_object());
+    let before = fs::read(settings_path(&dir)).expect("файл");
+    let store = SettingsStore::open_with(
+        dir.path(),
+        FsSeams {
+            read: read_eio,
+            ..seams()
+        },
+    );
+
+    let result = store.set(&SettingsPatch::MaxAttempts(9));
+
+    assert!(
+        matches!(result, Err(SettingsSetError::WriteFailed { .. })),
+        "{result:?}"
+    );
+    assert_eq!(fs::read(settings_path(&dir)).expect("файл"), before);
+    assert_eq!(names(dir.path()), vec![SETTINGS_FILE_NAME.to_owned()]);
+    assert_eq!(store.current(), Settings::default());
+    assert!(store.readout().whole_file_reset, "отказ снял пометку");
+}
+
+/// Белый список через шов: отказ в доступе и каталог на месте файла
+/// откладывают файл на любой ОС, а не только там, где их даёт настоящий диск
+/// теста (права — только Unix, `EISDIR` — не Windows).
+#[test]
+fn a_permission_or_directory_read_error_sets_the_file_aside() {
+    let cases: [(&str, ReadFn); 2] = [
+        ("отказ в доступе", read_permission_denied),
+        ("каталог на месте файла", read_is_a_directory),
+    ];
+    for (name, read) in cases {
+        let dir = tempdir().expect("временный каталог");
+        write_object(&dir, &valid_object());
+        let before = fs::read(settings_path(&dir)).expect("файл");
+
+        let store = SettingsStore::open_with(dir.path(), FsSeams { read, ..seams() });
+
+        assert_defaults_whole_reset(&store);
+        assert!(
+            matches!(
+                store.open_problem(),
+                Some(WholeFileProblem::Unreadable {
+                    set_aside: Ok(_),
+                    ..
+                })
+            ),
+            "{name}: {:?}",
+            store.open_problem()
+        );
+        assert!(!settings_path(&dir).exists(), "{name}: файл на месте");
+        assert_eq!(
+            fs::read(broken_path(&dir, ""))
+                .unwrap_or_else(|err| panic!("{name}: копии нет: {err}")),
+            before,
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -921,7 +1104,10 @@ fn a_folder_behind_a_closed_parent_is_no_access() {
     fs::create_dir_all(closed.join("папка")).expect("папки");
     fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).expect("права");
 
-    let result = check_folder(closed.join("папка").to_str().expect("UTF-8"));
+    let result = check_folder(
+        closed.join("папка").to_str().expect("UTF-8"),
+        real_canonicalize,
+    );
     fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).expect("права назад");
 
     assert_eq!(
@@ -1053,7 +1239,13 @@ fn a_failed_rename_keeps_the_previous_file_byte_for_byte() {
     object.insert(KEY_ATTEMPTS.to_owned(), json!(0));
     write_object(&dir, &object);
     let before = fs::read(settings_path(&dir)).expect("файл");
-    let store = SettingsStore::open_with(dir.path(), failing_rename, fixed_label);
+    let store = SettingsStore::open_with(
+        dir.path(),
+        FsSeams {
+            rename: failing_rename,
+            ..seams()
+        },
+    );
 
     let result = store.set(&SettingsPatch::NameTemplate("{id}".to_owned()));
 
@@ -1130,12 +1322,18 @@ fn garbage_that_could_not_be_set_aside_is_copied_once_before_the_save() {
     );
 
     let failing = SettingsStore {
-        rename: failing_rename,
+        seams: FsSeams {
+            rename: failing_rename,
+            ..store.seams
+        },
         ..store
     };
     assert!(failing.set(&SettingsPatch::MaxAttempts(2)).is_err());
     let store = SettingsStore {
-        rename: real_rename,
+        seams: FsSeams {
+            rename: real_rename,
+            ..failing.seams
+        },
         ..failing
     };
     store.set(&SettingsPatch::MaxAttempts(2)).expect("повтор");
@@ -1179,7 +1377,13 @@ fn a_failed_copy_of_a_newer_version_refuses_the_save() {
     let dir = tempdir().expect("временный каталог");
     let bytes = br#"{"version":9,"maxAttempts":3}"#;
     write_file(&dir, bytes);
-    let store = SettingsStore::open_with(dir.path(), real_rename, label_in_a_missing_directory);
+    let store = SettingsStore::open_with(
+        dir.path(),
+        FsSeams {
+            label: label_in_a_missing_directory,
+            ..seams()
+        },
+    );
 
     let result = store.set(&SettingsPatch::MaxAttempts(5));
 
@@ -1195,19 +1399,130 @@ fn a_failed_copy_of_a_newer_version_refuses_the_save() {
 
 // ───────────────────────────── замки ─────────────────────────────
 
-/// Запас ожидания в тестах замков. В верном коде ждать нечего — рандеву
-/// идут через барьеры, — и порог срабатывает только в сломанном, поэтому
-/// его величина не делает тест хрупким, а лишь ограничивает зависание.
-const LOCK_PATIENCE: Duration = Duration::from_secs(5);
+/// Потолок ожидания на рандеву в тестах замков. В верном коде ждать нечего:
+/// каждое ожидание кончается, как только сосед дошёл до условленного места.
+/// Порог срабатывает только в сломанном коде и превращает зависание в
+/// красный тест (TL-102), поэтому его величина не делает тест хрупким.
+const PATIENCE: Duration = Duration::from_secs(10);
 
-static SLOW_SAVE_ENTERED: LazyLock<Barrier> = LazyLock::new(|| Barrier::new(2));
-static SLOW_SAVE_RELEASE: LazyLock<Barrier> = LazyLock::new(|| Barrier::new(2));
+type SaveResult = Result<Settings, SettingsSetError>;
+
+/// Что сообщает сохранение, запущенное через [`Hold::spawn_save`].
+#[derive(Debug)]
+enum SaveEvent {
+    /// Шов вошёл в удержание и стоит до [`Hold::release`].
+    Entered,
+    /// `set` вернулся — через удержание или мимо него.
+    Returned,
+}
+
+/// Рандеву «шов вошёл — тест отпустил» с потолком ожидания с обеих сторон.
+///
+/// Швы — указатели на функции без захвата, поэтому удержание живёт в
+/// статике, своей у каждого теста. `Barrier` здесь не годится: сохранение,
+/// отказавшее до шва (например, не создался временный файл), на встречу не
+/// приходит, и тест висел бы вечно вместо того, чтобы покраснеть (TL-102).
+/// Здесь сохранение сообщает и о возврате, так что отказ до шва виден сразу,
+/// вместе с результатом `set`, а пропавший сосед — через [`PATIENCE`].
+struct Hold {
+    events_tx: Mutex<mpsc::Sender<SaveEvent>>,
+    events_rx: Mutex<mpsc::Receiver<SaveEvent>>,
+    release_tx: Mutex<mpsc::Sender<()>>,
+    release_rx: Mutex<mpsc::Receiver<()>>,
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Hold {
+    fn new() -> Self {
+        let (events_tx, events_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        Self {
+            events_tx: Mutex::new(events_tx),
+            events_rx: Mutex::new(events_rx),
+            release_tx: Mutex::new(release_tx),
+            release_rx: Mutex::new(release_rx),
+        }
+    }
+
+    /// Сторона шва: сообщить о входе и стоять до [`Self::release`]. Тест так
+    /// и не отпустил — отказ шва, а не вечное ожидание.
+    fn enter(&self) -> io::Result<()> {
+        let _ = locked(&self.events_tx).send(SaveEvent::Entered);
+        locked(&self.release_rx)
+            .recv_timeout(PATIENCE)
+            .map_err(|err| io::Error::other(format!("тест не отпустил шов: {err}")))
+    }
+
+    /// Запускает `set` в отдельном потоке; о возврате поток сообщает.
+    fn spawn_save(
+        &self,
+        store: &Arc<SettingsStore>,
+        patch: SettingsPatch,
+    ) -> JoinHandle<SaveResult> {
+        let store = Arc::clone(store);
+        let events = locked(&self.events_tx).clone();
+        std::thread::spawn(move || {
+            let result = store.set(&patch);
+            let _ = events.send(SaveEvent::Returned);
+            result
+        })
+    }
+
+    /// Сторона теста: ждать, пока сохранение войдёт в шов. Вернулось раньше —
+    /// тест краснеет сразу и с результатом `set`; не пришло за
+    /// [`PATIENCE`] — краснеет по потолку.
+    fn await_entered(&self, save: JoinHandle<SaveResult>) -> JoinHandle<SaveResult> {
+        let event = locked(&self.events_rx).recv_timeout(PATIENCE);
+        match event {
+            Ok(SaveEvent::Entered) => save,
+            Ok(SaveEvent::Returned) => {
+                panic!("сохранение вернулось, не дойдя до шва: {:?}", save.join())
+            }
+            Err(err) => panic!("сохранение не дошло до шва за {PATIENCE:?}: {err}"),
+        }
+    }
+
+    /// Ждать возврата сохранения, запущенного после входа в шов. `false` —
+    /// не вернулось за [`PATIENCE`].
+    fn await_returned(&self) -> bool {
+        matches!(
+            locked(&self.events_rx).recv_timeout(PATIENCE),
+            Ok(SaveEvent::Returned)
+        )
+    }
+
+    /// Отпустить шов.
+    fn release(&self) {
+        let _ = locked(&self.release_tx).send(());
+    }
+}
+
+/// Что увидел читатель из другого потока. `Err` — не ответил за
+/// [`PATIENCE`]: ждал замок, который держит сохранение.
+type Seen = Result<(Settings, SettingsReadout), mpsc::RecvTimeoutError>;
+
+/// `current()` и `readout()` из другого потока — так, как их зовёт
+/// оркестрация на старте задачи и `settings_get`.
+fn read_from_another_thread(store: &Arc<SettingsStore>) -> (Seen, JoinHandle<()>) {
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let reader = {
+        let store = Arc::clone(store);
+        std::thread::spawn(move || {
+            let _ = seen_tx.send((store.current(), store.readout()));
+        })
+    };
+    (seen_rx.recv_timeout(PATIENCE), reader)
+}
+
+static SLOW_SAVE: LazyLock<Hold> = LazyLock::new(Hold::new);
 
 /// `rename`, который стоит, пока тест его не отпустит: сохранение прошло
 /// копию и `sync_all` и находится на последнем шаге записи.
 fn rename_held_by_the_test(from: &Path, to: &Path) -> io::Result<()> {
-    SLOW_SAVE_ENTERED.wait();
-    SLOW_SAVE_RELEASE.wait();
+    SLOW_SAVE.enter()?;
     fs::rename(from, to)
 }
 
@@ -1219,28 +1534,19 @@ fn current_does_not_wait_for_a_slow_save() {
     write_object(&dir, &valid_object());
     let store = Arc::new(SettingsStore::open_with(
         dir.path(),
-        rename_held_by_the_test,
-        fixed_label,
+        FsSeams {
+            rename: rename_held_by_the_test,
+            ..seams()
+        },
     ));
 
-    let writer = {
-        let store = Arc::clone(&store);
-        std::thread::spawn(move || store.set(&SettingsPatch::MaxAttempts(9)))
-    };
-    SLOW_SAVE_ENTERED.wait();
-
-    let (seen_tx, seen_rx) = mpsc::channel();
-    let reader = {
-        let store = Arc::clone(&store);
-        std::thread::spawn(move || {
-            let _ = seen_tx.send((store.current(), store.readout()));
-        })
-    };
-    let seen = seen_rx.recv_timeout(LOCK_PATIENCE);
+    let writer =
+        SLOW_SAVE.await_entered(SLOW_SAVE.spawn_save(&store, SettingsPatch::MaxAttempts(9)));
+    let (seen, reader) = read_from_another_thread(&store);
 
     // Отпустить запись до любых проверок: иначе упавший тест оставит
-    // писателя висеть на барьере.
-    SLOW_SAVE_RELEASE.wait();
+    // писателя стоять в шве до потолка ожидания.
+    SLOW_SAVE.release();
     let saved = writer.join().expect("поток писателя");
     reader.join().expect("поток читателя");
 
@@ -1255,15 +1561,66 @@ fn current_does_not_wait_for_a_slow_save() {
     assert_eq!(store.current().max_attempts(), 9);
 }
 
-static RACE_ENTERED: LazyLock<Barrier> = LazyLock::new(|| Barrier::new(2));
-static RACE_RELEASE: LazyLock<Barrier> = LazyLock::new(|| Barrier::new(2));
+static SLOW_CHECK: LazyLock<Hold> = LazyLock::new(Hold::new);
+
+/// `canonicalize`, который стоит, пока тест его не отпустит: сохранение
+/// своей папки находится в проверке значения.
+fn canonicalize_held_by_the_test(path: &Path) -> io::Result<PathBuf> {
+    SLOW_CHECK.enter()?;
+    fs::canonicalize(path)
+}
+
+/// `canonicalize` на подвисшем сетевом томе ждёт без потолка (Н-3): проверка
+/// своей папки идёт до замков и не останавливает ни `current()` на старте
+/// задачи, ни очередь сохранений.
+#[test]
+fn current_does_not_wait_for_a_slow_folder_check() {
+    let dir = tempdir().expect("временный каталог");
+    write_object(&dir, &valid_object());
+    let folder = tempdir().expect("папка назначения");
+    let store = Arc::new(SettingsStore::open_with(
+        dir.path(),
+        FsSeams {
+            canonicalize: canonicalize_held_by_the_test,
+            ..seams()
+        },
+    ));
+    let before = store.current();
+
+    let save = SLOW_CHECK.await_entered(SLOW_CHECK.spawn_save(
+        &store,
+        SettingsPatch::DestinationFolder(DestinationFolder::Custom {
+            path: folder.path().to_string_lossy().into_owned(),
+        }),
+    ));
+    let writer_free = store.writer.try_lock().is_ok();
+    let (seen, reader) = read_from_another_thread(&store);
+
+    // Отпустить проверку до любых утверждений (см. тест выше).
+    SLOW_CHECK.release();
+    let saved = save.join().expect("поток сохранения");
+    reader.join().expect("поток читателя");
+
+    let (current, readout) = seen.expect("current() ждал, пока проверка папки канонизирует путь");
+    assert_eq!(
+        current, before,
+        "значение в памяти сменилось до конца проверки"
+    );
+    assert_eq!(readout.settings, before);
+    assert!(writer_free, "проверка значения идёт под замком записи");
+    let canonical = fs::canonicalize(folder.path()).expect("канон");
+    let expected = custom(canonical.to_str().expect("UTF-8"));
+    assert_eq!(saved.expect("сохранение").destination(), &expected);
+    assert_eq!(store.current().destination(), &expected);
+}
+
+static RACE: LazyLock<Hold> = LazyLock::new(Hold::new);
 static RACE_RENAMES: AtomicUsize = AtomicUsize::new(0);
 
 /// Первый `rename` стоит, пока тест его не отпустит; остальные проходят.
 fn first_rename_held_by_the_test(from: &Path, to: &Path) -> io::Result<()> {
     if RACE_RENAMES.fetch_add(1, Ordering::SeqCst) == 0 {
-        RACE_ENTERED.wait();
-        RACE_RELEASE.wait();
+        RACE.enter()?;
     }
     fs::rename(from, to)
 }
@@ -1280,30 +1637,22 @@ fn two_concurrent_saves_of_different_fields_keep_both() {
     write_object(&dir, &valid_object());
     let store = Arc::new(SettingsStore::open_with(
         dir.path(),
-        first_rename_held_by_the_test,
-        fixed_label,
+        FsSeams {
+            rename: first_rename_held_by_the_test,
+            ..seams()
+        },
     ));
     let template = "{title} [{quality}]";
 
-    let first = {
-        let store = Arc::clone(&store);
-        std::thread::spawn(move || store.set(&SettingsPatch::MaxAttempts(9)))
-    };
-    RACE_ENTERED.wait();
+    let first = RACE.await_entered(RACE.spawn_save(&store, SettingsPatch::MaxAttempts(9)));
 
     let writer_free = !matches!(store.writer.try_lock(), Err(TryLockError::WouldBlock));
-    let second = {
-        let store = Arc::clone(&store);
-        std::thread::spawn(move || store.set(&SettingsPatch::NameTemplate(template.to_owned())))
-    };
-    if writer_free {
-        let deadline = Instant::now() + LOCK_PATIENCE;
-        while !second.is_finished() && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-    }
+    let second = RACE.spawn_save(&store, SettingsPatch::NameTemplate(template.to_owned()));
+    // Замок свободен — второе обязано пройти целиком, пока первое стоит:
+    // дождаться его возврата, а не надеяться на планировщик.
+    let second_returned_first = writer_free && RACE.await_returned();
 
-    RACE_RELEASE.wait();
+    RACE.release();
     let first = first.join().expect("поток первого сохранения");
     let second = second.join().expect("поток второго сохранения");
 
@@ -1316,7 +1665,8 @@ fn two_concurrent_saves_of_different_fields_keep_both() {
             on_disk["nameTemplate"].clone()
         ),
         (json!(9), json!(template)),
-        "в файле потеряно поле; замок записи свободен во время записи: {writer_free}"
+        "в файле потеряно поле; замок записи свободен во время записи: {writer_free}, \
+         второе вернулось раньше первого: {second_returned_first}"
     );
     assert_eq!(
         (in_memory.max_attempts(), in_memory.name_template()),
@@ -1345,7 +1695,13 @@ fn reset_marks_live_until_the_first_successful_save_of_any_field() {
     let mut object = valid_object();
     object.insert(KEY_TEMPLATE.to_owned(), json!("{channel}"));
     write_object(&dir, &object);
-    let store = SettingsStore::open_with(dir.path(), failing_rename, fixed_label);
+    let store = SettingsStore::open_with(
+        dir.path(),
+        FsSeams {
+            rename: failing_rename,
+            ..seams()
+        },
+    );
 
     for _ in 0..2 {
         assert_eq!(
@@ -1362,7 +1718,10 @@ fn reset_marks_live_until_the_first_successful_save_of_any_field() {
     );
 
     let store = SettingsStore {
-        rename: real_rename,
+        seams: FsSeams {
+            rename: real_rename,
+            ..store.seams
+        },
         ..store
     };
     store

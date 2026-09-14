@@ -48,7 +48,8 @@
 //! | файла нет (и каталога нет) | умолчания | — | не создаётся |
 //! | пустой, не JSON, не объект, нет `version` или она не целое ≥ 1 | умолчания | `whole_file_reset` | откладывается под `settings.json.broken-<метка>` |
 //! | `version` больше [`SETTINGS_FORMAT_VERSION`] | умолчания | `whole_file_reset` | **не тронут**; копия байт в байт откладывается при первом сохранении |
-//! | файл не читается (права, каталог на месте файла) | умолчания | `whole_file_reset` | откладывается под `settings.json.broken-<метка>` |
+//! | файл не читается: отказ в доступе или каталог на месте файла | умолчания | `whole_file_reset` | откладывается под `settings.json.broken-<метка>` |
+//! | файл не читается по иной причине (`EIO` на сетевом томе, таймаут) | умолчания | `whole_file_reset` | **не тронут**; копия откладывается при первом сохранении |
 //! | версия 1, поле отсутствует | умолчание поля | — | — |
 //! | версия 1, поле вне правил | умолчание поля, остальные как в файле | имя поля в `reset_fields` | — |
 //! | версия 1, неизвестный ключ | игнорируется | — | ключ переживает запись |
@@ -80,6 +81,16 @@
 //! только на чтение), файл остаётся на месте и копируется перед первым
 //! сохранением, как чужая версия; у нечитаемого копия не удаётся, и
 //! сохранение отказывает `WriteFailed`, не тронув файл.
+//!
+//! **Нечитаемый откладывается только по белому списку отказов** (TL-102):
+//! отказ в доступе и каталог на месте файла — состояния диска, которые сами
+//! не пройдут. Прочий отказ чтения (`EIO` на сетевом томе, таймаут, устаревший
+//! дескриптор NFS) может быть временным: отложенный по нему файл следующий
+//! запуск не нашёл бы, взял бы умолчания уже без пометки, и настройки,
+//! целые на диске, пропали бы для пользователя молча. Такой файл остаётся на
+//! месте, как чужая версия: пометка правдива на каждом запуске, пока отказ
+//! держится, а первое сохранение сначала копирует байты под `.broken-` и при
+//! отказе копии отказывает само.
 //!
 //! **Отложенная копия не затирает прежнюю**: занятая метка получает суффикс
 //! `-1`, `-2`, … (приём истории). Метка — Unix-секунды.
@@ -126,7 +137,12 @@
 //! - **замок состояния** держится только на чтение значений для сборки
 //!   файла и на финальную подмену. Диск под ним не трогается, поэтому
 //!   [`SettingsStore::current`], который оркестрация зовёт на старте каждой
-//!   задачи (Р-4), не ждёт ни копии, ни `sync_all`, ни `rename`.
+//!   задачи (Р-4), не ждёт ни `canonicalize`, ни копии, ни `sync_all`, ни
+//!   `rename`.
+//!
+//! Обещание закреплено тестами на швах `canonicalize` и `rename` (указатели
+//! на функции в [`SettingsStore`], в продакшене — вызовы `std::fs`):
+//! `current()` из другого потока отвечает, пока шов стоит.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -332,7 +348,8 @@ pub enum WholeFileProblem {
     Unreadable {
         path: PathBuf,
         reason: String,
-        /// Куда отложен файл, либо почему отложить не удалось.
+        /// Куда отложен файл, либо почему он на месте: отложить не удалось
+        /// или отказ чтения не из белого списка (шапка модуля).
         set_aside: Result<PathBuf, String>,
     },
 }
@@ -340,7 +357,7 @@ pub enum WholeFileProblem {
 fn aside_detail(set_aside: &Result<PathBuf, String>) -> String {
     match set_aside {
         Ok(path) => format!("отложен под {}", path.display()),
-        Err(reason) => format!("отложить не удалось, файл на месте: {reason}"),
+        Err(reason) => format!("файл на месте: {reason}"),
     }
 }
 
@@ -391,10 +408,17 @@ pub struct FolderCheckError {
 /// показывать пользователю и сравнивать с системной «Загрузками». Хранит
 /// значение домен, поэтому и снимает он, а не команда.
 ///
+/// `canonicalize` — шов: хранилище передаёт свой (в продакшене
+/// [`std::fs::canonicalize`]), тест — медленный, чтобы проверить, что
+/// читатели настроек проверку не ждут.
+///
 /// # Errors
 ///
 /// [`FolderProblem`] по порядку проверок; `reason` — текст для лога.
-pub fn check_folder(path: &str) -> Result<FolderPath, FolderCheckError> {
+pub fn check_folder(
+    path: &str,
+    canonicalize: CanonicalizeFn,
+) -> Result<FolderPath, FolderCheckError> {
     let fail = |problem, reason: String| FolderCheckError { problem, reason };
 
     if !Path::new(path).is_absolute() {
@@ -404,7 +428,7 @@ pub fn check_folder(path: &str) -> Result<FolderPath, FolderCheckError> {
         ));
     }
 
-    let canonical = fs::canonicalize(path).map_err(|err| {
+    let canonical = canonicalize(Path::new(path)).map_err(|err| {
         let problem = match err.kind() {
             io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => FolderProblem::NotFound,
             _ => FolderProblem::NoAccess,
@@ -501,12 +525,53 @@ fn without_verbatim_prefix(path: String, windows: bool) -> String {
     }
 }
 
+/// Чтение байт `settings.json` — при открытии и перед копией под `.broken-`.
+/// Шов для теста «временный отказ чтения не откладывает файл»: у настоящей
+/// файловой системы `EIO` по заказу не получить.
+type ReadFn = fn(&Path) -> io::Result<Vec<u8>>;
+
+/// Канонизация пути своей папки в проверке значения ([`check_folder`]). Шов
+/// для теста «`current()` не ждёт `canonicalize`».
+type CanonicalizeFn = fn(&Path) -> io::Result<PathBuf>;
+
 /// Переименование на последнем шаге записи. Шов для теста атомарности:
 /// отказ `rename` подменяется, а всё до него — настоящее.
 type RenameFn = fn(&Path, &Path) -> io::Result<()>;
 
 /// Метка отложенной копии. Шов для теста «прежняя копия не затёрта».
 type LabelFn = fn() -> String;
+
+/// Швы файловой системы хранилища. В продакшене — [`FsSeams::REAL`], то есть
+/// ровно те вызовы `std::fs`, что стояли бы на их месте без шва; тесты
+/// подменяют отдельные поля.
+#[derive(Debug, Clone, Copy)]
+struct FsSeams {
+    read: ReadFn,
+    canonicalize: CanonicalizeFn,
+    rename: RenameFn,
+    label: LabelFn,
+}
+
+impl FsSeams {
+    const REAL: Self = Self {
+        read: real_read,
+        canonicalize: real_canonicalize,
+        rename: real_rename,
+        label: unix_secs_label,
+    };
+}
+
+fn real_read(path: &Path) -> io::Result<Vec<u8>> {
+    fs::read(path)
+}
+
+fn real_canonicalize(path: &Path) -> io::Result<PathBuf> {
+    fs::canonicalize(path)
+}
+
+fn real_rename(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
 
 fn unix_secs_label() -> String {
     crate::clock::now_unix_secs().to_string()
@@ -539,8 +604,7 @@ pub struct SettingsStore {
     /// трогается.
     state: Mutex<State>,
     open_problem: Option<WholeFileProblem>,
-    rename: RenameFn,
-    label: LabelFn,
+    seams: FsSeams,
 }
 
 #[derive(Debug)]
@@ -576,32 +640,27 @@ impl SettingsStore {
         if OPENED_IN_PROCESS.swap(true, Ordering::SeqCst) {
             return Err(SettingsOpenError::AlreadyOpen);
         }
-        Ok(Self::open_with(
-            data_dir,
-            |from, to| fs::rename(from, to),
-            unix_secs_label,
-        ))
+        Ok(Self::open_with(data_dir, FsSeams::REAL))
     }
 
     /// [`Self::open`] без процессного флага — только для тестов: открытий за
     /// тестовый процесс много, и порядок их не задан.
     #[cfg(test)]
     pub(crate) fn open_isolated(data_dir: &Path) -> Self {
-        Self::open_with(data_dir, |from, to| fs::rename(from, to), unix_secs_label)
+        Self::open_with(data_dir, FsSeams::REAL)
     }
 
-    fn open_with(data_dir: &Path, rename: RenameFn, label: LabelFn) -> Self {
+    fn open_with(data_dir: &Path, seams: FsSeams) -> Self {
         let path = data_dir.join(SETTINGS_FILE_NAME);
         let temp_path = data_dir.join(SETTINGS_TEMP_FILE_NAME);
-        let (state, open_problem) = load(&path, &temp_path, label);
+        let (state, open_problem) = load(&path, &temp_path, seams);
         Self {
             path,
             temp_path,
             writer: Mutex::new(()),
             state: Mutex::new(state),
             open_problem,
-            rename,
-            label,
+            seams,
         }
     }
 
@@ -642,7 +701,7 @@ impl SettingsStore {
     pub fn set(&self, patch: &SettingsPatch) -> Result<Settings, SettingsSetError> {
         // Проверка — до замков: `canonicalize` на подвисшем томе не должен
         // держать ни читателей, ни очередь сохранений.
-        let accepted = accept_patch(patch)?;
+        let accepted = accept_patch(patch, self.seams.canonicalize)?;
 
         let _writer = self.write_lock();
 
@@ -655,13 +714,13 @@ impl SettingsStore {
         };
 
         if preserve_before_save {
-            preserve_copy(&self.path, self.label).map_err(|err| self.write_failed(&err))?;
+            preserve_copy(&self.path, self.seams).map_err(|err| self.write_failed(&err))?;
             // Копия есть: повторная попытка после отказа ниже не плодит
             // вторую такую же.
             self.lock().preserve_before_save = false;
         }
 
-        write_atomic(&self.path, &self.temp_path, &bytes, self.rename).map_err(|err| {
+        write_atomic(&self.path, &self.temp_path, &bytes, self.seams.rename).map_err(|err| {
             let _ = fs::remove_file(&self.temp_path);
             self.write_failed(&err)
         })?;
@@ -714,16 +773,20 @@ impl Accepted {
 }
 
 /// Проверка патча. От состояния хранилища не зависит и зовётся без замков.
-fn accept_patch(patch: &SettingsPatch) -> Result<Accepted, SettingsSetError> {
+fn accept_patch(
+    patch: &SettingsPatch,
+    canonicalize: CanonicalizeFn,
+) -> Result<Accepted, SettingsSetError> {
     Ok(match patch {
         SettingsPatch::DestinationFolder(DestinationFolder::System) => {
             Accepted::Destination(Destination::System)
         }
         SettingsPatch::DestinationFolder(DestinationFolder::Custom { path }) => {
-            let folder = check_folder(path).map_err(|err| SettingsSetError::Folder {
-                problem: err.problem,
-                reason: err.reason,
-            })?;
+            let folder =
+                check_folder(path, canonicalize).map_err(|err| SettingsSetError::Folder {
+                    problem: err.problem,
+                    reason: err.reason,
+                })?;
             Accepted::Destination(Destination::Custom(folder))
         }
         SettingsPatch::NameTemplate(text) => Accepted::Template(accept_template(text)?),
@@ -779,7 +842,7 @@ fn accept_attempts(value: i64) -> Result<u32, SettingsSetError> {
         })
 }
 
-fn load(path: &Path, temp_path: &Path, label: LabelFn) -> (State, Option<WholeFileProblem>) {
+fn load(path: &Path, temp_path: &Path, seams: FsSeams) -> (State, Option<WholeFileProblem>) {
     // Огрызок временного файла пережить запись не может: это след убитого
     // процесса, а не чужое незаконченное дело (писатель один, TL-20).
     let _ = fs::remove_file(temp_path);
@@ -792,7 +855,7 @@ fn load(path: &Path, temp_path: &Path, label: LabelFn) -> (State, Option<WholeFi
         preserve_before_save,
     };
 
-    let raw = match fs::read(path) {
+    let raw = match (seams.read)(path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return (
@@ -807,9 +870,19 @@ fn load(path: &Path, temp_path: &Path, label: LabelFn) -> (State, Option<WholeFi
             );
         }
         Err(err) => {
-            // Не прочитали — не значит, что байт нет: убрать с дороги, как
-            // мусор, иначе первое сохранение займёт имя поверх настроек.
-            let set_aside = set_aside(path, label).map_err(|err| err.to_string());
+            // Не прочитали — не значит, что байт нет. Отказ, который сам не
+            // пройдёт, — убрать с дороги, как мусор, иначе первое сохранение
+            // займёт имя поверх настроек. Прочий оставить на месте: копия
+            // уйдёт под `.broken-` перед первым сохранением.
+            let set_aside = if set_aside_on_read_error(err.kind()) {
+                set_aside(path, seams.label).map_err(|err| format!("отложить не удалось: {err}"))
+            } else {
+                Err(
+                    "отказ чтения не из белого списка (права, каталог на месте файла) \
+                     и может быть временным — файл не откладывается"
+                        .to_owned(),
+                )
+            };
             return (
                 whole_reset(set_aside.is_err()),
                 Some(WholeFileProblem::Unreadable {
@@ -832,7 +905,8 @@ fn load(path: &Path, temp_path: &Path, label: LabelFn) -> (State, Option<WholeFi
             }),
         ),
         Classified::Malformed(reason) => {
-            let set_aside = set_aside(path, label).map_err(|err| err.to_string());
+            let set_aside =
+                set_aside(path, seams.label).map_err(|err| format!("отложить не удалось: {err}"));
             (
                 whole_reset(set_aside.is_err()),
                 Some(WholeFileProblem::Malformed {
@@ -843,6 +917,17 @@ fn load(path: &Path, temp_path: &Path, label: LabelFn) -> (State, Option<WholeFi
             )
         }
     }
+}
+
+/// Отказ чтения, после которого файл откладывается при открытии. Белый
+/// список (шапка модуля): отказ в доступе и каталог на месте файла — на
+/// Unix это `EISDIR`, на Windows открытие каталога даёт отказ в доступе.
+/// Всё прочее может пройти само, и такой файл остаётся на месте.
+fn set_aside_on_read_error(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::PermissionDenied | io::ErrorKind::IsADirectory
+    )
 }
 
 enum Classified {
@@ -981,14 +1066,15 @@ fn set_aside(path: &Path, label: LabelFn) -> io::Result<PathBuf> {
 
 /// Копирует байты, лежащие под именем файла, под свободное имя
 /// `.broken-<метка>[-N]` — перед первым сохранением поверх файла, который
-/// эта сборка не поняла. Файла уже нет — копировать нечего.
-fn preserve_copy(path: &Path, label: LabelFn) -> io::Result<()> {
-    let bytes = match fs::read(path) {
+/// эта сборка не поняла или не смогла прочитать. Файла уже нет — копировать
+/// нечего. Байты читаются тем же швом, что при открытии.
+fn preserve_copy(path: &Path, seams: FsSeams) -> io::Result<()> {
+    let bytes = match (seams.read)(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     };
-    let target = free_broken_name(path, &label())?;
+    let target = free_broken_name(path, &(seams.label)())?;
     let written = OpenOptions::new()
         .write(true)
         .create_new(true)
