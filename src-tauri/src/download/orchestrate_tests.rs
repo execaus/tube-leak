@@ -78,7 +78,8 @@ enum Step {
     /// папке `-P` строкой `Destination` и создать его ровно там. Имя и папку
     /// тест не выписывает сам — их берёт из argv оркестрации.
     ///
-    /// `partial` — оборвать поток: создать `<имя>.part` (ревью TL-89, B1).
+    /// `partial` — какие потоки оборвать ([`Partial`]): создать `<имя>.part`
+    /// (ревью TL-89, B1; выборочно — TL-104).
     /// Без него — как yt-dlp с `--continue` по умолчанию: готовый файл под
     /// этим именем даёт `has already been downloaded`, лежащий `<имя>.part`
     /// докачивается (переименовывается в файл потока с прежним содержимым),
@@ -89,7 +90,29 @@ enum Step {
     /// [`Call::emulate_failures`], и задача кончается не `Done`. Так сценарий
     /// никогда не пишет за пределы папки теста, а проверку `-o` делает сам
     /// тест по argv.
-    Emulate { partial: bool },
+    Emulate { partial: Partial },
+}
+
+/// Какие потоки [`Step::Emulate`] обрывает.
+#[derive(Debug, Clone, Copy)]
+enum Partial {
+    /// Ни одного: все потоки дописаны.
+    Nothing,
+    /// Все.
+    Every,
+    /// Только этот формат, остальные дописаны (TL-104: задача оставила один
+    /// готовый поток и один `.part`).
+    Only(&'static str),
+}
+
+impl Partial {
+    fn covers(self, format_id: &str) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Every => true,
+            Self::Only(only) => only == format_id,
+        }
+    }
 }
 
 /// Содержимое `.part`, оставленного оборванным потоком: докачанный файл
@@ -172,12 +195,23 @@ impl Script {
     }
 
     fn emulate(mut self) -> Self {
-        self.steps.push(Step::Emulate { partial: false });
+        self.steps.push(Step::Emulate {
+            partial: Partial::Nothing,
+        });
         self
     }
 
     fn emulate_partial(mut self) -> Self {
-        self.steps.push(Step::Emulate { partial: true });
+        self.steps.push(Step::Emulate {
+            partial: Partial::Every,
+        });
+        self
+    }
+
+    fn emulate_partial_only(mut self, format_id: &'static str) -> Self {
+        self.steps.push(Step::Emulate {
+            partial: Partial::Only(format_id),
+        });
         self
     }
 }
@@ -321,7 +355,8 @@ impl DownloadLauncher for ScriptedLauncher {
                             }
                             let path = Path::new(&dir).join(&name);
                             let part = Path::new(&dir).join(format!("{name}.part"));
-                            let already = !*partial && path.exists();
+                            let partial = partial.covers(format_id);
+                            let already = !partial && path.exists();
                             let line = if already {
                                 format!("[download] {} has already been downloaded", path.display())
                             } else {
@@ -330,7 +365,7 @@ impl DownloadLauncher for ScriptedLauncher {
                             call.lines.push(line.clone());
                             call.line_times.push(monotonic_now());
                             call.deadlines.push(on_line(&line));
-                            let written = if *partial {
+                            let written = if partial {
                                 std::fs::write(&part, PARTIAL_BYTES)
                             } else if already {
                                 Ok(())
@@ -368,6 +403,9 @@ struct ScriptedFfmpeg {
     calls: AtomicUsize,
     /// Входы каждой склейки: (видео, звук) — значения двух `-i` по порядку.
     inputs: StdMutex<Vec<(String, String)>>,
+    /// Содержимое тех же входов в момент склейки (TL-104): по нему видно,
+    /// чей поток ушёл в готовый файл, — после склейки входы подчищены.
+    input_bytes: StdMutex<Vec<(Vec<u8>, Vec<u8>)>>,
 }
 
 impl ScriptedFfmpeg {
@@ -377,6 +415,7 @@ impl ScriptedFfmpeg {
             hangs,
             calls: AtomicUsize::new(0),
             inputs: StdMutex::new(Vec::new()),
+            input_bytes: StdMutex::new(Vec::new()),
         }
     }
 
@@ -410,6 +449,16 @@ impl ScriptedFfmpeg {
         let (video, audio) = inputs.last().expect("склейка была");
         (name(video), name(audio))
     }
+
+    /// Содержимое файлов, ушедших в последнюю склейку: (видео, звук).
+    fn last_input_bytes(&self) -> (Vec<u8>, Vec<u8>) {
+        self.input_bytes
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("склейка была")
+    }
 }
 
 impl FfmpegLauncher for ScriptedFfmpeg {
@@ -431,6 +480,13 @@ impl FfmpegLauncher for ScriptedFfmpeg {
                     .lock()
                     .unwrap()
                     .push((video.clone(), audio.clone()));
+                let read = |arg: &str| {
+                    std::fs::read(arg.strip_prefix("file:").unwrap_or(arg)).unwrap_or_default()
+                };
+                self.input_bytes
+                    .lock()
+                    .unwrap()
+                    .push((read(video), read(audio)));
             }
 
             if self.hangs {
@@ -542,6 +598,18 @@ fn request(streams: QualityStreams) -> StartDownloadRequest {
     }
 }
 
+/// Рабочая основа задачи из названия и ссылки — тем же кодом, что
+/// [`build_task`].
+fn partial_base(title: &str, url: &str) -> String {
+    download_stem(
+        &sanitized_stem(title, &video_id_of(url)),
+        &PartialId::of_url(url),
+    )
+}
+
+/// Рабочая основа запроса [`request`]: название и id ролика [`URL`] (TL-104).
+const BASE: &str = "Big Buck Bunny.aqz-KE-bpKQ";
+
 /// Оценка размера пункта `133 + 139` в запросе — сумма размеров, которые
 /// отдавал локальный сервер при съёмке `single-launch` (894 838 + 323 730).
 /// Та же величина, что дал бы разбор E2: сумма `filesize` форматов пункта.
@@ -607,6 +675,55 @@ fn two_stream_scripts(dir: &Path) -> Vec<Script> {
     vec![launch_script("video-and-audio.json", dir)]
 }
 
+/// Основа `-o`, с которой снят запуск: значение `-o` без нашего хвоста.
+fn shot_base(capture: &fixtures::Capture) -> String {
+    const TAIL: &str = ".f%(format_id)s.%(ext)s";
+    let at = capture
+        .argv
+        .iter()
+        .position(|arg| arg == "-o")
+        .expect("в argv съёмки есть -o");
+    let template = &capture.argv[at + 1];
+    template
+        .strip_suffix(TAIL)
+        .unwrap_or_else(|| panic!("шаблон имени съёмки не наш: {template}"))
+        .to_string()
+}
+
+/// Имена файлов снятого запуска — под рабочей основой приложения.
+///
+/// Набор `single-launch` снят до TL-104, когда рабочей основой было одно
+/// название; теперь в ней id ролика. Основу из `-o` yt-dlp пишет только в
+/// имена файлов (`Destination`, `has already been downloaded`, листинги),
+/// поэтому оснастка подставляет её так же, как папку назначения:
+/// `<основа съёмки>.f` → `<рабочая основа>.f`. Что основа съёмки с id ролика
+/// съёмки — ровно то, что построило бы приложение, проверяет
+/// `the_single_launch_fixtures_were_shot_with_the_arguments_of_the_app`.
+fn shot_names_to_app(capture: &fixtures::Capture, text: &str) -> String {
+    let shot = shot_base(capture);
+    text.replace(
+        &format!("{shot}.f"),
+        &format!("{}.f", partial_base(&shot, URL)),
+    )
+}
+
+/// Строки stdout снятого запуска с папкой теста и рабочей основой
+/// приложения ([`shot_names_to_app`]).
+fn launch_stdout(name: &str, dir: &Path) -> Vec<String> {
+    let launch = fixtures::single_launch(name);
+    let folder = dir.display().to_string();
+    launch
+        .stdout
+        .lines()
+        .map(|line| {
+            shot_names_to_app(
+                &launch.capture,
+                &line.replace(DESTINATION_PLACEHOLDER, &folder),
+            )
+        })
+        .collect()
+}
+
 /// Сценарий из снятой фикстуры одного запуска (TL-48).
 ///
 /// Строки, код и stderr — как сняты, с папкой теста вместо плейсхолдера.
@@ -629,21 +746,22 @@ fn launch_script_with(
 ) -> Script {
     let launch = fixtures::single_launch(name);
     let folder = dir.display().to_string();
+    let rename = |text: &str| shot_names_to_app(&launch.capture, text);
     let mut script = Script {
         exit_code: launch.exit_code,
-        stderr: launch.stderr.replace(DESTINATION_PLACEHOLDER, &folder),
+        stderr: rename(&launch.stderr.replace(DESTINATION_PLACEHOLDER, &folder)),
         ..Script::default()
     };
 
     let mut on_disk = BTreeSet::new();
     for file in &launch.listing_before {
-        script = script.creates(file);
-        on_disk.insert(file.clone());
+        let file = rename(file);
+        script = script.creates(&file);
+        on_disk.insert(file);
     }
 
     let mut destinations: Vec<String> = Vec::new();
-    for raw in launch.stdout.lines() {
-        let line = raw.replace(DESTINATION_PLACEHOLDER, &folder);
+    for line in launch_stdout(name, dir) {
         if let Some(by) = pause(&line) {
             script = script.advance(by);
         }
@@ -670,7 +788,11 @@ fn launch_script_with(
 
     assert_eq!(
         on_disk.into_iter().collect::<Vec<_>>(),
-        launch.listing_after,
+        launch
+            .listing_after
+            .iter()
+            .map(|file| rename(file))
+            .collect::<Vec<_>>(),
         "{name}: сценарий разошёлся с тем, что осталось на диске при съёмке"
     );
     script
@@ -829,8 +951,11 @@ async fn the_url_is_the_last_argument_and_stands_after_the_separator() {
     let launcher = ScriptedLauncher::new(
         dir.path(),
         vec![Script::ok()
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
-            .creates("Big Buck Bunny.f140.m4a")],
+            .line(&destination_line(
+                dir.path(),
+                "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+            ))
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a")],
     );
 
     run_task(
@@ -879,8 +1004,7 @@ fn nothing_the_template_would_expand_ever_reaches_it() {
     const TAIL: &str = ".f%(format_id)s.%(ext)s";
 
     for title in HOSTILE_TITLES {
-        let stem = sanitized_stem(title, "aqz-KE-bpKQ");
-        let template = output_template(&download_stem(&stem));
+        let template = output_template(&partial_base(title, URL));
 
         let head = template
             .strip_suffix(TAIL)
@@ -909,8 +1033,8 @@ fn a_hostile_title_still_makes_a_deterministic_partial_name() {
     // Обещание Р-2 держится на детерминированности, а не на совпадении с
     // финальным именем: вставил ту же ссылку — получил ту же основу.
     for title in HOSTILE_TITLES {
-        let first = download_stem(&sanitized_stem(title, "aqz-KE-bpKQ"));
-        let second = download_stem(&sanitized_stem(title, "aqz-KE-bpKQ"));
+        let first = partial_base(title, URL);
+        let second = partial_base(title, URL);
         assert_eq!(first, second, "«{title}»");
     }
 }
@@ -933,10 +1057,7 @@ async fn a_title_with_a_percent_and_a_dollar_reaches_a_file_inside_the_destinati
 
     // Сценарий кладёт файл ровно туда, куда его положил бы yt-dlp по
     // нашему шаблону: имя частичного файла тест выводит тем же кодом.
-    let partial = format!(
-        "{}.f140.m4a",
-        download_stem(&sanitized_stem(TITLE, "aqz-KE-bpKQ"))
-    );
+    let partial = format!("{}.f140.m4a", partial_base(TITLE, URL));
     let launcher = ScriptedLauncher::new(
         &dir,
         vec![Script::ok()
@@ -983,10 +1104,7 @@ async fn a_hostile_title_is_still_cleaned_up_after_a_cancel() {
     let task = new_task(req);
     let sink = RecordingSink::new();
 
-    let partial = format!(
-        "{}.f140.m4a.part",
-        download_stem(&sanitized_stem(TITLE, "aqz-KE-bpKQ"))
-    );
+    let partial = format!("{}.f140.m4a.part", partial_base(TITLE, URL));
     let launcher = ScriptedLauncher::new(dir.path(), vec![Script::ok().creates(&partial).hangs()]);
 
     let canceller = Arc::clone(&task);
@@ -1152,8 +1270,11 @@ async fn a_progressive_format_never_enters_merging() {
     let launcher = ScriptedLauncher::new(
         dir.path(),
         vec![Script::ok()
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f18.mp4"))
-            .creates("Big Buck Bunny.f18.mp4")],
+            .line(&destination_line(
+                dir.path(),
+                "Big Buck Bunny.aqz-KE-bpKQ.f18.mp4",
+            ))
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f18.mp4")],
     );
 
     run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
@@ -1184,9 +1305,12 @@ async fn audio_only_keeps_the_extension_the_stream_actually_has() {
     let launcher = ScriptedLauncher::new(
         dir.path(),
         vec![Script::ok()
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
+            .line(&destination_line(
+                dir.path(),
+                "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+            ))
             .lines(fixture_progress("audio-only.json", "140"))
-            .creates("Big Buck Bunny.f140.m4a")],
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a")],
     );
 
     run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
@@ -1320,12 +1444,18 @@ async fn cancelling_in_downloading_removes_every_partial_file() {
     let launcher = ScriptedLauncher::new(
         dir.path(),
         vec![Script::ok()
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f133.mp4"))
+            .line(&destination_line(
+                dir.path(),
+                "Big Buck Bunny.aqz-KE-bpKQ.f133.mp4",
+            ))
             .lines(fixture_progress("video-and-audio.json", "133"))
-            .creates("Big Buck Bunny.f133.mp4")
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f139.m4a"))
-            .creates("Big Buck Bunny.f139.m4a.part")
-            .creates("Big Buck Bunny.f139.m4a.ytdl")
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f133.mp4")
+            .line(&destination_line(
+                dir.path(),
+                "Big Buck Bunny.aqz-KE-bpKQ.f139.m4a",
+            ))
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f139.m4a.part")
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f139.m4a.ytdl")
             .hangs()],
     );
 
@@ -1370,8 +1500,11 @@ async fn cancelling_during_the_pause_before_a_retry_answers_at_once() {
         dir.path(),
         vec![
             Script::failing(1, "ERROR: unable to download video data: Read timed out")
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
-                .creates("Big Buck Bunny.f140.m4a.part"),
+                .line(&destination_line(
+                    dir.path(),
+                    "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+                ))
+                .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a.part"),
         ],
     );
 
@@ -1461,14 +1594,20 @@ async fn an_interrupted_attempt_is_retried_and_the_percent_does_not_fall_to_zero
         dir.path(),
         vec![
             Script::failing(1, &connection_lost_stderr())
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f134.mp4"))
+                .line(&destination_line(
+                    dir.path(),
+                    "Big Buck Bunny.aqz-KE-bpKQ.f134.mp4",
+                ))
                 .lines(fixture_progress("resume-interrupted.json", "134"))
-                .creates("Big Buck Bunny.f134.mp4.part"),
+                .creates("Big Buck Bunny.aqz-KE-bpKQ.f134.mp4.part"),
             Script::ok()
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f134.mp4"))
+                .line(&destination_line(
+                    dir.path(),
+                    "Big Buck Bunny.aqz-KE-bpKQ.f134.mp4",
+                ))
                 .line("[download] Resuming download at byte 995883")
                 .lines(fixture_progress("resume-continued.json", "134"))
-                .creates("Big Buck Bunny.f134.mp4"),
+                .creates("Big Buck Bunny.aqz-KE-bpKQ.f134.mp4"),
         ],
     );
 
@@ -1526,16 +1665,22 @@ async fn any_advance_resets_the_attempt_counter() {
     for (index, sample) in samples.iter().take(MAX_ATTEMPTS as usize + 2).enumerate() {
         scripts.push(
             Script::failing(1, &connection_lost_stderr())
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
+                .line(&destination_line(
+                    dir.path(),
+                    "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+                ))
                 .line(sample)
-                .creates(&format!("Big Buck Bunny.f140.m4a.part.{index}")),
+                .creates(&format!("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a.part.{index}")),
         );
     }
     scripts.push(
         Script::ok()
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
+            .line(&destination_line(
+                dir.path(),
+                "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+            ))
             .lines(samples.clone())
-            .creates("Big Buck Bunny.f140.m4a"),
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a"),
     );
     let expected_calls = scripts.len();
     let launcher = ScriptedLauncher::new(dir.path(), scripts);
@@ -1581,8 +1726,11 @@ async fn attempts_without_a_single_byte_run_out_and_become_connection_lost() {
     let scripts: Vec<Script> = (0..MAX_ATTEMPTS)
         .map(|_| {
             Script::failing(1, &connection_lost_stderr())
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
-                .creates("Big Buck Bunny.f140.m4a.part")
+                .line(&destination_line(
+                    dir.path(),
+                    "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+                ))
+                .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a.part")
         })
         .collect();
     let launcher = ScriptedLauncher::new(dir.path(), scripts);
@@ -1625,7 +1773,9 @@ async fn attempts_without_a_single_byte_run_out_and_become_connection_lost() {
          закончились»"
     );
     assert!(
-        dir.path().join("Big Buck Bunny.f140.m4a.part").exists(),
+        dir.path()
+            .join("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a.part")
+            .exists(),
         "частичное осталось на диске"
     );
 }
@@ -1648,10 +1798,10 @@ async fn a_stream_already_on_disk_is_not_downloaded_again() {
     let launcher = ScriptedLauncher::new(
         dir.path(),
         vec![Script::ok()
-            .creates("Big Buck Bunny.f133.mp4")
-            .line(&already("Big Buck Bunny.f133.mp4"))
-            .creates("Big Buck Bunny.f139.m4a")
-            .line(&already("Big Buck Bunny.f139.m4a"))],
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f133.mp4")
+            .line(&already("Big Buck Bunny.aqz-KE-bpKQ.f133.mp4"))
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f139.m4a")
+            .line(&already("Big Buck Bunny.aqz-KE-bpKQ.f139.m4a"))],
     );
 
     run_task(
@@ -1745,8 +1895,8 @@ async fn every_progress_line_of_one_launch_goes_to_the_stream_of_its_format() {
     assert_eq!(
         ffmpeg.last_input_names(),
         (
-            "Big Buck Bunny.f133.mp4".to_string(),
-            "Big Buck Bunny.f139.m4a".to_string()
+            "Big Buck Bunny.aqz-KE-bpKQ.f133.mp4".to_string(),
+            "Big Buck Bunny.aqz-KE-bpKQ.f139.m4a".to_string()
         )
     );
 }
@@ -1761,12 +1911,18 @@ async fn stream_files_are_attributed_by_name_and_not_by_the_order_of_lines() {
     let launcher = ScriptedLauncher::new(
         dir.path(),
         vec![Script::ok()
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f139.m4a"))
+            .line(&destination_line(
+                dir.path(),
+                "Big Buck Bunny.aqz-KE-bpKQ.f139.m4a",
+            ))
             .lines(fixture_progress("video-and-audio.json", "139"))
-            .creates("Big Buck Bunny.f139.m4a")
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f133.mp4"))
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f139.m4a")
+            .line(&destination_line(
+                dir.path(),
+                "Big Buck Bunny.aqz-KE-bpKQ.f133.mp4",
+            ))
             .lines(fixture_progress("video-and-audio.json", "133"))
-            .creates("Big Buck Bunny.f133.mp4")],
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f133.mp4")],
     );
     let ffmpeg = ScriptedFfmpeg::merging();
     let sink = RecordingSink::new();
@@ -1776,8 +1932,8 @@ async fn stream_files_are_attributed_by_name_and_not_by_the_order_of_lines() {
     assert_eq!(
         ffmpeg.last_input_names(),
         (
-            "Big Buck Bunny.f133.mp4".to_string(),
-            "Big Buck Bunny.f139.m4a".to_string()
+            "Big Buck Bunny.aqz-KE-bpKQ.f133.mp4".to_string(),
+            "Big Buck Bunny.aqz-KE-bpKQ.f139.m4a".to_string()
         ),
         "видео и звук склейки — по именам файлов"
     );
@@ -1822,8 +1978,8 @@ async fn a_launch_that_finds_the_video_on_disk_closes_it_and_downloads_only_the_
     assert_eq!(
         ffmpeg.last_input_names(),
         (
-            "Big Buck Bunny.f133.mp4".to_string(),
-            "Big Buck Bunny.f139.m4a".to_string()
+            "Big Buck Bunny.aqz-KE-bpKQ.f133.mp4".to_string(),
+            "Big Buck Bunny.aqz-KE-bpKQ.f139.m4a".to_string()
         )
     );
     assert!(matches!(sink.last(), DownloadProgress::Done { .. }));
@@ -1832,30 +1988,31 @@ async fn a_launch_that_finds_the_video_on_disk_closes_it_and_downloads_only_the_
 #[test]
 fn only_a_name_built_by_our_template_belongs_to_a_stream() {
     let dir = Path::new("/папка назначения");
-    let owns = |format_id: &str, name: &str| {
-        is_file_of_stream("Big Buck Bunny", format_id, &dir.join(name))
-    };
+    let owns = |format_id: &str, name: &str| is_file_of_stream(BASE, format_id, &dir.join(name));
 
-    assert!(owns("133", "Big Buck Bunny.f133.mp4"));
-    assert!(owns("140-drc", "Big Buck Bunny.f140-drc.m4a"));
+    assert!(owns("133", "Big Buck Bunny.aqz-KE-bpKQ.f133.mp4"));
+    assert!(owns("140-drc", "Big Buck Bunny.aqz-KE-bpKQ.f140-drc.m4a"));
 
     // Чужой формат, формат с общим началом, другая основа.
-    assert!(!owns("133", "Big Buck Bunny.f139.m4a"));
-    assert!(!owns("133", "Big Buck Bunny.f1333.mp4"));
-    assert!(!owns("140", "Big Buck Bunny.f140-drc.m4a"));
+    assert!(!owns("133", "Big Buck Bunny.aqz-KE-bpKQ.f139.m4a"));
+    assert!(!owns("133", "Big Buck Bunny.aqz-KE-bpKQ.f1333.mp4"));
+    assert!(!owns("140", "Big Buck Bunny.aqz-KE-bpKQ.f140-drc.m4a"));
     assert!(!owns("133", "Big Buck Bunny 2.f133.mp4"));
+    // Другой ролик с тем же названием и основа без id (TL-104).
+    assert!(!owns("133", "Big Buck Bunny.YE7VzlLtp-4.f133.mp4"));
+    assert!(!owns("133", "Big Buck Bunny.f133.mp4"));
     // Рабочие хвосты — не файл потока.
-    assert!(!owns("133", "Big Buck Bunny.f133.mp4.part"));
-    assert!(!owns("133", "Big Buck Bunny.f133.temp.mp4"));
-    assert!(!owns("133", "Big Buck Bunny.f133."));
+    assert!(!owns("133", "Big Buck Bunny.aqz-KE-bpKQ.f133.mp4.part"));
+    assert!(!owns("133", "Big Buck Bunny.aqz-KE-bpKQ.f133.temp.mp4"));
+    assert!(!owns("133", "Big Buck Bunny.aqz-KE-bpKQ.f133."));
     // Идентификатор с точкой не делает соседа владельцем.
-    assert!(owns("sb.0", "Big Buck Bunny.fsb.0.mhtml"));
-    assert!(!owns("sb", "Big Buck Bunny.fsb.0.mhtml"));
+    assert!(owns("sb.0", "Big Buck Bunny.aqz-KE-bpKQ.fsb.0.mhtml"));
+    assert!(!owns("sb", "Big Buck Bunny.aqz-KE-bpKQ.fsb.0.mhtml"));
     // Совпадает только имя, а не каталог.
     assert!(!is_file_of_stream(
-        "Big Buck Bunny",
+        BASE,
         "133",
-        Path::new("/Big Buck Bunny.f133.mp4/другое.mp4")
+        Path::new("/Big Buck Bunny.aqz-KE-bpKQ.f133.mp4/другое.mp4")
     ));
 }
 
@@ -1891,8 +2048,8 @@ async fn a_retry_after_an_interrupted_launch_asks_only_for_what_is_still_missing
     assert_eq!(
         ffmpeg.last_input_names(),
         (
-            "Big Buck Bunny.f133.mp4".to_string(),
-            "Big Buck Bunny.f139.m4a".to_string()
+            "Big Buck Bunny.aqz-KE-bpKQ.f133.mp4".to_string(),
+            "Big Buck Bunny.aqz-KE-bpKQ.f139.m4a".to_string()
         ),
         "видео из первой попытки не потеряно"
     );
@@ -1941,12 +2098,9 @@ async fn a_format_that_fell_out_of_the_selection_of_an_interrupted_launch_is_sta
     let dir = tempfile::tempdir().unwrap();
     let task = new_task(request(streams(Some("133"), Some("139"))));
     let sink = RecordingSink::new();
-    let folder = dir.path().display().to_string();
-    let lines: Vec<String> = fixtures::single_launch("one-format-missing.json")
-        .stdout
-        .lines()
+    let lines: Vec<String> = launch_stdout("one-format-missing.json", dir.path())
+        .into_iter()
         .take(4)
-        .map(|line| line.replace(DESTINATION_PLACEHOLDER, &folder))
         .collect();
     assert!(
         matches!(parse_line(&lines[0]), StdoutLine::SelectedFormats { .. }),
@@ -1956,7 +2110,7 @@ async fn a_format_that_fell_out_of_the_selection_of_an_interrupted_launch_is_sta
         dir.path(),
         vec![Script::failing(1, &connection_lost_stderr())
             .lines(lines)
-            .creates("Big Buck Bunny.f133.mp4.part")],
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f133.mp4.part")],
     );
 
     tokio::time::pause();
@@ -1988,11 +2142,8 @@ async fn a_selected_stream_whose_file_was_never_named_is_asked_for_again() {
     let dir = tempfile::tempdir().unwrap();
     let task = new_task(request(streams(Some("133"), Some("139"))));
     let sink = RecordingSink::new();
-    let folder = dir.path().display().to_string();
-    let lines: Vec<String> = fixtures::single_launch("video-and-audio.json")
-        .stdout
-        .lines()
-        .map(|line| line.replace(DESTINATION_PLACEHOLDER, &folder))
+    let lines: Vec<String> = launch_stdout("video-and-audio.json", dir.path())
+        .into_iter()
         .take_while(|line| !line.contains(".f139."))
         .collect();
     assert!(
@@ -2003,7 +2154,9 @@ async fn a_selected_stream_whose_file_was_never_named_is_asked_for_again() {
     );
     let first = ScriptedLauncher::new(
         dir.path(),
-        vec![Script::ok().lines(lines).creates("Big Buck Bunny.f133.mp4")],
+        vec![Script::ok()
+            .lines(lines)
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f133.mp4")],
     );
     run_task(&task, &first, &ScriptedFfmpeg::merging(), &sink, dir.path()).await;
 
@@ -2016,12 +2169,14 @@ async fn a_selected_stream_whose_file_was_never_named_is_asked_for_again() {
     task.set_progress(DownloadProgress::Queued);
     let already = format!(
         "[download] {} has already been downloaded",
-        dir.path().join("Big Buck Bunny.f139.m4a").display()
+        dir.path()
+            .join("Big Buck Bunny.aqz-KE-bpKQ.f139.m4a")
+            .display()
     );
     let second = ScriptedLauncher::new(
         dir.path(),
         vec![Script::ok()
-            .creates("Big Buck Bunny.f139.m4a")
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f139.m4a")
             .line(&already)],
     );
     run_task(
@@ -2049,9 +2204,12 @@ async fn a_failure_that_removes_the_streams_also_forgets_that_they_were_done() {
         dir.path(),
         vec![
             Script::failing(1, &fixtures::outcome("video-unavailable.json").stderr)
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f133.mp4"))
+                .line(&destination_line(
+                    dir.path(),
+                    "Big Buck Bunny.aqz-KE-bpKQ.f133.mp4",
+                ))
                 .lines(fixture_progress("video-and-audio.json", "133"))
-                .creates("Big Buck Bunny.f133.mp4"),
+                .creates("Big Buck Bunny.aqz-KE-bpKQ.f133.mp4"),
         ],
     );
     run_task(&task, &first, &ScriptedFfmpeg::merging(), &sink, dir.path()).await;
@@ -2100,14 +2258,19 @@ fn the_single_launch_fixtures_were_shot_with_the_arguments_of_the_app() {
             capture.argv[at + 1].clone()
         };
         let selector = value_of("-f");
-        let template = value_of("-o");
-        let stem = template
-            .strip_suffix(TAIL)
-            .unwrap_or_else(|| panic!("{name}: шаблон имени не наш: {template}"));
+        // TL-104: набор снят до id ролика в рабочей основе. Из названия и
+        // ссылки съёмки (ролик `aqz-KE-bpKQ`, его id в `[info]` снятого
+        // stdout) приложение строит `<основа съёмки>.<id>` — и больше ничем
+        // от съёмки не отличается. Id в имена файлов снятого вывода
+        // подставляет оснастка ([`shot_names_to_app`]).
+        let shot_stem = shot_base(&capture);
+        assert_eq!(value_of("-o"), format!("{shot_stem}{TAIL}"));
+        let template = output_template(&partial_base(&shot_stem, URL));
         assert_eq!(
-            download_stem(&sanitized_stem(stem, "aqz-KE-bpKQ")),
-            stem,
-            "{name}: основа имени съёмки — не та, что приложение построило бы из названия"
+            template,
+            format!("{shot_stem}.aqz-KE-bpKQ{TAIL}"),
+            "{name}: основа имени съёмки с id — не та, что приложение построило бы \
+             из названия и ссылки"
         );
 
         let destination = format!("home:{DESTINATION_PLACEHOLDER}");
@@ -2125,6 +2288,8 @@ fn the_single_launch_fixtures_were_shot_with_the_arguments_of_the_app() {
         assert_eq!(expected_tail, ["--", URL]);
 
         let mut shot = capture.argv.clone();
+        let output_at = shot.iter().position(|arg| arg == "-o").expect("-o есть") + 1;
+        shot[output_at] = template.clone();
         let shot_tail = shot.split_off(shot.len() - 2);
         assert_eq!(shot_tail, ["--load-info-json", "<infoJson>"], "{name}");
         assert_eq!(shot, expected, "{name}: съёмка шла не с argv приложения");
@@ -2150,9 +2315,12 @@ async fn after_a_removing_failure_the_new_download_rearms_the_watchdog_and_the_p
         dir.path(),
         vec![
             Script::failing(1, &fixtures::outcome("video-unavailable.json").stderr)
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f133.mp4"))
+                .line(&destination_line(
+                    dir.path(),
+                    "Big Buck Bunny.aqz-KE-bpKQ.f133.mp4",
+                ))
                 .lines(launch_progress("video-and-audio.json", "133"))
-                .creates("Big Buck Bunny.f133.mp4"),
+                .creates("Big Buck Bunny.aqz-KE-bpKQ.f133.mp4"),
         ],
     );
     first.observe(&task);
@@ -2309,8 +2477,8 @@ async fn a_title_carrying_the_already_downloaded_phrase_still_closes_its_stream(
     req.title = TITLE.to_string();
     let task = new_task(req);
     assert_eq!(
-        download_stem(&sanitized_stem(TITLE, "aqz-KE-bpKQ")),
-        TITLE,
+        partial_base(TITLE, URL),
+        format!("{TITLE}.aqz-KE-bpKQ"),
         "фраза целиком доходит до имени частичного файла"
     );
     let ffmpeg = ScriptedFfmpeg::merging();
@@ -2331,7 +2499,10 @@ async fn a_title_carrying_the_already_downloaded_phrase_still_closes_its_stream(
     );
     assert_eq!(
         ffmpeg.last_input_names(),
-        (format!("{TITLE}.f133.mp4"), format!("{TITLE}.f139.m4a"))
+        (
+            format!("{TITLE}.aqz-KE-bpKQ.f133.mp4"),
+            format!("{TITLE}.aqz-KE-bpKQ.f139.m4a")
+        )
     );
 }
 
@@ -2344,7 +2515,7 @@ async fn a_repeated_line_naming_the_same_stream_does_not_extend_the_watchdog() {
     tokio::time::pause();
     let dir = tempfile::tempdir().unwrap();
     let task = new_task(request(streams(Some("133"), Some("139"))));
-    let destination = destination_line(dir.path(), "Big Buck Bunny.f133.mp4");
+    let destination = destination_line(dir.path(), "Big Buck Bunny.aqz-KE-bpKQ.f133.mp4");
     let video = launch_progress("video-and-audio.json", "133");
     let launcher = ScriptedLauncher::new(
         dir.path(),
@@ -2402,14 +2573,17 @@ async fn the_stall_watchdog_is_armed_from_the_last_advance_not_from_the_last_lin
     let launcher = ScriptedLauncher::new(
         dir.path(),
         vec![Script::ok()
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
+            .line(&destination_line(
+                dir.path(),
+                "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+            ))
             .line(&samples[0])
             .line(&samples[1])
             // Та же строка ещё дважды: вывод есть, принятых байт больше
             // не становится.
             .line(&repeated)
             .line(&repeated)
-            .creates("Big Buck Bunny.f140.m4a")],
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a")],
     );
 
     run_task(
@@ -2451,17 +2625,23 @@ async fn a_stalled_stream_is_retried_like_a_lost_connection() {
         dir.path(),
         vec![
             Script::stalled()
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
+                .line(&destination_line(
+                    dir.path(),
+                    "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+                ))
                 .lines(
                     fixture_progress("audio-only.json", "140")
                         .into_iter()
                         .take(3),
                 )
-                .creates("Big Buck Bunny.f140.m4a.part"),
+                .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a.part"),
             Script::ok()
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
+                .line(&destination_line(
+                    dir.path(),
+                    "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+                ))
                 .lines(fixture_progress("audio-only.json", "140"))
-                .creates("Big Buck Bunny.f140.m4a"),
+                .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a"),
         ],
     );
 
@@ -2526,8 +2706,11 @@ async fn the_first_deadline_of_every_launch_is_the_preparation_one() {
     let launcher = ScriptedLauncher::new(
         dir.path(),
         vec![Script::ok()
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
-            .creates("Big Buck Bunny.f140.m4a")],
+            .line(&destination_line(
+                dir.path(),
+                "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+            ))
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a")],
     );
 
     run_task(
@@ -2557,7 +2740,7 @@ async fn a_stale_format_removes_what_it_downloaded() {
         dir.path(),
         vec![
             Script::failing(1, &fixtures::outcome("stale-format.json").stderr)
-                .creates("Big Buck Bunny.f140.m4a.part"),
+                .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a.part"),
         ],
     );
 
@@ -2632,7 +2815,10 @@ async fn a_failed_merge_keeps_both_streams_and_no_half_merged_file() {
     assert!(error.retryable);
     assert_eq!(
         dir_listing(dir.path()),
-        ["Big Buck Bunny.f133.mp4", "Big Buck Bunny.f139.m4a"],
+        [
+            "Big Buck Bunny.aqz-KE-bpKQ.f133.mp4",
+            "Big Buck Bunny.aqz-KE-bpKQ.f139.m4a"
+        ],
         "оба потока на месте, рабочего файла склейки нет"
     );
 }
@@ -2718,9 +2904,12 @@ async fn a_burst_of_progress_lines_does_not_become_a_burst_of_events() {
     let launcher = ScriptedLauncher::new(
         dir.path(),
         vec![Script::ok()
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f602.mp4"))
+            .line(&destination_line(
+                dir.path(),
+                "Big Buck Bunny.aqz-KE-bpKQ.f602.mp4",
+            ))
             .lines(samples.clone())
-            .creates("Big Buck Bunny.f602.mp4")],
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f602.mp4")],
     );
 
     run_task(
@@ -2766,13 +2955,19 @@ async fn the_shape_of_the_state_always_gets_through() {
         dir.path(),
         vec![
             Script::failing(1, &connection_lost_stderr())
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
+                .line(&destination_line(
+                    dir.path(),
+                    "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+                ))
                 .lines(samples.iter().take(2).cloned())
-                .creates("Big Buck Bunny.f140.m4a.part"),
+                .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a.part"),
             Script::ok()
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
+                .line(&destination_line(
+                    dir.path(),
+                    "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+                ))
                 .lines(samples)
-                .creates("Big Buck Bunny.f140.m4a"),
+                .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a"),
         ],
     );
 
@@ -2802,27 +2997,71 @@ async fn the_shape_of_the_state_always_gets_through() {
 
 #[test]
 fn the_partial_name_of_the_longest_title_still_fits_the_file_system() {
-    let stem = sanitized_stem(&"я".repeat(400), "aqz-KE-bpKQ");
-    let download = download_stem(&stem);
-    let longest = format!("{download}.f{}.mhtml.part", "a".repeat(MAX_FORMAT_ID_BYTES));
+    use crate::download::filename::MAX_FILE_NAME_BYTES;
+    use crate::download::merge::{working_file_name, MergeContainer};
 
-    assert!(
-        longest.len() <= crate::download::filename::MAX_FILE_NAME_BYTES,
-        "имя частичного файла длиной {} байт не переживёт ни одну из трёх ФС",
-        longest.len()
+    // Самый длинный id — запасной вариант (TL-104): ссылка без распознанного id.
+    let hashed = PartialId::of_url("https://example.com/video");
+    assert_eq!(
+        hashed.as_str().len(),
+        MAX_PARTIAL_ID_BYTES,
+        "сторож стоит не на самом длинном id"
     );
+
+    for title in ["я".repeat(400), "a".repeat(400)] {
+        let download = download_stem(&sanitized_stem(&title, "aqz-KE-bpKQ"), &hashed);
+        assert!(
+            download.ends_with(&format!(".{}", hashed.as_str())),
+            "id обязан доезжать до имени целиком: {download}"
+        );
+        assert!(
+            download.len() <= download_stem_budget(),
+            "{}",
+            download.len()
+        );
+
+        // Предел всего, что дописывается к основе частичного: идентификатор
+        // формата, расширение в 8 байт и `.part`.
+        let longest = format!(
+            "{download}.f{}.{}.part",
+            "a".repeat(MAX_FORMAT_ID_BYTES),
+            "e".repeat(8)
+        );
+        assert!(
+            longest.len() <= MAX_FILE_NAME_BYTES,
+            "имя частичного файла длиной {} байт не переживёт ни одну из трёх ФС",
+            longest.len()
+        );
+        for container in [
+            MergeContainer::Mp4,
+            MergeContainer::Webm,
+            MergeContainer::Mkv,
+        ] {
+            let working = working_file_name(&download, container);
+            assert!(
+                working.len() <= MAX_FILE_NAME_BYTES,
+                "рабочий файл склейки длиной {} байт: {working}",
+                working.len()
+            );
+        }
+    }
+
+    // ASCII-название упирается в бюджет байт в байт: сторож стоит на пределе,
+    // а не рядом с ним.
+    let ascii = download_stem(&sanitized_stem(&"a".repeat(400), "id"), &hashed);
+    assert_eq!(ascii.len(), download_stem_budget());
 }
 
 #[test]
-fn the_partial_name_is_derived_from_the_title_and_nothing_else() {
+fn the_partial_name_is_derived_from_the_title_and_the_link_and_nothing_else() {
     // На этом стоит обещание Р-2: после выхода из приложения пользователь
     // вставляет ту же ссылку, ядро строит то же имя, yt-dlp продолжает с
     // места. Любая недетерминированная часть имени это отменяет.
-    let first = download_stem(&sanitized_stem(TITLE, "aqz-KE-bpKQ"));
-    let second = download_stem(&sanitized_stem(TITLE, "aqz-KE-bpKQ"));
+    let first = partial_base(TITLE, URL);
+    let second = partial_base(TITLE, URL);
 
     assert_eq!(first, second);
-    assert_eq!(first, "Big Buck Bunny");
+    assert_eq!(first, BASE);
 }
 
 #[test]
@@ -3330,7 +3569,7 @@ async fn the_date_in_the_name_is_the_completion_date_from_the_clock_seam() {
     assert_eq!(dir_listing(dir.path()), ["2031-02-04 Big Buck Bunny.m4a"]);
     assert_eq!(
         launcher.calls()[0].value_of("-o"),
-        Some("Big Buck Bunny.f%(format_id)s.%(ext)s"),
+        Some("Big Buck Bunny.aqz-KE-bpKQ.f%(format_id)s.%(ext)s"),
         "рабочее имя — основа E3, без даты и шаблона"
     );
 }
@@ -3362,8 +3601,11 @@ async fn one_attempt_from_the_settings_fails_after_the_first_interruption() {
     let launcher = ScriptedLauncher::new(
         dir.path(),
         vec![Script::failing(1, &connection_lost_stderr())
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
-            .creates("Big Buck Bunny.f140.m4a.part")],
+            .line(&destination_line(
+                dir.path(),
+                "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+            ))
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a.part")],
     );
 
     super::run_task(
@@ -3419,8 +3661,11 @@ async fn the_attempt_total_is_taken_at_the_start_and_survives_a_change_of_the_se
     let env = env_with(Some(Arc::clone(&settings)), None, Some(dir.path()));
     let failing = || {
         Script::failing(1, &connection_lost_stderr())
-            .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
-            .creates("Big Buck Bunny.f140.m4a.part")
+            .line(&destination_line(
+                dir.path(),
+                "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+            ))
+            .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a.part")
     };
     let changer = Arc::clone(&settings);
     let scripts = vec![
@@ -3479,8 +3724,11 @@ async fn twenty_attempts_from_the_settings_show_twenty_in_the_events() {
         dir.path(),
         vec![
             Script::failing(1, &connection_lost_stderr())
-                .line(&destination_line(dir.path(), "Big Buck Bunny.f140.m4a"))
-                .creates("Big Buck Bunny.f140.m4a.part"),
+                .line(&destination_line(
+                    dir.path(),
+                    "Big Buck Bunny.aqz-KE-bpKQ.f140.m4a",
+                ))
+                .creates("Big Buck Bunny.aqz-KE-bpKQ.f140.m4a.part"),
             Script::ok().emulate(),
         ],
     );
@@ -3726,7 +3974,8 @@ async fn no_hostile_template_or_title_puts_a_file_outside_the_folder_or_into_a_s
     // каждая из двух проверок (ревью TL-89, S1):
     //
     // - **argv**: `-o` запуска равен `output_template(download_stem(основа
-    //   E3))` и до нашего хвоста состоит только из символов `template_safe`.
+    //   E3, id ролика))` и до нашего хвоста состоит только из символов
+    //   `template_safe` — вместе с id ролика в основе (TL-104).
     //   В шаблон yt-dlp не уходит ничего, что он раскрыл бы (`$`, `%`, ведущая
     //   `~`, разделители), и ничего от шаблона настроек. Раскрытия сценарий не
     //   моделирует, поэтому доказывает это только argv, а не обход диска.
@@ -3762,10 +4011,11 @@ async fn no_hostile_template_or_title_puts_a_file_outside_the_folder_or_into_a_s
         "  {title}  ",
         "{title}.part",
         "{title}:{id}*?",
-        // Финальное имя под префиксом частичного файла и склейки (B1):
-        // подчистка на `Done` обязана пощадить готовый файл.
-        "{title}.f140.{id}",
-        "{title}.tl-merging.{id}",
+        // Финальное имя под префиксом частичного файла и склейки (B1; с
+        // TL-104 в префиксе id ролика): подчистка на `Done` обязана пощадить
+        // готовый файл.
+        "{title}.{id}.f140.{id}",
+        "{title}.{id}.tl-merging.{id}",
     ];
     let mut titles: Vec<String> = HOSTILE_TITLES.iter().map(|t| (*t).to_string()).collect();
     titles.extend(
@@ -3820,7 +4070,7 @@ async fn no_hostile_template_or_title_puts_a_file_outside_the_folder_or_into_a_s
             let output = calls[0].value_of("-o").expect("-o обязателен");
             assert_eq!(
                 output,
-                output_template(&download_stem(&sanitized_stem(title, &video_id_of(URL)))),
+                output_template(&partial_base(title, URL)),
                 "шаблон {template:?}, название {title:?}: -o не из рабочей основы E3"
             );
             let head = output
@@ -4002,7 +4252,10 @@ async fn a_retry_after_a_failed_merge_on_the_next_day_merges_yesterdays_streams_
     ));
     assert_eq!(
         dir_listing(dir.path()),
-        ["Big Buck Bunny.f133.mp4", "Big Buck Bunny.f139.m4a"],
+        [
+            "Big Buck Bunny.aqz-KE-bpKQ.f133.mp4",
+            "Big Buck Bunny.aqz-KE-bpKQ.f139.m4a"
+        ],
         "в рабочих именах нет ни даты, ни шаблона"
     );
 
@@ -4065,7 +4318,10 @@ async fn a_task_restored_on_the_next_day_resumes_yesterdays_part_file_and_leaves
         sink.last(),
         DownloadProgress::Failed { error } if error.kind == DownloadErrorKind::ConnectionLost
     ));
-    assert_eq!(dir_listing(dir.path()), ["Big Buck Bunny.f140.m4a.part"]);
+    assert_eq!(
+        dir_listing(dir.path()),
+        ["Big Buck Bunny.aqz-KE-bpKQ.f140.m4a.part"]
+    );
 
     // Перезапуск: новая задача из того же запроса (снимок очереди, Ф-9 E4).
     let restored = audio_task();
@@ -4152,22 +4408,22 @@ async fn a_final_name_under_a_partial_prefix_survives_the_cleanup_on_done() {
     // готовую загрузку.
     for (template, video, audio, expected) in [
         (
-            "{title}.f140.{id}",
+            "{title}.{id}.f140.{id}",
             None,
             "140",
-            "Big Buck Bunny.f140.aqz-KE-bpKQ.m4a",
+            "Big Buck Bunny.aqz-KE-bpKQ.f140.aqz-KE-bpKQ.m4a",
         ),
         (
-            "{title}.tl-merging.{id}",
+            "{title}.{id}.tl-merging.{id}",
             None,
             "140",
-            "Big Buck Bunny.tl-merging.aqz-KE-bpKQ.m4a",
+            "Big Buck Bunny.aqz-KE-bpKQ.tl-merging.aqz-KE-bpKQ.m4a",
         ),
         (
-            "{title}.f133.{id}",
+            "{title}.{id}.f133.{id}",
             Some("133"),
             "139",
-            "Big Buck Bunny.f133.aqz-KE-bpKQ.mp4",
+            "Big Buck Bunny.aqz-KE-bpKQ.f133.aqz-KE-bpKQ.mp4",
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -4316,4 +4572,308 @@ async fn a_cancel_during_the_history_write_leaves_one_record_and_one_done() {
     assert_eq!(task.snapshot(), done);
     assert_eq!(records(&history).len(), 1, "запись одна");
     assert_eq!(dir_listing(dir.path()), ["Big Buck Bunny.m4a"]);
+}
+
+// ───────────── Разные ролики с одним названием (TL-104) ─────────────
+
+/// Другой ролик для тестов TL-104: свой id, название задаёт тест.
+const OTHER_URL: &str = "https://www.youtube.com/watch?v=YE7VzlLtp-4";
+
+/// Имена и содержимое файлов папки, по имени: видно и что лежит, и что
+/// чужое не переписано.
+fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    dir_listing(dir)
+        .into_iter()
+        .map(|name| {
+            let bytes = std::fs::read(dir.join(&name)).expect("файл читается");
+            (name, bytes)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn partial_files_of_another_video_with_the_same_title_are_neither_resumed_nor_taken_nor_removed(
+) {
+    // TL-104. Первая задача оборвалась с сохранением частичного: видео
+    // дописано, звук — `.part`. Вторая — **другой** ролик с тем же названием
+    // и теми же форматами в той же папке — завершается. С одной рабочей
+    // основой на двоих вторая приняла бы чужое видео за своё («has already
+    // been downloaded»), докачала бы чужой `.part`, а подчистка на `Done`
+    // удалила бы оба. Потом повтор первой обязан докачать свои частичные
+    // файлы и не качать готовое заново.
+    //
+    // yt-dlp — `Step::Emulate`: имя и папку берёт из argv, а `--continue`
+    // ведёт себя как у настоящего (готовый файл — «уже скачан», `.part` —
+    // докачивается с прежним содержимым). Проверки — по `-o`, по строкам
+    // запуска, по байтам, ушедшим в склейку, и обходом папки.
+    const TITLE: &str = "Трейлер";
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let env = env_with(
+        Some(settings_with(data.path(), None, "{title}", 1)),
+        None,
+        Some(dir.path()),
+    );
+    let task_of = |url: &str| {
+        let mut req = request(streams(Some("133"), Some("139")));
+        req.url = url.to_string();
+        req.title = TITLE.to_string();
+        new_task(req)
+    };
+    let first = task_of(URL);
+    let second = task_of(OTHER_URL);
+
+    // ── Первая задача: обрыв, частичное сохранено ──
+    let interrupted = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::failing(1, &connection_lost_stderr()).emulate_partial_only("139")],
+    );
+    let sink = RecordingSink::new();
+    super::run_task(
+        &first,
+        &interrupted,
+        &ScriptedFfmpeg::merging(),
+        &sink,
+        &env,
+    )
+    .await;
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("ожидался отказ первой задачи: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::ConnectionLost);
+    assert_eq!(error.partial_data, PartialData::Kept);
+    assert_eq!(
+        interrupted.calls()[0].value_of("-o"),
+        Some("Трейлер.aqz-KE-bpKQ.f%(format_id)s.%(ext)s")
+    );
+    let left_by_first = contents(dir.path());
+    assert_eq!(
+        left_by_first,
+        [
+            (
+                "Трейлер.aqz-KE-bpKQ.f133.mp4".to_string(),
+                b"stream bytes".to_vec()
+            ),
+            (
+                "Трейлер.aqz-KE-bpKQ.f139.m4a.part".to_string(),
+                PARTIAL_BYTES.to_vec()
+            ),
+        ],
+        "первая задача оставила готовое видео и оборванный звук"
+    );
+
+    // ── Вторая задача: другой ролик, то же название ──
+    let other = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let sink = RecordingSink::new();
+    super::run_task(&second, &other, &ffmpeg, &sink, &env).await;
+
+    let call = &other.calls()[0];
+    assert_eq!(
+        call.value_of("-o"),
+        Some("Трейлер.YE7VzlLtp-4.f%(format_id)s.%(ext)s"),
+        "у другого ролика своя рабочая основа"
+    );
+    assert_eq!(call.lines.len(), 2, "{:?}", call.lines);
+    assert!(
+        call.lines
+            .iter()
+            .all(|line| line.starts_with("[download] Destination: ")),
+        "оба потока качаются сами: ни «уже скачан», ни докачки чужого — {:?}",
+        call.lines
+    );
+    assert_eq!(
+        ffmpeg.last_input_names(),
+        (
+            "Трейлер.YE7VzlLtp-4.f133.mp4".to_string(),
+            "Трейлер.YE7VzlLtp-4.f139.m4a".to_string()
+        )
+    );
+    assert_eq!(
+        ffmpeg.last_input_bytes(),
+        (b"stream bytes".to_vec(), b"stream bytes".to_vec()),
+        "в склейку ушли свои потоки, а не чужой дописанный `.part`"
+    );
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: "Трейлер.mp4".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
+        }
+    );
+    let mut expected = left_by_first.clone();
+    expected.push(("Трейлер.mp4".to_string(), b"merged bytes".to_vec()));
+    expected.sort();
+    assert_eq!(
+        contents(dir.path()),
+        expected,
+        "частичные файлы первой задачи на месте и не переписаны"
+    );
+
+    // ── Повтор первой: докачка своего ──
+    first.set_progress(DownloadProgress::Queued);
+    let resumed = ScriptedLauncher::new(dir.path(), vec![Script::ok().emulate()]);
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let sink = RecordingSink::new();
+    super::run_task(&first, &resumed, &ffmpeg, &sink, &env).await;
+
+    let call = &resumed.calls()[0];
+    assert_eq!(
+        call.value_of("-o"),
+        interrupted.calls()[0].value_of("-o"),
+        "повтор строит те же рабочие имена"
+    );
+    assert_eq!(call.lines.len(), 2, "{:?}", call.lines);
+    assert!(
+        call.lines[0].ends_with("Трейлер.aqz-KE-bpKQ.f133.mp4 has already been downloaded"),
+        "готовое видео не качается заново: {:?}",
+        call.lines
+    );
+    assert!(
+        call.lines[1].starts_with("[download] Destination: ")
+            && call.lines[1].ends_with("Трейлер.aqz-KE-bpKQ.f139.m4a"),
+        "звук докачивается под своим именем: {:?}",
+        call.lines
+    );
+    assert_eq!(
+        ffmpeg.last_input_bytes(),
+        (b"stream bytes".to_vec(), PARTIAL_BYTES.to_vec()),
+        "в склейку ушли своё готовое видео и свой докачанный `.part`"
+    );
+    assert_eq!(
+        sink.last(),
+        DownloadProgress::Done {
+            file_name: "Трейлер (2).mp4".to_string(),
+            folder_display: crate::types::FolderDisplay::SystemDownloads,
+        }
+    );
+    assert_eq!(
+        dir_listing(dir.path()),
+        ["Трейлер (2).mp4", "Трейлер.mp4"],
+        "обе задачи готовы, частичных файлов не осталось"
+    );
+}
+
+#[tokio::test]
+async fn a_link_without_a_recognised_id_puts_only_its_hash_into_the_partial_name() {
+    // TL-104, К-5 для id. `video_id_of` на чужой ссылке отдаёт что угодно из
+    // адреса — `../`, `$HOME`, `%(…)s`, обратную косую, пустоту, — а
+    // плейсхолдер YouTube (`videoseries`) и чужой хост проходят форму id. В
+    // рабочую основу из этого не попадает ни байта: только хеш ссылки.
+    // Проверки — `-o` в argv, обход ФС и различимость ссылок.
+    const LINKS: &[&str] = &[
+        "https://example.com/watch?v=../../escape",
+        "https://example.com/watch?v=$HOME",
+        "https://example.com/watch?v=~/leading",
+        "https://example.com/watch?v=%(title)s",
+        "https://example.com/watch?v=a\\b",
+        "https://example.com/watch?v=",
+        "https://example.com/../../etc/passwd",
+        "https://example.com/CON",
+        "https://youtube.com.example/watch?v=aqz-KE-bpKQ",
+        "https://www.youtube.com/embed/videoseries?list=PL1",
+        "https://www.youtube.com/embed/videoseries?list=PL2",
+        "https://www.youtube.com/watch?v=aqz-KE-bpK",
+    ];
+    const TAIL: &str = ".f%(format_id)s.%(ext)s";
+    // Корпус не пустой по сути: сырой id хоть одной ссылки увёл бы имя из
+    // папки или раскрылся бы в шаблоне, а плейсхолдер форму id проходит.
+    assert!(LINKS.iter().any(|link| video_id_of(link).contains('/')));
+    assert!(LINKS.iter().any(|link| video_id_of(link).contains('$')));
+    assert!(LINKS.iter().any(|link| video_id_of(link) == "videoseries"));
+
+    let mut hashes = BTreeSet::new();
+    for link in LINKS {
+        assert_eq!(
+            canonical_video_id(link),
+            None,
+            "«{link}» — не разобранная форма"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        let mut req = request(streams(None, Some("140")));
+        req.url = (*link).to_string();
+        let launcher = ScriptedLauncher::new(&dest, vec![Script::ok().emulate()]);
+        let sink = RecordingSink::new();
+
+        run_task(
+            &new_task(req),
+            &launcher,
+            &ScriptedFfmpeg::merging(),
+            &sink,
+            &dest,
+        )
+        .await;
+
+        let calls = launcher.calls();
+        let output = calls[0].value_of("-o").expect("-o обязателен");
+        let head = output
+            .strip_suffix(TAIL)
+            .unwrap_or_else(|| panic!("«{link}»: хвост -o не наш: {output:?}"));
+        let id = head
+            .strip_prefix("Big Buck Bunny.")
+            .unwrap_or_else(|| panic!("«{link}»: -o не из названия и id: {output:?}"));
+        assert!(
+            id.len() == PARTIAL_ID_HASH_HEX
+                && id
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+            "«{link}»: в имени не хеш ссылки, а {id:?}"
+        );
+        assert!(
+            head.chars().all(template_safe),
+            "«{link}»: в -o символ вне белого списка: {output:?}"
+        );
+        assert_eq!(calls[0].emulate_failures, Vec::<String>::new(), "«{link}»");
+        let DownloadProgress::Done { file_name, .. } = sink.last() else {
+            panic!("«{link}»: {:?}", sink.last());
+        };
+        assert_eq!(
+            tree(root.path()),
+            ["dest".to_string(), format!("dest/{file_name}")],
+            "«{link}»: файл вне папки назначения или подпапка"
+        );
+        assert!(
+            hashes.insert(id.to_string()),
+            "«{link}»: хеш совпал с хешем другой ссылки корпуса"
+        );
+    }
+}
+
+#[test]
+fn a_recognised_link_puts_the_video_id_itself_into_the_partial_name() {
+    for url in [
+        "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+        "https://www.youtube.com/watch?v=aqz-KE-bpKQ&list=PL1&index=2",
+        "https://youtu.be/aqz-KE-bpKQ?si=Kx1yQ7wSomething",
+        "https://www.youtube.com/shorts/aqz-KE-bpKQ",
+        "  https://m.youtube.com/shorts/aqz-KE-bpKQ?feature=share  ",
+    ] {
+        assert_eq!(PartialId::of_url(url).as_str(), "aqz-KE-bpKQ", "«{url}»");
+    }
+    assert_eq!(PartialId::of_url(OTHER_URL).as_str(), "YE7VzlLtp-4");
+}
+
+#[test]
+fn the_fallback_id_is_a_fixed_alphabet_hash_of_the_link() {
+    // Опубликованный вектор: sha256("abc") = ba7816bf8f01cfea414140de…
+    assert_eq!(url_digest("abc"), "ba7816bf8f01cfea");
+    assert_eq!(
+        url_digest("  abc "),
+        "ba7816bf8f01cfea",
+        "пробелы по краям — та же ссылка"
+    );
+
+    let first = PartialId::of_url("https://example.com/video/1");
+    assert_eq!(
+        first.as_str(),
+        PartialId::of_url("https://example.com/video/1").as_str(),
+        "та же ссылка — то же имя (Р-2)"
+    );
+    assert_ne!(
+        first.as_str(),
+        PartialId::of_url("https://example.com/video/2").as_str()
+    );
+    assert_eq!(first.as_str().len(), PARTIAL_ID_HASH_HEX);
 }
