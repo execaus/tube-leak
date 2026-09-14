@@ -99,6 +99,7 @@ useYtDlpWarmupRecheck({ isLoading, check })
  */
 const {
   snapshot: ytDlpUpdateSnapshot,
+  pending: ytDlpUpdatePending,
   checkNow: checkYtDlpUpdateNow,
   rollback: rollBackYtDlpUpdate,
 } = useYtDlpUpdate()
@@ -800,10 +801,14 @@ watch(activeTab, (tab) => {
           (дизайн, «Где живёт блок»). Кнопка «Вернуться к …» и инлайн-
           подтверждение рисуются самим блоком по снимку контура; вызов
           самой команды отката (Р-3) — здесь, тем же приёмом, что «Проверить
-          сейчас»/`checkYtDlpUpdateNow`.
+          сейчас»/`checkYtDlpUpdateNow`. `pending` (TL-120, issue #127) —
+          «ответ ещё не пришёл», отдельно от `snapshot.busy`: без него
+          кнопки выглядели бы живыми, пока откат без активной загрузки ждёт
+          переключения (до 24 с на холодном дереве).
         -->
         <YtDlpUpdateBlock
           :snapshot="ytDlpUpdateSnapshot"
+          :pending="ytDlpUpdatePending"
           :active-version="report?.ytDlp.version"
           @check="checkYtDlpUpdateNow"
           @rollback="rollBackYtDlpUpdate"

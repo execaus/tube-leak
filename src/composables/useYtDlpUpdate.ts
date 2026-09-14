@@ -53,17 +53,35 @@ export interface UseYtDlpUpdateReturn {
   /** Последний известный снимок контура — `undefined` до первого ответа `ytdlp_update_state`. */
   snapshot: Ref<YtDlpUpdateSnapshot | undefined>
   /**
+   * Истинно с момента вызова `checkNow()`/`rollback()` и до того, как их
+   * промис разрешится или отклонится — регрессия TL-120 (issue #127):
+   * после TL-66 ответ `roll_back_ytdlp` без активной загрузки приходит не
+   * сразу (на холодном дереве — до 24 с, проверка запуска цели), а
+   * `snapshot.value?.busy` до этого момента ещё несёт старое значение,
+   * которое может быть `false`. Вызывающая сторона обязана держать обе
+   * кнопки блока неактивными, пока это истинно, в дополнение к
+   * `snapshot.value?.busy` — иначе кнопки выглядят живыми, а ядро молча
+   * отклоняет повторное нажатие как `busy` (composable его проглатывает,
+   * см. `callCommandAndApply`). Не второй источник истины: как только
+   * промис settled, флаг снимается и состояние дальше целиком ведёт
+   * `snapshot` (ответ команды или более свежее событие) — никакого
+   * локального предположения об исходе.
+   */
+  pending: Ref<boolean>
+  /**
    * «Проверить сейчас» — вызывающая сторона обязана не давать нажать её,
    * пока `snapshot.value?.busy` истинно (тот же контракт, что у кнопок
-   * `YtDlpUpdateSnapshot.busy` — doc в `src/types/generated/update.ts`).
+   * `YtDlpUpdateSnapshot.busy` — doc в `src/types/generated/update.ts`) —
+   * и пока `pending.value` истинно (doc `pending` выше).
    */
   checkNow: () => Promise<void>
   /**
    * «Вернуться» (Р-3, TL-60) — тот же контракт неактивности кнопки, что и
    * `checkNow`: вызывающая сторона не даёт нажать её, пока
-   * `snapshot.value?.busy` истинно. Инлайн-подтверждение и решение
-   * пользователя «Вернуться»/«Отмена» — в `YtDlpUpdateBlock`; здесь только
-   * сам вызов команды и применение её ответа.
+   * `snapshot.value?.busy` истинно, и пока `pending.value` истинно (doc
+   * `pending` выше). Инлайн-подтверждение и решение пользователя
+   * «Вернуться»/«Отмена» — в `YtDlpUpdateBlock`; здесь только сам вызов
+   * команды и применение её ответа.
    */
   rollback: () => Promise<void>
 }
@@ -115,6 +133,8 @@ export interface UseYtDlpUpdateReturn {
  */
 export function useYtDlpUpdate(): UseYtDlpUpdateReturn {
   const snapshot = ref<YtDlpUpdateSnapshot>()
+  /** «Команда в пути» — doc `pending` в {@link UseYtDlpUpdateReturn} выше (TL-120). */
+  const pending = ref(false)
 
   let unlisten: UnlistenFn | undefined
   let listening: Promise<void> | undefined
@@ -183,6 +203,13 @@ export function useYtDlpUpdate(): UseYtDlpUpdateReturn {
    */
   async function callCommandAndApply(command: () => Promise<YtDlpUpdateSnapshot>): Promise<void> {
     const generationBeforeCall = eventGeneration
+    // TL-120 (issue #127): поднимается до вызова команды и снимается в
+    // `finally` — на путь «дошло до `catch`» и на путь «пришло раньше
+    // события и отброшено по поколению» действует одинаково, потому что
+    // сам факт ожидания ответа команды, а не его применение к `snapshot`,
+    // должен держать кнопки неактивными (doc `pending` в
+    // `UseYtDlpUpdateReturn`).
+    pending.value = true
     try {
       const result = await command()
       if (eventGeneration === generationBeforeCall) {
@@ -194,6 +221,8 @@ export function useYtDlpUpdate(): UseYtDlpUpdateReturn {
       // `snapshot.value.busy` истинно, а «Вернуться» вдобавок не рисуется
       // вовсе без `rollbackTarget` (doc типов в контракте). Проглатывается
       // по той же причине, что и в `loadInitialSnapshot`.
+    } finally {
+      pending.value = false
     }
   }
 
@@ -228,5 +257,5 @@ export function useYtDlpUpdate(): UseYtDlpUpdateReturn {
     }
   })
 
-  return { snapshot, checkNow, rollback }
+  return { snapshot, pending, checkNow, rollback }
 }

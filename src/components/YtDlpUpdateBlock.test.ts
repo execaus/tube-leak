@@ -11,7 +11,7 @@ import YtDlpUpdateBlock from './YtDlpUpdateBlock.vue'
 
 const ACTIVE_VERSION = '2026.08.20'
 
-function mountBlock(props: { snapshot?: YtDlpUpdateSnapshot; activeVersion?: string }) {
+function mountBlock(props: { snapshot?: YtDlpUpdateSnapshot; activeVersion?: string; pending?: boolean }) {
   return mount(YtDlpUpdateBlock, { props })
 }
 
@@ -487,6 +487,116 @@ describe('YtDlpUpdateBlock — доступность', () => {
     })
 
     expect(wrapper.get('.ytdlp-update-block').attributes('aria-live')).toBe('polite')
+  })
+
+  it('reflects aria-busy="false" on the block while nothing is busy or pending', () => {
+    const wrapper = mountBlock({
+      snapshot: { busy: false, status: 'neverChecked' },
+      activeVersion: ACTIVE_VERSION,
+    })
+
+    expect(wrapper.get('.ytdlp-update-block').attributes('aria-busy')).toBe('false')
+  })
+
+  it('reflects aria-busy="true" on the block while pending is true, same as the button-disabling busy flag', () => {
+    const wrapper = mountBlock({
+      snapshot: { busy: false, status: 'upToDate', at: '2026-08-25T12:00:00Z' },
+      activeVersion: ACTIVE_VERSION,
+      pending: true,
+    })
+
+    expect(wrapper.get('.ytdlp-update-block').attributes('aria-busy')).toBe('true')
+  })
+})
+
+/*
+ * TL-120 (issue #127): регрессия TL-66 — откат без активной загрузки
+ * отвечает только после переключения (до 24 с на холодном дереве), а
+ * `snapshot.busy` до этого момента ещё несёт старое значение. `pending`
+ * — сигнал «ответ команды ещё не пришёл», отдельный от `snapshot`,
+ * который держит обе кнопки неактивными вне зависимости от того, что
+ * говорит текущий снимок.
+ */
+describe('YtDlpUpdateBlock — «команда в пути» (TL-120, issue #127)', () => {
+  it('disables both buttons while pending is true, even though snapshot.busy is still false (stale value)', () => {
+    const wrapper = mountBlock({
+      snapshot: {
+        busy: false,
+        status: 'upToDate',
+        at: '2026-08-25T12:00:00Z',
+        rollbackTarget: '2026.07.11',
+      },
+      activeVersion: ACTIVE_VERSION,
+      pending: true,
+    })
+
+    expect(checkButton(wrapper)?.attributes('disabled')).toBeDefined()
+    expect(rollbackButton(wrapper)?.attributes('disabled')).toBeDefined()
+  })
+
+  it('does not disable the buttons when pending is false (default) and snapshot.busy is false', () => {
+    const wrapper = mountBlock({
+      snapshot: {
+        busy: false,
+        status: 'upToDate',
+        at: '2026-08-25T12:00:00Z',
+        rollbackTarget: '2026.07.11',
+      },
+      activeVersion: ACTIVE_VERSION,
+    })
+
+    expect(checkButton(wrapper)?.attributes('disabled')).toBeUndefined()
+    expect(rollbackButton(wrapper)?.attributes('disabled')).toBeUndefined()
+  })
+
+  it('re-enables both buttons once pending flips back to false, snapshot unchanged (command refused/rejected)', async () => {
+    const wrapper = mountBlock({
+      snapshot: {
+        busy: false,
+        status: 'upToDate',
+        at: '2026-08-25T12:00:00Z',
+        rollbackTarget: '2026.07.11',
+      },
+      activeVersion: ACTIVE_VERSION,
+      pending: true,
+    })
+    expect(checkButton(wrapper)?.attributes('disabled')).toBeDefined()
+
+    await wrapper.setProps({ pending: false })
+
+    expect(checkButton(wrapper)?.attributes('disabled')).toBeUndefined()
+    expect(rollbackButton(wrapper)?.attributes('disabled')).toBeUndefined()
+  })
+
+  it('does not locally jump to "applied" while pending — status text is unchanged until a new snapshot arrives', async () => {
+    const wrapper = mountBlock({
+      snapshot: {
+        busy: false,
+        status: 'upToDate',
+        at: '2026-08-25T12:00:00Z',
+        rollbackTarget: '2026.07.11',
+      },
+      activeVersion: ACTIVE_VERSION,
+    })
+    const textBefore = statusText(wrapper)
+
+    await wrapper.setProps({ pending: true })
+    expect(statusText(wrapper)).toBe(textBefore)
+    expect(statusText(wrapper)).not.toContain('Возврат выполнен')
+
+    await wrapper.setProps({
+      pending: false,
+      snapshot: {
+        busy: false,
+        status: 'rolledBack',
+        at: '2026-08-25T12:00:05Z',
+        active: '2026.07.11',
+        abandoned: '2026.08.20',
+        rollbackTarget: '2026.08.20',
+      },
+    })
+
+    expect(statusText(wrapper)).toContain('Возврат выполнен')
   })
 })
 
