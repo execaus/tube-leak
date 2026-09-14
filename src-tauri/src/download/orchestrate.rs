@@ -99,6 +99,44 @@
 //! частичного файла выводится из названия ролика и папки назначения, а не
 //! из состояния, которого приложение между запусками не помнит.
 //!
+//! # Настройки снимаются на старте задачи (TL-89, Р-4 эпика E5)
+//!
+//! Папка назначения, шаблон имени и предел попыток читаются **один раз** —
+//! первой строкой [`run_task`], из живого хранилища настроек ([`TaskEnv`]),
+//! а не при постановке и не при старте очереди. Отсюда два следствия Ф-14:
+//! ожидающая задача получает значения, действующие к её собственному
+//! старту, а идущая держит свои до терминального исхода, включая
+//! автоматические повторы. «Повторить» после отказа — новый вызов
+//! [`run_task`], то есть новый старт с текущими значениями.
+//!
+//! Если на новом старте папка или основа имени не те, что на прошлом, всё,
+//! что задача знала о забранных потоках, забывается: они лежат в прежней
+//! папке под прежними именами, и докачивать их некуда. Задача качается с
+//! нуля, прежние частичные файлы остаются, где лежали, — цена, названная в
+//! Р-4 и в тексте экрана настроек.
+//!
+//! Имя строит только `Settings::file_stem` (шаблон целиком уходит в
+//! санитизацию E3). `{id}` — [`video_id_of`], тот же id, что E3 брал для
+//! запасного имени, а не канонический id очереди (решение ведущего по ревью
+//! TL-86). `{date}` — дата **завершения** по UTC (Ф-12): рабочие имена
+//! потоков и склейки строятся на старте, финальное — перед финализацией, с
+//! тем же шаблоном и датой из того же шва. У шаблона без `{date}` обе основы
+//! совпадают байт в байт.
+//!
+//! # Запись в историю (TL-89, Р-1 эпика E5)
+//!
+//! Пишется только `Done`, ровно одна запись, через managed-состояние истории
+//! (`commands::history::HistoryState`) — своего открытия хранилища здесь нет.
+//! Пишется **до** события `done` и до возврата очереди: к моменту, когда о
+//! готовой задаче узнает окно, запись уже в базе (Ф-3). Отказ записи исход не
+//! меняет: Done остаётся Done, экран истории получает пометку
+//! `lastWriteFailed`. `Failed` и `Cancelled` в историю не пишутся.
+//!
+//! `folderDisplay` у `Done` строит `commands::history::folder_display` —
+//! та же функция, что у записи на экране истории, на том же значении папки,
+//! что уходит в запись, и с тем же резолвом системной «Загрузок». Без
+//! канонизации ни с одной стороны.
+//!
 //! # Три места, где задача может кончиться
 //!
 //! `Done` — файл под финальным именем в папке назначения. `Failed` — один
@@ -117,19 +155,23 @@ use std::time::{Duration, Instant};
 use super::aggregate::{ProgressAggregator, SampleOutcome};
 use super::classify::{classify_attempt, AttemptOutcome, AttemptVerdict};
 use super::error::{DownloadCommandRejection, DownloadFailure};
-use super::filename::{finalize_in_dir, sanitized_stem};
+use super::filename::finalize_in_dir;
 use super::merge::{merge_streams, FfmpegLauncher, MergeRequest, MergeVerdict};
 use super::progress::{SampleStatus, StdoutLine, PROGRESS_TEMPLATE};
 use super::retry::{RetryDecision, RetryPolicy};
 use super::PROGRESS_EVENT;
-use crate::clock::monotonic_now;
+use crate::clock::{self, monotonic_now};
+use crate::commands::{folder_display, HistoryState, SettingsState};
+use crate::queue::video_id::canonical_video_id;
 use crate::sidecar::{
     run_streaming, stderr_tail, ChildRegistry, RunHandle, SidecarError, StreamedRun,
 };
+use crate::storage::history::NewHistoryRecord;
+use crate::storage::settings::{Destination, Settings, TemplateContext, TemplateDate};
 use crate::types::{
     DownloadErrorDetails, DownloadErrorKind, DownloadPercent, DownloadPlan, DownloadProgress,
-    DownloadProgressEvent, DownloadStream, DownloadingState, PartialData, QualityStreams,
-    StartDownloadRequest, YtDlpFailureReason,
+    DownloadProgressEvent, DownloadStream, DownloadingState, HistoryWriteFailure, PartialData,
+    QualityStreams, StartDownloadRequest, YtDlpFailureReason,
 };
 
 // ───────────────────────────── Числа ─────────────────────────────
@@ -768,10 +810,15 @@ struct StreamJob {
 struct TaskWork {
     aggregator: ProgressAggregator,
     jobs: Vec<StreamJob>,
-    /// Основа финального имени (санитизация названия, TL-40).
+    /// Основа имени, построенная на старте (шаблон из настроек через
+    /// санитизацию E3): от неё — рабочий файл склейки и префикс подчистки.
+    /// Пустая до первого старта.
     stem: String,
-    /// Основа имени частичных файлов.
+    /// Основа имени частичных файлов. Пустая до первого старта.
     download_stem: String,
+    /// Папка назначения последнего старта. `None` — задача ещё не
+    /// стартовала: имён нет, подчищать нечего.
+    destination: Option<PathBuf>,
     /// Детали последней прерванной попытки.
     ///
     /// Хранятся здесь, потому что понадобятся не там, где получены:
@@ -933,8 +980,10 @@ pub fn build_task(
         .ok_or(DownloadCommandRejection::NoStreamsSelected)?;
     let plan = aggregator.plan();
 
-    let stem = sanitized_stem(&request.title, &video_id_of(&request.url));
-    let download_stem = download_stem(&stem);
+    // Имени и папки здесь нет (TL-89): их снимает с настроек старт задачи,
+    // а постановка случается раньше — иногда в прошлом сеансе (снимок
+    // очереди), — и ожидающая задача обязана увидеть настройки своего
+    // старта (Р-4).
     let jobs = jobs_of(&request.streams);
 
     eprintln!(
@@ -955,8 +1004,9 @@ pub fn build_task(
         work: tokio::sync::Mutex::new(TaskWork {
             aggregator,
             jobs,
-            stem,
-            download_stem,
+            stem: String::new(),
+            download_stem: String::new(),
+            destination: None,
             last_interrupt: None,
         }),
     }))
@@ -998,7 +1048,7 @@ fn jobs_of(streams: &QualityStreams) -> Vec<StreamJob> {
 /// Разбором ссылок YouTube это не является и являться не должно
 /// (инвариант проекта: адреса — дело yt-dlp). Берётся значение `v=`,
 /// иначе — последний непустой сегмент пути; доверия ему не больше, чем
-/// названию, и [`sanitized_stem`] пропускает его через собственный белый
+/// названию, и [`crate::download::filename::sanitized_stem`] пропускает его через собственный белый
 /// список.
 fn video_id_of(url: &str) -> String {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
@@ -1017,6 +1067,220 @@ fn video_id_of(url: &str) -> String {
         .find(|segment| !segment.is_empty())
         .unwrap_or_default()
         .to_string()
+}
+
+// ─────────────────── Настройки и история задачи (TL-89) ───────────────────
+
+/// Откуда задача берёт настройки и куда пишет историю (E5).
+///
+/// Здесь **хранилища**, а не значения из них: значения снимает сам
+/// [`run_task`] в своей первой строке (Р-4). Окружение живёт дольше
+/// задачи — в бою это managed-состояние приложения, — и прочитай его
+/// кто-нибудь раньше, при постановке или при старте очереди, ожидающие
+/// задачи не увидели бы смены настроек, сделанной, пока они стояли.
+pub struct TaskEnv {
+    /// Настройки процесса. `None` — `setup` их не положил; тогда, как и у
+    /// хранилища, не открывшегося на сеанс, действуют умолчания (Н-4).
+    pub settings: Option<Arc<SettingsState>>,
+    /// История процесса — то же managed-состояние, что у команд истории
+    /// (TL-90). `None` — `setup` его не положил: Done без записи, в лог.
+    pub history: Option<Arc<HistoryState>>,
+    /// Системная «Загрузки» (`download_dir()`) — тот же резолв, что у
+    /// команд истории и настроек. `None` — ОС её не дала.
+    pub system_downloads: Option<PathBuf>,
+    /// Сегодняшняя дата для `{date}`. В бою — [`today_utc_date`]; шов ради
+    /// тестов, которые не ждут полуночи.
+    pub today: fn() -> TemplateDate,
+}
+
+/// Сегодняшняя дата по UTC для `{date}`: `clock::today_utc` — та же
+/// функция, что у предпросмотра шаблона (TL-91), и то же преобразование
+/// ([`TemplateDate::from_civil`]).
+///
+/// Часы ОС за 9999 годом — не повод ронять готовую загрузку: подставляется
+/// [`TemplateDate::UNIX_EPOCH`], причина — в лог.
+pub fn today_utc_date() -> TemplateDate {
+    let civil = clock::today_utc();
+    TemplateDate::from_civil(civil).unwrap_or_else(|| {
+        eprintln!(
+            "download: часы ОС дают дату {civil:?} вне 1…9999 года — в {{date}} уходит 1970-01-01"
+        );
+        TemplateDate::UNIX_EPOCH
+    })
+}
+
+/// Что задача сняла с настроек на своём старте и держит до терминального
+/// исхода (Р-4, Ф-14).
+struct TaskStart {
+    /// Папка назначения: своя из настроек либо системная «Загрузки».
+    destination: PathBuf,
+    /// Снимок настроек: шаблон имени и предел попыток.
+    settings: Settings,
+}
+
+impl TaskStart {
+    /// Единственное место, где оркестрация читает настройки.
+    ///
+    /// Системная папка, которую ОС не дала, — пустой путь: он честно
+    /// доезжает до класса `destinationUnavailable` проверкой
+    /// [`ensure_destination`], своей ветки отказа не нужно (как и в E3).
+    fn read(task: &DownloadTask, env: &TaskEnv) -> Self {
+        let settings = match env.settings.as_deref().map(SettingsState::store) {
+            Some(Ok(store)) => store.current(),
+            Some(Err(reason)) => {
+                eprintln!(
+                    "download: задача {}: хранилища настроек нет ({reason}) — действуют умолчания",
+                    task.id
+                );
+                Settings::default()
+            }
+            None => {
+                eprintln!(
+                    "download: задача {}: настройки не подключены — действуют умолчания",
+                    task.id
+                );
+                Settings::default()
+            }
+        };
+        let destination = match settings.destination() {
+            Destination::System => env.system_downloads.clone().unwrap_or_default(),
+            Destination::Custom(folder) => folder.as_path().to_path_buf(),
+        };
+        Self {
+            destination,
+            settings,
+        }
+    }
+
+    /// Основа имени по снятому шаблону на дату `date` (Ф-12).
+    fn file_stem(&self, task: &DownloadTask, date: TemplateDate) -> String {
+        let video_id = video_id_of(&task.request.url);
+        self.settings.file_stem(&TemplateContext {
+            title: &task.request.title,
+            video_id: &video_id,
+            quality: task.request.quality,
+            date,
+        })
+    }
+}
+
+impl TaskWork {
+    /// Раскладывает имена и папку этого старта.
+    ///
+    /// Сменились папка или основа имени с прошлого старта — забранные потоки
+    /// забываются (doc модуля, «Настройки снимаются на старте задачи»).
+    fn begin(&mut self, destination: &Path, stem: String) {
+        let moved = self
+            .destination
+            .as_deref()
+            .is_some_and(|previous| previous != destination || self.stem != stem);
+        if moved {
+            eprintln!(
+                "download: папка назначения или имя сменились с прошлого старта задачи — \
+                 потоки качаются заново, прежние частичные файлы остаются на месте (Р-4)"
+            );
+            forget_streams(self);
+        }
+        self.download_stem = download_stem(&stem);
+        self.stem = stem;
+        self.destination = Some(destination.to_path_buf());
+    }
+}
+
+/// Пишет запись Done в историю — ровно одну (Ф-3, Р-1, Р-2).
+///
+/// Отказ исход задачи не меняет (Н-4). Пометку `lastWriteFailed` при
+/// отказе вставки выставляет сам `HistoryStore::insert`; здесь она
+/// ставится только за отказы раньше вставки: не снялся размер файла,
+/// запись прервалась паникой.
+///
+/// Работа блокирующая (`metadata` и транзакция SQLite с `fsync`) и уходит с
+/// потока рантайма (Н-3) — тот же приём, что у команд истории.
+async fn record_done(task: &DownloadTask, env: &TaskEnv, folder: &Path, file_name: &str) {
+    let Some(history) = env.history.clone() else {
+        eprintln!(
+            "download: задача {} готова, но история не подключена — запись не сделана",
+            task.id
+        );
+        return;
+    };
+
+    let writer = Arc::clone(&history);
+    let task_id = task.id.clone();
+    let request = task.request.clone();
+    let folder = folder.to_path_buf();
+    let file_name = file_name.to_owned();
+    let written = tokio::task::spawn_blocking(move || {
+        write_done(&writer, &task_id, &request, folder, file_name);
+    })
+    .await;
+
+    if let Err(err) = written {
+        eprintln!(
+            "download: запись истории задачи {} прервана: {err}",
+            task.id
+        );
+        if let Ok(store) = history.store() {
+            store.record_write_failure(HistoryWriteFailure::StorageFailed);
+        }
+    }
+}
+
+/// Тело [`record_done`] — на потоке блокирующего пула.
+fn write_done(
+    history: &HistoryState,
+    task_id: &str,
+    request: &StartDownloadRequest,
+    folder: PathBuf,
+    file_name: String,
+) {
+    let store = match history.store() {
+        Ok(store) => store,
+        Err(unavailable) => {
+            eprintln!(
+                "download: задача {task_id} готова, но история на сеанс недоступна ({:?}) — \
+                 запись не сделана",
+                unavailable.reason
+            );
+            return;
+        }
+    };
+
+    let size_bytes = match std::fs::metadata(folder.join(&file_name)) {
+        Ok(meta) => meta.len(),
+        Err(err) => {
+            eprintln!(
+                "download: задача {task_id}: размер готового файла не снят ({err}) — запись \
+                 истории не сделана"
+            );
+            store.record_write_failure(if err.kind() == io::ErrorKind::PermissionDenied {
+                HistoryWriteFailure::NoAccess
+            } else {
+                HistoryWriteFailure::StorageFailed
+            });
+            return;
+        }
+    };
+
+    let record = NewHistoryRecord {
+        // Канонический id очереди (TL-72), как требует запись. Ссылка, форму
+        // которой он не разбирает, даёт пустую строку, а не догадку: поле
+        // обещает тот id, по которому очередь сравнивает дубли.
+        video_id: canonical_video_id(&request.url)
+            .map(|id| id.as_str().to_owned())
+            .unwrap_or_default(),
+        url: request.url.clone(),
+        title: request.title.clone(),
+        quality: request.quality,
+        file_name,
+        folder,
+        size_bytes,
+        finished_at_unix_secs: clock::now_unix_secs(),
+    };
+    match store.insert(&record) {
+        Ok(id) => eprintln!("download: задача {task_id} записана в историю под id {id}"),
+        Err(err) => eprintln!("download: задача {task_id} не записана в историю: {err}"),
+    }
 }
 
 // ──────────────────────────── Воркер ────────────────────────────
@@ -1043,11 +1307,21 @@ pub async fn run_task(
     launcher: &dyn DownloadLauncher,
     ffmpeg: &dyn FfmpegLauncher,
     sink: &dyn ProgressSink,
-    destination: &Path,
+    env: &TaskEnv,
 ) {
+    // Р-4: настройки снимаются здесь и больше не читаются — ни на повторах
+    // внутри задачи, ни на финализации. Имена раскладываются до всего
+    // остального: подчистка любого исхода ищет файлы по ним.
+    let start = TaskStart::read(task, env);
+    let destination = start.destination.as_path();
+    task.work
+        .lock()
+        .await
+        .begin(destination, start.file_stem(task, (env.today)()));
+
     let mut emitter = Emitter::new(task, sink);
     let started = monotonic_now();
-    let end = execute(task, launcher, ffmpeg, &mut emitter, destination).await;
+    let end = execute(task, launcher, ffmpeg, &mut emitter, &start, env).await;
     let elapsed = monotonic_now().duration_since(started);
 
     // Подчистка и терминальное событие — в одном месте на все ветки:
@@ -1055,6 +1329,7 @@ pub async fn run_task(
     // классу (doc [`crate::types::PartialData`]), и узнаётся он ровно тем,
     // что подчистка сделала.
     let mut work = task.work.lock().await;
+    let mut finished = None;
     let progress = match end {
         TaskEnd::Done { file_name } => {
             // Готовый файл лежит под финальным именем; всё, что от задачи
@@ -1067,12 +1342,13 @@ pub async fn run_task(
                 task.id,
                 elapsed.as_millis()
             );
-            // Папка назначения сегодня всегда системная «Загрузки»: её резолвит
-            // воркер очереди (`commands::queue::run`). Настоящее решение по
-            // фактической папке из настроек подставит TL-89.
+            // Та же функция, что у записи на экране истории, на том же
+            // значении папки, что уходит в запись (doc модуля).
+            let folder_display = folder_display(destination, env.system_downloads.as_deref());
+            finished = Some(file_name.clone());
             DownloadProgress::Done {
                 file_name,
-                folder_display: crate::types::FolderDisplay::SystemDownloads,
+                folder_display,
             }
         }
         TaskEnd::Cancelled => {
@@ -1109,6 +1385,12 @@ pub async fn run_task(
     work.last_interrupt = None;
     drop(work);
 
+    // Запись — раньше события: к моменту, когда о готовой задаче узнает
+    // окно, она уже в базе (Ф-3).
+    if let Some(file_name) = finished {
+        record_done(task, env, destination, &file_name).await;
+    }
+
     emitter.emit(progress);
 
     // Границу задач (Ф-7, Р-2 эпика E6) объявляет не воркер, а очередь —
@@ -1125,8 +1407,10 @@ async fn execute(
     launcher: &dyn DownloadLauncher,
     ffmpeg: &dyn FfmpegLauncher,
     emitter: &mut Emitter<'_>,
-    destination: &Path,
+    start: &TaskStart,
+    env: &TaskEnv,
 ) -> TaskEnd {
+    let destination = start.destination.as_path();
     if task.cancel.is_cancelled() {
         return TaskEnd::Cancelled;
     }
@@ -1145,7 +1429,9 @@ async fn execute(
     };
 
     let mut work = task.work.lock().await;
-    let mut policy = RetryPolicy::new(monotonic_now());
+    // Предел — снятый на старте (Ф-13), а не текущая настройка: смена числа
+    // посреди задачи её `total` не трогает.
+    let mut policy = RetryPolicy::new(monotonic_now(), start.settings.max_attempts());
 
     emitter.emit(DownloadProgress::Fetching);
 
@@ -1298,7 +1584,10 @@ async fn execute(
     // внутри одной операции — требование TL-40, между ними не должно быть
     // ни строки нашего кода.
     let (ready_file, extension) = ready;
-    match finalize_in_dir(destination, &ready_file, &work.stem, &extension) {
+    // Финальная основа — шаблон старта на дату завершения (Ф-12). Считается
+    // до финализации, а не между занятием имени и переименованием.
+    let final_stem = start.file_stem(task, (env.today)());
+    match finalize_in_dir(destination, &ready_file, &final_stem, &extension) {
         Ok(file_name) => TaskEnd::Done { file_name },
         Err(error) => {
             eprintln!("download: не удалось положить готовый файл в папку назначения: {error}");
@@ -1880,6 +2169,11 @@ fn forget_streams(work: &mut TaskWork) {
 
 /// Все префиксы, под которыми задача могла оставить файлы.
 fn prefixes_of(work: &TaskWork) -> Vec<String> {
+    // До первого старта имён нет: пустая основа дала бы префикс `.f140.`,
+    // под который попал бы чужой скрытый файл в папке назначения.
+    if work.destination.is_none() {
+        return Vec::new();
+    }
     let mut prefixes: Vec<String> = work
         .jobs
         .iter()

@@ -277,8 +277,7 @@ SELECT id, video_id, url, title, quality_kind, quality_height_px,
 FROM history
 WHERE id = ?1";
 
-// Запись Done — TL-89; до неё путь вставки зовут только тесты.
-#[allow(dead_code)]
+/// Вставка записи Done (зовёт оркестрация, TL-89).
 const INSERT_SQL: &str = "
 INSERT INTO history (video_id, url, title, quality_kind, quality_height_px,
                      file_name, folder, size_bytes, finished_at_unix_secs)
@@ -312,8 +311,7 @@ impl fmt::Display for RecordId {
 }
 
 /// Запись для вставки — данные Done-задачи на момент завершения (Ф-2, Р-2).
-// Строит оркестрация (TL-89); до неё — только тесты.
-#[allow(dead_code)]
+// Строит оркестрация в момент Done (TL-89).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewHistoryRecord {
     /// Канонический id ролика (TL-72).
@@ -459,7 +457,6 @@ pub enum StorageFailure {
 
 impl StorageFailure {
     /// Причина отказа записи в форме контракта.
-    #[allow(dead_code)] // путь записи — TL-89
     pub fn as_write_failure(self) -> HistoryWriteFailure {
         match self {
             Self::DiskFull => HistoryWriteFailure::DiskFull,
@@ -479,7 +476,6 @@ pub struct HistoryStorageError {
 }
 
 /// Почему запись Done не вставлена.
-#[allow(dead_code)] // путь записи — TL-89
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HistoryWriteError {
     /// Запись не прошла проверку до базы: имя файла не одно имя, папка не
@@ -493,7 +489,6 @@ pub enum HistoryWriteError {
 
 impl HistoryWriteError {
     /// Причина для пометки `lastWriteFailed`.
-    #[allow(dead_code)] // путь записи — TL-89
     pub fn failure(&self) -> HistoryWriteFailure {
         match self {
             Self::InvalidRecord { .. } => HistoryWriteFailure::StorageFailed,
@@ -663,7 +658,6 @@ impl HistoryStore {
     ///
     /// Отказ — любой, включая проверку записи — сам выставляет пометку
     /// [`HistoryNotice::LastWriteFailed`].
-    #[allow(dead_code)] // зовёт оркестрация в момент Done — TL-89
     pub fn insert(&self, record: &NewHistoryRecord) -> Result<RecordId, HistoryWriteError> {
         let result = self.try_insert(record);
         if let Err(err) = &result {
@@ -672,7 +666,6 @@ impl HistoryStore {
         result
     }
 
-    #[allow(dead_code)] // путь записи — TL-89
     fn try_insert(&self, record: &NewHistoryRecord) -> Result<RecordId, HistoryWriteError> {
         let row = ValidRow::check(record)?;
         let mut conn = self.connection();
@@ -686,7 +679,6 @@ impl HistoryStore {
 
     /// Запоминает, что запись Done не сохранилась по причине, случившейся
     /// до [`Self::insert`] (для TL-89). Последняя причина вытесняет прежнюю.
-    #[allow(dead_code)] // зовёт оркестрация — TL-89
     pub fn record_write_failure(&self, cause: HistoryWriteFailure) {
         self.pending_notices().last_write_failed = Some(cause);
     }
@@ -852,7 +844,6 @@ impl HistoryStore {
 }
 
 /// Проверенная запись, готовая к вставке.
-#[allow(dead_code)] // путь записи — TL-89
 struct ValidRow<'a> {
     record: &'a NewHistoryRecord,
     folder: &'a str,
@@ -861,7 +852,6 @@ struct ValidRow<'a> {
 }
 
 impl<'a> ValidRow<'a> {
-    #[allow(dead_code)] // путь записи — TL-89
     fn check(record: &'a NewHistoryRecord) -> Result<Self, HistoryWriteError> {
         let invalid = |reason| HistoryWriteError::InvalidRecord { reason };
         if !is_single_file_name(&record.file_name) {
@@ -887,7 +877,6 @@ impl<'a> ValidRow<'a> {
     }
 }
 
-#[allow(dead_code)] // путь записи — TL-89
 fn insert_row(tx: &Transaction<'_>, row: &ValidRow<'_>) -> rusqlite::Result<RecordId> {
     let record = row.record;
     tx.execute(
@@ -967,7 +956,6 @@ fn conversion_failure(column: usize, kind: Type, what: &'static str) -> rusqlite
     rusqlite::Error::FromSqlConversionFailure(column, kind, what.into())
 }
 
-#[allow(dead_code)] // путь записи — TL-89
 fn kind_to_column(kind: QualityKind) -> &'static str {
     match kind {
         QualityKind::Standard => "standard",

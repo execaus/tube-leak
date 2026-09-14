@@ -145,7 +145,7 @@ impl HistoryState {
 
     /// [`Self::open`] без процессного флага — только для тестов.
     #[cfg(test)]
-    fn open_isolated(data_dir: Result<PathBuf, String>) -> Self {
+    pub(crate) fn open_isolated(data_dir: Result<PathBuf, String>) -> Self {
         Self::open_by(data_dir, HistoryStore::open_isolated)
     }
 
@@ -501,9 +501,13 @@ fn entry_to_contract(record: HistoryRecord, system_downloads: Option<&Path>) -> 
 /// Сравнение — по компонентам пути (`Path::eq`: хвостовой разделитель не
 /// важен), без обращения к диску. Символьные ссылки и регистр на
 /// нечувствительных к нему томах не разрешаются: такая папка покажется
-/// своим путём, что не ложь, а только менее короткая подпись. Правило для
-/// `Done` выбирает TL-89 и должно совпасть с этим — иначе одна и та же
-/// папка называлась бы по-разному на панели и в истории.
+/// своим путём, что не ложь, а только менее короткая подпись.
+///
+/// `Done` строится **этой же** функцией (оркестрация, TL-89) на том же
+/// значении папки, что уходит в запись истории, и с тем же резолвом
+/// системной «Загрузок» (`download_dir()`), — иначе одна и та же папка
+/// называлась бы по-разному на панели и в истории. Сторож —
+/// `download::orchestrate` тесты «folderDisplay совпадает».
 pub(crate) fn folder_display(folder: &Path, system_downloads: Option<&Path>) -> FolderDisplay {
     if system_downloads == Some(folder) {
         FolderDisplay::SystemDownloads

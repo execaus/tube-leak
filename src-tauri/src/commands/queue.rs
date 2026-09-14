@@ -26,7 +26,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::sidecar::resolve_ytdlp_path;
 use super::update::trigger_broken_extraction_check;
-use crate::download::{self, AppSink, DownloadTask, SidecarDownloader, SidecarFfmpeg};
+use super::{HistoryState, SettingsState};
+use crate::download::{self, AppSink, DownloadTask, SidecarDownloader, SidecarFfmpeg, TaskEnv};
 use crate::queue::scheduler::{self, QueueEnv, QueueScheduler};
 use crate::queue::CHANGED_EVENT;
 use crate::sidecar::{resolve_sidecar_path, ChildRegistry};
@@ -106,22 +107,43 @@ impl QueueEnv for AppQueue {
 }
 
 /// Ведёт одну задачу до терминальной фазы (E3, механизм не меняется).
+///
+/// Настроек здесь не читает (TL-89): воркер отдаёт задаче **хранилища** —
+/// managed-состояние настроек и истории, — а значения из них снимает сам
+/// `download::run_task` в своей первой строке (Р-4 эпика E5).
 async fn run(app: AppHandle, task: Arc<DownloadTask>) {
     // Пути резолвятся здесь, а не в команде, по двум причинам: они нужны
     // воркеру, а не вызывающему, и их неудача обязана стать отказом
     // **задачи** (событие `failed` в панели), а не отказом команды —
     // иначе один и тот же класс ошибки рисовался бы то панелью, то
     // реджектом промиса.
-    let destination = match app.path().download_dir() {
-        Ok(dir) => dir,
+    //
+    // Системная «Загрузки» резолвится и при своей папке в настройках: по ней
+    // `folderDisplay` решает, «Загрузки» это или свой путь, — тем же
+    // `download_dir()`, что у команд истории и настроек.
+    let system_downloads = match app.path().download_dir() {
+        Ok(dir) => Some(dir),
         Err(err) => {
             // Практически недостижимо: системная папка «Загрузки» есть на
-            // всех трёх целевых ОС. Путь, которого не существует, честно
-            // доедет до класса `destinationUnavailable` проверкой в
+            // всех трёх целевых ОС. При системной папке в настройках задача
+            // честно доедет до класса `destinationUnavailable` проверкой в
             // домене — своей ветки отказа заводить незачем.
             eprintln!("download: папка «Загрузки» не определяется: {err}");
-            std::path::PathBuf::new()
+            None
         }
+    };
+    // `try_state`: состояние кладёт `setup` до первой команды, но если его
+    // нет, задача всё равно идёт — на умолчаниях и без записи в историю
+    // (Н-4), с причиной в логе.
+    let env = TaskEnv {
+        settings: app
+            .try_state::<Arc<SettingsState>>()
+            .map(|state| Arc::clone(&state)),
+        history: app
+            .try_state::<Arc<HistoryState>>()
+            .map(|state| Arc::clone(&state)),
+        system_downloads,
+        today: download::today_utc_date,
     };
 
     // `None` — готовой установки нет; домен отдаст задаче честный «сбой
@@ -146,7 +168,7 @@ async fn run(app: AppHandle, task: Arc<DownloadTask>) {
     let merger = SidecarFfmpeg::new(ffmpeg, &registry);
     let sink = AppSink(app.clone());
 
-    download::run_task(&task, &launcher, &merger, &sink, &destination).await;
+    download::run_task(&task, &launcher, &merger, &sink, &env).await;
 }
 
 /// Кончилась ли задача сбоем yt-dlp (С-13 эпика E6).

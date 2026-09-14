@@ -147,7 +147,7 @@ impl SettingsState {
 
     /// [`Self::open`] без процессного флага — только для тестов.
     #[cfg(test)]
-    fn open_isolated(data_dir: Result<PathBuf, String>) -> Self {
+    pub(crate) fn open_isolated(data_dir: Result<PathBuf, String>) -> Self {
         Self::open_by(data_dir, |dir| Ok(SettingsStore::open_isolated(dir)))
     }
 
@@ -262,12 +262,7 @@ pub async fn preview_name_template(
 
 /// Сегодняшняя дата образца (doc [`preview_name_template`]).
 fn today() -> Option<TemplateDate> {
-    let (year, month, day) = clock::today_utc();
-    TemplateDate::new(
-        u16::try_from(year).ok()?,
-        u8::try_from(month).ok()?,
-        u8::try_from(day).ok()?,
-    )
+    TemplateDate::from_civil(clock::today_utc())
 }
 
 /// Тело предпросмотра с датой параметром.

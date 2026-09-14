@@ -19,6 +19,9 @@ pub use download::{cancel_download, retry_download, start_download};
 pub use history::{
     clear_history, delete_history_record, history_page, show_in_folder, HistoryState,
 };
+// Подпись папки у `Done` строит оркестрация (TL-89) той же функцией, что у
+// записи на экране истории: одна папка — одно имя в обоих местах.
+pub(crate) use history::folder_display;
 pub use probe::{cancel_probe, probe_url};
 pub use queue::{dismiss_queue_task, queue_state, resume_queue};
 pub use settings::{preview_name_template, settings_get, settings_set, SettingsState};

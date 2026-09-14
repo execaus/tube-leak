@@ -949,15 +949,15 @@ impl QueueEnv for LiveEnv {
 
     fn spawn(self: Arc<Self>, scheduler: Arc<QueueScheduler>, task: Arc<DownloadTask>) {
         tokio::spawn(async move {
-            let destination = self.destination.clone();
-            run_task(
-                &task,
-                self.launcher.as_ref(),
-                &NoFfmpeg,
-                &SilentSink,
-                &destination,
-            )
-            .await;
+            // Настроек и истории нет: умолчания — системная папка, она же
+            // `destination` (механизм очереди от E5 не зависит).
+            let env = crate::download::TaskEnv {
+                settings: None,
+                history: None,
+                system_downloads: Some(self.destination.clone()),
+                today: crate::download::today_utc_date,
+            };
+            run_task(&task, self.launcher.as_ref(), &NoFfmpeg, &SilentSink, &env).await;
             let env: Arc<dyn QueueEnv> = self;
             task_finished(&scheduler, &task.id, &env).await;
         });

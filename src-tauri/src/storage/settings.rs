@@ -144,8 +144,7 @@ use crate::types::{
 };
 
 // Реэкспорт для оркестрации (TL-89): контекст подстановки ей нужен, а модуль
-// шаблона — нет. `TemplateDate` пока строят только тесты.
-#[allow(unused_imports)]
+// шаблона — нет.
 pub use crate::download::name_template::{TemplateContext, TemplateDate};
 
 /// Имя файла настроек в корне каталога данных приложения.
@@ -256,7 +255,6 @@ impl Settings {
     }
 
     /// Предел попыток на задачу, всегда в [`MIN_ATTEMPTS`]…[`MAX_ATTEMPTS_LIMIT`].
-    #[allow(dead_code)] // потребитель — оркестрация (TL-89)
     pub fn max_attempts(&self) -> u32 {
         self.max_attempts
     }
@@ -264,7 +262,6 @@ impl Settings {
     /// Основа имени файла по сохранённому шаблону (Ф-12) — для оркестрации
     /// (TL-89), чтобы ей не импортировать модуль шаблона. Отказов нет:
     /// шаблон проверен при чтении или сохранении.
-    #[allow(dead_code)] // потребитель — оркестрация (TL-89)
     pub fn file_stem(&self, ctx: &TemplateContext<'_>) -> String {
         self.name_template.file_stem(ctx)
     }
@@ -616,7 +613,6 @@ impl SettingsStore {
 
     /// Текущие настройки — дешёвая копия из памяти, диск не трогается. Её
     /// снимает оркестрация при старте каждой задачи (Р-4, Ф-14).
-    #[allow(dead_code)] // потребитель — оркестрация (TL-89)
     pub fn current(&self) -> Settings {
         self.lock().settings.clone()
     }
