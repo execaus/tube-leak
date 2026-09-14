@@ -1,10 +1,11 @@
 # Лицензии сторонних компонентов
 
-tube-leak — GUI-обёртка над двумя внешними бинарниками, которые
+tube-leak — GUI-обёртка над внешними бинарниками, которые
 поставляются вместе с приложением как sidecar-процессы (см.
-`src-tauri/binaries.lock.json` и `CLAUDE.md`): **yt-dlp** и **ffmpeg**.
-Этот файл — обязательная часть дистрибутива, требуемая условиями их
-лицензий.
+`src-tauri/binaries.lock.json` и `CLAUDE.md`): **yt-dlp**, **ffmpeg** и
+**deno** (JavaScript-рантайм, который нужен yt-dlp для извлечения
+YouTube). Этот файл — обязательная часть дистрибутива, требуемая
+условиями их лицензий.
 
 Версии ниже зафиксированы в `src-tauri/binaries.lock.json` (источник
 истины по версиям и SHA256 sidecar-бинарников); при обновлении пина
@@ -827,6 +828,75 @@ OTHER DEALINGS IN THE SOFTWARE.
 
 For more information, please refer to <http://unlicense.org/>
 ```
+
+## deno 2.9.6 — MIT
+
+tube-leak поставляется вместе с **deno версии 2.9.6** (GitHub Releases
+`denoland/deno`, тег `v2.9.6`, официальные ассеты `deno-<тройка>.zip`,
+TL-108). yt-dlp запускает его как JavaScript-рантайм для решения
+JS-челленджей YouTube; самостоятельно приложение deno не использует.
+Бинарник кладётся в бандл без изменений, как ffmpeg: `Contents/MacOS/deno`
+на macOS, рядом с исполняемым файлом приложения на Windows и Linux.
+
+Сам deno распространяется под лицензией MIT — файл `LICENSE.md` по тому
+же тегу: https://github.com/denoland/deno/blob/v2.9.6/LICENSE.md.
+В официальном архиве лицензий и NOTICE нет (в архиве ровно один файл),
+поэтому текст воспроизводится здесь.
+
+### Полный текст лицензии deno
+
+```
+MIT License
+
+Copyright 2018-2026 the Deno authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+### Компоненты, встроенные в исполняемый файл deno
+
+Исполняемый файл deno статически содержит сторонний код. Сводного файла
+сторонних лицензий апстрим не публикует ни в архиве, ни в репозитории,
+поэтому крупные компоненты перечислены здесь со ссылками на исходные
+тексты их лицензий. Все лицензии разрешительные, копилефта среди них нет.
+
+- **V8** — JavaScript-движок Google, BSD-3-Clause:
+  https://chromium.googlesource.com/v8/v8/+/refs/heads/main/LICENSE.
+  В deno он входит через биндинги `deno_v8` 0.3.0 (форк `rusty_v8`,
+  лицензия MIT — лицензия workspace deno;
+  https://github.com/denoland/rusty_v8/blob/main/LICENSE).
+- **Данные ICU** (`deno_core_icudata` 0.77.0) — данные International
+  Components for Unicode, Unicode License v3:
+  https://www.unicode.org/license.txt,
+  https://github.com/unicode-org/icu/blob/main/LICENSE.
+- **Компилятор TypeScript** 6.0.3 (`cli/tsc/00_typescript.js`) —
+  Apache-2.0: https://github.com/microsoft/TypeScript/blob/v6.0.3/LICENSE.txt;
+  собственный перечень сторонних уведомлений TypeScript —
+  https://github.com/microsoft/TypeScript/blob/v6.0.3/ThirdPartyNoticeText.txt.
+- Определения типов `@types/node` и `undici` (`cli/tsc/dts/node/`,
+  `cli/tsc/dts/.../undici/`) и `ext/webgpu` — MIT, файлы `LICENSE` в тех же
+  каталогах репозитория deno по тегу `v2.9.6`.
+- Сотни Rust-крейтов под MIT, Apache-2.0 и BSD. Полный перечень — файл
+  `Cargo.lock` релиза: https://github.com/denoland/deno/blob/v2.9.6/Cargo.lock.
+
+Полноту этой инвентаризации по крейтам никто не проверял построчно;
+перечислены компоненты, названные в составе репозитория и `Cargo.toml`
+deno v2.9.6.
 
 ## SQLite 3.53.2 — общественное достояние (public domain)
 

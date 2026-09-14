@@ -7,7 +7,9 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { parseArgs, run } from './index.mjs'
+import { BINARY_NAMES } from './pin.mjs'
 import { KNOWN_TARGETS, resolveHostTarget } from './targets.mjs'
+import { machoThin } from './test-headers.mjs'
 
 function sha256Of(content) {
   return createHash('sha256').update(content).digest('hex')
@@ -68,32 +70,40 @@ describe('parseArgs', () => {
 })
 
 describe('run — end to end against a temporary pin file (real repo pin is never touched)', () => {
+  const target = 'x86_64-apple-darwin'
   let dir
   let outDir
   let ytDlpContent
-  let ffmpegArchiveBytes
-  let ffmpegMemberContent
+  let archives
+
+  async function zipWith(name, member, content) {
+    const src = join(dir, `${name}-src`)
+    await mkdir(join(src, 'bin'), { recursive: true })
+    await writeFile(join(src, 'bin', member), content)
+    const archivePath = join(dir, `${name}.zip`)
+    execFileSync('zip', ['-r', archivePath, '.'], { cwd: src })
+    return readFile(archivePath)
+  }
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'fetch-binaries-run-test-'))
     outDir = join(dir, 'binaries')
     await mkdir(outDir, { recursive: true })
 
-    ytDlpContent = 'fake yt-dlp payload\n'
-
-    ffmpegMemberContent = 'fake ffmpeg payload\n'
-    const pkgDir = join(dir, 'pkg')
-    await mkdir(join(pkgDir, 'bin'), { recursive: true })
-    await writeFile(join(pkgDir, 'bin', 'ffmpeg'), ffmpegMemberContent)
-    const archivePath = join(dir, 'ffmpeg.zip')
-    execFileSync('zip', ['-r', archivePath, 'pkg'], { cwd: dir })
-    ffmpegArchiveBytes = await readFile(archivePath)
+    ytDlpContent = machoThin('x86_64')
+    archives = {
+      ffmpeg: { member: machoThin('x86_64'), bytes: null },
+      deno: { member: machoThin('x86_64'), bytes: null },
+    }
+    archives.ffmpeg.bytes = await zipWith('ffmpeg', 'ffmpeg', archives.ffmpeg.member)
+    archives.deno.bytes = await zipWith('deno', 'deno', archives.deno.member)
 
     vi.stubGlobal(
       'fetch',
       vi.fn(async (url) => {
         if (url === 'https://example.invalid/yt-dlp') return new Response(ytDlpContent)
-        if (url === 'https://example.invalid/ffmpeg.zip') return new Response(ffmpegArchiveBytes)
+        if (url === 'https://example.invalid/ffmpeg.zip') return new Response(archives.ffmpeg.bytes)
+        if (url === 'https://example.invalid/deno.zip') return new Response(archives.deno.bytes)
         throw new Error(`unexpected test URL: ${url}`)
       }),
     )
@@ -104,30 +114,24 @@ describe('run — end to end against a temporary pin file (real repo pin is neve
     await rm(dir, { recursive: true, force: true })
   })
 
-  function buildPin({ ffmpegSha256 } = {}) {
-    const target = 'x86_64-apple-darwin'
+  function buildPin({ ffmpegSha256, denoSha256 } = {}) {
     // Пин обязан покрывать все известные тройки (см. pin.mjs), поэтому
     // остальные три получают инертные заглушки-плейсхолдеры — run() в
     // этом тесте запрашивается только для `target`, они не скачиваются.
     const otherTargets = KNOWN_TARGETS.filter((t) => t !== target)
-    const placeholderYtDlp = Object.fromEntries(
-      otherTargets.map((t) => [
-        t,
-        { url: `https://example.invalid/yt-dlp-${t}`, sha256: 'a'.repeat(64), binaryName: `yt-dlp-${t}` },
-      ]),
-    )
-    const placeholderFfmpeg = Object.fromEntries(
-      otherTargets.map((t) => [
-        t,
-        { url: `https://example.invalid/ffmpeg-${t}`, sha256: 'a'.repeat(64), binaryName: `ffmpeg-${t}` },
-      ]),
-    )
+    const placeholders = (tool) =>
+      Object.fromEntries(
+        otherTargets.map((t) => [
+          t,
+          { url: `https://example.invalid/${tool}-${t}`, sha256: 'a'.repeat(64), binaryName: `${tool}-${t}` },
+        ]),
+      )
 
     return {
       ytDlp: {
         version: '2026.01.01',
         targets: {
-          ...placeholderYtDlp,
+          ...placeholders('yt-dlp'),
           [target]: {
             url: 'https://example.invalid/yt-dlp',
             sha256: sha256Of(ytDlpContent),
@@ -138,12 +142,24 @@ describe('run — end to end against a temporary pin file (real repo pin is neve
       ffmpeg: {
         version: '9.0.1',
         targets: {
-          ...placeholderFfmpeg,
+          ...placeholders('ffmpeg'),
           [target]: {
             url: 'https://example.invalid/ffmpeg.zip',
-            sha256: ffmpegSha256 ?? sha256Of(ffmpegArchiveBytes),
+            sha256: ffmpegSha256 ?? sha256Of(archives.ffmpeg.bytes),
             binaryName: `ffmpeg-${target}`,
             archive: { type: 'zip', member: 'ffmpeg' },
+          },
+        },
+      },
+      deno: {
+        version: '2.9.6',
+        targets: {
+          ...placeholders('deno'),
+          [target]: {
+            url: 'https://example.invalid/deno.zip',
+            sha256: denoSha256 ?? sha256Of(archives.deno.bytes),
+            binaryName: `deno-${target}`,
+            archive: { type: 'zip', member: 'deno' },
           },
         },
       },
@@ -156,30 +172,48 @@ describe('run — end to end against a temporary pin file (real repo pin is neve
     return path
   }
 
-  it('installs both binaries when every checksum in the pin matches', async () => {
+  it('delivers every sidecar section of the pin — deno included', () => {
+    expect(BINARY_NAMES).toStrictEqual(['ytDlp', 'ffmpeg', 'deno'])
+  })
+
+  it('installs all three binaries when every checksum and architecture in the pin matches', async () => {
     const pinPath = await writeTempPin(buildPin())
 
-    await run({ targets: ['x86_64-apple-darwin'], pinPath, outDir })
+    await run({ targets: [target], pinPath, outDir })
 
-    await expect(readFile(join(outDir, 'yt-dlp-x86_64-apple-darwin'), 'utf8')).resolves.toBe(ytDlpContent)
-    await expect(readFile(join(outDir, 'ffmpeg-x86_64-apple-darwin'), 'utf8')).resolves.toBe(
-      ffmpegMemberContent,
-    )
+    await expect(readFile(join(outDir, `yt-dlp-${target}`))).resolves.toStrictEqual(ytDlpContent)
+    await expect(readFile(join(outDir, `ffmpeg-${target}`))).resolves.toStrictEqual(archives.ffmpeg.member)
+    await expect(readFile(join(outDir, `deno-${target}`))).resolves.toStrictEqual(archives.deno.member)
+    expect((await readdir(outDir)).sort()).toStrictEqual([`deno-${target}`, `ffmpeg-${target}`, `yt-dlp-${target}`])
   })
 
   it('fails the run and leaves no file for the target whose pinned sha256 was tampered with', async () => {
     // Заведомо неверная контрольная сумма — имитирует подмену пина.
     const tamperedSha256 = 'f'.repeat(64)
-    const pinPath = await writeTempPin(buildPin({ ffmpegSha256: tamperedSha256 }))
+    const pinPath = await writeTempPin(buildPin({ denoSha256: tamperedSha256 }))
 
-    await expect(run({ targets: ['x86_64-apple-darwin'], pinPath, outDir })).rejects.toThrow(
-      /1\/2 binaries failed to install/,
-    )
+    await expect(run({ targets: [target], pinPath, outDir })).rejects.toThrow(/1\/3 binaries failed to install/)
 
-    // yt-dlp с верной суммой всё же установлен...
-    await expect(readFile(join(outDir, 'yt-dlp-x86_64-apple-darwin'), 'utf8')).resolves.toBe(ytDlpContent)
-    // ...а ffmpeg с подменённой суммой — нет, и никакого частичного файла не осталось.
-    const entries = await readdir(outDir)
-    expect(entries).toStrictEqual(['yt-dlp-x86_64-apple-darwin'])
+    // yt-dlp и ffmpeg с верными суммами всё же установлены...
+    // ...а deno с подменённой суммой — нет, и никакого частичного файла не осталось.
+    expect((await readdir(outDir)).sort()).toStrictEqual([`ffmpeg-${target}`, `yt-dlp-${target}`])
+  })
+
+  it('fails the run when deno of a foreign architecture is pinned under this target', async () => {
+    // Перепутанный macOS-ассет deno: сумма верная, архитектура — нет.
+    archives.deno.member = machoThin('aarch64')
+    archives.deno.bytes = await zipWith('deno-arm', 'deno', archives.deno.member)
+    const pinPath = await writeTempPin(buildPin())
+    const errors = []
+    const spy = vi.spyOn(console, 'error').mockImplementation((line) => errors.push(line))
+
+    try {
+      await expect(run({ targets: [target], pinPath, outDir })).rejects.toThrow(/1\/3 binaries failed to install/)
+    } finally {
+      spy.mockRestore()
+    }
+
+    expect(errors.join('\n')).toMatch(/deno \(x86_64-apple-darwin\): architecture mismatch .*expects mach-o x86_64, got mach-o aarch64/)
+    expect((await readdir(outDir)).sort()).toStrictEqual([`ffmpeg-${target}`, `yt-dlp-${target}`])
   })
 })
