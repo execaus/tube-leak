@@ -328,8 +328,11 @@ pub enum FetchError {
     #[error("обновление не скачалось: {reason}")]
     Network { reason: String },
 
-    /// Соединение состоялось, а отдали не то: источник кончился раньше
-    /// объявленного размера. Это не «нет сети» — сеть как раз была.
+    /// Соединение состоялось, а отдали не то: источник ответил HTTP-кодом
+    /// ошибки вместо архива ([`HttpStatus`], TL-65 — переименованный или
+    /// удалённый ассет) либо ассет из метаданных объявил нулевой размер.
+    /// Это не «нет сети» — сеть как раз была. Поток, кончившийся раньше
+    /// объявленного, сюда не относится: у сети это обрыв (К-5).
     #[error("источник отдал не то, что обещал: {reason}")]
     Source { reason: String },
 
@@ -843,10 +846,52 @@ fn discard(archive_path: &Path) {
     }
 }
 
-/// Оборвавшееся чтение: класс зависит от того, откуда поток.
+/// Источник ответил HTTP-кодом ошибки вместо архива (TL-65).
+///
+/// Едет внутри [`io::Error`]: приём архива говорит с источником через
+/// [`Read`], и других способов передать «ответ пришёл, но не тот» у
+/// транспорта нет. По `io::ErrorKind` его не отличить: `ureq` отдаёт в
+/// `Other` и статус, и многое из того, что статусом не является. Поэтому
+/// признак — **тип**, который ставит только транспорт
+/// (`super::transport`), а не текст сообщения: [`read_failure`] ищет
+/// именно его и ничего кроме, и всё, что не опознано как ответ, остаётся
+/// «нет сети».
+#[derive(Debug, thiserror::Error)]
+#[error("источник ответил {status}, а не архивом")]
+pub struct HttpStatus {
+    pub status: u16,
+}
+
+impl HttpStatus {
+    /// Отказ в форме, в которой его понимает [`read_failure`].
+    pub fn into_io(self) -> io::Error {
+        io::Error::other(self)
+    }
+
+    /// Несёт ли отказ HTTP-ответ источника.
+    fn carried_by(err: &io::Error) -> bool {
+        err.get_ref().is_some_and(|inner| inner.is::<Self>())
+    }
+}
+
+/// Оборвавшееся или не открывшееся чтение: класс зависит от того, откуда
+/// поток и что именно не удалось.
+///
+/// Из сети — два класса, как у проверки метаданных (`super::release`,
+/// TL-55), и расходиться с ней здесь нечему:
+///
+/// - источник ответил кодом ошибки ([`HttpStatus`]) — сеть работает, а
+///   апстрим отдал не то, что обещал в метаданных (переименованный или
+///   удалённый ассет): «источник недоступен»;
+/// - всё остальное — соединение не установилось, DNS, TLS, таймаут, обрыв
+///   тела: «нет сети».
+///
+/// До TL-65 404 на ассете уходил во второй класс, и строка статуса
+/// отправляла пользователя проверять исправное соединение.
 fn read_failure(source: &dyn ArchiveSource, err: &io::Error) -> FetchError {
     let reason = format!("{}: {err}", source.describe());
     match source.origin() {
+        Origin::Network if HttpStatus::carried_by(err) => FetchError::Source { reason },
         Origin::Network => FetchError::Network { reason },
         Origin::Bundled => FetchError::Archive { reason },
     }
@@ -1601,6 +1646,62 @@ mod tests {
                 expect_network,
                 "{origin:?}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn an_http_error_from_the_network_is_the_source_and_everything_else_is_the_network() {
+        // TL-65: 404 на релизном ассете уходил в «нет сети», и строка
+        // статуса отправляла проверять исправное соединение.
+        let fixture = Fixture::new();
+        let identity = ArchiveIdentity {
+            version: CANDIDATE_VERSION,
+            sha256: WRONG_SHA256,
+        };
+
+        /// Откуда поток, чем он отказал и какой класс контракта ждём.
+        type Case = (Origin, fn() -> io::Error, &'static str);
+
+        let cases: [Case; 5] = [
+            (
+                Origin::Network,
+                || HttpStatus { status: 404 }.into_io(),
+                "sourceUnavailable",
+            ),
+            (
+                Origin::Network,
+                || HttpStatus { status: 503 }.into_io(),
+                "sourceUnavailable",
+            ),
+            (
+                Origin::Network,
+                || io::Error::new(io::ErrorKind::ConnectionRefused, "отказ соединения"),
+                "networkUnavailable",
+            ),
+            // Тот же текст, но без типа — не ответ источника: признак
+            // ищется по типу, а не по словам в сообщении.
+            (
+                Origin::Network,
+                || io::Error::other("источник ответил 404, а не архивом"),
+                "networkUnavailable",
+            ),
+            // У бандла сети нет вовсе, что бы ни лежало внутри отказа.
+            (
+                Origin::Bundled,
+                || HttpStatus { status: 404 }.into_io(),
+                "archiveCorrupted",
+            ),
+        ];
+
+        for (origin, failure, expected) in cases {
+            let source = StreamArchive::new(origin, "ассет", 1024, move || Err(failure()));
+            let error = fetch_and_install(&source, identity, fixture.layout(), &mut |_, _, _| {})
+                .expect_err("источник не открылся");
+            let json =
+                serde_json::to_value(error.to_failure(CANDIDATE_VERSION)).expect("сериализуется");
+
+            assert_eq!(json["kind"], expected, "{origin:?}: {error}");
+            fixture.assert_no_debris(&build_id_of(identity));
         }
     }
 
