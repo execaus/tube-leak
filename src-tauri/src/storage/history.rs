@@ -46,16 +46,25 @@
 //!
 //! # Доктрина отказов открытия (Ф-1 а–д, прецедент TL-71)
 //!
-//! | Что на диске | Что делает [`HistoryStore::open`] |
-//! |---|---|
-//! | файла нет или он пуст | создаёт базу, применяет все миграции |
-//! | версия ниже текущей | доводит миграциями; отказ шага — откат шага, [`HistoryOpenError::MigrationFailed`] |
-//! | рядом лежит `history.sqlite-wal` или заголовок объявляет WAL — при любом содержимом файла | **не открывает и не пишет**, [`HistoryOpenError::NewerVersion`] с `wal: true` |
-//! | версия выше текущей или отрицательная | **не открывает и не пишет**, [`HistoryOpenError::NewerVersion`] |
-//! | не SQLite (заголовок) или порча (`PRAGMA integrity_check`, `SQLITE_NOTADB`, `SQLITE_CORRUPT`) | откладывает файл под `history.sqlite.broken-<unix-секунды>`, заводит новую базу, пометка [`HistoryNotice::BaseRecreated`] |
-//! | нет прав на каталог или файл, файл открывается только на чтение | [`HistoryOpenError::NoAccess`] |
+//! Строки — в том порядке, в каком их проверяет код. Срабатывает первая
+//! подошедшая.
 //!
-//! Строки проверяются сверху вниз: первые две — до любого вызова SQLite.
+//! | # | Что на диске | Где замечено | Что делает [`HistoryStore::open`] |
+//! |---|---|---|---|
+//! | 1 | рядом лежит `history.sqlite-wal` (в том числе символьной ссылкой) или байт 18 либо 19 заголовка равен 2 — при любом содержимом файла, в том числе когда файла нет | до SQLite | **не открывает и не пишет**, [`HistoryOpenError::NewerVersion`], причина [`NewerCause::Wal`] |
+//! | 2 | байт 18 или 19 заголовка больше 2 — формат файла новее | до SQLite | **не открывает и не пишет**, `NewerVersion`, причина [`NewerCause::FileFormat`] |
+//! | 3 | версия схемы выше текущей или отрицательная | до SQLite по заголовку; в SQLite ещё раз, страховкой | **не открывает и не пишет**, `NewerVersion`, причина [`NewerCause::SchemaVersion`] |
+//! | 4 | не SQLite: непустой файл короче заголовка или с чужой магической строкой | до SQLite | откладывает файл байт в байт со спутниками, заводит новую базу, пометка [`HistoryNotice::BaseRecreated`] |
+//! | 5 | файла нет или он пуст | — | переходит к SQLite: база создаётся, строки 6–8 проверяются и для неё |
+//! | 6 | нет прав на каталог или файл, файл открывается только на чтение | в SQLite; каталог, который не создаётся, и заголовок или `-wal`, которые не читаются, — раньше строки 1 | [`HistoryOpenError::NoAccess`] |
+//! | 7 | порча в настоящей базе: `SQLITE_NOTADB`, `SQLITE_CORRUPT`, отказ `PRAGMA integrity_check` (страницы или индекс против таблицы) | в SQLite | откладывает базу после штатного восстановления журнала под `history.sqlite.broken-<unix-секунды>`, заводит новую, пометка `BaseRecreated` |
+//! | 8 | версия ниже текущей | в SQLite | доводит миграциями; отказ шага — откат шага, [`HistoryOpenError::MigrationFailed`] |
+//!
+//! Строки 1–4 решаются только файловой системой и байтами заголовка, до
+//! любого вызова SQLite. Поэтому строка WAL главнее «файла нет»: чужой `-wal`
+//! рядом с отсутствующим файлом SQLite удалил бы. Отказ по строкам 1–3
+//! оставляет каталог данных байт в байт тем же.
+//!
 //! Всё это — у первого вызова за процесс. Второй и последующие диск не
 //! трогают вовсе и отвечают [`HistoryOpenError::AlreadyOpen`] (doc
 //! [`HistoryStore::open`]).
@@ -88,6 +97,8 @@
 //! `history_newest_first` с таблицей тоже считается порчей. Цена каждого
 //! старта растёт с историей (Р-7), но по замеру ревью разница с
 //! `quick_check` — около 15 мс на 100 000 записей в релизной сборке.
+//! Сторож выбора — тест с индексом, разошедшимся с таблицей при целых
+//! страницах: `quick_check` отвечает на такую базу `ok` (TL-99).
 //!
 //! **WAL не открывается вовсе.** Эта версия WAL не создаёт, значит его
 //! создала будущая версия приложения или чужой инструмент. Опасен он
@@ -108,6 +119,21 @@
 //! ссылкой) и байт 18 или 19 заголовка (версия формата записи и чтения)
 //! равен 2. Любой из них — [`HistoryOpenError::NewerVersion`], файлы не
 //! тронуты.
+//!
+//! **Формат файла новее — тоже не открывается** (TL-99). Байты 18 и 19 —
+//! версии формата записи и чтения: 1 — классический журнал, 2 — WAL, больше
+//! — формат, которого эта сборка SQLite не знает. С байтом 18 больше 2
+//! SQLite открыл бы базу только на чтение: `open` прошёл бы, а отказ
+//! случился бы на первой записи, `noAccess` и пометкой вместо «база новее».
+//! Базу с байтом 19 больше 2 SQLite не читает вовсе (`SQLITE_NOTADB`), и
+//! новый формат ушёл бы в `.broken` как порча. Оба случая —
+//! [`HistoryOpenError::NewerVersion`] до SQLite, файлы не тронуты.
+//!
+//! **Экран при WAL говорит «база новее»** — решение ведущего для v0.1
+//! (TL-99): отдельной причины в контракте нет. Эта сборка WAL не создаёт, и
+//! такое бывает только от чужого инструмента или восстановления из
+//! резервной копии. Точная причина — в тексте отказа для лога
+//! ([`NewerCause`]): рядом журнал `-wal`, заголовок в режиме WAL или оба.
 //!
 //! Остаточный риск — `-wal`, появившийся между проверкой и открытием. Его
 //! может создать только другой процесс, а единственность открытия
@@ -195,10 +221,14 @@ const WAL_SUFFIX: &str = "-wal";
 /// Спутники файла базы, которые SQLite ищет по имени базы с суффиксом.
 const SIDE_FILE_SUFFIXES: [&str; 3] = ["-journal", WAL_SUFFIX, "-shm"];
 
-/// Смещения версий формата записи и чтения в заголовке (по байту).
-const FILE_FORMAT_OFFSETS: [usize; 2] = [18, 19];
+/// Смещение версии формата записи в заголовке (один байт).
+const WRITE_FORMAT_OFFSET: usize = 18;
+
+/// Смещение версии формата чтения в заголовке (один байт).
+const READ_FORMAT_OFFSET: usize = 19;
 
 /// Значение версии формата у базы в режиме WAL (`1` — классический журнал).
+/// Больше — формат, которого эта сборка не знает.
 const WAL_FILE_FORMAT: u8 = 2;
 
 /// Магическая строка заголовка файла SQLite 3.
@@ -404,24 +434,18 @@ pub enum HistoryOpenError {
     /// База, которую эта сборка не может тронуть, не рискуя чужими данными.
     /// Файл не открыт в SQLite, ни он, ни спутники не изменены.
     ///
-    /// Сюда входят:
-    /// - версия схемы выше известной этой сборке;
-    /// - отрицательная `user_version` — консервативно, текст отказа для
-    ///   неё неточен (см. [`refuse_foreign_version`]);
-    /// - база в режиме журнала, которого эта версия не создаёт: рядом лежит
-    ///   `history.sqlite-wal` или заголовок объявляет WAL (`wal == true`).
-    ///   Тогда `found` — версия из заголовка, если он есть, иначе `0`, и
-    ///   причина отказа — журнал, а не версия.
+    /// Что именно не так — [`NewerCause`]. `found` — версия схемы из
+    /// заголовка, если он есть, иначе `0`; при причине, отличной от
+    /// [`NewerCause::SchemaVersion`], она сама по себе может быть нашей.
     ///
-    /// Причина в контракте одна — `newerVersion`: WAL создаёт только
-    /// будущая версия приложения.
-    #[error("история {path}: {} — файл не тронут", newer_detail(*.found, *.supported, *.wal))]
+    /// Причина в контракте одна — `newerVersion` (решение ведущего для
+    /// v0.1, TL-99). Точную причину несёт только текст отказа для лога.
+    #[error("история {path}: {} — файл не тронут", newer_detail(*.cause, *.found, *.supported))]
     NewerVersion {
         path: PathBuf,
         found: i64,
         supported: u32,
-        /// Отказ по признаку WAL, а не по версии схемы.
-        wal: bool,
+        cause: NewerCause,
     },
     /// Нет прав на каталог данных или файл базы, либо файл не читается.
     #[error("история {path}: нет доступа — {reason}")]
@@ -446,17 +470,71 @@ pub enum HistoryOpenError {
     AlreadyOpen,
 }
 
-fn newer_detail(found: i64, supported: u32, wal: bool) -> String {
-    if wal {
-        "база в режиме журнала WAL, которого эта сборка не создаёт".to_owned()
-    } else {
-        format!("база чужой версии схемы {found}, эта сборка знает версии до {supported}")
+/// Почему база не наша ([`HistoryOpenError::NewerVersion`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewerCause {
+    /// `user_version` выше известной этой сборке или отрицательная. Для
+    /// отрицательной текст отказа неточен (см. [`refuse_foreign_version`]).
+    SchemaVersion,
+    /// Байт 18 или 19 заголовка больше 2: формат файла SQLite новее того,
+    /// что знает эта сборка. Поля — значения байтов как есть.
+    FileFormat { write: u8, read: u8 },
+    /// Режим журнала WAL, которого эта сборка не создаёт.
+    Wal(WalSign),
+}
+
+/// Что выдало режим WAL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalSign {
+    /// Рядом лежит `history.sqlite-wal`, а заголовок WAL не объявляет или
+    /// файла базы нет.
+    File,
+    /// Заголовок объявляет WAL (байт 18 или 19 равен 2), `-wal` рядом нет.
+    Header,
+    /// И журнал рядом, и заголовок.
+    FileAndHeader,
+}
+
+impl WalSign {
+    fn from_signs(file: bool, header: bool) -> Option<Self> {
+        match (file, header) {
+            (true, true) => Some(Self::FileAndHeader),
+            (true, false) => Some(Self::File),
+            (false, true) => Some(Self::Header),
+            (false, false) => None,
+        }
+    }
+}
+
+fn newer_detail(cause: NewerCause, found: i64, supported: u32) -> String {
+    match cause {
+        NewerCause::SchemaVersion => {
+            format!("база чужой версии схемы {found}, эта сборка знает версии до {supported}")
+        }
+        NewerCause::FileFormat { write, read } => format!(
+            "формат файла SQLite новее известного этой сборке: версии формата записи и чтения \
+             в заголовке {write} и {read}, известны до {WAL_FILE_FORMAT}"
+        ),
+        NewerCause::Wal(sign) => {
+            let seen = match sign {
+                WalSign::File => {
+                    format!("рядом лежит журнал WAL {HISTORY_FILE_NAME}{WAL_SUFFIX}")
+                }
+                WalSign::Header => "заголовок файла объявляет режим журнала WAL".to_owned(),
+                WalSign::FileAndHeader => format!(
+                    "рядом лежит журнал WAL {HISTORY_FILE_NAME}{WAL_SUFFIX}, и заголовок \
+                     файла объявляет режим WAL"
+                ),
+            };
+            format!("{seen}, а эта сборка WAL не создаёт; версия схемы здесь ни при чём")
+        }
     }
 }
 
 impl HistoryOpenError {
-    /// Причина в форме контракта. Для [`Self::NewerVersion`] это и чужая
-    /// версия схемы, и база в режиме журнала, которого эта версия не создаёт.
+    /// Причина в форме контракта. Для [`Self::NewerVersion`] это при любой
+    /// [`NewerCause`] одна причина `newerVersion`: чужая версия схемы, новый
+    /// формат файла и режим WAL (TL-99, решение ведущего для v0.1).
     pub fn reason(&self) -> HistoryUnavailableReason {
         match self {
             Self::NewerVersion { .. } => HistoryUnavailableReason::NewerVersion,
@@ -630,22 +708,41 @@ impl HistoryStore {
         let wal_beside = exists_no_follow(&with_suffix(&path, WAL_SUFFIX))
             .map_err(|err| no_access(format!("спутник {WAL_SUFFIX} не проверяется: {err}")))?;
         let (header_version, wal_header) = match header {
-            Header::Sqlite { user_version, wal } => (user_version, wal),
+            Header::Sqlite {
+                user_version,
+                format,
+            } => (user_version, format.declares_wal()),
             Header::Absent | Header::Foreign => (0, false),
         };
-        if wal_beside || wal_header {
+        // Строка 1 таблицы отказов.
+        if let Some(sign) = WalSign::from_signs(wal_beside, wal_header) {
             return Err(HistoryOpenError::NewerVersion {
                 path,
                 found: header_version,
                 supported,
-                wal: true,
+                cause: NewerCause::Wal(sign),
             });
         }
 
         let mut recreated = false;
         match header {
             Header::Absent => {}
-            Header::Sqlite { user_version, .. } => {
+            Header::Sqlite {
+                user_version,
+                format,
+            } => {
+                // Строка 2, затем строка 3.
+                if format.is_newer() {
+                    return Err(HistoryOpenError::NewerVersion {
+                        path,
+                        found: user_version,
+                        supported,
+                        cause: NewerCause::FileFormat {
+                            write: format.write,
+                            read: format.read,
+                        },
+                    });
+                }
                 refuse_foreign_version(&path, user_version, supported)?;
             }
             Header::Foreign => {
@@ -1053,11 +1150,36 @@ fn schema_version_of(migrations: &[&str]) -> u32 {
 enum Header {
     /// Файла нет или он пуст — SQLite заведёт базу с нуля.
     Absent,
-    /// Заголовок SQLite 3 с этой `user_version`; `wal` — байт 18 или 19
-    /// (версия формата записи или чтения) равен 2.
-    Sqlite { user_version: i64, wal: bool },
+    /// Заголовок SQLite 3 с этой `user_version` и версиями формата.
+    Sqlite {
+        user_version: i64,
+        format: FileFormat,
+    },
     /// Не SQLite: чужая магическая строка или файл короче заголовка.
     Foreign,
+}
+
+/// Версии формата записи и чтения — байты 18 и 19 заголовка как есть.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileFormat {
+    write: u8,
+    read: u8,
+}
+
+impl FileFormat {
+    /// Классический журнал: `1` в обоих байтах.
+    #[cfg(test)]
+    const JOURNAL: Self = Self { write: 1, read: 1 };
+
+    /// Режим WAL: хотя бы один байт равен 2.
+    fn declares_wal(self) -> bool {
+        self.write == WAL_FILE_FORMAT || self.read == WAL_FILE_FORMAT
+    }
+
+    /// Формат, которого эта сборка не знает: хотя бы один байт больше 2.
+    fn is_newer(self) -> bool {
+        self.write > WAL_FILE_FORMAT || self.read > WAL_FILE_FORMAT
+    }
 }
 
 fn inspect_header(path: &Path) -> io::Result<Header> {
@@ -1080,12 +1202,13 @@ fn inspect_header(path: &Path) -> io::Result<Header> {
     else {
         return Ok(Header::Foreign);
     };
-    let wal = FILE_FORMAT_OFFSETS
-        .iter()
-        .any(|&offset| head.get(offset) == Some(&WAL_FILE_FORMAT));
+    let (Some(&write), Some(&read)) = (head.get(WRITE_FORMAT_OFFSET), head.get(READ_FORMAT_OFFSET))
+    else {
+        return Ok(Header::Foreign);
+    };
     Ok(Header::Sqlite {
         user_version: i64::from(i32::from_be_bytes(bytes)),
-        wal,
+        format: FileFormat { write, read },
     })
 }
 
@@ -1107,7 +1230,7 @@ fn refuse_foreign_version(path: &Path, found: i64, supported: u32) -> Result<(),
             path: path.to_path_buf(),
             found,
             supported,
-            wal: false,
+            cause: NewerCause::SchemaVersion,
         }),
     }
 }
