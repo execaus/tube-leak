@@ -15,13 +15,21 @@
 export type LaunchFailedReason = "permissionDenied" | "corrupted" | "other";
 
 /**
- * Агрегат результатов проверки обоих sidecar-бинарников, возвращаемый
- * командой `check_sidecar` (Ф-9 эпика E1).
+ * Агрегат результатов проверки sidecar-бинарников, возвращаемый командой
+ * `check_sidecar` (Ф-9 эпика E1): yt-dlp, ffmpeg и deno — JavaScript-рантайм,
+ * который yt-dlp запускает для YouTube-извлечения (TL-110, #114).
+ *
+ * `deno.version` — нормализованная версия из первой строки `deno --version`
+ * (`deno 2.9.6 (stable, …)` даёт `2.9.6`). Одно отличие deno от двух других
+ * строк: если бинарник ответил, но версии в выводе не нашлось, приходит не
+ * `ok` с выводом вместо версии, а `launchFailed` с причиной `other`, и
+ * нераспознанный вывод лежит в `stderrTail`. У yt-dlp и ffmpeg в этом
+ * случае по-прежнему `ok`.
  */
-export type SidecarCheckReport = { ytDlp: SidecarCheckResult, ffmpeg: SidecarCheckResult, };
+export type SidecarCheckReport = { ytDlp: SidecarCheckResult, ffmpeg: SidecarCheckResult, deno: SidecarCheckResult, };
 
 /**
- * Результат проверки одного sidecar-бинарника (yt-dlp или ffmpeg).
+ * Результат проверки одного sidecar-бинарника (yt-dlp, ffmpeg или deno).
  *
  * Поля, специфичные для конкретного `status`, сериализуются только когда
  * заполнены (`version` — при `ok`, `reason` — при `launchFailed`,
