@@ -76,6 +76,7 @@ use crate::types::{
 use super::fetch::{self, ArchiveSource, FetchStage, PreparedCandidate};
 use super::layout::{self, ArchiveIdentity, BuildId, Layout, RepairLog};
 use super::release::{self, MetadataSource, ReleaseVersion};
+use super::session::Session;
 use super::smoke;
 use super::state::{self, InUse, InstallEntry, InstallState};
 use super::update::{UpdateAsset, UpdateCheck};
@@ -216,6 +217,10 @@ pub struct Pipeline<'a> {
     archives: &'a dyn ArchiveSupply,
     registry: &'a ChildRegistry,
     in_use: &'a InUse,
+    /// Память подготовки на время сеанса (TL-23): контур сбрасывает её,
+    /// когда меняет корень установок, иначе служебный экран показал бы
+    /// версию, которой приложение уже не работает.
+    session: &'a Session,
     sink: &'a dyn UpdateSink,
     boundary: &'a dyn TaskBoundary,
 }
@@ -831,6 +836,13 @@ impl UpdateController {
             }
         };
 
+        // В корне установок появилось новое дерево (TL-23). Экрану оно ещё
+        // не видно — активная запись прежняя, — но сеанс помнит только то,
+        // что верно для корня целиком, и разбирать, какая установка на что
+        // влияет, здесь не берутся: лишний сброс стоит одного запуска
+        // `--version` на следующей проверке.
+        env.session.invalidate();
+
         // Прогрев не соревнуется с активной загрузкой (Н-3): первый
         // запуск распакованного дерева стоит 24–36 с дисковой работы, и
         // smoke-проверка — это он и есть.
@@ -966,6 +978,12 @@ impl UpdateController {
                 message: format!("активная установка не записана: {error}"),
             }
         })?;
+
+        // Активная установка сменилась — обновлением или откатом (TL-23):
+        // версия, которую помнит сеанс, больше не та, которой работает
+        // приложение. Сразу после записи, до уборки: уборка может снести
+        // дерево, путь к которому сеанс ещё помнит.
+        env.session.invalidate();
 
         // Уборка — только после подтверждённого переключения: запись уже
         // называет обе установки, которые обязаны остаться, и всё
@@ -1327,17 +1345,23 @@ pub struct UpdateJob<'a> {
     bundled: Option<PathBuf>,
     registry: &'a ChildRegistry,
     in_use: &'a InUse,
+    session: &'a Session,
     sink: &'a dyn UpdateSink,
     boundary: &'a dyn TaskBoundary,
 }
 
 impl<'a> UpdateJob<'a> {
+    // Каждый аргумент — отдельное состояние приложения со своим смыслом
+    // (см. doc `Pipeline`); сворачивать их в структуру-контекст значило бы
+    // завести у границы вторую сборку того же `Pipeline`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         data_dir: &std::path::Path,
         bundled: Option<PathBuf>,
         transport: &'a super::transport::GithubTransport,
         registry: &'a ChildRegistry,
         in_use: &'a InUse,
+        session: &'a Session,
         sink: &'a dyn UpdateSink,
         boundary: &'a dyn TaskBoundary,
     ) -> Self {
@@ -1347,6 +1371,7 @@ impl<'a> UpdateJob<'a> {
             bundled,
             registry,
             in_use,
+            session,
             sink,
             boundary,
         }
@@ -1390,6 +1415,7 @@ impl<'a> UpdateJob<'a> {
             archives,
             registry: self.registry,
             in_use: self.in_use,
+            session: self.session,
             sink: self.sink,
             boundary: self.boundary,
         }
@@ -1644,6 +1670,7 @@ mod tests {
         layout: Layout,
         registry: ChildRegistry,
         in_use: InUse,
+        session: Session,
         controller: UpdateController,
     }
 
@@ -1657,6 +1684,7 @@ mod tests {
             layout,
             registry: ChildRegistry::new(),
             in_use: InUse::new(),
+            session: Session::new(),
             controller: UpdateController::new(),
         }
     }
@@ -1752,9 +1780,34 @@ mod tests {
                 archives,
                 registry: &self.registry,
                 in_use: &self.in_use,
+                session: &self.session,
                 sink,
                 boundary,
             }
+        }
+
+        /// Заполняет память сеанса так, как её оставил бы тёплый старт на
+        /// активной установке `version` (TL-23).
+        fn remember_warm_start(&self, version: &str) {
+            let executable = self.layout.root().join("remembered").join(EXECUTABLE);
+            self.session.remember_for_test(
+                crate::types::YtDlpPrepared {
+                    version: version.to_string(),
+                    path: executable.display().to_string(),
+                    prepared: false,
+                    duration_ms: 1,
+                },
+                super::super::prepare::WarmLaunch {
+                    executable,
+                    output: crate::sidecar::RunOutput {
+                        stdout: format!("{version}\n"),
+                        stderr: String::new(),
+                    },
+                    checked_at: crate::clock::now_iso8601(),
+                    duration_ms: 1,
+                },
+            );
+            assert!(self.session.remembers_anything());
         }
     }
 
@@ -2619,6 +2672,109 @@ mod tests {
             "кнопка обязана вести обратно: откат — переключатель, а не действие в \
              одну сторону"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rollback_makes_the_session_forget_the_version_it_remembered() {
+        // TL-23: служебный экран берёт версию из запуска пробы подготовки.
+        // После отката приложение работает другой установкой, и помнить
+        // прежнюю версию сеанс не вправе. Откат не принимает архива, то есть
+        // сброс здесь — только от переключения.
+        let fixture = fixture();
+        let older = fixture.install(OLDER, &"a1".repeat(32));
+        let newer = fixture.install(CANDIDATE, &"b2".repeat(32));
+        fixture.record(&[older, newer]);
+        fixture.remember_warm_start(CANDIDATE);
+
+        let sink = RecordingSink::default();
+        let boundary = Boundary::idle(&fixture.layout);
+        let supply = Supply::of(b"");
+
+        fixture.controller.refresh_rollback_target(&fixture.layout);
+        fixture
+            .controller
+            .begin_rollback()
+            .expect("возвращаться есть куда");
+        fixture
+            .controller
+            .run_rollback(&fixture.pipeline(&Offline, &supply, &sink, &boundary))
+            .await;
+
+        assert_eq!(stage_name(&sink.last()), "rolledBack");
+        assert!(
+            !fixture.session.remembers_anything(),
+            "после отката сеанс обязан забыть версию прежней установки"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_update_makes_the_session_forget_the_version_it_remembered() {
+        let fixture = fixture();
+        let active = fixture.install(ACTIVE, &"a1".repeat(32));
+        fixture.record(&[active]);
+        fixture.remember_warm_start(ACTIVE);
+
+        let body = onedir_zip(CANDIDATE);
+        let upstream = Upstream::offering(CANDIDATE, &body);
+        let supply = Supply::of(&body);
+        let sink = RecordingSink::default();
+        let boundary = Boundary::idle(&fixture.layout);
+
+        fixture.controller.begin_manual_check().expect("свободен");
+        fixture
+            .controller
+            .run_check(
+                &fixture.pipeline(&upstream, &supply, &sink, &boundary),
+                CheckTrigger::Manual,
+                Instant::now(),
+            )
+            .await;
+
+        assert_eq!(stage_name(&sink.last()), "updated");
+        assert!(!fixture.session.remembers_anything());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_installed_candidate_makes_the_session_forget_even_if_it_is_not_switched_to() {
+        // Кандидат распакован, но не прошёл smoke: активная запись прежняя,
+        // а корень установок изменился — сеанс помнит только то, что верно
+        // для корня целиком (см. комментарий в `install`). Переключения
+        // здесь нет, поэтому сброс — только от установки.
+        let fixture = fixture();
+        let active = fixture.install(ACTIVE, &"a1".repeat(32));
+        fixture.record(&[active]);
+        fixture.remember_warm_start(ACTIVE);
+
+        // Архив отвечает не той версией, которую обещают метаданные.
+        let body = onedir_zip(OLDER);
+        let upstream = Upstream::offering(CANDIDATE, &body);
+        let supply = Supply::of(&body);
+        let sink = RecordingSink::default();
+        let boundary = Boundary::idle(&fixture.layout);
+
+        fixture.controller.begin_manual_check().expect("свободен");
+        fixture
+            .controller
+            .run_check(
+                &fixture.pipeline(&upstream, &supply, &sink, &boundary),
+                CheckTrigger::Manual,
+                Instant::now(),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                sink.last(),
+                YtDlpUpdateStatus::Failed {
+                    failure: YtDlpUpdateFailure::SmokeCheckFailed { .. },
+                    ..
+                }
+            ),
+            "предусловие: кандидат не прошёл smoke, а не {:?}",
+            sink.last()
+        );
+        assert_eq!(fixture.active_version().as_deref(), Some(ACTIVE));
+        assert!(!fixture.session.remembers_anything());
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1057,6 +1057,7 @@ mod tests {
         fixture.touch(&format!("{}.json", gone.build_id()));
         fixture.touch(&format!("{}.repair.json", gone.build_id()));
         fixture.touch(&format!("{}.update.json", gone.build_id()));
+        fixture.touch(&format!("{}.slow-warmup.json", gone.build_id()));
         fixture.touch(&format!("{}.json.tmp", active.build_id()));
         fixture.touch("installs.json.tmp");
         fixture.mkdir("who-put-this-here");
@@ -1090,6 +1091,7 @@ mod tests {
         fixture.install(&active);
         fixture.touch(&format!("{}.repair.json", active.build_id()));
         fixture.touch(&format!("{}.update.json", active.build_id()));
+        fixture.touch(&format!("{}.slow-warmup.json", active.build_id()));
 
         let mut state = InstallState::default();
         state
@@ -1101,6 +1103,10 @@ mod tests {
         let names = fixture.root_names();
         assert!(names.contains(&format!("{}.repair.json", active.build_id())));
         assert!(names.contains(&format!("{}.update.json", active.build_id())));
+        assert!(
+            names.contains(&format!("{}.slow-warmup.json", active.build_id())),
+            "отметка медленного прогрева (TL-21) живёт вместе со своей установкой"
+        );
     }
 
     #[test]

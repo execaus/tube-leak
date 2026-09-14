@@ -10,6 +10,7 @@
 //!     _internal/…
 //!   2026.08.19-07e54b086530.json        манифест этой установки
 //!   2026.08.19-07e54b086530.repair.json счётчик безуспешных переустановок
+//!   2026.08.19-07e54b086530.slow-warmup.json прогрев не уложился в таймаут
 //!   .staging-2026.08.19-07e54b086530-1f3c…/ временный каталог распаковки
 //! ```
 //!
@@ -147,6 +148,18 @@ const UPDATE_ATTEMPT_SUFFIX: &str = ".update.json";
 /// то, что сохраняется **вместе с установкой**), а сохраняется уборкой
 /// безусловно — см. [`Layout::is_smoke_journal`] и `super::state::cleanup`.
 const SMOKE_SUFFIX: &str = ".smoke.json";
+
+/// Суффикс отметки «прогрев этой установки не уложился в таймаут» (TL-21,
+/// [`SlowWarmupMark`]).
+///
+/// Четвёртый файл рядом с установкой и снова отдельный, потому что смысл
+/// у него противоположный [`REPAIR_SUFFIX`]: тот помнит «дерево не
+/// запускается, не чинить без конца», этот — «дерево запускается, но
+/// медленно, не заставлять экран ждать». Слей их — и медленная машина
+/// копила бы попытки починки, пока не получила бы отказ, ровно то, чего
+/// TL-21 запрещает. В [`Layout::belongs_to`] он перечислен: живёт и
+/// уходит вместе со своей установкой, как манифест.
+const SLOW_WARMUP_SUFFIX: &str = ".slow-warmup.json";
 
 /// Сколько имён каталога распаковки пробовать, прежде чем сдаться.
 const STAGING_NAME_ATTEMPTS: u8 = 4;
@@ -439,6 +452,14 @@ impl Layout {
         self.root.join(format!("{build_id}{REPAIR_SUFFIX}"))
     }
 
+    /// Файл отметки «прогрев этой установки не уложился в таймаут» (TL-21).
+    ///
+    /// Рядом с манифестом по той же причине, что [`Self::repair_path`]:
+    /// переживает перезапуск приложения, а адресован конкретному build id.
+    pub fn slow_warmup_path(&self, build_id: &BuildId) -> PathBuf {
+        self.root.join(format!("{build_id}{SLOW_WARMUP_SUFFIX}"))
+    }
+
     /// Файл со счётчиком безуспешных попыток установить обновление до
     /// этого build id (TL-56).
     ///
@@ -613,7 +634,7 @@ impl Layout {
         };
         matches!(
             rest,
-            "" | MANIFEST_SUFFIX | REPAIR_SUFFIX | UPDATE_ATTEMPT_SUFFIX
+            "" | MANIFEST_SUFFIX | REPAIR_SUFFIX | UPDATE_ATTEMPT_SUFFIX | SLOW_WARMUP_SUFFIX
         )
     }
 
@@ -733,6 +754,81 @@ impl RepairLog {
     ///
     /// Отсутствие файла — не ошибка и обычное дело: на исправной машине
     /// этот файл не появляется никогда.
+    pub fn clear(path: &Path) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Отметка «прогрев этой установки не уложился в таймаут» (TL-21).
+///
+/// Нужна против одного сценария: дерево цело по манифесту и запускается,
+/// но на этой машине первый запуск дольше
+/// [`super::prepare`]`::WARMUP_TIMEOUT` (очень медленный диск, агрессивный
+/// антивирус). Без отметки каждый старт приложения ждал бы весь таймаут
+/// заново. С ней следующий старт экран не задерживает: дерево считается
+/// готовым, прогрев идёт в фоне, а удачный прогрев отметку снимает.
+///
+/// Отказа отметка не означает и к нему не ведёт — счётчика, после
+/// которого подготовка отвечала бы «не работает», у неё нет намеренно.
+/// Число таймаутов подряд хранится только для лога.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlowWarmupMark {
+    pub schema_version: u32,
+    /// Сколько прогревов подряд упёрлись в таймаут — только для лога.
+    pub timeouts: u32,
+    /// Когда это случилось в последний раз, секунды с эпохи Unix.
+    pub last_timeout_unix: u64,
+    /// То же время в RFC 3339 — для чтения человеком.
+    pub last_timeout_at: String,
+    /// Таймаут, в который упёрся последний прогрев, миллисекунды.
+    pub timeout_ms: u64,
+}
+
+impl SlowWarmupMark {
+    /// Читает отметку.
+    ///
+    /// `Ok(None)` — файла нет, обычное дело. `Err` — файл есть, но не
+    /// читается, не разбирается или записан другой версией формата: для
+    /// подготовки это то же, что отсутствие (прогрев идёт как без отметки,
+    /// то есть медленнее, но честно), однако молча это не проходит —
+    /// причину вызывающий обязан записать в лог. Отличать «нет» от «испорчен»
+    /// здесь, а не в вызывающем, потому что только здесь видно, что файл
+    /// всё-таки был.
+    pub fn read(path: &Path) -> Result<Option<Self>, String> {
+        let raw = match fs::read(path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(format!("не читается: {err}")),
+        };
+        let mark: Self =
+            serde_json::from_slice(&raw).map_err(|err| format!("не разбирается: {err}"))?;
+        if mark.schema_version != MANIFEST_SCHEMA_VERSION {
+            return Err(format!(
+                "версия формата {} (поддерживается {MANIFEST_SCHEMA_VERSION})",
+                mark.schema_version
+            ));
+        }
+        Ok(Some(mark))
+    }
+
+    /// Отметка с ещё одним учтённым таймаутом.
+    pub fn recorded(previous: Option<&Self>, timeout_ms: u64, now_unix: u64) -> Self {
+        Self {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            timeouts: previous.map_or(0, |mark| mark.timeouts).saturating_add(1),
+            last_timeout_unix: now_unix,
+            last_timeout_at: crate::clock::now_iso8601(),
+            timeout_ms,
+        }
+    }
+
+    /// Записывает отметку атомарно.
+    pub fn write_atomic(&self, path: &Path) -> Result<(), PrepareError> {
+        write_json_atomic(path, self, "отметки медленного прогрева")
+    }
+
+    /// Снимает отметку: прогрев уложился, помнить нечего.
     pub fn clear(path: &Path) {
         let _ = fs::remove_file(path);
     }
