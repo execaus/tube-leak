@@ -1301,7 +1301,7 @@ mod tests {
         let registry = ChildRegistry::new();
         let launcher = SidecarLauncher::new(
             script,
-            YtDlpJsRuntime::from_deno(Err(SidecarError::NotFound)),
+            YtDlpJsRuntime::for_tests(Err(SidecarError::NotFound)),
             &registry,
         );
         let session = ProbeSession::with_timeout(Duration::from_millis(300));
@@ -1334,7 +1334,7 @@ mod tests {
         let registry = ChildRegistry::new();
         let launcher = SidecarLauncher::new(
             script,
-            YtDlpJsRuntime::from_deno(Ok(DenoLaunch::new(deno.clone(), &data_dir))),
+            YtDlpJsRuntime::for_tests(Ok(DenoLaunch::new(deno.clone(), &data_dir))),
             &registry,
         );
         launcher
@@ -1390,7 +1390,7 @@ mod tests {
         ] {
             let registry = ChildRegistry::new();
             let launcher =
-                SidecarLauncher::new(script.clone(), YtDlpJsRuntime::from_deno(deno), &registry);
+                SidecarLauncher::new(script.clone(), YtDlpJsRuntime::for_tests(deno), &registry);
             launcher
                 .launch(&probe_args(URL), PROBE_TIMEOUT, &RunHandle::new())
                 .await

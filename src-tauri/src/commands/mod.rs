@@ -6,6 +6,8 @@
 
 mod download;
 mod history;
+#[cfg(test)]
+mod js_runtime_guard_tests;
 mod probe;
 mod queue;
 mod settings;

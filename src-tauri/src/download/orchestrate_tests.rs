@@ -6161,7 +6161,7 @@ async fn the_production_downloader_hands_deno_and_its_environment_to_yt_dlp() {
     let registry = ChildRegistry::new();
     let launcher = SidecarDownloader::new(
         Some(script),
-        YtDlpJsRuntime::from_deno(Ok(DenoLaunch::new(deno.clone(), &data_dir))),
+        YtDlpJsRuntime::for_tests(Ok(DenoLaunch::new(deno.clone(), &data_dir))),
         &registry,
     );
     let run = launch_once(&launcher).await;
@@ -6222,7 +6222,7 @@ async fn without_deno_or_a_data_dir_the_downloader_disables_runtimes_and_adds_no
         let registry = ChildRegistry::new();
         let launcher = SidecarDownloader::new(
             Some(script.clone()),
-            YtDlpJsRuntime::from_deno(deno),
+            YtDlpJsRuntime::for_tests(deno),
             &registry,
         );
         let run = launch_once(&launcher).await;

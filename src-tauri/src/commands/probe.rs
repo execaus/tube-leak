@@ -15,7 +15,7 @@
 
 use tauri::{AppHandle, State};
 
-use super::sidecar::{resolve_deno, resolve_ytdlp_path};
+use super::sidecar::resolve_ytdlp_path;
 use crate::probe::{probe, validate_url, ProbeFailure, ProbeSession, SidecarLauncher};
 use crate::sidecar::{ChildRegistry, YtDlpJsRuntime};
 use crate::types::{ProbeError, ProbeErrorDetails, ProbeResult, YtDlpFailureReason};
@@ -97,8 +97,9 @@ async fn probe_now(
 
     // deno — путь к sidecar и окружение одним значением (TL-109); если
     // запускать его нельзя, yt-dlp получает `--no-js-runtimes`, а причина
-    // уходит в лог одной строкой.
-    let js_runtime = YtDlpJsRuntime::from_deno(resolve_deno(app));
+    // уходит в лог одной строкой. Резолв — внутри единственного
+    // продакшен-конструктора (TL-114): подставить его исход здесь нельзя.
+    let js_runtime = YtDlpJsRuntime::for_app(app);
 
     probe(
         session,

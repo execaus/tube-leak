@@ -148,7 +148,7 @@ pub async fn check_sidecar(
         Err(error) => (Err(error), None),
     };
 
-    let deno = resolve_deno(&app).inspect_err(|err| {
+    let deno = DenoLaunch::for_app(&app).inspect_err(|err| {
         eprintln!(
             "deno: запуск невозможен: {}",
             DenoLaunch::failure_reason(err)
@@ -162,19 +162,6 @@ pub async fn check_sidecar(
         &registry,
     )
     .await)
-}
-
-/// Резолвит deno: sidecar рядом с приложением плюс окружение с кэшем в
-/// каталоге данных — для служебного экрана (TL-110) и для запусков yt-dlp
-/// разбора и скачивания (TL-109, `crate::sidecar::YtDlpJsRuntime`).
-///
-/// Тонкая обёртка над чистой [`DenoLaunch::resolve`], где и живёт логика
-/// (какое имя резолвится, куда ложится `DENO_DIR`, что делать без каталога
-/// данных) вместе с тестами. Каталог данных, который не определяется, —
-/// отказ с причиной в `stderr`: на экране она доезжает до «Подробнее». В
-/// лог пишет вызывающий — у экрана и у запуска yt-dlp строка разная.
-pub(super) fn resolve_deno(app: &AppHandle) -> Result<DenoLaunch, SidecarError> {
-    DenoLaunch::resolve(app.path().app_data_dir(), sidecar::resolve_sidecar_path)
 }
 
 /// Путь к yt-dlp — в каталоге данных, а не рядом с приложением (TL-12),
@@ -831,7 +818,7 @@ mod tests {
         "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers";
 
     /// Запуск deno из фикстурного скрипта с окружением, построенным от
-    /// `data_dir`, — то, что в продакшене собирает `resolve_deno`.
+    /// `data_dir`, — то, что в продакшене собирает `DenoLaunch::for_app`.
     fn deno_launch(path: PathBuf, data_dir: &std::path::Path) -> Result<DenoLaunch, SidecarError> {
         Ok(DenoLaunch::new(path, data_dir))
     }

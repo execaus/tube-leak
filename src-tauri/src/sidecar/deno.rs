@@ -52,10 +52,26 @@
 //! Путь без окружения и окружение без пути не передать по построению:
 //! [`YtDlpJsRuntime`] делается только из [`DenoLaunch`], а тот — только от
 //! каталога данных.
+//!
+//! # Один продакшен-конструктор (TL-114)
+//!
+//! Рантайм yt-dlp в продакшене собирается только
+//! [`YtDlpJsRuntime::for_app`] — от `AppHandle`, с резолвом внутри. Подставить
+//! исход резолва (`Err`, чужой [`DenoLaunch`]) или отключённый рантайм
+//! вызывающий не может: `from_deno` и `disabled` приватны модулю, а
+//! `YtDlpJsRuntime::for_tests` существует только под `#[cfg(test)]`. В
+//! тестовой сборке продакшен-код компилируется с тем же `cfg(test)` и видит
+//! `for_tests`; сборки без `cfg(test)` такой вызов не компилируют, а
+//! независимо от состава прогона его ловит сторож по исходникам
+//! (`commands::js_runtime_guard_tests`).
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+
+use tauri::{AppHandle, Manager};
 
 use super::error::SidecarError;
 use crate::types::LaunchFailedReason;
@@ -151,6 +167,17 @@ impl DenoLaunch {
         Ok(Self::new(resolve_sidecar(DENO_SIDECAR)?, &data_dir))
     }
 
+    /// Резолвит deno приложения `app`: каталог данных приложения и sidecar
+    /// рядом с ним — единственная продакшен-связка [`DenoLaunch::resolve`]
+    /// с настоящим окружением. Её берут служебный экран
+    /// (`crate::commands::sidecar`) и [`YtDlpJsRuntime::for_app`].
+    ///
+    /// Тело этой функции тестом не исполняется (`AppHandle` в тестах нет) и
+    /// поэтому сверяется по исходнику сторожем TL-114.
+    pub fn for_app(app: &AppHandle) -> Result<Self, SidecarError> {
+        Self::resolve(app.path().app_data_dir(), super::resolve_sidecar_path)
+    }
+
     /// Путь к бинарнику deno.
     pub fn path(&self) -> &Path {
         &self.path
@@ -184,6 +211,21 @@ const JS_RUNTIMES_FLAG: &str = "--js-runtimes";
 /// Флаг, отключающий JS-рантаймы yt-dlp целиком.
 const NO_JS_RUNTIMES_FLAG: &str = "--no-js-runtimes";
 
+/// Строки об отключённом рантайме, уже записанные в лог этим процессом.
+static REPORTED_DISABLED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Впервые ли процесс видит строку `line` (и запоминает её).
+///
+/// Отравленный мьютекс не повод терять запуск: множество строк после
+/// паники в чужом потоке целостно (вставка атомарна для нас), поэтому
+/// берётся как есть.
+fn first_report(line: &str) -> bool {
+    REPORTED_DISABLED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(line.to_string())
+}
+
 /// JS-рантайм запуска yt-dlp — аргументы и окружение одним значением
 /// (см. шапку модуля).
 ///
@@ -206,14 +248,32 @@ enum Runtime {
 }
 
 impl YtDlpJsRuntime {
+    /// Рантайм приложения `app` — **единственный** продакшен-конструктор
+    /// (см. «Один продакшен-конструктор» в шапке модуля): резолв deno
+    /// делается здесь, а не у вызывающего, поэтому подставить отказ или
+    /// отключённый рантайм в разбор или скачивание нельзя.
+    pub fn for_app(app: &AppHandle) -> Self {
+        Self::from_deno(DenoLaunch::for_app(app))
+    }
+
+    /// Рантайм по заданному исходу резолва — только для тестов.
+    ///
+    /// Вызов из продакшен-кода под `cargo test` компилируется; его ловит
+    /// сторож `commands::js_runtime_guard_tests`.
+    #[cfg(test)]
+    pub fn for_tests(deno: Result<DenoLaunch, SidecarError>) -> Self {
+        Self::from_deno(deno)
+    }
+
     /// Рантайм по исходу резолва deno.
     ///
     /// Отказ резолва — `--no-js-runtimes`, а не пропуск флага (иначе yt-dlp
     /// возьмёт deno из `PATH`, см. шапку модуля); причина пишется в лог
-    /// одной строкой. Путь, который не записывается строкой UTF-8, — тот же
-    /// отказ: argv запуска у проекта строковый, а подменять путь его
-    /// лоссовой копией значило бы указать yt-dlp несуществующий файл.
-    pub fn from_deno(deno: Result<DenoLaunch, SidecarError>) -> Self {
+    /// одной строкой, один раз за процесс. Путь, который не записывается
+    /// строкой UTF-8, — тот же отказ: argv запуска у проекта строковый, а
+    /// подменять путь его лоссовой копией значило бы указать yt-dlp
+    /// несуществующий файл.
+    fn from_deno(deno: Result<DenoLaunch, SidecarError>) -> Self {
         let launch = match deno {
             Ok(launch) => launch,
             Err(error) => {
@@ -236,9 +296,25 @@ impl YtDlpJsRuntime {
         }
     }
 
-    /// Рантайм отключён по причине `reason` (пишется в лог).
+    /// Рантайм отключён по причине `reason`; причина уходит в `stderr`
+    /// один раз за процесс (см. [`YtDlpJsRuntime::disabled_with`]).
     fn disabled(reason: &str) -> Self {
-        eprintln!("yt-dlp: JS-рантайм отключён ({NO_JS_RUNTIMES_FLAG}): {reason}");
+        Self::disabled_with(reason, &mut |line| eprintln!("{line}"))
+    }
+
+    /// [`YtDlpJsRuntime::disabled`] с логом `log` вместо `stderr` — чтобы
+    /// «один раз» проверялось тестом, а не глазами.
+    ///
+    /// Рантайм собирается на каждый разбор и каждую задачу очереди, а
+    /// причина отказа за процесс не меняется (sidecar и каталог данных те
+    /// же), поэтому строка на каждый запуск была бы шумом (#121, п. 3).
+    /// Запоминается строка целиком: другая причина — другая строка, и она
+    /// тоже пишется, один раз. Причин в процессе единицы, память не растёт.
+    fn disabled_with(reason: &str, log: &mut dyn FnMut(&str)) -> Self {
+        let line = format!("yt-dlp: JS-рантайм отключён ({NO_JS_RUNTIMES_FLAG}): {reason}");
+        if first_report(&line) {
+            log(&line);
+        }
         Self {
             runtime: Runtime::Disabled,
         }
@@ -498,6 +574,46 @@ mod tests {
             assert_eq!(&argv[1..], PROBE_LIKE);
             assert!(runtime.env().is_empty(), "{case}");
         }
+    }
+
+    /// #121, п. 3: причина отключения пишется один раз за процесс, а не на
+    /// каждый разбор и каждую задачу. Причины уникальны для теста — множество
+    /// записанных строк общее на процесс, и соседние тесты его тоже пополняют.
+    #[test]
+    fn a_disabled_runtime_logs_each_reason_once_per_process() {
+        let reason = "причина теста a_disabled_runtime_logs_each_reason_once_per_process";
+        let other = format!("{reason} (другая)");
+        let mut lines = Vec::new();
+
+        for next in [reason, reason, other.as_str(), reason, other.as_str()] {
+            let runtime =
+                YtDlpJsRuntime::disabled_with(next, &mut |line| lines.push(line.to_string()));
+            assert_eq!(runtime.argv(&[]), ["--no-js-runtimes"], "{next}");
+        }
+
+        assert_eq!(
+            lines,
+            [
+                format!("yt-dlp: JS-рантайм отключён (--no-js-runtimes): {reason}"),
+                format!("yt-dlp: JS-рантайм отключён (--no-js-runtimes): {other}"),
+            ]
+        );
+    }
+
+    /// Отказ резолва идёт в лог через то же «один раз»: после него та же
+    /// причина второй строки не даёт.
+    #[test]
+    fn a_resolve_failure_is_remembered_by_the_same_once() {
+        let reason = "причина теста a_resolve_failure_is_remembered_by_the_same_once";
+        let runtime = YtDlpJsRuntime::from_deno(Err(SidecarError::LaunchFailed {
+            reason: LaunchFailedReason::Other,
+            stderr: reason.to_string(),
+        }));
+        assert_eq!(runtime.argv(&[]), ["--no-js-runtimes"]);
+
+        let mut lines = Vec::new();
+        YtDlpJsRuntime::disabled_with(reason, &mut |line| lines.push(line.to_string()));
+        assert_eq!(lines, Vec::<String>::new(), "причина уже записана резолвом");
     }
 
     #[cfg(unix)]
