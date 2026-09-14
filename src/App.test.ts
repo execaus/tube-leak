@@ -554,10 +554,14 @@ describe('App — service screen (unchanged behaviour from TL-8)', () => {
 
     // `stderrTail` живёт в свёрнутом по умолчанию блоке «Подробнее»
     // (`SidecarStatusRow`, doc `details`) — раскрываем его тем же приёмом,
-    // что `SidecarStatusRow.test.ts`.
-    const detailsButton = wrapper.findAll('button').find((b) => b.text().includes('Подробнее'))
-    expect(detailsButton).toBeDefined()
-    await detailsButton?.trigger('click')
+    // что `SidecarStatusRow.test.ts`. Кнопка ищется по доступному имени
+    // («Подробнее о deno»), а не по позиции в списке (ревью TL-116/#123,
+    // TL-117): у ffmpeg/yt-dlp тоже может появиться своя кнопка
+    // «Подробнее» (TL-116, отличающийся `versionRaw`), и первая найденная
+    // кнопка тогда была бы чужой.
+    const detailsButton = wrapper.find('[aria-label="Подробнее о deno"]')
+    expect(detailsButton.exists()).toBe(true)
+    await detailsButton.trigger('click')
     expect(wrapper.text()).toContain('Deno 1.0')
 
     const retryButton = wrapper.findAll('button').find((b) => b.text().includes('Повторить проверку'))
