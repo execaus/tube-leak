@@ -52,7 +52,10 @@ const statusText = computed(() => {
     case 'notFound':
       return 'не найден'
     case 'launchFailed':
-      return 'не удалось запустить'
+      // `unrecognizedOutput` (TL-113): бинарник запустился и завершился
+      // успешно — «не удалось запустить» здесь было бы неправдой, короткий
+      // статус называет то, что реально произошло.
+      return result.reason === 'unrecognizedOutput' ? 'неожиданный ответ' : 'не удалось запустить'
     case 'nonZeroExit':
       return 'не удалось запустить'
     case 'timeout':
@@ -97,6 +100,16 @@ const LAUNCH_FAILED_EXPLANATIONS: Record<LaunchFailedReason, (name: string, path
   other: (name) =>
     `Файл ${name} найден, но не запустился, а точную причину определить не удалось. ` +
     `Попробуйте переустановить tube-leak; если не поможет — посмотрите код ошибки ОС в «Подробнее» ниже.`,
+  // `unrecognizedOutput` (TL-113, ядро TL-109): в отличие от всех
+  // остальных причин, бинарник здесь именно запустился и завершился без
+  // ошибки — «не запустился»/«код ошибки ОС» были бы неправдой (ядро их и
+  // не присылает: `osErrorCode` для этой причины пуст). Правдивая версия:
+  // ответ есть, но в нём нет ожидаемой строки версии — типичный симптом
+  // подмены файла под тем же именем.
+  unrecognizedOutput: (name) =>
+    `Файл ${name} запустился и завершился без ошибок, но ответил не так, как мы ожидали: ` +
+    `версии в выводе нет. Похоже, под этим именем лежит не тот файл — он подменён или ` +
+    `повреждён. Попробуйте переустановить tube-leak; вывод процесса — в «Подробнее» ниже.`,
 }
 
 const explanation = computed(() => {
@@ -162,7 +175,13 @@ const details = computed<DetailEntry[]>(() => {
     entries.push({ label: 'Таймаут', value: `${result.timeoutMs} мс` })
   }
   if (result.stderrTail) {
-    entries.push({ label: 'stderr', value: result.stderrTail })
+    // `unrecognizedOutput` (TL-113): это не stderr процесса, упавшего с
+    // ошибкой, а полный вывод (stdout, затем stderr) процесса, который
+    // отработал успешно и просто ответил не то, что ожидалось —
+    // подпись «stderr» здесь была бы неправдой.
+    const isUnrecognizedOutput =
+      result.status === 'launchFailed' && result.reason === 'unrecognizedOutput'
+    entries.push({ label: isUnrecognizedOutput ? 'Вывод' : 'stderr', value: result.stderrTail })
   }
 
   return entries
@@ -214,6 +233,7 @@ function toggleDetails(): void {
         type="button"
         class="tap-target"
         :aria-expanded="detailsOpen"
+        :aria-label="`Подробнее о ${displayName}`"
         @click="toggleDetails"
       >
         Подробнее {{ detailsOpen ? '▴' : '▾' }}

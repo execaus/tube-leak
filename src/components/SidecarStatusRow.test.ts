@@ -78,6 +78,22 @@ const timeoutResult: SidecarCheckResult = {
   stderrTail: 'partial output before kill',
 }
 
+/**
+ * `unrecognizedOutput` (TL-113, ядро TL-109): в отличие от всех остальных
+ * причин `launchFailed`, здесь процесс реально запустился и завершился без
+ * ошибки — просто в его выводе не нашлось ожидаемой строки версии
+ * (например, deno). `osErrorCode` для этой причины ядро не присылает,
+ * `stderrTail` содержит вывод отработавшего процесса (stdout, затем
+ * stderr), а не диагностику сбоя запуска.
+ */
+const launchFailedUnrecognizedOutputResult: SidecarCheckResult = {
+  name: 'deno',
+  path: '/opt/tube-leak/bin/deno',
+  status: 'launchFailed',
+  reason: 'unrecognizedOutput',
+  stderrTail: 'Deno 1.0\n',
+}
+
 describe('SidecarStatusRow', () => {
   it('renders the Checking state before a result arrives, with no buttons or details', () => {
     const wrapper = mount(SidecarStatusRow, { props: { fallbackName: 'yt-dlp' } })
@@ -156,6 +172,41 @@ describe('SidecarStatusRow', () => {
     expect(wrapper.text()).toContain(launchFailedPermissionDeniedResult.path)
   })
 
+  it('renders the LaunchFailed(unrecognizedOutput) state truthfully, without "not started" or an OS error code (TL-113)', () => {
+    const wrapper = mount(SidecarStatusRow, {
+      props: { fallbackName: 'deno', result: launchFailedUnrecognizedOutputResult },
+    })
+
+    const text = wrapper.text()
+    expect(text).not.toContain('не запустился')
+    expect(text).not.toContain('код ошибки ОС')
+    expect(text).toContain('неожиданный ответ')
+    expect(text).toContain('переустановить tube-leak')
+    expect(text).toContain('запустился и завершился без ошибок')
+  })
+
+  it('labels the process output as "Вывод" (not "stderr") only for unrecognizedOutput (TL-113)', async () => {
+    const wrapper = mount(SidecarStatusRow, {
+      props: { fallbackName: 'deno', result: launchFailedUnrecognizedOutputResult },
+    })
+
+    const detailsButton = wrapper.findAll('button').find((b) => b.text().includes('Подробнее'))
+    await detailsButton?.trigger('click')
+
+    expect(wrapper.text()).toContain('Вывод')
+    expect(wrapper.text()).not.toContain('stderr')
+    expect(wrapper.text()).toContain(launchFailedUnrecognizedOutputResult.stderrTail?.trim())
+  })
+
+  it('keeps the "not started" text and the "stderr" label unchanged for LaunchFailed(other) (TL-113 regression guard)', async () => {
+    const wrapper = mount(SidecarStatusRow, {
+      props: { fallbackName: 'yt-dlp', result: launchFailedOtherResult },
+    })
+
+    expect(wrapper.text()).toContain('не удалось запустить')
+    expect(wrapper.text()).not.toContain('неожиданный ответ')
+  })
+
   it('renders the NonZeroExit state with the exit code interpolated', () => {
     const wrapper = mount(SidecarStatusRow, {
       props: { fallbackName: 'yt-dlp', result: nonZeroExitResult },
@@ -210,4 +261,21 @@ describe('SidecarStatusRow', () => {
     expect(wrapper.text()).toContain(launchFailedCorruptedResult.osErrorCode)
     expect(wrapper.text()).toContain(launchFailedCorruptedResult.stderrTail)
   })
+
+  it.each([
+    { result: notFoundResult, expectedName: 'yt-dlp' },
+    { result: timeoutResult, expectedName: 'ffmpeg' },
+    { result: launchFailedUnrecognizedOutputResult, expectedName: 'deno' },
+  ])(
+    'gives the "Подробнее" button an accessible name that includes the tool name ($expectedName), without changing its visible text',
+    ({ result, expectedName }) => {
+      const wrapper = mount(SidecarStatusRow, {
+        props: { fallbackName: expectedName, result },
+      })
+
+      const detailsButton = wrapper.findAll('button').find((b) => b.text().includes('Подробнее'))
+      expect(detailsButton?.text()).toBe('Подробнее ▾')
+      expect(detailsButton?.attributes('aria-label')).toContain(expectedName)
+    },
+  )
 })
