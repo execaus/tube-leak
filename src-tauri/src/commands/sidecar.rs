@@ -214,8 +214,6 @@ pub async fn check_sidecar(
         Err(error) => (Err(error), None),
     };
 
-    let yt_dlp = yt_dlp_input(app.state::<Session>().inner(), yt_dlp_path);
-
     let deno = DenoLaunch::for_app(&app).inspect_err(|err| {
         eprintln!(
             "deno: запуск невозможен: {}",
@@ -223,13 +221,56 @@ pub async fn check_sidecar(
         );
     });
 
-    Ok(check_report_with(
-        yt_dlp,
+    Ok(check_report_in_session(
+        app.state::<Session>().inner(),
+        yt_dlp_path,
         sidecar::resolve_sidecar_path("ffmpeg"),
         deno,
         &registry,
     )
     .await)
+}
+
+/// Отчёт так, как его собирает [`check_sidecar`] в сеансе приложения:
+/// строка yt-dlp — из запуска пробы подготовки или из своего запуска
+/// ([`yt_dlp_input`]), и сброс памяти сеанса, если свой запуск показал, что
+/// дерево не работает.
+///
+/// # Почему сброс (Д-1 ревью TL-23)
+///
+/// «Повторить проверку» зовёт подготовку и проверку снова. Подготовка
+/// отвечает из памяти сеанса, поэтому дерево, сломанное посреди сеанса,
+/// повтор не чинил: память говорила «готово», проверка — «не запускается»,
+/// и так на каждом нажатии до перезапуска приложения. Сброшенная память
+/// отправляет следующую подготовку к пробе, а та при негодном дереве — к
+/// переустановке.
+///
+/// Сбрасывает только **свой** запуск по найденному пути. Строка из
+/// запуска пробы не может быть отказом по построению, а «пути нет» бывает
+/// законно — до конца первой подготовки, — и сброс на нём заставил бы
+/// эту подготовку пробовать дерево второй раз (TL-23).
+async fn check_report_in_session(
+    session: &Session,
+    yt_dlp_path: Result<PathBuf, SidecarError>,
+    ffmpeg_path: Result<PathBuf, SidecarError>,
+    deno: Result<DenoLaunch, SidecarError>,
+    registry: &ChildRegistry,
+) -> SidecarCheckReport {
+    let yt_dlp = yt_dlp_input(session, yt_dlp_path);
+    let launched_itself = matches!(yt_dlp, YtDlpCheck::Launch(Ok(_)));
+
+    let report = check_report_with(yt_dlp, ffmpeg_path, deno, registry).await;
+
+    if launched_itself && report.yt_dlp.status != SidecarStatus::Ok {
+        eprintln!(
+            "yt-dlp: проверка экрана запустила {} и получила {:?} — забываю подготовку \
+             сеанса, повтор проверит дерево пробой",
+            report.yt_dlp.path, report.yt_dlp.status
+        );
+        session.invalidate();
+    }
+
+    report
 }
 
 /// Откуда берётся строка yt-dlp (TL-23).
@@ -1057,8 +1098,9 @@ mod tests {
         async fn check(&self, session: &Session) -> SidecarCheckResult {
             let (path, _guard) = ytdlp::installed_executable(&self.data_dir, &self.in_use)
                 .expect("путь к установке обязан находиться");
-            check_report_with(
-                yt_dlp_input(session, Ok(path)),
+            check_report_in_session(
+                session,
+                Ok(path),
                 Err(SidecarError::NotFound),
                 Err(SidecarError::NotFound),
                 &self.registry,
@@ -1066,6 +1108,43 @@ mod tests {
             .await
             .yt_dlp
         }
+    }
+
+    #[tokio::test]
+    async fn retrying_in_the_same_session_repairs_a_tree_broken_mid_session() {
+        // Д-1 ревью TL-23: подготовка отвечала из памяти сеанса, и дерево,
+        // сломанное после неё, «Повторить проверку» не чинила ни разу — два
+        // повтора подряд давали отказ запуска до перезапуска приложения.
+        let start = warm_start().await;
+        let session = Session::new();
+        start.prepare(&session).await;
+        assert_eq!(start.check(&session).await.status, SidecarStatus::Ok);
+
+        let (path, guard) =
+            ytdlp::installed_executable(&start.data_dir, &start.in_use).expect("путь");
+        drop(guard);
+        let size =
+            usize::try_from(fs::metadata(&path).expect("размер").len()).expect("размер помещается");
+        let mut broken = b"#!/bin/sh\nexit 3\n".to_vec();
+        broken.resize(size, b'#');
+        fs::write(&path, &broken).expect("сломать, сохранив размер");
+
+        // Первый повтор: подготовка ещё отвечает из памяти, но свой запуск
+        // проверки видит, что дерево не работает.
+        let first = start.prepare(&session).await;
+        assert!(!first.prepared, "память сеанса ещё цела");
+        let row = start.check(&session).await;
+        assert_ne!(row.status, SidecarStatus::Ok, "{row:?}");
+
+        // Второй повтор: память сброшена — проба, переустановка, рабочее
+        // дерево.
+        let second = start.prepare(&session).await;
+        assert!(
+            second.prepared,
+            "повтор обязан дойти до пробы и переустановки, а не ответить из памяти"
+        );
+        let row = start.check(&session).await;
+        assert_eq!(row.status, SidecarStatus::Ok, "{row:?}");
     }
 
     /// Результат так, как его видит фронтенд, без полей времени: они

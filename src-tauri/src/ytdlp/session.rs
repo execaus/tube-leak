@@ -203,6 +203,16 @@ impl Session {
             warmup.run(registry).await
         };
 
+        // Отказ фонового прогрева — дерево, которое не запускается (или
+        // зависает раз за разом), а не медленная машина. Подготовка,
+        // которую помнит сеанс, про него уже неправда: без сброса «Повторить
+        // проверку» получила бы из памяти прежний успех и до пробы с
+        // переустановкой не дошла бы (Д-1 ревью TL-23). Сброс — до события:
+        // экран по нему и зовёт повтор.
+        if matches!(outcome, BackgroundOutcome::Failed(_)) {
+            self.invalidate();
+        }
+
         sink.warmup_finished(outcome.event());
         outcome
     }
@@ -375,6 +385,64 @@ mod tests {
         assert!(
             !session.remembers_anything(),
             "отказ не запоминается: повтор обязан попробовать снова"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_during_an_in_flight_prepare_is_not_remembered() {
+        // Заметка 7 ревью TL-23: сброс, пришедший, пока подготовка шла,
+        // обязан пережить её завершение.
+        let fixture = installed().await;
+        let session = Session::new();
+        fixture.control.hang();
+        let ((prepared, _), ()) = tokio::join!(fixture.prepare(&session), async {
+            fixture.control.wait_until_hanging().await;
+            session.invalidate();
+            fixture.control.release();
+        });
+        assert!(
+            !session.remembers_anything(),
+            "итог подготовки, пережившей сброс, не запоминается"
+        );
+        assert!(session
+            .take_warm_launch(Path::new(&prepared.path))
+            .is_none());
+        let before = fixture.control.launches();
+        let _ = fixture.prepare(&session).await;
+        assert_eq!(
+            fixture.control.launches() - before,
+            1,
+            "после сброса — снова проба"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_background_warm_up_that_fails_makes_the_session_forget_its_preparation() {
+        // Д-1 ревью TL-23: без сброса «Повторить проверку» получала из памяти
+        // прежний успех и до пробы с переустановкой не доходила.
+        let fixture = installed().await;
+        let session = Session::new();
+        fixture.write_mark();
+        fixture.break_executable();
+
+        let (_, background) = fixture.prepare(&session).await;
+        assert!(session.remembers_anything(), "предусловие: итог запомнен");
+
+        let outcome = session
+            .run_background(
+                background.expect("отметка есть — прогрев в фоне"),
+                &fixture.registry,
+                &RecordingWarmup::default(),
+            )
+            .await;
+
+        assert!(
+            matches!(outcome, BackgroundOutcome::Failed(_)),
+            "{outcome:?}"
+        );
+        assert!(
+            !session.remembers_anything(),
+            "отказ фонового прогрева сбрасывает память сеанса"
         );
     }
 
