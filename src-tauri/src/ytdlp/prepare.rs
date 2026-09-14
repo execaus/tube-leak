@@ -207,9 +207,27 @@ const _: () = assert!(PROBE_TIMEOUT.as_secs() * 10 <= WARMUP_TIMEOUT.as_secs());
 /// укладывается в [`WARMUP_TIMEOUT`], не измерял никто. Десять минут — 5×
 /// к таймауту переднего плана и ~16× к худшему измеренному прогреву
 /// (36,4 с). Упрётся фоновый прогрев и в них — отметка остаётся, и
-/// следующий старт снова отдаст прогрев в фон; сохраняет ли убитый процесс
+/// следующий старт снова отдаст прогрев в фон, но не больше
+/// [`MAX_BACKGROUND_TIMEOUTS`] раз подряд; сохраняет ли убитый процесс
 /// часть проверенных ОС подписей, не измерялось, и код на это не опирается.
 const BACKGROUND_WARMUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Сколько фоновых прогревов подряд могут упереться в таймаут, прежде чем
+/// отметка медленного прогрева снимается (заметка 5 ревью TL-21).
+///
+/// Без предела зависающий yt-dlp держал бы отметку вечно: каждый старт
+/// отдавал бы прогрев в фон, тот через десять минут упирался бы в таймаут
+/// и обновлял отметку, а до пробы дерева дело не доходило бы ни разу.
+/// Счётчик живёт в самой отметке и уходит вместе с ней при удачном прогреве.
+///
+/// Цена названа. Снятая отметка возвращает старт на обычный путь, но
+/// **зависающее** дерево переустановкой не лечится и там: проба упирается
+/// в свой таймаут и считает дерево холодным, прогрев переднего плана — в
+/// свой, и отметка появляется снова. Цикл становится конечным (три фоновых
+/// прогрева и один экран подготовки на [`WARMUP_TIMEOUT`]), а не вечным
+/// молчанием. Лечить зависание переустановкой значило бы объявить
+/// медленную машину сломанной, чего TL-21 не делает.
+const MAX_BACKGROUND_TIMEOUTS: u32 = 3;
 
 // Фоновый прогрев обязан быть не короче переднего плана: иначе отметка,
 // записанная как раз потому, что прогрев не уложился, заставляла бы
@@ -380,8 +398,8 @@ pub enum BackgroundOutcome {
     Warmed,
     /// Снова не уложился: отметка обновлена, следующий старт тоже не ждёт.
     TimedOut,
-    /// Не запустился: отметка снята, следующий старт проверит дерево
-    /// обычным путём.
+    /// Не запустился либо упёрся в таймаут [`MAX_BACKGROUND_TIMEOUTS`] раз
+    /// подряд: отметка снята, следующий старт проверит дерево обычным путём.
     Failed(String),
 }
 
@@ -408,7 +426,28 @@ impl BackgroundWarmup {
                 BackgroundOutcome::Warmed
             }
             Err(SidecarError::Timeout { ms, .. }) => {
-                record_slow_warmup(&self.mark_path, &self.build_id, ms);
+                let previous = SlowWarmupMark::read(&self.mark_path).ok().flatten();
+                let mark = SlowWarmupMark::recorded_in_background(
+                    previous.as_ref(),
+                    ms,
+                    crate::clock::now_unix_secs(),
+                );
+                // Зависающее дерево (заметка 5 ревью TL-21): без предела
+                // отметка обновлялась бы вечно, и старт ни разу не дошёл бы
+                // до пробы.
+                if mark.background_timeouts >= MAX_BACKGROUND_TIMEOUTS {
+                    SlowWarmupMark::clear(&self.mark_path);
+                    let reason = format!(
+                        "фоновый прогрев {} упёрся в таймаут {ms} мс {} раз(а) подряд",
+                        self.build_id, mark.background_timeouts
+                    );
+                    eprintln!(
+                        "yt-dlp: {reason} — отметка медленного прогрева снята, следующий старт \
+                         проверит дерево пробой"
+                    );
+                    return BackgroundOutcome::Failed(reason);
+                }
+                write_slow_warmup(&self.mark_path, &self.build_id, &mark);
                 BackgroundOutcome::TimedOut
             }
             Err(error) => {
@@ -1130,10 +1169,15 @@ fn record_slow_warmup(path: &Path, build_id: &BuildId, timeout_ms: u64) {
     let previous = SlowWarmupMark::read(path).ok().flatten();
     let mark =
         SlowWarmupMark::recorded(previous.as_ref(), timeout_ms, crate::clock::now_unix_secs());
+    write_slow_warmup(path, build_id, &mark);
+}
+
+/// Пишет отметку и строку о ней в лог — общее у переднего плана и фона.
+fn write_slow_warmup(path: &Path, build_id: &BuildId, mark: &SlowWarmupMark) {
     eprintln!(
-        "yt-dlp: прогрев {build_id} не уложился в {timeout_ms} мс (подряд: {}) — это медленная \
-         машина, а не отказ: экран этот прогрев больше не ждёт",
-        mark.timeouts
+        "yt-dlp: прогрев {build_id} не уложился в {} мс (подряд: {}, из них в фоне: {}) — это \
+         медленная машина, а не отказ: экран этот прогрев больше не ждёт",
+        mark.timeout_ms, mark.timeouts, mark.background_timeouts
     );
     if let Err(err) = mark.write_atomic(path) {
         eprintln!("yt-dlp: не удалось записать отметку медленного прогрева: {err}");
@@ -2533,6 +2577,68 @@ mod tests {
             .expect("читается")
             .expect("отметка остаётся");
         assert_eq!(mark.timeouts, 2, "второй таймаут подряд учтён");
+    }
+
+    #[tokio::test]
+    async fn a_tree_that_hangs_in_the_background_three_times_in_a_row_loses_its_mark() {
+        // Заметка 5 ревью TL-21: зависающий yt-dlp обновлял отметку каждые
+        // десять минут, и старт до пробы не доходил никогда.
+        let (fixture, control) = controlled_fixture();
+        fixture
+            .prepare(&RecordingSink::default())
+            .await
+            .expect("первая подготовка");
+        control.hang();
+        fixture
+            .outcome_with(&RecordingSink::default(), HUNG)
+            .await
+            .expect("прогрев переднего плана упёрся в таймаут");
+        assert!(fixture.mark_path().exists(), "предусловие: отметка есть");
+
+        for round in 1..=MAX_BACKGROUND_TIMEOUTS {
+            control.hang();
+            let outcome = fixture
+                .outcome_with(&RecordingSink::default(), HUNG)
+                .await
+                .expect("с отметкой — успех");
+            let result = outcome
+                .background
+                .expect("с отметкой прогрев уходит в фон")
+                .run(&fixture.registry)
+                .await;
+
+            if round < MAX_BACKGROUND_TIMEOUTS {
+                assert_eq!(
+                    result,
+                    BackgroundOutcome::TimedOut,
+                    "таймаут в фоне №{round}"
+                );
+                let mark = SlowWarmupMark::read(&fixture.mark_path())
+                    .expect("читается")
+                    .expect("отметка остаётся");
+                assert_eq!(mark.background_timeouts, round);
+            } else {
+                assert!(
+                    matches!(result, BackgroundOutcome::Failed(_)),
+                    "таймаут в фоне №{round} — уже не медленная машина: {result:?}"
+                );
+                assert!(
+                    !fixture.mark_path().exists(),
+                    "после {MAX_BACKGROUND_TIMEOUTS} фоновых таймаутов подряд отметка снимается"
+                );
+            }
+        }
+        control.release();
+
+        // Следующий старт — обычным путём: проба, а не сразу фон.
+        let launches = control.launches();
+        let outcome = fixture
+            .outcome_with(&RecordingSink::default(), Timeouts::DEFAULT)
+            .await
+            .expect("обычный старт");
+        assert!(outcome.background.is_none(), "без отметки фон не выдаётся");
+        assert!(outcome.warm_launch.is_some(), "дерево проверено пробой");
+        assert_eq!(control.launches(), launches + 1);
     }
 
     #[tokio::test]

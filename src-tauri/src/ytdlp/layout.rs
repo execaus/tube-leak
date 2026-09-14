@@ -789,6 +789,15 @@ pub struct SlowWarmupMark {
     pub last_timeout_at: String,
     /// Таймаут, в который упёрся последний прогрев, миллисекунды.
     pub timeout_ms: u64,
+    /// Сколько **фоновых** прогревов подряд упёрлись в свой таймаут.
+    ///
+    /// Отдельно от `timeouts`: тот учитывает и таймаут переднего плана,
+    /// которым отметка появилась. По этому счётчику отметка снимается
+    /// (`super::prepare`, «Зависающее дерево»), и удачный прогрев его
+    /// обнуляет вместе с самой отметкой. `default` — отметка, записанная до
+    /// появления поля, читается с нулём, а не как испорченная.
+    #[serde(default)]
+    pub background_timeouts: u32,
 }
 
 impl SlowWarmupMark {
@@ -819,7 +828,8 @@ impl SlowWarmupMark {
         Ok(Some(mark))
     }
 
-    /// Отметка с ещё одним учтённым таймаутом.
+    /// Отметка с ещё одним учтённым таймаутом переднего плана. Счётчик
+    /// фоновых таймаутов переносится из прежней отметки как есть.
     pub fn recorded(previous: Option<&Self>, timeout_ms: u64, now_unix: u64) -> Self {
         Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
@@ -827,6 +837,18 @@ impl SlowWarmupMark {
             last_timeout_unix: now_unix,
             last_timeout_at: crate::clock::now_iso8601(),
             timeout_ms,
+            background_timeouts: previous.map_or(0, |mark| mark.background_timeouts),
+        }
+    }
+
+    /// Отметка с ещё одним учтённым таймаутом **фонового** прогрева: растут
+    /// оба счётчика.
+    pub fn recorded_in_background(previous: Option<&Self>, timeout_ms: u64, now_unix: u64) -> Self {
+        Self {
+            background_timeouts: previous
+                .map_or(0, |mark| mark.background_timeouts)
+                .saturating_add(1),
+            ..Self::recorded(previous, timeout_ms, now_unix)
         }
     }
 
@@ -1632,6 +1654,38 @@ mod tests {
         );
         // Счётчик тоже не отказывает в работе: нечитаемый — пустой.
         assert_eq!(RepairLog::read(&path), RepairLog::empty());
+    }
+
+    #[test]
+    fn a_slow_warmup_mark_counts_background_timeouts_apart_and_reads_old_marks_as_zero() {
+        // Отметка, записанная до появления счётчика фоновых таймаутов, —
+        // не порча: поле читается с нулём.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("mark.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"schemaVersion":{MANIFEST_SCHEMA_VERSION},"timeouts":2,"lastTimeoutUnix":1,"lastTimeoutAt":"","timeoutMs":120000}}"#
+            ),
+        )
+        .expect("записать отметку прежнего формата");
+        let old = SlowWarmupMark::read(&path)
+            .expect("читается")
+            .expect("отметка есть");
+        assert_eq!(old.background_timeouts, 0);
+
+        let background = SlowWarmupMark::recorded_in_background(Some(&old), 600_000, 2);
+        assert_eq!(
+            (background.timeouts, background.background_timeouts),
+            (3, 1)
+        );
+
+        // Таймаут переднего плана фоновый счётчик не трогает.
+        let foreground = SlowWarmupMark::recorded(Some(&background), 120_000, 3);
+        assert_eq!(
+            (foreground.timeouts, foreground.background_timeouts),
+            (4, 1)
+        );
     }
 
     #[test]
