@@ -22,7 +22,13 @@ interface Fixture {
   reason?: YtDlpFailureReason
   timeoutSecs?: number
   expectedTitle: string
-  expectedExplanation: string
+  /**
+   * `undefined` для `signInRequired` (TL-124): пояснение этого класса
+   * перечисляет четыре причины прозой, и точное совпадение всей строки —
+   * слишком хрупкая проверка (ломается от перестановки слов или запятой).
+   * Содержимое проверяется отдельным блоком ниже, по подстрокам.
+   */
+  expectedExplanation: string | undefined
   expectedCanRetry: boolean
 }
 
@@ -51,8 +57,7 @@ const FIXTURES_BY_KIND: Record<BlockProbeErrorKind, FixtureVariant[]> = {
     {
       message: DECOY_MESSAGE,
       expectedTitle: 'Требуется вход в аккаунт YouTube',
-      expectedExplanation:
-        'В этой версии такие ролики не поддерживаются — ни с возрастным ограничением, ни по подписке.',
+      expectedExplanation: undefined,
       expectedCanRetry: false,
     },
   ],
@@ -126,7 +131,9 @@ describe('getProbeErrorText — таблица, не message (восемь бл�
     const text = getProbeErrorText(fixture.kind, fixture.reason, fixture.timeoutSecs)
 
     expect(text.title).toBe(fixture.expectedTitle)
-    expect(text.explanation).toBe(fixture.expectedExplanation)
+    if (fixture.expectedExplanation !== undefined) {
+      expect(text.explanation).toBe(fixture.expectedExplanation)
+    }
     expect(text.canRetry).toBe(fixture.expectedCanRetry)
 
     // Самое главное: ни заголовок, ни пояснение не совпадают с `message`
@@ -145,6 +152,41 @@ describe('getProbeErrorText — таблица, не message (восемь бл�
   it('signature does not accept notAUrl at all (blocker fix) — TypeScript rejects it at compile time', () => {
     // @ts-expect-error notAUrl не относится к блочным классам — не должен собираться.
     getProbeErrorText('notAUrl')
+  })
+})
+
+/**
+ * TL-124: `signInRequired` покрывает четыре случая (возрастное ограничение,
+ * подписка, приватный ролик, антибот-проверка YouTube), а прежнее пояснение
+ * называло только два. Владелец на приёмке получил именно антибот-проверку
+ * и прочитал формулировку про две чужие причины.
+ *
+ * Проверка — по подстрокам, а не по точному совпадению всей строки: текст —
+ * связная проза, а не пункты таблицы, и тест не должен ломаться от запятой
+ * или перестановки слов (см. doc-комментарий у `expectedExplanation`).
+ */
+describe('SIGN_IN_REQUIRED explanation (TL-124)', () => {
+  const { explanation, title } = getProbeErrorText('signInRequired')
+
+  it.each([
+    ['возрастное ограничение', /возрастн/i],
+    ['доступ по подписке', /подписк/i],
+    ['приватный ролик', /приватн/i],
+    ['антибот-проверку YouTube', /не робот/i],
+  ])('называет причину «%s»', (_label, pattern: RegExp) => {
+    expect(explanation).toMatch(pattern)
+  })
+
+  it('не обещает вход в самом приложении — входа нет до эпика E8', () => {
+    // «Требуется вход в аккаунт YouTube» в заголовке — название явления
+    // (так его называет сам YouTube), не инструкция и не кнопка. Ни
+    // заголовок, ни пояснение не должны звать что-то нажать или войти —
+    // такой функции в v0.1 нет.
+    expect(title + ' ' + explanation).not.toMatch(/войдите|нажмите|кнопк/i)
+  })
+
+  it('для антибот-случая объясняет, что дело обычно в сети, а не в ролике', () => {
+    expect(explanation).toMatch(/сет/i)
   })
 })
 
