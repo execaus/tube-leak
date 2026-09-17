@@ -33,7 +33,12 @@ pub use orchestrate::{probe, validate_url, ProbeSession, SidecarLauncher};
 // и том же порядке. Открыт ровно этот кусок классификации — извлечение
 // текста отказа, общие классы, транспортный сбой и под-причина «устарел»;
 // сами маркеры и разбор метаданных остаются внутренним делом E2.
+// `normalize_typography` открыт по той же причине и на тех же правах:
+// маркеры скачивания сравниваются с текстом так же, как маркеры разбора,
+// и если сведение типографских знаков к ASCII (TL-122) останется только
+// здесь, у второго классификатора вернётся ровно тот дефект, который
+// правился в первом.
 pub(crate) use classify::{
-    fatal_text, is_transport_failure, shared_failure_class, yt_dlp_failure_reason,
-    SharedFailureClass,
+    fatal_text, is_transport_failure, normalize_typography, shared_failure_class,
+    yt_dlp_failure_reason, SharedFailureClass,
 };

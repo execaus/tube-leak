@@ -41,8 +41,8 @@
 
 use crate::download::error::DownloadFailure;
 use crate::probe::{
-    fatal_text, is_transport_failure, shared_failure_class, yt_dlp_failure_reason,
-    SharedFailureClass,
+    fatal_text, is_transport_failure, normalize_typography, shared_failure_class,
+    yt_dlp_failure_reason, SharedFailureClass,
 };
 use crate::sidecar::stderr_tail;
 use crate::types::DownloadErrorDetails;
@@ -176,8 +176,16 @@ fn details(outcome: &AttemptOutcome<'_>) -> DownloadErrorDetails {
     }
 }
 
+/// Та же проверка маркеров, что у разбора ссылки, и **той же**
+/// нормализацией типографских знаков (TL-122): своя копия сравнения
+/// здесь есть только потому, что списки маркеров свои, а правило
+/// сравнения — общее и приезжает из [`crate::probe`].
 fn contains_any(text: &str, markers: &[&str]) -> bool {
-    markers.iter().any(|marker| text.contains(marker))
+    let text = normalize_typography(text);
+
+    markers
+        .iter()
+        .any(|marker| text.contains(normalize_typography(marker).as_ref()))
 }
 
 /// Почему папка назначения недоступна — в тех же словах, которыми об
@@ -693,6 +701,36 @@ mod tests {
                  переснимите фикстуру и сверьтесь с probe::classify"
             );
         }
+    }
+
+    #[test]
+    fn the_typographic_apostrophe_of_youtube_is_a_sign_in_on_this_path_too() {
+        // Дефект TL-122 (#129) владелец поймал на разборе ссылки, но
+        // маркеры у обоих классификаторов общие, и починка обязана
+        // доехать сюда же. Вывод читается из той единственной фикстуры,
+        // в которой он снят: второй копии этого текста в проекте нет —
+        // копиям было бы нечем помешать разойтись.
+        let envelope = fixtures::probe_metadata("outcomes/sign-in-not-a-bot.json");
+        let stderr = envelope["stderr"]
+            .as_str()
+            .expect("в конверте фикстуры есть stderr");
+
+        assert!(
+            stderr.contains('\u{2019}') && !stderr.contains('\''),
+            "фикстура перестала быть тем случаем, ради которого взята: \
+             апостроф в ней обязан быть только типографским"
+        );
+
+        assert!(
+            matches!(
+                classify_attempt(&AttemptOutcome {
+                    exit_code: Some(1),
+                    stderr,
+                }),
+                AttemptVerdict::Failed(DownloadFailure::SignInRequired { .. })
+            ),
+            "класс «требуется вход» опознаётся независимо от формы апострофа"
+        );
     }
 
     #[test]

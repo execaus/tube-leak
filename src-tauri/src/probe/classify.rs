@@ -48,6 +48,8 @@
 //!   Это ограничение оркестрации, а не классификации, и снимается выбором
 //!   аргументов в TL-32.
 
+use std::borrow::Cow;
+
 use serde_json::Value;
 
 use crate::probe::error::ProbeFailure;
@@ -328,8 +330,71 @@ pub(crate) fn fatal_text(stderr: &str) -> String {
     }
 }
 
+/// Свести к ASCII знаки, которые YouTube печатает типографскими.
+///
+/// # Зачем это вообще понадобилось
+///
+/// Дефект TL-122 (#129), найденный владельцем на финальной приёмке v0.1:
+/// YouTube ответил `Sign in to confirm you’re not a bot` — с апострофом
+/// U+2019, — а маркер записан ASCII-апострофом. Совпадения не случилось,
+/// и штатное «требуется вход» ушло в «сбой yt-dlp» с сырым stderr на
+/// экране.
+///
+/// # Почему нормализуются и маркеры тоже, а не только текст
+///
+/// Иначе список маркеров можно записать «неправильной» формой знака, и
+/// он молча перестанет срабатывать — ровно тот класс дефекта, который
+/// здесь и чинится. После нормализации обеих сторон форма записи маркера
+/// вообще перестаёт что-либо значить. Сторож — тест
+/// `a_marker_written_with_a_typographic_sign_still_matches_plain_output`.
+///
+/// # Что именно нормализуется — по измерению, а не по догадке
+///
+/// Пин 2026.08.19 распакован, PYZ разжат, и по нему проверено, какие
+/// формулировки принадлежат самому yt-dlp, а какие он передаёт от
+/// YouTube дословно (контроль поиска — строки, которые у yt-dlp свои:
+/// «Requested format is not available», «No video formats found»,
+/// «live event will begin», «--cookies-from-browser»; все найдены).
+/// Ни `Sign in to confirm`, ни `not a bot`, ни `granted access` в коде
+/// yt-dlp **не встречаются вовсе** — это текст сервера, и его знаки
+/// задаёт YouTube, а не наш пин.
+///
+/// Отсюда состав: апострофы (их живая форма и подтверждена дефектом),
+/// а с ними тире/дефисы U+2010…U+2015 и неразрывные пробелы. Последние
+/// два вида живьём **не наблюдались** — в снятом наборе фикстур
+/// типографских знаков нет ни одного, — но стоят они в маркерах,
+/// целиком состоящих из текста YouTube (`members-only content` — с
+/// дефисом, все маркеры — со пробелами), то есть ровно там, где форму
+/// знака выбирает не наш код.
+pub(crate) fn normalize_typography(text: &str) -> Cow<'_, str> {
+    // Быстрый путь: маркеры и подавляющая часть вывода — ASCII, и им
+    // замена не нужна вовсе.
+    if text.is_ascii() {
+        return Cow::Borrowed(text);
+    }
+
+    Cow::Owned(text.chars().map(normalize_char).collect())
+}
+
+/// Один знак после сведения к ASCII; всё незнакомое остаётся как есть.
+const fn normalize_char(ch: char) -> char {
+    match ch {
+        // Апострофы и одиночные кавычки, которыми YouTube заменяет `'`.
+        '\u{2019}' | '\u{2018}' | '\u{02BC}' | '\u{00B4}' | '\u{2032}' => '\'',
+        // Дефисы и тире всех ширин.
+        '\u{2010}'..='\u{2015}' => '-',
+        // Неразрывные пробелы: обычный и узкий.
+        '\u{00A0}' | '\u{202F}' => ' ',
+        other => other,
+    }
+}
+
 fn contains_any(text: &str, markers: &[&str]) -> bool {
-    markers.iter().any(|marker| text.contains(marker))
+    let text = normalize_typography(text);
+
+    markers
+        .iter()
+        .any(|marker| text.contains(normalize_typography(marker).as_ref()))
 }
 
 /// Технические детали отказа для «Подробнее» (Н-4).
@@ -437,9 +502,17 @@ const SIGN_IN_MARKERS: [&str; 5] = [
     // Снято живьём на приватном ролике — обе формулировки.
     "sign in if you've been granted access",
     "please sign in",
-    // ЖИВЬЁМ НЕ ПРОВЕРЕНО: ролик для спонсоров канала и антибот-проверка
-    // YouTube. Обе просят ровно того же — войти в аккаунт.
+    // ЖИВЬЁМ НЕ ПРОВЕРЕНО: ролик для спонсоров канала. Просит ровно того
+    // же — войти в аккаунт.
     "members-only content",
+    // Снято живьём, но не здесь: антибот-проверку YouTube поймал владелец
+    // на финальной приёмке v0.1 собранным .dmg (TL-122, #129, фикстура
+    // `sign-in-not-a-bot`). До неё тут стояло «ЖИВЬЁМ НЕ ПРОВЕРЕНО» — и
+    // живые данные это опровергли дважды: проверка не только случается,
+    // но и приходит с ТИПОГРАФСКИМ апострофом (`you’re`), от которого
+    // маркер с ASCII-апострофом не срабатывал вовсе. Форма знака здесь
+    // больше ничего не решает — обе стороны сравнения сводит к ASCII
+    // `normalize_typography`.
     "confirm you're not a bot",
 ];
 
@@ -930,6 +1003,113 @@ mod tests {
             verdict(&classify(&with_hint.outcome())),
             verdict(&classify(&without_hint.outcome()))
         );
+    }
+
+    #[test]
+    fn the_live_antibot_answer_of_youtube_is_a_sign_in_and_not_a_yt_dlp_failure() {
+        // Дефект TL-122 (#129) целиком: этот вывод владелец получил на
+        // финальной приёмке v0.1 собранным .dmg, и приложение показало
+        // ему сырой stderr под заголовком «сбой yt-dlp» — потому что
+        // апостроф в `you’re` типографский, а маркер записан ASCII.
+        let capture = capture("sign-in-not-a-bot");
+
+        assert!(
+            capture.stderr.contains('\u{2019}') && !capture.stderr.contains('\''),
+            "фикстура перестала быть тем случаем, ради которого взята: \
+             апостроф в ней обязан быть только типографским"
+        );
+        assert_eq!(capture.exit_code, Some(1));
+
+        assert!(
+            matches!(
+                classify(&capture.outcome()),
+                Err(ProbeFailure::SignInRequired { .. })
+            ),
+            "штатная просьба войти опознаётся независимо от формы апострофа"
+        );
+    }
+
+    #[test]
+    fn both_forms_of_the_apostrophe_land_in_the_same_class() {
+        // Каждый маркер с апострофом — в двух формах сразу. Класс обязан
+        // совпасть: форму знака выбирает YouTube, а не мы.
+        let with_apostrophe: Vec<&str> = SIGN_IN_MARKERS
+            .iter()
+            .copied()
+            .filter(|marker| marker.contains('\''))
+            .collect();
+
+        assert_eq!(
+            with_apostrophe.len(),
+            2,
+            "маркеров с апострофом стало другое число — проверьте, что \
+             новый тоже покрыт обеими формами"
+        );
+
+        for marker in with_apostrophe {
+            let plain = format!("ERROR: [youtube] dQw4w9WgXcQ: {marker}");
+            let typographic = plain.replace('\'', "\u{2019}");
+            assert_ne!(plain, typographic, "{marker}: подмена знака не состоялась");
+
+            let classify_line = |stderr: &str| {
+                verdict(&classify(&YtDlpOutcome {
+                    exit_code: Some(1),
+                    stdout: "",
+                    stderr,
+                }))
+            };
+
+            assert_eq!(
+                classify_line(&plain),
+                Expected::Failure(ProbeErrorKind::SignInRequired),
+                "{marker}: ASCII-форма"
+            );
+            assert_eq!(
+                classify_line(&typographic),
+                Expected::Failure(ProbeErrorKind::SignInRequired),
+                "{marker}: типографская форма"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_written_with_a_typographic_sign_still_matches_plain_output() {
+        // Сторож второй половины правила: нормализуется не только текст,
+        // но и сам маркер. Иначе список маркеров можно записать
+        // «неправильной» формой знака, и он молча перестанет срабатывать —
+        // ровно тот дефект, который здесь и чинится, только зеркальный.
+        assert!(
+            contains_any(
+                "sign in if you've been granted access",
+                &["sign in if you\u{2019}ve been granted access"],
+            ),
+            "маркер с типографским апострофом обязан находить ASCII-текст"
+        );
+        assert!(
+            contains_any("members-only content", &["members\u{2010}only content"]),
+            "то же правило для дефиса"
+        );
+        assert!(
+            contains_any(
+                "no space left on device",
+                &["no\u{00a0}space left on device"]
+            ),
+            "и для неразрывного пробела"
+        );
+    }
+
+    #[test]
+    fn ordinary_ascii_output_goes_through_the_normaliser_without_a_copy() {
+        // Нормализация стоит на пути каждой проверки маркеров, а ASCII —
+        // это весь вывод yt-dlp в подавляющем большинстве запусков.
+        assert!(matches!(
+            normalize_typography("please sign in"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            normalize_typography("confirm you\u{2019}re not a bot"),
+            Cow::Owned(_)
+        ));
     }
 
     #[test]
