@@ -84,6 +84,12 @@ const VERBATIM_LICENSE_FINGERPRINTS = Object.freeze([
 const TRAILING_PUNCTUATION = /[).,;:!?»"'`]+$/
 
 /**
+ * Путь канарейки. Достаточно одного сегмента: именно такой формой
+ * измерено, что code.videolan.org отвечает 200 на несуществующее.
+ */
+const CANARY_PATH = '/tube-leak-check-pins-canary-does-not-exist-9f3a2b7c'
+
+/**
  * Страницы issues нашего репозитория — и только они. Намеренно НЕ
  * `startsWith('/execaus/tube-leak')`: такое правило накрыло бы и
  * `tube-leak-docs`, и будущий `/execaus/tube-leak/releases/download/…`,
@@ -210,6 +216,37 @@ export function planProbe(url) {
 }
 
 /**
+ * Адрес назван пином? У таких адресов нет права на «не подтверждён»:
+ * пин — это то, что мы СКАЧИВАЕМ на сборке, и неподтверждённый адрес
+ * там означает несобираемый установщик (#140). Решение ведущего по
+ * замечанию Б4 ревью: любой неподтверждённый адрес пина валит гейт, а
+ * для адресов документов класс «не подтверждён» допустим.
+ *
+ * @param {{ origins: string[] }} entry
+ * @returns {boolean}
+ */
+export function isPinAddress(entry) {
+  return entry.origins.includes('pin')
+}
+
+/**
+ * Путь-канарейка: заведомо несуществующий адрес на том же хосте.
+ *
+ * Зачем (замечание Б5 ревью). Измерено: code.videolan.org отвечает 200 и
+ * на `no-such-project-xyz123`, и на `no-such-xyz123.git` — то есть «200»
+ * от такого хоста не значит, что ресурс существует, и восемь адресов
+ * стояли зелёными независимо от их наличия. Список таких хостов вести
+ * нельзя — он устареет молча; поэтому спрашиваем каждый хост сами.
+ *
+ * @param {string} url
+ * @returns {string}
+ */
+export function canaryUrlFor(url) {
+  const { protocol, host } = new URL(url)
+  return `${protocol}//${host}${CANARY_PATH}`
+}
+
+/**
  * Адреса из пина: по одному на каждую пару (sidecar, тройка).
  *
  * @param {object} pin результат loadPin
@@ -220,7 +257,11 @@ export function collectPinUrls(pin) {
   for (const section of BINARY_NAMES) {
     for (const target of KNOWN_TARGETS) {
       const entry = pin[section].targets[target]
-      found.push({ url: entry.url, where: `binaries.lock.json ${section}.${target}` })
+      found.push({
+        url: entry.url,
+        where: `binaries.lock.json ${section}.${target}`,
+        origin: 'pin',
+      })
     }
   }
   return found
@@ -236,7 +277,11 @@ export function collectPinUrls(pin) {
  */
 export function extractMarkdownUrls(text, where) {
   const matches = text.match(/https?:\/\/[^\s<>()[\]"'`|]+/g) ?? []
-  return matches.map((raw) => ({ url: raw.replace(TRAILING_PUNCTUATION, ''), where }))
+  return matches.map((raw) => ({
+    url: raw.replace(TRAILING_PUNCTUATION, ''),
+    where,
+    origin: 'docs',
+  }))
 }
 
 /**
@@ -261,17 +306,22 @@ export async function collectDocUrls(repoRoot = REPO_ROOT) {
  * @returns {Array<{ url: string; where: string[] }>}
  */
 export function mergeByUrl(entries) {
-  /** @type {Map<string, string[]>} */
+  /** @type {Map<string, { where: string[]; origins: Set<string> }>} */
   const byUrl = new Map()
-  for (const { url, where } of entries) {
-    const places = byUrl.get(url)
-    if (places) {
-      if (!places.includes(where)) places.push(where)
+  for (const { url, where, origin } of entries) {
+    const found = byUrl.get(url)
+    if (found) {
+      if (!found.where.includes(where)) found.where.push(where)
+      found.origins.add(origin)
     } else {
-      byUrl.set(url, [where])
+      byUrl.set(url, { where: [where], origins: new Set([origin]) })
     }
   }
-  return [...byUrl].map(([url, where]) => ({ url, where }))
+  return [...byUrl].map(([url, { where, origins }]) => ({
+    url,
+    where,
+    origins: [...origins].sort(),
+  }))
 }
 
 /**

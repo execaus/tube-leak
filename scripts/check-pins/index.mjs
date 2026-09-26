@@ -9,10 +9,17 @@
 // Отдельная команда, а не тест: в тестах проекта сети нет, и `cargo test`
 // с `npm test` ходить наружу не должны. Запускать перед выпуском.
 //
-// Что ловит: исчезновение чужого ассета (у сборщиков ffmpeg теги
-// ротируются, см. _note записей пина) и протухание указателя §6d GPL v3.
-// Чего НЕ ловит: подмену файла под тем же адресом — это работа sha256 в
-// пине, её проверяет доставка (scripts/fetch-binaries).
+// Строгость разная у пина и у документов (решение ведущего, Б4 ревью):
+//
+// - АДРЕС ПИНА обязан быть подтверждён живым. Это то, что доставка
+//   СКАЧИВАЕТ на сборке: неподтверждённый адрес там — несобираемый
+//   установщик, то есть ровно #140. Любой исход, кроме «жив», валит гейт:
+//   и 404, и упорный 5xx, и «клиент не пропущен», и хост-канарейка.
+// - АДРЕС ДОКУМЕНТА — указатель §6d. Мёртвый валит гейт, «не
+//   подтверждён» — нет, но печатается отдельным списком с причиной.
+//
+// Чего сторож НЕ ловит: подмену файла под тем же адресом — это работа
+// sha256 в пине, её проверяет доставка (scripts/fetch-binaries).
 //
 // Офлайн-часть сторожа — в sources.mjs (crossCheckDocs) и идёт в обычном
 // `npm test`: она требует, чтобы документы называли сборки АДРЕСАМИ, а не
@@ -20,7 +27,15 @@
 
 import { fileURLToPath } from 'node:url'
 
-import { collectAllUrls, collectPinUrls, mergeByUrl, PIN_PATH, planProbe } from './sources.mjs'
+import {
+  canaryUrlFor,
+  collectAllUrls,
+  collectPinUrls,
+  isPinAddress,
+  mergeByUrl,
+  PIN_PATH,
+  planProbe,
+} from './sources.mjs'
 import { loadPin } from '../fetch-binaries/pin.mjs'
 
 /** Сколько адресов проверяется одновременно. */
@@ -34,9 +49,7 @@ const TIMEOUT_MS = 30_000
  * Не перестраховка, а измерение (2026-09-26): шесть HEAD подряд к
  * `aomedia.googlesource.com/aom` дали `200 200 503 503 503 200`, GET —
  * `200 503 200`. Три отказа подряд возможны, поэтому и попыток четыре, и
- * паузы растут. Без повторов релизный гейт краснел на ровном месте
- * (замечание Б3 ревью TL-133), а сторож, красный от случайностей,
- * перестают читать — это принцип из шапки этого же файла.
+ * паузы растут.
  */
 const RETRY_DELAYS_MS = Object.freeze([1_000, 3_000, 6_000])
 
@@ -48,10 +61,8 @@ const RETRY_DELAYS_MS = Object.freeze([1_000, 3_000, 6_000])
  * `fetch` — 406, и это не лечится ни `User-Agent`, ни `Accept`, ни
  * `Accept-Encoding` (проверены все семь комбинаций, HEAD и GET с Range).
  * Отличается не ресурс, а клиент. Повторы таким ответам не помогают —
- * они стабильны, поэтому попытка одна.
- *
- * Границу это не размывает: пропажа ассета у GitHub — 404, и она
- * остаётся отказом. Именно так выглядел #140.
+ * они стабильны, поэтому попытка одна. Для адреса ПИНА этот исход всё
+ * равно валит гейт: «не опровергнут» — не то же, что «подтверждён».
  */
 const CLIENT_REFUSED = new Set([401, 403, 406])
 
@@ -100,7 +111,7 @@ export async function checkUrl(url, { fetchImpl = fetch, sleepImpl = sleep } = {
         return {
           kind: 'warn',
           status,
-          detail: `HTTP ${status} — хост ответил, но этому клиенту не отдаёт (ресурс не опровергнут)`,
+          detail: `HTTP ${status} — хост ответил, но этому клиенту не отдаёт (существование не подтверждено)`,
           attempts,
         }
       }
@@ -108,7 +119,7 @@ export async function checkUrl(url, { fetchImpl = fetch, sleepImpl = sleep } = {
         last = {
           kind: 'warn',
           status,
-          detail: `HTTP ${status} — хост временно недоступен, ${attempts} попыток подряд (ресурс не опровергнут)`,
+          detail: `HTTP ${status} — хост временно недоступен, ${attempts} попыток подряд (существование не подтверждено)`,
         }
         continue
       }
@@ -122,10 +133,50 @@ export async function checkUrl(url, { fetchImpl = fetch, sleepImpl = sleep } = {
 }
 
 /**
+ * Спрашивает у хоста заведомо несуществующий путь. Если хост отвечает на
+ * него «жив», значит его 200 ничего не доказывает — ни один его адрес
+ * нельзя считать подтверждённым.
+ *
+ * Механизм общий, а не список хостов: список устарел бы молча. Измерено
+ * 2026-09-26 — так отвечают `code.videolan.org` (200, длина 0) и
+ * `gitlab.freedesktop.org` (200), причём второго не было ни в одном
+ * списке, пока канарейка его не нашла.
+ *
+ * Результат кэшируется по хосту: один лишний запрос на хост, а не на
+ * адрес.
+ *
+ * @param {string} url любой адрес нужного хоста
+ * @param {{ fetchImpl?: typeof fetch; sleepImpl?: (ms: number) => Promise<void>; canaryCache?: Map<string, object> }} [deps]
+ * @returns {Promise<{ url: string; status: number | null; indistinguishable: boolean }>}
+ */
+export function hostCanary(url, deps = {}) {
+  const cache = deps.canaryCache ?? new Map()
+  const { host } = new URL(url)
+  const cached = cache.get(host)
+  if (cached) return cached
+
+  // Кэшируется ОБЕЩАНИЕ, а не готовый ответ. Проверки идут параллельно
+  // (CONCURRENCY), и при кэше по результату несколько адресов одного
+  // хоста успевают промахнуться мимо пустого кэша раньше, чем первый из
+  // них допросит канарейку: замерено — три адреса давали три запроса
+  // вместо одного. С обещанием все ждут первый запрос.
+  const canaryUrl = canaryUrlFor(url)
+  const pending = checkUrl(canaryUrl, deps).then((verdict) => ({
+    url: canaryUrl,
+    status: verdict.status,
+    // Только «жив» означает, что хост не различает существование. 404,
+    // 403, 401 и даже упорный 5xx — не ложное подтверждение.
+    indistinguishable: verdict.kind === 'ok',
+  }))
+  cache.set(host, pending)
+  return pending
+}
+
+/**
  * Делит адреса на проверяемые (возможно, по адресу-замене) и
  * пропускаемые с названной причиной — см. planProbe.
  *
- * @param {Array<{ url: string; where: string[] }>} entries
+ * @param {Array<{ url: string; where: string[]; origins: string[] }>} entries
  */
 export function planAll(entries) {
   const checked = []
@@ -139,10 +190,12 @@ export function planAll(entries) {
 }
 
 /**
- * @param {Array<{ url: string; probeUrl: string; where: string[] }>} entries
- * @param {{ fetchImpl?: typeof fetch; sleepImpl?: (ms: number) => Promise<void> }} [deps]
+ * @param {Array<{ url: string; probeUrl?: string; where: string[]; origins: string[] }>} entries
+ * @param {{ fetchImpl?: typeof fetch; sleepImpl?: (ms: number) => Promise<void>; canaryCache?: Map<string, object> }} [deps]
  */
 export async function checkAll(entries, deps = {}) {
+  const canaryCache = deps.canaryCache ?? new Map()
+  const withCache = { ...deps, canaryCache }
   const results = new Array(entries.length)
   let next = 0
 
@@ -152,13 +205,45 @@ export async function checkAll(entries, deps = {}) {
       next += 1
       if (index >= entries.length) return
       const entry = entries[index]
-      const { kind, detail } = await checkUrl(entry.probeUrl ?? entry.url, deps)
+      const probeUrl = entry.probeUrl ?? entry.url
+      const verdict = await checkUrl(probeUrl, withCache)
+      let { kind, detail } = verdict
+
+      // «Жив» засчитывается только у хоста, который умеет отвечать
+      // отказом. Иначе 200 не отличает существующее от выдуманного.
+      if (kind === 'ok') {
+        const canary = await hostCanary(probeUrl, withCache)
+        if (canary.indistinguishable) {
+          kind = 'warn'
+          detail =
+            `${detail}, но хост отвечает так же на несуществующий путь ` +
+            `(канарейка ${canary.url} → HTTP ${canary.status}): существование не подтверждено`
+        }
+      }
+
       results[index] = { ...entry, kind, detail }
     }
   }
 
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, entries.length) }, worker))
   return results
+}
+
+/**
+ * Приговор по строгости происхождения: у пина «не подтверждён» —
+ * это отказ, у документов — терпимая оговорка (Б4 ревью).
+ *
+ * @param {Array<{ kind: string; origins: string[] }>} results
+ */
+export function judge(results) {
+  const alive = results.filter((result) => result.kind === 'ok')
+  const fatal = results.filter(
+    (result) => result.kind === 'dead' || (result.kind === 'warn' && isPinAddress(result)),
+  )
+  const tolerated = results.filter(
+    (result) => result.kind === 'warn' && !isPinAddress(result),
+  )
+  return { alive, fatal, tolerated }
 }
 
 /**
@@ -176,6 +261,21 @@ export function parseArgs(argv) {
   return { pinOnly }
 }
 
+function report(title, results) {
+  console.log(`\n── ${title} ──`)
+  if (results.length === 0) {
+    console.log('  (пусто)')
+    return
+  }
+  const mark = { ok: 'OK   ', warn: 'WARN ', dead: 'DEAD ' }
+  for (const result of results) {
+    console.log(`${mark[result.kind]} ${result.detail}`)
+    console.log(`      ${result.url}`)
+    if (result.why) console.log(`      проверено заменой: ${result.probeUrl} — ${result.why}`)
+    if (result.kind !== 'ok') console.log(`      назван в: ${result.where.join(', ')}`)
+  }
+}
+
 async function main() {
   const { pinOnly } = parseArgs(process.argv.slice(2))
   const entries = pinOnly ? mergeByUrl(collectPinUrls(await loadPin(PIN_PATH))) : await collectAllUrls()
@@ -183,37 +283,37 @@ async function main() {
 
   console.log(
     `check-pins: ${entries.length} адресов${pinOnly ? ' (только пин)' : ''}, ` +
-      `проверяем ${checked.length}, пропускаем ${skipped.length}\n`,
+      `проверяем ${checked.length}, пропускаем ${skipped.length}`,
   )
 
   const results = await checkAll(checked)
-  const mark = { ok: 'OK   ', warn: 'WARN ', dead: 'DEAD ' }
 
-  for (const result of results) {
-    console.log(`${mark[result.kind]} ${result.detail}`)
-    console.log(`      ${result.url}`)
-    if (result.why) console.log(`      проверено заменой: ${result.probeUrl} — ${result.why}`)
-    if (result.kind !== 'ok') console.log(`      назван в: ${result.where.join(', ')}`)
+  // Пин и документы печатаются врозь: у них разная строгость, и
+  // сваливать их в один список — значит прятать, что именно упало.
+  report('адреса пина (обязаны быть подтверждены живыми)', results.filter(isPinAddress))
+  report('адреса документов §6d', results.filter((result) => !isPinAddress(result)))
+
+  if (skipped.length > 0) {
+    console.log('\n── пропущено (причина названа, адрес не проверялся) ──')
+    for (const entry of skipped) {
+      console.log(`SKIP  ${entry.reason}`)
+      console.log(`      ${entry.url}`)
+    }
   }
 
-  // Пропуски печатаются всегда: молча выкинутый адрес ничем не отличается
-  // от непроверенного, а сторож обязан отчитываться о собственных границах.
-  for (const entry of skipped) {
-    console.log(`SKIP  ${entry.reason}`)
-    console.log(`      ${entry.url}`)
-  }
-
-  const dead = results.filter((result) => result.kind === 'dead')
-  const warned = results.filter((result) => result.kind === 'warn')
+  const { alive, fatal, tolerated } = judge(results)
   console.log(
-    `\nИтог: живых ${results.length - dead.length - warned.length}, ` +
-      `не подтверждённых ${warned.length}, мёртвых ${dead.length}, пропущено ${skipped.length}.`,
+    `\nИтог: подтверждено живыми ${alive.length}, ` +
+      `терпимо не подтверждено ${tolerated.length} (только документы), ` +
+      `отказов ${fatal.length}, пропущено ${skipped.length}.`,
   )
 
-  if (dead.length > 0) {
+  if (fatal.length > 0) {
+    const pinFatal = fatal.filter(isPinAddress).length
     throw new Error(
-      `${dead.length} адресов недоступны — перепиновать источник и обновить указатель §6d ` +
-        '(SOURCES-FFMPEG.md, THIRD-PARTY-LICENSES.md) той же задачей',
+      `${fatal.length} адресов не прошли проверку (из них адресов пина — ${pinFatal}). ` +
+        'Перепиновать источник и обновить указатель §6d (SOURCES-FFMPEG.md, ' +
+        'THIRD-PARTY-LICENSES.md) той же задачей',
     )
   }
 }
