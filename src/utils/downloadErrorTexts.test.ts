@@ -14,6 +14,7 @@ const ALL_KINDS = knownKindsOf({
   diskFull: true,
   staleFormat: true,
   mergeFailed: true,
+  streamsMissing: true,
   destinationUnavailable: true,
   videoUnavailable: true,
   signInRequired: true,
@@ -21,8 +22,8 @@ const ALL_KINDS = knownKindsOf({
   ytDlpFailure: true,
 } satisfies Record<DownloadErrorKind, true>)
 
-describe('getDownloadErrorText — 9 классов ошибок скачивания (Ф-10, таблица дизайна E3)', () => {
-  it('returns a distinct, non-empty title and explanation for every one of the 9 classes', () => {
+describe('getDownloadErrorText — 10 классов ошибок скачивания (Ф-10, таблица дизайна E3 + TL-130)', () => {
+  it('returns a distinct, non-empty title and explanation for every one of the 10 classes', () => {
     const texts = ALL_KINDS.map((kind) => getDownloadErrorText(kind))
     for (const text of texts) {
       expect(text.title.length).toBeGreaterThan(0)
@@ -87,6 +88,31 @@ describe('getDownloadErrorText — под-причина «yt-dlp устарел
     expect(getDownloadErrorText('ytDlpFailure').title).toBe('Не удалось скачать ролик')
     expect(getDownloadErrorText('ytDlpFailure', 'outdated').title).toBe('Не удалось скачать ролик')
     expect(getDownloadErrorText('ytDlpFailure', 'outdated').title).not.toContain('данные о ролике')
+  })
+})
+
+describe('getDownloadErrorText — «потоков нет» (TL-131, живой дефект #137 на Windows)', () => {
+  it('matches the exact wording — replacing it with the old merge-failure text must fail this test', () => {
+    expect(getDownloadErrorText('streamsMissing')).toStrictEqual({
+      title: 'Файлы потоков не найдены',
+      explanation: 'Приложение не получило файлы скачанных потоков. Попробуйте ещё раз — потоки скачаются заново.',
+    })
+  })
+
+  it('never blames ffmpeg or the merge step — yt-dlp finished, the merge never even started', () => {
+    const text = getDownloadErrorText('streamsMissing')
+    const combined = `${text.title} ${text.explanation}`.toLowerCase()
+    expect(combined).not.toContain('ffmpeg')
+    expect(combined).not.toContain('склеи')
+    expect(combined).not.toContain('склад')
+    expect(combined).not.toContain('объединит')
+  })
+
+  it('does not promise that partially downloaded stream files survived — that is `partialData`, not this text', () => {
+    const text = getDownloadErrorText('streamsMissing')
+    const combined = `${text.title} ${text.explanation}`.toLowerCase()
+    expect(combined).not.toContain('осталось на диске')
+    expect(combined).not.toContain('оба потока скачались')
   })
 })
 

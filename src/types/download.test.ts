@@ -12,8 +12,8 @@ import type {
 
 /**
  * Нормативный тест TL-39 (критерий приёмки issue #41): полный набор
- * значений `DownloadErrorKind` (9) и `DownloadPhase` (7) должен совпадать
- * с контрактом `src-tauri/src/types.rs`.
+ * значений `DownloadErrorKind` (10, TL-130 добавил `streamsMissing`) и
+ * `DownloadPhase` (7) должен совпадать с контрактом `src-tauri/src/types.rs`.
  *
  * Строковые литеральные объединения не существуют в рантайме, поэтому
  * прямое сравнение массивов невозможно — вместо этого используется
@@ -43,6 +43,7 @@ const ALL_DOWNLOAD_ERROR_KINDS = {
   diskFull: true,
   staleFormat: true,
   mergeFailed: true,
+  streamsMissing: true,
   destinationUnavailable: true,
   videoUnavailable: true,
   signInRequired: true,
@@ -91,9 +92,9 @@ describe('DownloadPhase — ровно семь значений контрак�
   })
 })
 
-describe('DownloadErrorKind — ровно девять классов контракта (Ф-10)', () => {
-  it('has exactly 9 error kinds', () => {
-    expect(Object.keys(ALL_DOWNLOAD_ERROR_KINDS)).toHaveLength(9)
+describe('DownloadErrorKind — ровно десять классов контракта (Ф-10, TL-130)', () => {
+  it('has exactly 10 error kinds', () => {
+    expect(Object.keys(ALL_DOWNLOAD_ERROR_KINDS)).toHaveLength(10)
   })
 
   it('reuses the four probe error kinds verbatim (E2 texts stay valid without translation)', () => {

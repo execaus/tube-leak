@@ -4,8 +4,8 @@ import type { DownloadErrorKind } from '@/types/generated/download'
 import type { YtDlpFailureReason } from '@/types/generated/probe'
 
 /**
- * Тексты для девяти классов отказа скачивания (Ф-10), строго по таблице
- * раздела «Ошибки» дизайна E3.
+ * Тексты для десяти классов отказа скачивания (Ф-10, TL-130 добавил
+ * `streamsMissing`), строго по таблице раздела «Ошибки» дизайна E3.
  *
  * # Нормативно: не `DownloadError.message`
  *
@@ -53,6 +53,24 @@ const STALE_FORMAT_TEXT: DownloadErrorText = {
 const MERGE_FAILED_TEXT: DownloadErrorText = {
   title: 'Не удалось склеить видео и звук',
   explanation: 'Оба потока скачались, но объединить их в один файл не получилось.',
+}
+
+/**
+ * `streamsMissing` (TL-130, живой дефект #137 на Windows): yt-dlp
+ * завершился, но приложение не нашло файлы скачанных потоков — склеивать
+ * (и вообще запускать ffmpeg) было нечего. Раньше этот исход попадал под
+ * {@link MERGE_FAILED_TEXT}, и все три её утверждения — «оба потока
+ * скачались», «склейка», «уже скачанное осталось на диске» (примечание
+ * `getFailedPartialDataNote`) — были неправдой: владелец прочитал текст
+ * про сбой склейки и пошёл искать несуществующую поломку ffmpeg. Текст
+ * ниже не называет причину пропажи файлов (её не знает и ядро) и не
+ * утверждает, что на диске что-то осталось или не осталось — это решает
+ * отдельно `partialData` (см. doc-комментарий {@link getFailedPartialDataNote}
+ * в `src/utils/downloadOutcomeTexts.ts`).
+ */
+const STREAMS_MISSING_TEXT: DownloadErrorText = {
+  title: 'Файлы потоков не найдены',
+  explanation: 'Приложение не получило файлы скачанных потоков. Попробуйте ещё раз — потоки скачаются заново.',
 }
 
 const DESTINATION_UNAVAILABLE_TEXT: DownloadErrorText = {
@@ -103,6 +121,8 @@ export function getDownloadErrorText(
       return STALE_FORMAT_TEXT
     case 'mergeFailed':
       return MERGE_FAILED_TEXT
+    case 'streamsMissing':
+      return STREAMS_MISSING_TEXT
     case 'destinationUnavailable':
       return DESTINATION_UNAVAILABLE_TEXT
     case 'videoUnavailable':
