@@ -1635,6 +1635,346 @@ async fn a_cyrillic_stream_name_reaches_the_merge_when_the_launch_pins_utf8() {
 }
 
 #[tokio::test]
+async fn an_already_downloaded_line_with_a_cyrillic_name_is_attributed_too() {
+    // Ревью TL-130: имя файла несёт не только `Destination`. Строка
+    // `… has already been downloaded` ломалась бы на cp1251 ровно так же
+    // — и поток, уже лежащий на диске, снова стал бы незабранным.
+    const TITLE: &str = "Трейлер (Comedy Club), 18.09.2026";
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = request(streams(Some("18"), None));
+    req.title = TITLE.to_string();
+    let task = new_task(req);
+
+    let stream = format!("{}.f18.mp4", partial_base(TITLE, URL));
+    let already = format!(
+        "[download] {} has already been downloaded",
+        dir.path().join(&stream).display()
+    );
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::ok().creates(&stream).native_line(&already)],
+    );
+
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
+
+    let lines = &launcher.calls()[0].lines;
+    assert!(
+        lines.iter().all(|line| !line.contains('\u{FFFD}')),
+        "имя прочитано без потерь: {lines:?}"
+    );
+    assert!(
+        matches!(sink.last(), DownloadProgress::Done { .. }),
+        "уже скачанный поток обязан быть засчитан: {:?}",
+        sink.last()
+    );
+    assert_eq!(
+        dir_listing(dir.path()).len(),
+        1,
+        "остался ровно готовый файл: {:?}",
+        dir_listing(dir.path())
+    );
+}
+
+#[tokio::test]
+async fn a_failure_without_any_stream_on_disk_promises_nothing_kept() {
+    // Р-3 ревью TL-130: класс «потоков нет» не должен обещать
+    // сохранённые файлы, когда на диске пусто. Значение берётся не из
+    // класса, а из подчистки — поэтому пустая папка даёт
+    // `nothingCreated`, и экран не соврёт про «уже скачанное».
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    // Запуск кончился кодом 0, перечень форматов назвал, файлов не создал.
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::ok().line("[info] aqz-KE-bpKQ: Downloading 2 format(s): 133, 139")],
+    );
+
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
+
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("файлов нет — отказ: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::StreamsMissing);
+    assert_eq!(
+        error.partial_data,
+        PartialData::NothingCreated,
+        "на диске пусто — обещать сохранённое нельзя"
+    );
+    assert_eq!(ffmpeg.calls(), 0, "ffmpeg не запускался");
+    assert!(
+        dir_listing(dir.path()).is_empty(),
+        "{:?}",
+        dir_listing(dir.path())
+    );
+}
+
+#[tokio::test]
+async fn the_scan_finds_stream_files_the_output_never_named() {
+    // TL-130, причина (б): строки с именем файла в выводе не было вовсе
+    // — в полном логе владельца её и нет. Файлы на диске лежат, и
+    // находятся они по нашим же ASCII-меткам, а не по чужому тексту.
+    let dir = tempfile::tempdir().unwrap();
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let video = format!("{BASE}.f133.mp4");
+    let audio = format!("{BASE}.f139.m4a");
+
+    run_two_streams(
+        &dir,
+        &sink,
+        vec![Script::ok()
+            .line("[info] aqz-KE-bpKQ: Downloading 2 format(s): 133, 139")
+            .creates(&video)
+            .creates(&audio)],
+        &ffmpeg,
+    )
+    .await;
+
+    assert_eq!(
+        ffmpeg.last_input_names(),
+        (video, audio),
+        "оба потока найдены обходом папки"
+    );
+    assert!(
+        matches!(sink.last(), DownloadProgress::Done { .. }),
+        "{:?}",
+        sink.last()
+    );
+}
+
+#[tokio::test]
+async fn the_scan_finds_a_stream_file_whose_name_came_back_mangled() {
+    // TL-130, причина (а): имя в выводе испорчено (cp1251), и пусть даже
+    // `--encoding utf-8` не подействовал бы — файл всё равно находится.
+    const TITLE: &str = "Новый выпуск камеди клаб (Comedy Club), 18.09.2026";
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = request(streams(Some("133"), Some("139")));
+    req.title = TITLE.to_string();
+    let task = new_task(req);
+    let base = partial_base(TITLE, URL);
+    let video = format!("{base}.f133.mp4");
+    let audio = format!("{base}.f139.m4a");
+    let mangled = |name: &str| as_process_output(&[], &destination_line(dir.path(), name));
+
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::ok()
+            .line(&mangled(&video))
+            .creates(&video)
+            .line(&mangled(&audio))
+            .creates(&audio)],
+    );
+
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
+
+    let calls = launcher.calls();
+    let named: Vec<&String> = calls[0]
+        .lines
+        .iter()
+        .filter(|line| line.contains('\u{FFFD}'))
+        .collect();
+    assert_eq!(named.len(), 2, "обе строки пришли испорченными: {named:?}");
+    assert_eq!(
+        ffmpeg.last_input_names(),
+        (video, audio),
+        "испорченный вывод не помешал найти файлы"
+    );
+    assert!(
+        matches!(sink.last(), DownloadProgress::Done { .. }),
+        "{:?}",
+        sink.last()
+    );
+}
+
+#[tokio::test]
+async fn the_scan_takes_no_file_of_another_video_another_format_or_a_partial() {
+    // TL-130: метки узкие. Чужой ролик, незаказанный формат и рабочий
+    // хвост `.part` файлами потока не считаются — задача честно падает
+    // «потоков нет», а чужое остаётся нетронутым.
+    let dir = tempfile::tempdir().unwrap();
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let video = format!("{BASE}.f133.mp4");
+    let strangers = [
+        "YE7VzlLtp-4.Big Buck Bunny.f139.m4a".to_string(),
+        format!("{BASE}.f251.webm"),
+        format!("{BASE}.f139.m4a.part"),
+    ];
+
+    let mut script = Script::ok()
+        .line("[info] aqz-KE-bpKQ: Downloading 2 format(s): 133, 139")
+        .line(&destination_line(dir.path(), &video))
+        .creates(&video);
+    for name in &strangers {
+        script = script.creates(name);
+    }
+    run_two_streams(&dir, &sink, vec![script], &ffmpeg).await;
+
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("звука нет — отказ: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::StreamsMissing);
+    assert_eq!(ffmpeg.calls(), 0, "склеивать нечем");
+    let listing = dir_listing(dir.path());
+    for name in &strangers {
+        assert!(listing.contains(name), "{name} пропал: {listing:?}");
+    }
+}
+
+#[tokio::test]
+async fn two_candidates_for_one_stream_are_not_guessed_between() {
+    // TL-130: два файла с нашим id и нашей меткой формата, и ни один не
+    // носит имя, построенное нашим `-o`. Какой из них наш — неизвестно;
+    // взять «поновее» значило бы склеить чужое, поэтому поток остаётся
+    // незабранным.
+    let dir = tempfile::tempdir().unwrap();
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let video = format!("{BASE}.f133.mp4");
+    let candidates = [
+        "aqz-KE-bpKQ.Другое название.f139.m4a".to_string(),
+        "aqz-KE-bpKQ.Третье название.f139.webm".to_string(),
+    ];
+
+    let mut script = Script::ok()
+        .line("[info] aqz-KE-bpKQ: Downloading 2 format(s): 133, 139")
+        .line(&destination_line(dir.path(), &video))
+        .creates(&video);
+    for name in &candidates {
+        script = script.creates(name);
+    }
+    run_two_streams(&dir, &sink, vec![script], &ffmpeg).await;
+
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!(
+            "выбирать между кандидатами нельзя — отказ: {:?}",
+            sink.last()
+        );
+    };
+    assert_eq!(error.kind, DownloadErrorKind::StreamsMissing);
+    assert_eq!(ffmpeg.calls(), 0, "ни один кандидат не ушёл в склейку");
+    let listing = dir_listing(dir.path());
+    for name in &candidates {
+        assert!(listing.contains(name), "{name} пропал: {listing:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_name_our_template_built_wins_over_a_stranger_with_the_same_id_and_format() {
+    // Обратная сторона предыдущего: если среди кандидатов ровно один
+    // носит точное имя нашего `-o`, это не догадка — построить его было
+    // некому, кроме нашего же запуска.
+    let dir = tempfile::tempdir().unwrap();
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let video = format!("{BASE}.f133.mp4");
+    let audio = format!("{BASE}.f139.m4a");
+    let stranger = "aqz-KE-bpKQ.Другое название.f139.webm".to_string();
+
+    run_two_streams(
+        &dir,
+        &sink,
+        vec![Script::ok()
+            .line("[info] aqz-KE-bpKQ: Downloading 2 format(s): 133, 139")
+            .line(&destination_line(dir.path(), &video))
+            .creates(&video)
+            .creates(&audio)
+            .creates(&stranger)],
+        &ffmpeg,
+    )
+    .await;
+
+    assert_eq!(
+        ffmpeg.last_input_names(),
+        (video, audio.clone()),
+        "в склейку ушло имя, построенное нашим шаблоном"
+    );
+    assert!(
+        matches!(sink.last(), DownloadProgress::Done { .. }),
+        "{:?}",
+        sink.last()
+    );
+}
+
+#[test]
+fn the_shortage_report_speaks_only_when_a_stream_is_left_without_a_file() {
+    // TL-130: строка диагностики нужна ровно тогда, когда поток остался
+    // без файла. На здоровой загрузке её быть не должно — иначе тот
+    // единственный случай, ради которого она заведена, утонет в логе.
+    let mut stats = StdoutStats {
+        total: 4,
+        destination: 1,
+        progress: 2,
+        ..StdoutStats::default()
+    };
+    let long = "я".repeat(DIAGNOSTIC_LINE_MAX_CHARS + 50);
+    stats.other += 1;
+    stats.sample(&long);
+    for index in 0..DIAGNOSTIC_SAMPLES + 3 {
+        stats.sample(&format!("строка {index}"));
+    }
+
+    assert_eq!(
+        shortage_report(&stats, &[]),
+        None,
+        "файлы есть у всех потоков — молчим"
+    );
+
+    let report = shortage_report(&stats, &["139"]).expect("недостача обязана попасть в лог");
+    assert!(report.contains("139"), "{report}");
+    assert!(report.contains("строк всего 4"), "{report}");
+    assert!(report.contains("Destination 1"), "{report}");
+    assert_eq!(
+        stats.samples.len(),
+        DIAGNOSTIC_SAMPLES,
+        "образцов не больше предела"
+    );
+    assert_eq!(
+        stats.samples[0].chars().count(),
+        DIAGNOSTIC_LINE_MAX_CHARS + 1,
+        "длинная строка обрезана и помечена многоточием"
+    );
+}
+
+#[test]
+fn the_scan_marks_only_our_id_and_our_format_marker() {
+    // Единица обхода — сам `scan_stream_files`: белый список меток
+    // проверяется без оркестрации, по файлам на диске.
+    let dir = tempfile::tempdir().unwrap();
+    let ours = format!("{BASE}.f133.mp4");
+    let renamed = "aqz-KE-bpKQ.Имя, изменённое санитизацией.f133.webm".to_string();
+    for name in [
+        ours.as_str(),
+        renamed.as_str(),
+        "aqz-KE-bpKQ.Big Buck Bunny.f133.mp4.part",
+        "aqz-KE-bpKQ.Big Buck Bunny.f139.m4a",
+        "YE7VzlLtp-4.Big Buck Bunny.f133.mp4",
+        "aqz-KE-bpKQ.Big Buck Bunny.f1330.mp4",
+    ] {
+        std::fs::write(dir.path().join(name), b"x").expect("файл создаётся");
+    }
+
+    let found = scan_stream_files(dir.path(), BASE, "133");
+    let names: Vec<String> = found
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        vec![ours, renamed],
+        "взяты только файлы нашего ролика с меткой .f133."
+    );
+}
+
+#[tokio::test]
 async fn the_percent_reaches_a_hundred_and_never_goes_backwards() {
     let dir = tempfile::tempdir().unwrap();
     let sink = RecordingSink::new();
@@ -2685,7 +3025,11 @@ async fn a_selected_stream_whose_file_was_never_named_is_asked_for_again() {
     let DownloadProgress::Failed { error } = sink.last() else {
         panic!("без файла звука склеивать нечего: {:?}", sink.last());
     };
-    assert_eq!(error.kind, DownloadErrorKind::MergeFailed);
+    assert_eq!(
+        error.kind,
+        DownloadErrorKind::StreamsMissing,
+        "ffmpeg не запускался — это не отказ склейки (TL-130)"
+    );
     assert!(error.retryable);
     assert!(
         !error.message.contains("ffmpeg"),
@@ -2855,7 +3199,11 @@ fn the_single_launch_fixtures_were_shot_with_the_arguments_of_the_app() {
             .iter()
             .position(|arg| arg == "--encoding")
             .expect("download_args обязан просить кодировку вывода (TL-130)");
-        assert_eq!(expected[encoding_at + 1], "utf-8", "{name}");
+        assert_eq!(
+            expected.get(encoding_at + 1).map(String::as_str),
+            Some("utf-8"),
+            "{name}: у --encoding обязано быть значение"
+        );
         expected.drain(encoding_at..=encoding_at + 1);
 
         let expected_tail = expected.split_off(expected.len() - 2);
@@ -5963,8 +6311,16 @@ async fn a_stream_file_gone_between_the_download_and_the_merge_is_not_merged_and
     let DownloadProgress::Failed { error } = sink.last() else {
         panic!("склеивать нечего — отказ: {:?}", sink.last());
     };
-    assert_eq!(error.kind, DownloadErrorKind::MergeFailed);
-    assert_eq!(error.partial_data, PartialData::Kept);
+    assert_eq!(
+        error.kind,
+        DownloadErrorKind::StreamsMissing,
+        "файл потока пропал до склейки — ffmpeg не запускался (TL-130)"
+    );
+    assert_eq!(
+        error.partial_data,
+        PartialData::Kept,
+        "уцелевший поток остался на диске — это правда, а не обещание"
+    );
     assert!(error.retryable);
 
     task.set_progress(DownloadProgress::Queued);

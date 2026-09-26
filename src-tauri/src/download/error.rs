@@ -1,9 +1,10 @@
 //! Типизированная ошибка скачивания (Ф-10 эпика E3, TL-38).
 //!
-//! Девять вариантов — ровно девять классов таблицы ошибок дизайна, ни
+//! Десять вариантов — ровно десять классов таблицы ошибок дизайна, ни
 //! больше ни меньше: фронтенд по классу выбирает заголовок и пояснение,
-//! поэтому появление десятого класса или исчезновение любого из девяти —
-//! изменение контракта, а не деталь реализации. Пять классов свои,
+//! поэтому появление одиннадцатого класса или исчезновение любого из
+//! десяти — изменение контракта, а не деталь реализации. Шесть классов
+//! свои (десятый, `StreamsMissing`, добавлен в TL-130),
 //! четыре переиспользуют смысловые классы разбора E2 (см. doc
 //! [`DownloadErrorKind`] — там же перечислено, каких классов E2 в девятке
 //! сознательно нет и почему).
@@ -38,6 +39,7 @@ use crate::types::{
 /// | `DiskFull` | [`PartialData::Kept`] — освободить место и продолжить |
 /// | `StaleFormat` | [`PartialData::Removed`]: докачка того же формата невозможна по построению |
 /// | `MergeFailed` | [`PartialData::Kept`] — оба потока целы, повтор пересобирает файл |
+/// | `StreamsMissing` | факт подчистки: [`PartialData::Kept`], если уцелевшее на диске есть, иначе [`PartialData::NothingCreated`] |
 /// | `DestinationUnavailable` | [`PartialData::Kept`], если папка ещё доступна; иначе честнее [`PartialData::Removed`] |
 /// | `VideoUnavailable` | [`PartialData::Removed`] — докачивать больше нечего |
 /// | `SignInRequired` | [`PartialData::Removed`] |
@@ -80,27 +82,36 @@ pub enum DownloadFailure {
     #[error("выбранный формат больше не доступен: данные разбора устарели")]
     StaleFormat { details: DownloadErrorDetails },
 
-    /// Склеить не вышло (С-11).
+    /// Потоки скачаны, ffmpeg завершился ошибкой (С-11).
     ///
     /// Класс отличим от сетевых сбоев ровно потому, что склейку ведёт
     /// отдельный процесс ffmpeg, запущенный ядром (решение дизайна по
     /// Ф-9): любая ошибка **этого** процесса и есть «не удалось склеить»,
     /// без текстовых эвристик поверх чужого stderr.
     ///
-    /// `reason` — почему именно, и он не украшение (TL-130). Под этим
-    /// классом живут два разных события: отказ ffmpeg и «файлов потоков к
-    /// склейке нет», где ffmpeg не запускался вовсе. Пока причина была
-    /// одна на двоих, второму случаю выдавался текст первого, и
-    /// пользователь на живой Windows читал про ошибку ffmpeg, которого не
-    /// было. Класс при этом общий намеренно: судьба частичного
-    /// ([`PartialData::Kept`]) и польза повтора у обоих совпадают, а
-    /// девятка классов Ф-10 от подпричины не растёт — как `reason` у
-    /// [`DownloadFailure::YtDlpFailure`].
-    #[error("не удалось склеить видео и звук: {reason}")]
-    MergeFailed {
-        reason: MergeFailedReason,
-        details: DownloadErrorDetails,
-    },
+    /// Класс означает ровно это и ничего больше: ffmpeg **запускался**.
+    /// Исход «склеивать было нечего» — отдельный
+    /// [`DownloadFailure::StreamsMissing`] (TL-130), иначе текст про
+    /// ошибку чужого процесса достаётся случаю, где процесса не было.
+    #[error("не удалось склеить видео и звук: ffmpeg завершился ошибкой")]
+    MergeFailed { details: DownloadErrorDetails },
+
+    /// Файлов скачанных потоков к склейке не нашлось (TL-130).
+    ///
+    /// Два пути сюда, и оба не про ffmpeg: запуск кончился кодом 0, но
+    /// файла потока yt-dlp так и не назвал (на живой Windows — потому что
+    /// имя приходило не в UTF-8, #137), либо файл забранного потока
+    /// пропал с диска между скачиванием и склейкой. Склеивать нечего,
+    /// ffmpeg не запускался, повтор спросит недостающий поток снова.
+    ///
+    /// Судьба частичного здесь не константа класса, а факт подчистки:
+    /// уцелевший поток остаётся лежать ([`PartialData::Kept`]) — удалять
+    /// его значило бы заставить повтор качать заново то, что уже есть, —
+    /// а если на диске пусто, подчистка честно скажет
+    /// [`PartialData::NothingCreated`], и экран не пообещает
+    /// несуществующего.
+    #[error("файлов скачанных потоков нет: склеивать было нечего")]
+    StreamsMissing { details: DownloadErrorDetails },
 
     /// Папка назначения недоступна: нет прав либо её не существует.
     ///
@@ -153,27 +164,6 @@ pub enum DownloadFailure {
     },
 }
 
-/// Почему склейка не состоялась ([`DownloadFailure::MergeFailed`], TL-130).
-///
-/// Подпричина домена, а не контракта: границу она пересекает только
-/// текстом `message`, поле `reason` у [`crate::types::DownloadError`]
-/// остаётся за `ytDlpFailure`. Фронтенду различать эти два случая незачем
-/// — действия пользователя (повтор, «Подробнее») у них совпадают, — а вот
-/// говорить ему неправду про чужой процесс нельзя.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum MergeFailedReason {
-    /// Процесс ffmpeg запускался и завершился ошибкой.
-    #[error("ffmpeg завершился ошибкой")]
-    FfmpegFailed,
-
-    /// Файлов потоков к склейке не нашлось: yt-dlp не назвал файл потока
-    /// либо названный файл пропал с диска до склейки. Склеивать было
-    /// нечего, **ffmpeg не запускался** — и упоминать его в тексте
-    /// значило бы отправить пользователя искать несуществующую поломку.
-    #[error("файлов скачанных потоков нет, склеивать было нечего")]
-    StreamsMissing,
-}
-
 #[allow(dead_code)]
 impl DownloadFailure {
     /// Класс ошибки для фронтенда.
@@ -183,6 +173,7 @@ impl DownloadFailure {
             Self::DiskFull { .. } => DownloadErrorKind::DiskFull,
             Self::StaleFormat { .. } => DownloadErrorKind::StaleFormat,
             Self::MergeFailed { .. } => DownloadErrorKind::MergeFailed,
+            Self::StreamsMissing { .. } => DownloadErrorKind::StreamsMissing,
             Self::DestinationUnavailable { .. } => DownloadErrorKind::DestinationUnavailable,
             Self::VideoUnavailable { .. } => DownloadErrorKind::VideoUnavailable,
             Self::SignInRequired { .. } => DownloadErrorKind::SignInRequired,
@@ -242,7 +233,8 @@ impl DownloadFailure {
             Self::ConnectionLost { details, .. }
             | Self::DiskFull { details }
             | Self::StaleFormat { details }
-            | Self::MergeFailed { details, .. }
+            | Self::MergeFailed { details }
+            | Self::StreamsMissing { details }
             | Self::DestinationUnavailable { details, .. }
             | Self::VideoUnavailable { details }
             | Self::SignInRequired { details }
@@ -263,7 +255,7 @@ mod tests {
         }
     }
 
-    /// Все девять классов Ф-10 с представителем каждого и той судьбой
+    /// Все десять классов с представителем каждого и той судьбой
     /// частичного, которую для него называет таблица дизайна.
     fn all_variants() -> Vec<(DownloadFailure, DownloadErrorKind, PartialData)> {
         vec![
@@ -286,11 +278,13 @@ mod tests {
                 PartialData::Removed,
             ),
             (
-                DownloadFailure::MergeFailed {
-                    reason: MergeFailedReason::FfmpegFailed,
-                    details: details(),
-                },
+                DownloadFailure::MergeFailed { details: details() },
                 DownloadErrorKind::MergeFailed,
+                PartialData::Kept,
+            ),
+            (
+                DownloadFailure::StreamsMissing { details: details() },
+                DownloadErrorKind::StreamsMissing,
                 PartialData::Kept,
             ),
             (
@@ -334,9 +328,10 @@ mod tests {
     fn maps_every_variant_to_its_own_contract_kind() {
         let variants = all_variants();
 
-        // Ф-10 плюс декомпозиция E3 — ровно девять классов; и лишний, и
-        // потерянный ломают таблицу текстов на стороне UI.
-        assert_eq!(variants.len(), 9);
+        // Ф-10 плюс декомпозиция E3 и десятый класс TL-130 — ровно
+        // десять; и лишний, и потерянный ломают таблицу текстов на
+        // стороне UI.
+        assert_eq!(variants.len(), 10);
 
         for (failure, expected_kind, partial) in variants {
             assert_eq!(failure.kind(), expected_kind);
@@ -398,11 +393,8 @@ mod tests {
 
     #[test]
     fn passes_stderr_tail_and_exit_code_through_to_the_contract() {
-        let contract = DownloadFailure::MergeFailed {
-            reason: MergeFailedReason::FfmpegFailed,
-            details: details(),
-        }
-        .to_contract(PartialData::Kept);
+        let contract =
+            DownloadFailure::MergeFailed { details: details() }.to_contract(PartialData::Kept);
 
         assert_eq!(contract.details, Some(details()));
     }
@@ -433,16 +425,10 @@ mod tests {
         // TL-130, дефект живой Windows (#137): «файлов потоков к склейке
         // нет» выдавалось текстом «ffmpeg завершился ошибкой», хотя ffmpeg
         // не запускался. Класс у двух причин общий, текст — нет.
-        let missing = DownloadFailure::MergeFailed {
-            reason: MergeFailedReason::StreamsMissing,
-            details: details(),
-        }
-        .to_contract(PartialData::Kept);
-        let ffmpeg = DownloadFailure::MergeFailed {
-            reason: MergeFailedReason::FfmpegFailed,
-            details: details(),
-        }
-        .to_contract(PartialData::Kept);
+        let missing =
+            DownloadFailure::StreamsMissing { details: details() }.to_contract(PartialData::Kept);
+        let ffmpeg =
+            DownloadFailure::MergeFailed { details: details() }.to_contract(PartialData::Kept);
 
         assert!(
             !missing.message.contains("ffmpeg"),
@@ -458,10 +444,14 @@ mod tests {
             missing.message, ffmpeg.message,
             "две причины — два текста, иначе различать их незачем"
         );
-        assert_eq!(
-            (missing.kind, missing.retryable, missing.partial_data),
-            (ffmpeg.kind, ffmpeg.retryable, ffmpeg.partial_data),
-            "класс, повторяемость и судьба частичного у причин общие"
+        assert_ne!(
+            missing.kind, ffmpeg.kind,
+            "это разные классы контракта, а не оттенки одного (TL-130)"
+        );
+        assert_eq!(missing.kind, DownloadErrorKind::StreamsMissing);
+        assert!(
+            missing.retryable,
+            "повтор скачает недостающий поток — смысл есть"
         );
     }
 
@@ -487,8 +477,6 @@ mod tests {
                 "Generic",
                 "Outdated",
                 "YtDlpFailureReason",
-                "MergeFailedReason",
-                "FfmpegFailed",
                 "StreamsMissing",
             ] {
                 assert!(

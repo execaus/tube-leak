@@ -161,11 +161,11 @@ stderrTail?: string,
 exitCode?: number, };
 
 /**
- * Девять классов отказа скачивания (Ф-10). Ровно по ним фронтенд выбирает
- * заголовок и пояснение (таблица в дизайне E3) — тексты живут на стороне
- * UI, в контракте только классификация.
+ * Десять классов отказа скачивания (Ф-10 плюс TL-130). Ровно по ним
+ * фронтенд выбирает заголовок и пояснение (таблица в дизайне E3) —
+ * тексты живут на стороне UI, в контракте только классификация.
  *
- * Пять классов — свои для E3, четыре последних переиспользуют смысловые
+ * Шесть классов — свои для E3, четыре последних переиспользуют смысловые
  * классы разбора: их строки на проводе **совпадают** с одноимёнными
  * значениями [`ProbeErrorKind`] намеренно, чтобы тексты, уже написанные
  * для карточки E2, годились без перевода (сторож —
@@ -187,7 +187,7 @@ exitCode?: number, };
  * А вот под-причина `outdated` у сбоя yt-dlp из E2 переносится и живёт
  * отдельным полем [`DownloadError::reason`] — почему, написано там же.
  */
-export type DownloadErrorKind = "connectionLost" | "diskFull" | "staleFormat" | "mergeFailed" | "destinationUnavailable" | "videoUnavailable" | "signInRequired" | "regionBlocked" | "ytDlpFailure";
+export type DownloadErrorKind = "connectionLost" | "diskFull" | "staleFormat" | "mergeFailed" | "streamsMissing" | "destinationUnavailable" | "videoUnavailable" | "signInRequired" | "regionBlocked" | "ytDlpFailure";
 
 /**
  * Доля скачанного в процентах, 0..=100.
