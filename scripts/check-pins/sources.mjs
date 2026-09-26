@@ -53,25 +53,55 @@ export const DOCUMENTED_SECTION = 'ffmpeg'
  * Граница нашего текста в THIRD-PARTY-LICENSES.md. Ниже первого раздела
  * «Полный текст …» идут ДОСЛОВНЫЕ тексты чужих лицензий и скопированные
  * из них уведомления: адреса там — чужие обещания, которые мы не вправе
- * править. Их в файле сотни, и часть из них мертва десятилетиями
+ * править. Их в файле сотни, и часть мертва десятилетиями
  * (университетские хосты 1990-х, trac Unicode). Сторож, красный от них,
  * — сторож, которого перестают читать; а править текст лицензии, чтобы
  * позеленеть, нельзя.
  */
 const OUR_TEXT_END = /^#{1,4} Полный текст/m
 
+/**
+ * Отпечатки дословных текстов чужих лицензий. Нужны потому, что
+ * проверять НАЛИЧИЕ маркера недостаточно: маркеров в файле три, и если
+ * пропадает ПЕРВЫЙ, граница молча съезжает на следующий — измерено
+ * 2026-09-26, наша часть выросла с 6 290 до 42 500 знаков (14 → 20
+ * адресов), втянув текст GPL v3. Ни одного из отпечатков в нашем тексте
+ * нет, а в съехавшей границе они появляются — это и ловится.
+ *
+ * Прежний комментарий здесь обещал «отсутствие маркера — ошибка» и был
+ * неверен для частичного удаления: сторож лгал о собственной границе
+ * (замечание Б2 ревью TL-133).
+ */
+const VERBATIM_LICENSE_FINGERPRINTS = Object.freeze([
+  'TERMS AND CONDITIONS',
+  'Preamble',
+  'THE SOFTWARE IS PROVIDED',
+  'WITHOUT WARRANTY OF ANY KIND',
+])
+
 // Хвостовая пунктуация, приклеивающаяся к URL в тексте markdown. Скобка
 // закрывающая — отдельный случай: она часть синтаксиса `[текст](url)`.
 const TRAILING_PUNCTUATION = /[).,;:!?»"'`]+$/
+
+/**
+ * Страницы issues нашего репозитория — и только они. Намеренно НЕ
+ * `startsWith('/execaus/tube-leak')`: такое правило накрыло бы и
+ * `tube-leak-docs`, и будущий `/execaus/tube-leak/releases/download/…`,
+ * а в день, когда мы заведём собственное зеркало ассета ffmpeg
+ * (исследование §2.4), пин-адрес молча стал бы «пропущенным» — то есть
+ * главный охраняемый адрес перестал бы охраняться (замечание Н1).
+ */
+const OWN_ISSUES_PATH = /^\/execaus\/tube-leak\/issues(\/\d+)?\/?$/
 
 /**
  * Часть документа, за которую отвечаем мы. Для SOURCES-FFMPEG.md это
  * файл целиком (он наш от начала до конца), для THIRD-PARTY-LICENSES.md
  * — до первого дословного текста лицензии.
  *
- * Отсутствие маркера — ошибка, а не повод молча проверить всё: сторож,
- * тихо расширивший собственные границы, — это ровно тот класс дефекта,
- * из-за которого заведён #140.
+ * Отказывает в двух случаях, а не в одном:
+ * - маркера нет вовсе — граница неизвестна;
+ * - граница съехала, и в нашу часть попал дословный текст чужой лицензии
+ *   (ловится отпечатками). Именно этот случай прежняя версия пропускала.
  *
  * @param {string} name имя файла
  * @param {string} text содержимое
@@ -79,6 +109,7 @@ const TRAILING_PUNCTUATION = /[).,;:!?»"'`]+$/
  */
 export function ourTextOf(name, text) {
   if (name !== 'THIRD-PARTY-LICENSES.md') return text
+
   const match = OUR_TEXT_END.exec(text)
   if (!match) {
     throw new Error(
@@ -87,42 +118,95 @@ export function ourTextOf(name, text) {
         'тексты чужих лицензий, адреса в которых нам не принадлежат.',
     )
   }
-  return text.slice(0, match.index)
+
+  const ours = text.slice(0, match.index)
+  const leaked = VERBATIM_LICENSE_FINGERPRINTS.filter((fingerprint) => ours.includes(fingerprint))
+  if (leaked.length > 0) {
+    throw new Error(
+      `${name}: граница нашего текста съехала — в неё попал дословный текст чужой лицензии ` +
+        `(отпечатки: ${leaked.join(', ')}). Скорее всего, пропал один из заголовков ` +
+        '«Полный текст …»: тогда граница уезжает на следующий, и сторож начинает проверять ' +
+        'чужие адреса, которые мы не вправе править.',
+    )
+  }
+  return ours
 }
 
 /**
- * Причина не проверять адрес по HTTP — или null, если проверять нужно.
- * Пропуски ИМЕНОВАННЫЕ и печатаются в отчёте: молча выкинутый адрес
- * ничем не отличается от непроверенного.
+ * Что делать с адресом: проверять как есть, проверять замену или
+ * пропустить с названной причиной.
+ *
+ * Правило сужено по замечанию Б1 ревью. Прежнее
+ * (`endsWith('.git') || /^(git|svn)\./`) было обосновано измерением лишь
+ * для трёх хостов, а применялось ко всем: пропускался **71 адрес из
+ * 129**, включая строки Linux-таблицы, которыми закрыт #136, и заведомо
+ * мёртвый `github.com/…/this-repo-does-not-exist-xyz123.git` проходил
+ * как SKIP. Измерено 2026-09-26 — отвечают **200**:
+ * `github.com/google/snappy.git`, `gitlab.com/AOMediaCodec/SVT-AV1.git`,
+ * `code.videolan.org/videolan/x264.git`,
+ * `git.savannah.gnu.org/git/libiconv.git`,
+ * `svn.code.sf.net/p/lame/svn/trunk/lame`. Все они теперь проверяются.
  *
  * @param {string} url
- * @returns {string | null}
+ * @returns {{ kind: 'check'; probeUrl: string; why: string | null } | { kind: 'skip'; reason: string }}
  */
-export function skipReason(url) {
+export function planProbe(url) {
   let parsed
   try {
     parsed = new URL(url)
   } catch {
-    return null
+    return { kind: 'check', probeUrl: url, why: null }
   }
 
-  // Эндпоинты систем контроля версий. Они рабочие, но отвечают на
-  // `git clone` / `svn checkout`, а не на HTTP-запрос страницы: измерено
-  // 2026-09-26 — git.code.sf.net/p/soxr/code и bitbucket .git дают 404,
-  // svn.xvid.org — 401, и это не признак пропажи исходников. Проверять
-  // их HTTP-статусом — ошибка категории, а не строгость.
-  if (parsed.pathname.endsWith('.git') || /^(git|svn)\./.test(parsed.hostname)) {
-    return 'VCS-эндпоинт: отвечает на git clone / svn checkout, а не на HTTP'
+  // SourceForge: git-эндпоинт отдаёт 404 на HTTP (измерено для soxr и
+  // opencore-amr), но у того же репозитория есть страница, которая
+  // отвечает 200. Пропускать незачем — проверяем замену.
+  if (parsed.hostname === 'git.code.sf.net') {
+    const project = /^\/p\/([^/]+)\/code\/?$/.exec(parsed.pathname)
+    if (project) {
+      return {
+        kind: 'check',
+        probeUrl: `https://sourceforge.net/p/${project[1]}/code/`,
+        why: 'git-эндпоинт SourceForge отвечает на HTTP 404; проверяется страница того же репозитория',
+      }
+    }
+    return {
+      kind: 'skip',
+      reason: 'git-эндпоинт SourceForge неизвестной формы: HTTP-статус о наличии исходников не говорит',
+    }
   }
 
-  // Наш собственный репозиторий: приватный, анонимно отдаёт 404 по
-  // устройству. Оба документа это прямо оговаривают. Станет публичным —
-  // пропуск исчезнет сам.
-  if (parsed.hostname === 'github.com' && parsed.pathname.startsWith('/execaus/tube-leak')) {
-    return 'наш репозиторий приватный: анонимно 404 по устройству (оговорено в самих документах)'
+  // Bitbucket: 404 анонимно и на `.git`, и на страницу репозитория
+  // (измерено 2026-09-26 на x265_git) — заменить нечем.
+  if (parsed.hostname === 'bitbucket.org' && parsed.pathname.endsWith('.git')) {
+    return {
+      kind: 'skip',
+      reason:
+        'Bitbucket анонимно отвечает 404 и на .git-эндпоинт, и на страницу репозитория (измерено); ' +
+        'адрес рабочий для git clone, HTTP-статус о наличии исходников не говорит',
+    }
   }
 
-  return null
+  // SVN-сервер xvid требует анонимный логин: сборщик ходит
+  // `svn checkout --username anonymous`, а обычный HTTP-запрос — 401.
+  if (parsed.hostname === 'svn.xvid.org') {
+    return {
+      kind: 'skip',
+      reason: 'SVN-сервер xvid требует анонимный логин: HTTP-запрос отвечает 401 (измерено)',
+    }
+  }
+
+  // Наш собственный репозиторий: приватный, анонимно 404 по устройству.
+  // Оба документа это прямо оговаривают. Станет публичным — пропуск
+  // исчезнет сам.
+  if (parsed.hostname === 'github.com' && OWN_ISSUES_PATH.test(parsed.pathname)) {
+    return {
+      kind: 'skip',
+      reason: 'наш репозиторий приватный: анонимно 404 по устройству (оговорено в самих документах)',
+    }
+  }
+
+  return { kind: 'check', probeUrl: url, why: null }
 }
 
 /**

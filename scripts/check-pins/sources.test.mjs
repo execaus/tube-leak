@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { loadPin } from '../fetch-binaries/pin.mjs'
 import { KNOWN_TARGETS } from '../fetch-binaries/targets.mjs'
-import { checkUrl, parseArgs, partitionBySkip } from './index.mjs'
+import { checkUrl, parseArgs, planAll } from './index.mjs'
 import {
   collectAllUrls,
   collectPinUrls,
@@ -12,13 +12,24 @@ import {
   extractMarkdownUrls,
   ourTextOf,
   PIN_PATH,
+  planProbe,
   readDocs,
-  skipReason,
 } from './sources.mjs'
 
 // Сети здесь нет и быть не может (правило проекта): всё, что ходит
 // наружу, живёт в `npm run check-pins`. В тестах — только разбор,
-// сведение списков и офлайн-сверка пина с документами §6d.
+// сведение списков и офлайн-сверка пина с документами §6d; у checkUrl
+// подменяются и fetch, и пауза между повторами.
+
+const FIRST_LICENSE_HEADING = '### Полный текст GNU General Public License v3'
+
+/**
+ * Адресов в нашей части THIRD-PARTY-LICENSES.md. Число заморожено
+ * НАМЕРЕННО: съехавшая граница втягивает чужие адреса из текста лицензии
+ * (замерено — 14 превращались в 20), и проверка «наша часть короче
+ * файла» такого не ловила. Меняется вместе с нашим текстом — осознанно.
+ */
+const OUR_LICENSE_TEXT_URLS = 14
 
 describe('extractMarkdownUrls', () => {
   it('ловит голые ссылки, ссылки в скобках и в обратных кавычках', () => {
@@ -53,7 +64,7 @@ describe('extractMarkdownUrls', () => {
   })
 })
 
-describe('ourTextOf', () => {
+describe('ourTextOf: граница нашего текста', () => {
   it('оставляет SOURCES-FFMPEG.md целиком — файл наш от начала до конца', () => {
     const text = '# Заголовок\n## Полный текст чего-то\nhttps://example.invalid/a'
 
@@ -80,42 +91,98 @@ describe('ourTextOf', () => {
     )
   })
 
-  it('на настоящем файле граница проходит до текстов лицензий', async () => {
+  it('на настоящем файле даёт РОВНО наш набор адресов', async () => {
     const docs = await readDocs()
     const ours = ourTextOf('THIRD-PARTY-LICENSES.md', docs['THIRD-PARTY-LICENSES.md'])
 
-    expect(ours.length).toBeLessThan(docs['THIRD-PARTY-LICENSES.md'].length)
-    // Адреса сборок ffmpeg — наши обещания и обязаны остаться внутри границы.
+    // Точное число, а не «меньше файла»: прежняя проверка была верна и
+    // при съехавшей границе (замечание Б2 ревью TL-133).
+    expect(extractMarkdownUrls(ours, 'x')).toHaveLength(OUR_LICENSE_TEXT_URLS)
+
+    // Адреса сборок ffmpeg — наши обещания и обязаны остаться внутри.
     const pin = await loadPin(PIN_PATH)
     for (const target of KNOWN_TARGETS) {
       expect(ours).toContain(pin[DOCUMENTED_SECTION].targets[target].url)
     }
   })
+
+  it('пропажа ОДНОГО из трёх маркеров — отказ, а не тихой съезд границы', async () => {
+    const docs = await readDocs()
+    const full = docs['THIRD-PARTY-LICENSES.md']
+    expect(full).toContain(FIRST_LICENSE_HEADING)
+
+    // Мутация ревьюера: убираем только ПЕРВЫЙ заголовок. Маркеры ещё
+    // есть, поэтому проверка «маркер найден» молчит — ловить обязаны
+    // отпечатки дословного текста лицензии.
+    const mutated = full.replace(FIRST_LICENSE_HEADING, '### Текст GNU GPL v3')
+
+    expect(() => ourTextOf('THIRD-PARTY-LICENSES.md', mutated)).toThrow(/граница нашего текста съехала/)
+    expect(() => ourTextOf('THIRD-PARTY-LICENSES.md', mutated)).toThrow(/TERMS AND CONDITIONS/)
+  })
 })
 
-describe('skipReason', () => {
-  it('пропускает VCS-эндпоинты: они отвечают на clone, а не на HTTP', () => {
+describe('planProbe: что проверяется, что заменяется, что пропускается', () => {
+  it('проверяет .git-адреса, которые отвечают по HTTP — их большинство', () => {
+    // Все пять измерены 2026-09-26 и отвечают 200. Прежнее правило
+    // «любой .git — пропустить» глотало их все (замечание Б1).
     for (const url of [
-      'https://bitbucket.org/multicoreware/x265_git.git',
-      'https://git.code.sf.net/p/soxr/code',
-      'https://svn.xvid.org/trunk/xvidcore',
+      'https://github.com/google/snappy.git',
+      'https://gitlab.com/AOMediaCodec/SVT-AV1.git',
+      'https://code.videolan.org/videolan/x264.git',
       'https://git.savannah.gnu.org/git/libiconv.git',
+      'https://svn.code.sf.net/p/lame/svn/trunk/lame',
     ]) {
-      expect(skipReason(url)).toMatch(/VCS-эндпоинт/)
+      expect(planProbe(url)).toStrictEqual({ kind: 'check', probeUrl: url, why: null })
     }
   })
 
-  it('пропускает наш приватный репозиторий с названной причиной', () => {
-    expect(skipReason('https://github.com/execaus/tube-leak/issues/14')).toMatch(/приватный/)
+  it('не глотает заведомо мёртвый .git — воспроизведение находки ревью', () => {
+    const url = 'https://github.com/google/this-repo-does-not-exist-xyz123.git'
+
+    expect(planProbe(url).kind).toBe('check')
   })
 
-  it('не пропускает обычные адреса — в том числе релизные ассеты GitHub', () => {
+  it('git-эндпоинт SourceForge проверяет заменой — страницей того же репозитория', () => {
+    expect(planProbe('https://git.code.sf.net/p/soxr/code')).toStrictEqual({
+      kind: 'check',
+      probeUrl: 'https://sourceforge.net/p/soxr/code/',
+      why: expect.stringContaining('страница того же репозитория'),
+    })
+    expect(planProbe('https://git.code.sf.net/p/opencore-amr/code').probeUrl).toBe(
+      'https://sourceforge.net/p/opencore-amr/code/',
+    )
+  })
+
+  it('пропускает только измеренные отказы, называя причину', () => {
+    expect(planProbe('https://bitbucket.org/multicoreware/x265_git.git')).toStrictEqual({
+      kind: 'skip',
+      reason: expect.stringContaining('Bitbucket'),
+    })
+    expect(planProbe('https://svn.xvid.org/trunk/xvidcore')).toStrictEqual({
+      kind: 'skip',
+      reason: expect.stringContaining('401'),
+    })
+  })
+
+  it('пропускает issues нашего приватного репозитория', () => {
     for (const url of [
-      'https://github.com/GyanD/codexffmpeg/releases/download/9.0.1/ffmpeg-9.0.1-essentials_build.zip',
-      'https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz',
-      'https://github.com/BtbN/FFmpeg-Builds',
+      'https://github.com/execaus/tube-leak/issues',
+      'https://github.com/execaus/tube-leak/issues/14',
     ]) {
-      expect(skipReason(url)).toBeNull()
+      expect(planProbe(url).kind).toBe('skip')
+    }
+  })
+
+  it('НЕ пропускает будущее зеркало ассета и соседний репозиторий', () => {
+    // Оба прошли бы как «наш приватный» при правиле startsWith (Н1):
+    // в день собственного зеркала пин-адрес ffmpeg перестал бы
+    // охраняться молча.
+    for (const url of [
+      'https://github.com/execaus/tube-leak/releases/download/v0.1.1/ffmpeg-x86_64-pc-windows-msvc.zip',
+      'https://github.com/execaus/tube-leak-docs/blob/main/epics/E1.md',
+      'https://github.com/execaus/tube-leak',
+    ]) {
+      expect(planProbe(url).kind).toBe('check')
     }
   })
 })
@@ -157,6 +224,15 @@ describe('collectAllUrls', () => {
     // скопированного уведомления ICU — он не наше обещание и мёртв не по
     // нашей вине. Сторож, красневший от него, читать перестали бы.
     expect(all.some((entry) => entry.url.includes('chasen.aist-nara.ac.jp'))).toBe(false)
+  })
+
+  it('оставляет под охраной подавляющее большинство адресов', async () => {
+    const { checked, skipped } = planAll(await collectAllUrls())
+
+    // До сужения правила пропускался 71 адрес из 129 — то есть строки
+    // Linux-таблицы, которыми закрыт #136, почти не охранялись.
+    expect(skipped.length).toBeLessThanOrEqual(5)
+    expect(checked.length).toBeGreaterThan(100)
   })
 })
 
@@ -208,17 +284,20 @@ describe('crossCheckDocs', () => {
   })
 })
 
-describe('partitionBySkip', () => {
-  it('делит адреса на проверяемые и пропускаемые с причиной', () => {
-    const { checked, skipped } = partitionBySkip([
+describe('planAll', () => {
+  it('делит адреса на проверяемые (в т.ч. по замене) и пропускаемые', () => {
+    const { checked, skipped } = planAll([
       { url: 'https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz', where: ['DOC.md'] },
       { url: 'https://git.code.sf.net/p/soxr/code', where: ['DOC.md'] },
+      { url: 'https://svn.xvid.org/trunk/xvidcore', where: ['DOC.md'] },
     ])
 
-    expect(checked.map((entry) => entry.url)).toStrictEqual([
+    expect(checked.map((entry) => entry.probeUrl)).toStrictEqual([
       'https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz',
+      'https://sourceforge.net/p/soxr/code/',
     ])
-    expect(skipped[0].reason).toMatch(/VCS-эндпоинт/)
+    expect(skipped).toHaveLength(1)
+    expect(skipped[0].reason).toContain('401')
   })
 })
 
@@ -228,34 +307,77 @@ describe('checkUrl', () => {
     status,
     headers: { get: (name) => headers[name.toLowerCase()] ?? null },
   })
+  // Пауз в тестах нет: ждать по 10 секунд ради проверки логики повторов
+  // незачем, а настоящие задержки заданы константой рядом с ними.
+  const noSleep = async () => {}
 
   it('считает живым ответ 200 и называет размер', async () => {
     const fetchImpl = async () => response(200, { 'content-length': '111253802' })
 
-    await expect(checkUrl('https://example.invalid/a', { fetchImpl })).resolves.toStrictEqual({
+    await expect(checkUrl('https://example.invalid/a', { fetchImpl, sleepImpl: noSleep })).resolves.toStrictEqual({
       kind: 'ok',
       status: 200,
       detail: 'HTTP 200, 111253802 байт',
+      attempts: 1,
     })
   })
 
-  it('404 — отказ: ровно так выглядела пропажа ассета в #140', async () => {
-    const fetchImpl = async () => response(404)
+  it('404 — отказ, и без повторов: так выглядела пропажа ассета в #140', async () => {
+    let calls = 0
+    const fetchImpl = async () => {
+      calls += 1
+      return response(404)
+    }
 
-    const result = await checkUrl('https://example.invalid/gone', { fetchImpl })
+    const result = await checkUrl('https://example.invalid/gone', { fetchImpl, sleepImpl: noSleep })
 
     expect(result.kind).toBe('dead')
     expect(result.detail).toBe('HTTP 404')
+    expect(calls).toBe(1)
   })
 
-  it('401/403/406 — не отказ: хост ответил про клиента, а не про ресурс', async () => {
+  it('переживает мигающий 503 и зеленеет — гейт не краснеет на ровном месте', async () => {
+    let calls = 0
+    const fetchImpl = async () => {
+      calls += 1
+      return calls <= 3 ? response(503) : response(200)
+    }
+
+    const result = await checkUrl('https://aomedia.invalid/aom', { fetchImpl, sleepImpl: noSleep })
+
+    expect(result.kind).toBe('ok')
+    expect(result.attempts).toBe(4)
+    expect(result.detail).toContain('с попытки 4')
+  })
+
+  it('упорный 5xx — не отказ, а «временно недоступен», но повторы исчерпаны', async () => {
+    let calls = 0
+    const fetchImpl = async () => {
+      calls += 1
+      return response(503)
+    }
+
+    const result = await checkUrl('https://example.invalid/down', { fetchImpl, sleepImpl: noSleep })
+
+    expect(result.kind).toBe('warn')
+    expect(calls).toBe(4)
+    expect(result.detail).toContain('временно недоступен')
+  })
+
+  it('401/403/406 — не отказ и без повторов: хост ответил про клиента', async () => {
     for (const status of [401, 403, 406]) {
+      let calls = 0
       const result = await checkUrl('https://example.invalid/gitlab', {
-        fetchImpl: async () => response(status),
+        fetchImpl: async () => {
+          calls += 1
+          return response(status)
+        },
+        sleepImpl: noSleep,
       })
 
       expect(result.kind).toBe('warn')
       expect(result.detail).toContain('не отдаёт')
+      expect(calls).toBe(1)
     }
   })
 
@@ -266,24 +388,38 @@ describe('checkUrl', () => {
       return init.method === 'HEAD' ? response(405) : response(206, { 'content-length': '1' })
     }
 
-    const result = await checkUrl('https://example.invalid/head-less', { fetchImpl })
+    const result = await checkUrl('https://example.invalid/head-less', { fetchImpl, sleepImpl: noSleep })
 
     expect(seen).toStrictEqual(['HEAD', 'GET'])
     expect(result.kind).toBe('ok')
   })
 
-  it('сетевой отказ — это отказ проверки, а не исключение наружу', async () => {
+  it('сетевой сбой повторяется, и только потом становится отказом', async () => {
+    let calls = 0
     const fetchImpl = async () => {
+      calls += 1
       throw new Error('getaddrinfo ENOTFOUND')
     }
 
-    const result = await checkUrl('https://example.invalid/dns', { fetchImpl })
+    const result = await checkUrl('https://example.invalid/dns', { fetchImpl, sleepImpl: noSleep })
 
-    expect(result).toStrictEqual({
-      kind: 'dead',
-      status: null,
-      detail: 'запрос не удался: getaddrinfo ENOTFOUND',
-    })
+    expect(result.kind).toBe('dead')
+    expect(calls).toBe(4)
+    expect(result.detail).toContain('getaddrinfo ENOTFOUND')
+  })
+
+  it('сетевой сбой, прошедший со второй попытки, — живой адрес', async () => {
+    let calls = 0
+    const fetchImpl = async () => {
+      calls += 1
+      if (calls === 1) throw new Error('socket hang up')
+      return response(200)
+    }
+
+    const result = await checkUrl('https://example.invalid/flaky', { fetchImpl, sleepImpl: noSleep })
+
+    expect(result.kind).toBe('ok')
+    expect(result.attempts).toBe(2)
   })
 })
 
