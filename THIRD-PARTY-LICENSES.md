@@ -17,14 +17,21 @@ tube-leak поставляется вместе со статическими с
 по одной на каждый поддерживаемый таргет (три операционные системы,
 четыре сборки: у macOS отдельные бинарники под Intel и Apple Silicon):
 
-| Платформа | Источник сборки |
-|---|---|
-| Windows (x86_64) | gyan.dev, `packages/ffmpeg-9.0.1-essentials_build.zip` |
-| macOS (x86_64, Intel) | ffmpeg.martin-riedl.de, `download/macos/amd64/1787081194_9.0.1/ffmpeg.zip` |
-| macOS (aarch64, нативная arm64) | ffmpeg.martin-riedl.de, `download/macos/arm64/1787073674_9.0.1/ffmpeg.zip` |
-| Linux (x86_64) | BtbN/FFmpeg-Builds, `ffmpeg-n9.0.1-6-g9d4ca21220-linux64-gpl-9.0.tar.xz` |
+| Платформа | Сборщик | Адрес сборки |
+|---|---|---|
+| Windows (x86_64) | GyanD/codexffmpeg (GitHub-зеркало gyan.dev) | https://github.com/GyanD/codexffmpeg/releases/download/9.0.1/ffmpeg-9.0.1-essentials_build.zip |
+| macOS (x86_64, Intel) | ffmpeg.martin-riedl.de | https://ffmpeg.martin-riedl.de/download/macos/amd64/1787081194_9.0.1/ffmpeg.zip |
+| macOS (aarch64, нативная arm64) | ffmpeg.martin-riedl.de | https://ffmpeg.martin-riedl.de/download/macos/arm64/1787073674_9.0.1/ffmpeg.zip |
+| Linux (x86_64) | BtbN/FFmpeg-Builds | https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-31-13-27/ffmpeg-n9.0.1-11-ge47273f4d9-linux64-gpl-9.0.tar.xz |
 
-Точные URL и SHA256 — в `src-tauri/binaries.lock.json`.
+SHA256 каждой сборки — в `src-tauri/binaries.lock.json`.
+
+Сборки названы **адресами, а не именами файлов** (TL-133). Это не
+оформление: пока в таблице стояли имена, проверка ссылок документа их не
+видела, и два из четырёх адресов успели умереть незамеченными (#140).
+Теперь их держат два сторожа: офлайн-сверка в `npm test` требует, чтобы
+каждый адрес из пина стоял здесь дословно, а `npm run check-pins`
+проверяет, что он ещё отвечает.
 
 **Где взять исходный код этих сборок — в `SOURCES-FFMPEG.md`** (TL-127): версии
 и ссылки на исходники каждой влинкованной библиотеки, ссылка на сценарии
