@@ -771,11 +771,11 @@ pub enum PartialData {
     Kept,
 }
 
-/// Девять классов отказа скачивания (Ф-10). Ровно по ним фронтенд выбирает
-/// заголовок и пояснение (таблица в дизайне E3) — тексты живут на стороне
-/// UI, в контракте только классификация.
+/// Десять классов отказа скачивания (Ф-10 плюс TL-130). Ровно по ним
+/// фронтенд выбирает заголовок и пояснение (таблица в дизайне E3) —
+/// тексты живут на стороне UI, в контракте только классификация.
 ///
-/// Пять классов — свои для E3, четыре последних переиспользуют смысловые
+/// Шесть классов — свои для E3, четыре последних переиспользуют смысловые
 /// классы разбора: их строки на проводе **совпадают** с одноимёнными
 /// значениями [`ProbeErrorKind`] намеренно, чтобы тексты, уже написанные
 /// для карточки E2, годились без перевода (сторож —
@@ -808,6 +808,21 @@ pub enum DownloadErrorKind {
     StaleFormat,
     /// Потоки скачаны, ffmpeg завершился ошибкой (С-11).
     MergeFailed,
+    /// Файлов скачанных потоков к склейке не нашлось (TL-130).
+    ///
+    /// Отдельный класс, а не оттенок [`Self::MergeFailed`], потому что у
+    /// пользователя другой случай и другой совет. При `mergeFailed` оба
+    /// потока лежат на диске, и повтор пересобирает из них файл, ничего
+    /// не скачивая заново. Здесь потока нет: yt-dlp не назвал его файл
+    /// либо названный файл пропал с диска до склейки, — и повтор именно
+    /// **скачивает** недостающее.
+    ///
+    /// Процесс ffmpeg при этом не запускался ни разу. Пока этот исход
+    /// ходил под `mergeFailed`, экран показывал «Оба потока скачались, но
+    /// объединить их в один файл не получилось» — три утверждения, из
+    /// которых ни одно не было правдой; ровно на это пожаловался владелец
+    /// на живой Windows (#137).
+    StreamsMissing,
     /// Папка назначения недоступна: нет прав либо её не существует.
     DestinationUnavailable,
     /// Ролик удалён, снят с публикации или не существует (класс E2).
@@ -842,6 +857,7 @@ impl DownloadErrorKind {
             Self::ConnectionLost
             | Self::DiskFull
             | Self::MergeFailed
+            | Self::StreamsMissing
             | Self::DestinationUnavailable
             | Self::VideoUnavailable
             | Self::YtDlpFailure => true,
@@ -3477,6 +3493,7 @@ mod tests {
             (DownloadErrorKind::DiskFull, "diskFull"),
             (DownloadErrorKind::StaleFormat, "staleFormat"),
             (DownloadErrorKind::MergeFailed, "mergeFailed"),
+            (DownloadErrorKind::StreamsMissing, "streamsMissing"),
             (
                 DownloadErrorKind::DestinationUnavailable,
                 "destinationUnavailable",
@@ -3487,9 +3504,9 @@ mod tests {
             (DownloadErrorKind::YtDlpFailure, "ytDlpFailure"),
         ];
 
-        // Ф-10 плюс декомпозиция E3 — ровно девять классов: пять своих и
-        // четыре переиспользованных из E2.
-        assert_eq!(kinds.len(), 9);
+        // Ф-10 плюс декомпозиция E3 и десятый класс TL-130 — ровно
+        // десять: шесть своих и четыре переиспользованных из E2.
+        assert_eq!(kinds.len(), 10);
 
         for (kind, expected) in kinds {
             assert_eq!(
@@ -3539,6 +3556,9 @@ mod tests {
             (DownloadErrorKind::DiskFull, true),
             (DownloadErrorKind::StaleFormat, false),
             (DownloadErrorKind::MergeFailed, true),
+            // Повтор скачает недостающий поток заново — это и есть
+            // починка (TL-130).
+            (DownloadErrorKind::StreamsMissing, true),
             (DownloadErrorKind::DestinationUnavailable, true),
             (DownloadErrorKind::VideoUnavailable, true),
             (DownloadErrorKind::SignInRequired, false),

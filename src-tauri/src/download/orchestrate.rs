@@ -362,7 +362,7 @@ const SOCKET_TIMEOUT_ARG: &str = "10";
 /// рантайме, и ставит их вместе с окружением deno запускатель
 /// ([`SidecarDownloader`]) — перед этим набором, то есть заведомо до `--`.
 /// Фикстуры одного запуска сняты без рантайма; переснятие — после v0.1.
-const DOWNLOAD_ARGS: [&str; 8] = [
+const DOWNLOAD_ARGS: [&str; 10] = [
     "--no-playlist",
     "--newline",
     "--progress-template",
@@ -371,6 +371,25 @@ const DOWNLOAD_ARGS: [&str; 8] = [
     PROGRESS_DELTA_ARG,
     "--socket-timeout",
     SOCKET_TIMEOUT_ARG,
+    // Кодировка вывода yt-dlp, прибитая к UTF-8 (TL-130). Без неё имя
+    // файла потока не читается на локали, которая не UTF-8, и это не
+    // гипотеза, а замер: yt-dlp кодирует **весь** свой текст
+    // `enc = encoding or out.encoding or preferredencoding()`
+    // (`utils/write_string`), то есть при выводе в канал — кодировкой
+    // локали. На русской Windows это cp1251, и кириллица в строке
+    // `[download] Destination: …` приходит байтами, которые UTF-8 не
+    // являются; чтение вывода (`String::from_utf8_lossy`) меняет их на
+    // U+FFFD, имя перестаёт совпадать с нашим `-o`, поток считается
+    // незабранным и склейка не начинается (#137, живая Windows).
+    //
+    // Почему флагом, а не окружением: `PYTHONIOENCODING` этот бинарник
+    // не читает вовсе — он собран PyInstaller-ом, и замер показал, что
+    // даже заведомо битое значение (`PYTHONIOENCODING=totally-bogus-
+    // encoding`) не роняет запуск, а `=ascii` не меняет байтов вывода.
+    // `--encoding` же меняет: с `cp1251` вывод воспроизводимо ломается,
+    // с `utf-8` остаётся UTF-8 при любой локали.
+    "--encoding",
+    "utf-8",
 ];
 
 /// Полный argv одной попытки.
@@ -472,6 +491,200 @@ fn is_file_of_stream(download_stem: &str, format_id: &str, path: &Path) -> bool 
     };
     name.strip_prefix(stream_prefix(download_stem, format_id).as_str())
         .is_some_and(|extension| !extension.is_empty() && !extension.contains('.'))
+}
+
+// ───────── Второй рубеж: файлы потоков находятся обходом папки ─────────
+//
+// Первый рубеж — вывод запуска (`Destination`, «уже скачан»): он
+// приписывает файл сразу, ещё по ходу скачивания, и остаётся главным.
+// Но он целиком зависит от того, что и как yt-dlp напечатал, а строку
+// с именем может испортить кодировка (#137), может не оказаться вовсе,
+// и имя в ней может разойтись с тем, что реально легло на диск
+// (санитизация Windows, усечение по длине пути). Поэтому после
+// завершения запуска ненайденное добирается обходом папки — по тем
+// частям имени, которые задаём **мы** и которые не зависят ни от
+// локали, ни от кодировки, ни от чужой санитизации: id ролика в начале
+// и метка формата `.f<id>.` перед расширением. Обе — ASCII.
+
+/// Сколько неразобранных строк stdout уходит в диагностику.
+const DIAGNOSTIC_SAMPLES: usize = 5;
+
+/// Предел длины одной строки диагностики, в символах, — чтобы в лог не
+/// уехал мегабайт чужого вывода (та же забота, что у `stderr_tail`).
+const DIAGNOSTIC_LINE_MAX_CHARS: usize = 200;
+
+/// Что запуск напечатал в stdout, по видам строк (TL-130).
+///
+/// Нужна ровно для одного: когда поток остался без файла, по логу
+/// владельца должно быть видно, **строки не было** или она была и не
+/// разобралась. Без этого различить две причины нельзя, и каждая
+/// проверка на Windows стоит ещё одного захода.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct StdoutStats {
+    total: usize,
+    destination: usize,
+    already_downloaded: usize,
+    progress: usize,
+    malformed_progress: usize,
+    selected_formats: usize,
+    resuming: usize,
+    other: usize,
+    /// Первые [`DIAGNOSTIC_SAMPLES`] строк, которых разбор не узнал.
+    samples: Vec<String>,
+}
+
+impl StdoutStats {
+    /// Запоминает неузнанную строку: не больше [`DIAGNOSTIC_SAMPLES`]
+    /// штук и не длиннее [`DIAGNOSTIC_LINE_MAX_CHARS`] символов каждая.
+    fn sample(&mut self, line: &str) {
+        if self.samples.len() >= DIAGNOSTIC_SAMPLES {
+            return;
+        }
+        let clipped: String = line.chars().take(DIAGNOSTIC_LINE_MAX_CHARS).collect();
+        let sample = if clipped.chars().count() < line.chars().count() {
+            format!("{clipped}…")
+        } else {
+            clipped
+        };
+        self.samples.push(sample);
+    }
+}
+
+/// Строка в лог о том, чего запуск не дал, — или `None`, если файл есть у
+/// каждого заказанного потока.
+///
+/// `None` при успехе не косметика: строка нужна для разбора дефекта, и
+/// печатать её на каждой здоровой загрузке значило бы утопить в ней тот
+/// случай, ради которого она заведена.
+fn shortage_report(stats: &StdoutStats, without_file: &[&str]) -> Option<String> {
+    if without_file.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "download: после запуска без файла остались потоки {without_file:?}; stdout: строк \
+         всего {}, Destination {}, «уже скачан» {}, прогресс {}, перечень форматов {}, \
+         докачка {}, прогресс не разобран {}, прочее {}; первые неразобранные строки: {:?}",
+        stats.total,
+        stats.destination,
+        stats.already_downloaded,
+        stats.progress,
+        stats.selected_formats,
+        stats.resuming,
+        stats.malformed_progress,
+        stats.other,
+        stats.samples,
+    ))
+}
+
+/// Id ролика — первый компонент рабочей основы `<id>.<название>`.
+///
+/// Точки в id не бывает по построению (doc [`PartialId`]), поэтому
+/// первый компонент — это он и есть, каким бы ни было название.
+fn stem_video_id(download_stem: &str) -> &str {
+    download_stem
+        .split_once('.')
+        .map_or(download_stem, |(id, _)| id)
+}
+
+/// Файлы, которые в папке `destination` могут быть файлом потока
+/// `format_id` этой задачи (TL-130).
+///
+/// Метки только ASCII и только наши: имя начинается с `<id ролика>.`, а
+/// перед непустым расширением без точек стоит `.f<format_id>.`.
+/// Название в расчёт не берётся вовсе — именно оно и страдает от
+/// кодировки, санитизации и усечения.
+///
+/// Требование «расширение без точек» отсекает рабочие хвосты (`.part`,
+/// `.ytdl`, `.temp.<ext>`) тем же способом, что [`is_file_of_stream`]:
+/// у `…f133.mp4.part` расширение после метки — `mp4.part`, точка в нём
+/// есть, файлом потока он не считается.
+///
+/// Чужое сюда не проходит: у файла другого ролика другой id в начале, у
+/// незаказанного формата — другая метка, а папка берётся только та, в
+/// которую писала эта задача.
+fn scan_stream_files(destination: &Path, download_stem: &str, format_id: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(destination) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}.", stem_video_id(download_stem));
+    let marker = format!(".f{format_id}.");
+
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| !kind.is_dir()))
+        .filter(|entry| {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            name.starts_with(&prefix)
+                && name
+                    .rsplit_once(marker.as_str())
+                    .is_some_and(|(_, extension)| !extension.is_empty() && !extension.contains('.'))
+        })
+        .map(|entry| entry.path())
+        .collect();
+    // Порядок обхода каталога не определён, а лог и выбор обязаны быть
+    // воспроизводимыми.
+    found.sort();
+    found
+}
+
+/// Добирает обходом папки файлы потоков, которых не дал вывод запуска.
+///
+/// Несколько кандидатов на один поток — не повод выбрать «поновее»:
+/// ошибиться здесь значит склеить чужой файл. Поэтому берётся ровно
+/// один случай из двух: кандидат единственный, либо среди нескольких
+/// ровно один носит **точное** имя, которое построил наш `-o`
+/// ([`is_file_of_stream`]) — это не догадка, такое имя больше некому
+/// было создать. В остальных случаях поток остаётся незабранным, а в
+/// лог уходят все кандидаты: повтор спросит поток снова, и это дешевле
+/// неверной склейки.
+fn adopt_stream_files_from_disk(work: &mut TaskWork, pending: &[usize], destination: &Path) {
+    for &index in pending {
+        if work.jobs[index].file.is_some() {
+            continue;
+        }
+        let format_id = work.jobs[index].format_id.clone();
+        let found = scan_stream_files(destination, &work.download_stem, &format_id);
+        let exact: Vec<&PathBuf> = found
+            .iter()
+            .filter(|path| is_file_of_stream(&work.download_stem, &format_id, path))
+            .collect();
+
+        let chosen = match (found.as_slice(), exact.as_slice()) {
+            ([single], _) => Some(single.clone()),
+            (_, [only_exact]) => Some((*only_exact).clone()),
+            _ => None,
+        };
+
+        match chosen {
+            Some(path) => {
+                eprintln!(
+                    "download: файл потока {format_id} найден обходом папки: {} — вывод \
+                     запуска его не назвал",
+                    path.display()
+                );
+                work.jobs[index].file = Some(path);
+            }
+            None if found.is_empty() => eprintln!(
+                "download: обход папки не нашёл файла потока {format_id} по меткам «{}.» \
+                 и «.f{format_id}.»",
+                stem_video_id(&work.download_stem)
+            ),
+            None => {
+                let names: Vec<String> = found
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect();
+                eprintln!(
+                    "download: на поток {format_id} претендует несколько файлов ({}) — \
+                     какой из них наш, неизвестно, поток остаётся незабранным",
+                    names.join(", ")
+                );
+            }
+        }
+    }
 }
 
 // ─────────────────────── Имя частичного файла ───────────────────────
@@ -1839,7 +2052,10 @@ async fn execute(
                     .map(|job| job.format_id.as_str())
                     .collect();
                 eprintln!("download: файлов потоков {unnamed:?} к склейке нет — склеивать нечего");
-                return TaskEnd::Failed(DownloadFailure::MergeFailed {
+                // Свой класс, а не оттенок склейки: ffmpeg здесь не
+                // запускался, и его имя в тексте было бы неправдой
+                // (TL-130).
+                return TaskEnd::Failed(DownloadFailure::StreamsMissing {
                     details: no_details(),
                 });
             };
@@ -2046,13 +2262,17 @@ async fn download_attempt(
     // какой из двух сторожей держит срок, и он же решает, чем стал
     // истёкший срок: зависшей подготовкой или зависшим потоком.
     let mut saw_progress = false;
+    // Чем был вывод запуска — для диагностики недостачи (TL-130).
+    let mut stats = StdoutStats::default();
 
     let outcome = {
         let mut on_line = |line: &str| -> Option<Instant> {
             let now = monotonic_now();
 
+            stats.total += 1;
             match crate::download::progress::parse_line(line) {
                 StdoutLine::Progress(sample) => {
+                    stats.progress += 1;
                     saw_progress = true;
                     match work.aggregator.apply(&sample) {
                         SampleOutcome::Applied { .. } => {
@@ -2085,6 +2305,8 @@ async fn download_attempt(
                     }
                 }
                 StdoutLine::MalformedProgress(line) => {
+                    stats.malformed_progress += 1;
+                    stats.sample(line);
                     // Маркер наш, а форма не читается: yt-dlp сменил вывод
                     // полей шаблона. Проглотить молча значило бы показывать
                     // замерший процент вместо честного отказа, поэтому
@@ -2093,14 +2315,17 @@ async fn download_attempt(
                     eprintln!("download: строка прогресса не разобрана: {line}");
                 }
                 StdoutLine::SelectedFormats { format_ids } => {
+                    stats.selected_formats += 1;
                     eprintln!("download: yt-dlp выбрал форматы {format_ids:?}");
                     selected = Some(format_ids.iter().map(|id| (*id).to_owned()).collect());
                 }
                 StdoutLine::Destination { path } => {
+                    stats.destination += 1;
                     let owners = attribute_file(work, &pending, Path::new(path));
                     note_stream_start(policy, &mut named, &owners, now);
                 }
                 StdoutLine::AlreadyDownloaded { path } => {
+                    stats.already_downloaded += 1;
                     let owners = attribute_file(work, &pending, Path::new(path));
                     note_stream_start(policy, &mut named, &owners, now);
                     for index in owners {
@@ -2120,9 +2345,13 @@ async fn download_attempt(
                     }
                 }
                 StdoutLine::Resuming { byte_offset } => {
+                    stats.resuming += 1;
                     eprintln!("download: попытка продолжает частичный файл с байта {byte_offset}");
                 }
-                StdoutLine::Other => {}
+                StdoutLine::Other => {
+                    stats.other += 1;
+                    stats.sample(line);
+                }
             }
 
             if saw_progress {
@@ -2216,6 +2445,23 @@ async fn download_attempt(
         AttemptRun::Interrupted(details) if !missing.is_empty() => stale_format(&missing, details),
         other => other,
     };
+
+    // Порядок (TL-130): сначала то, что дал вывод, — оно уже разложено
+    // по потокам выше; потом обход папки добирает ненайденное; сверка
+    // «файл ещё на диске» идёт своим чередом перед склейкой.
+    if let Some(destination) = work.destination.clone() {
+        adopt_stream_files_from_disk(work, &pending, &destination);
+    }
+
+    let without_file: Vec<&str> = pending
+        .iter()
+        .map(|&index| &work.jobs[index])
+        .filter(|job| job.file.is_none())
+        .map(|job| job.format_id.as_str())
+        .collect();
+    if let Some(report) = shortage_report(&stats, &without_file) {
+        eprintln!("{report}");
+    }
 
     let completed = matches!(verdict, AttemptRun::Completed);
     settle_streams(work, &pending, &ended, completed);
@@ -2483,6 +2729,10 @@ impl Cleanup {
             DownloadErrorKind::ConnectionLost
             | DownloadErrorKind::DiskFull
             | DownloadErrorKind::MergeFailed
+            // Уцелевший поток не удаляется (TL-130): повтор докачивает
+            // только недостающий, а что осталось на диске, скажет сама
+            // подчистка — пустая папка даст `nothingCreated`.
+            | DownloadErrorKind::StreamsMissing
             | DownloadErrorKind::DestinationUnavailable
             | DownloadErrorKind::YtDlpFailure => Self::Keep,
         }

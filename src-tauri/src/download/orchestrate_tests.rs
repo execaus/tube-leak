@@ -70,6 +70,19 @@ enum Step {
     /// Работает только под `tokio::time::pause()` и без него падает, а не
     /// ждёт по-настоящему.
     Advance(Duration),
+    /// Отдать строку stdout так, как её отдал бы настоящий yt-dlp: не
+    /// текстом, а байтами в **им же** выбранной кодировке, которые потом
+    /// читаются так, как их читает ядро (TL-130).
+    ///
+    /// Отличается от [`Step::Line`] ровно этим шагом через байты, и он не
+    /// декорация: кодировку yt-dlp берёт из `--encoding`, а без него — из
+    /// кодировки канала вывода (`out.encoding`, `utils/write_string`).
+    /// На русской Windows это cp1251, кириллица приходит не-UTF-8 байтами,
+    /// и `String::from_utf8_lossy` меняет их на U+FFFD. Сценарий повторяет
+    /// эту связку по argv запуска ([`as_process_output`]) — поэтому тест
+    /// на нём краснеет ровно тогда, когда запуск перестаёт просить UTF-8.
+    NativeLine(String),
+
     /// Сделать то, что делает пользователь, пока процесс идёт (TL-89:
     /// сменить настройку посреди задачи).
     Hook(Hook),
@@ -171,6 +184,13 @@ impl Script {
 
     fn lines(mut self, lines: impl IntoIterator<Item = String>) -> Self {
         self.steps.extend(lines.into_iter().map(Step::Line));
+        self
+    }
+
+    /// Строка, прошедшая через кодировку вывода настоящего yt-dlp
+    /// ([`Step::NativeLine`]).
+    fn native_line(mut self, line: &str) -> Self {
+        self.steps.push(Step::NativeLine(line.to_string()));
         self
     }
 
@@ -327,6 +347,19 @@ impl DownloadLauncher for ScriptedLauncher {
                     Step::Creates(name) => {
                         std::fs::write(self.dir.join(name), b"stream bytes")
                             .expect("сценарий обязан уметь создать файл");
+                    }
+                    Step::NativeLine(line) => {
+                        let line = as_process_output(&call.argv, line);
+                        call.lines.push(line.clone());
+                        call.line_times.push(monotonic_now());
+                        call.deadlines.push(on_line(&line));
+                        let observed = self.observed.lock().unwrap().clone();
+                        if let Some(task) = observed {
+                            self.snapshots
+                                .lock()
+                                .unwrap()
+                                .push((line.clone(), task.snapshot()));
+                        }
                     }
                     Step::HangUntilCancelled => handle.cancelled().await,
                     Step::Advance(by) => tokio::time::advance(*by).await,
@@ -583,6 +616,52 @@ impl ProgressSink for RecordingSink {
         }
         self.events.lock().unwrap().push(event.progress);
     }
+}
+
+/// Строка вывода yt-dlp такой, какой её увидит ядро, если запуск шёл с
+/// argv `argv` (TL-130).
+///
+/// Две ступени, обе настоящие: yt-dlp кодирует текст своей кодировкой
+/// вывода, ядро декодирует байты через `String::from_utf8_lossy` (тем же
+/// вызовом, что `sidecar::process`). Кодировку выбирает
+/// [`ytdlp_stdout_bytes`] по argv — как её выбирает сам yt-dlp.
+fn as_process_output(argv: &[String], line: &str) -> String {
+    String::from_utf8_lossy(&ytdlp_stdout_bytes(argv, line)).into_owned()
+}
+
+/// Байты, которые yt-dlp напечатает для строки `line` при argv `argv`.
+///
+/// Модель одной строки его `write_string`:
+/// `enc = encoding or out.encoding or preferredencoding()`. С нашим
+/// `--encoding utf-8` это UTF-8 при любой локали; без него — кодировка
+/// канала, и для русской Windows это cp1251 (замер #137).
+fn ytdlp_stdout_bytes(argv: &[String], line: &str) -> Vec<u8> {
+    let utf8_asked = argv
+        .windows(2)
+        .any(|pair| pair[0] == "--encoding" && pair[1] == "utf-8");
+    if utf8_asked {
+        line.as_bytes().to_vec()
+    } else {
+        to_cp1251_ignoring(line)
+    }
+}
+
+/// Текст в cp1251; непредставимое отбрасывается — то самое `'ignore'`,
+/// с которым yt-dlp зовёт `str.encode` (`utils/write_string`).
+///
+/// Таблица кириллицы cp1251 непрерывна, поэтому кодировщик короткий;
+/// что он совпадает с настоящим выводом yt-dlp, закреплено замером в
+/// `a_destination_line_in_cp1251_is_not_taken_for_a_stream_file`.
+fn to_cp1251_ignoring(text: &str) -> Vec<u8> {
+    text.chars()
+        .filter_map(|ch| match ch {
+            ch if (ch as u32) < 0x80 => Some(ch as u8),
+            'Ё' => Some(0xA8),
+            'ё' => Some(0xB8),
+            'А'..='я' => Some(0xC0 + (ch as u32 - 0x410) as u8),
+            _ => None,
+        })
+        .collect()
 }
 
 const URL: &str = "https://www.youtube.com/watch?v=aqz-KE-bpKQ";
@@ -1453,6 +1532,445 @@ async fn two_streams_go_through_merging_to_one_ready_file() {
         ["Big Buck Bunny.mp4"],
         "штатный исход не оставляет мусора (Н-4): ни потоков, ни рабочего \
          файла склейки"
+    );
+}
+
+#[test]
+fn every_download_launch_asks_yt_dlp_for_utf8_output() {
+    // TL-130. Кодировку вывода запуск задаёт сам, а не надеется на
+    // локаль машины: без этого на русской Windows имя файла потока
+    // приходит в cp1251 (#137).
+    let args = download_args(
+        "133,139",
+        "home:/downloads",
+        "x.f%(format_id)s.%(ext)s",
+        URL,
+    );
+    let at = args
+        .iter()
+        .position(|arg| *arg == "--encoding")
+        .expect("запуск обязан задавать кодировку вывода");
+    assert_eq!(
+        args.get(at + 1),
+        Some(&"utf-8"),
+        "кодировка вывода обязана быть UTF-8: {args:?}"
+    );
+}
+
+#[test]
+fn a_destination_line_in_cp1251_is_not_taken_for_a_stream_file() {
+    // Замер живого yt-dlp (`--encoding cp1251`, офлайн, `file://`):
+    // строка `[download] Destination: …` приходит байтами cp1251, и для
+    // «Новый» это ровно эти пять. Ими закреплён кодировщик оснастки —
+    // иначе сценарий проверял бы выдуманную поломку, а не снятую.
+    assert_eq!(
+        to_cp1251_ignoring("Новый"),
+        [0xCD, 0xEE, 0xE2, 0xFB, 0xE9],
+        "кодировщик оснастки разошёлся с замером настоящего yt-dlp"
+    );
+
+    let stem = "1hW0glDfom8.Новый выпуск камеди клаб (Comedy Club), 18.09.2026";
+    let name = format!("{stem}.f298.webm");
+    let mangled = String::from_utf8_lossy(&to_cp1251_ignoring(&name)).into_owned();
+
+    assert!(
+        is_file_of_stream(stem, "298", Path::new(&name)),
+        "имя в UTF-8 — файл своего потока"
+    );
+    assert_ne!(mangled, name, "cp1251-байты кириллицы не UTF-8");
+    assert!(
+        !is_file_of_stream(stem, "298", Path::new(&mangled)),
+        "испорченное чтением имя не должно сходить за файл потока: \
+         иначе к склейке уехал бы файл, которого на диске нет — {mangled}"
+    );
+}
+
+#[tokio::test]
+async fn a_cyrillic_stream_name_reaches_the_merge_when_the_launch_pins_utf8() {
+    // TL-130, воспроизведение #137 целиком: название ролика владельца,
+    // два потока, запуск кончается кодом 0. Строки `Destination` идут
+    // через кодировку настоящего yt-dlp ([`Step::NativeLine`]), то есть
+    // остаются UTF-8 только потому, что запуск просит `--encoding utf-8`.
+    // Убрать флаг — и оба потока станут незабранными, задача провалится
+    // «файлов потоков к склейке нет», как у владельца на Windows.
+    const TITLE: &str = "Новый выпуск камеди клаб (Comedy Club), 18.09.2026";
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = request(streams(Some("133"), Some("139")));
+    req.title = TITLE.to_string();
+    let task = new_task(req);
+
+    let base = partial_base(TITLE, URL);
+    let video = format!("{base}.f133.mp4");
+    let audio = format!("{base}.f139.m4a");
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::ok()
+            .native_line(&destination_line(dir.path(), &video))
+            .creates(&video)
+            .native_line(&destination_line(dir.path(), &audio))
+            .creates(&audio)],
+    );
+
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
+
+    let lines = &launcher.calls()[0].lines;
+    assert!(
+        lines.iter().all(|line| !line.contains('\u{FFFD}')),
+        "строки запуска прочитаны без потерь: {lines:?}"
+    );
+    assert_eq!(
+        ffmpeg.last_input_names(),
+        (video, audio),
+        "оба потока найдены на диске и ушли в склейку"
+    );
+    assert_eq!(ffmpeg.calls(), 1, "склейка состоялась ровно одна");
+    assert!(
+        matches!(sink.last(), DownloadProgress::Done { .. }),
+        "задача обязана дойти до готового файла: {:?}",
+        sink.last()
+    );
+}
+
+#[tokio::test]
+async fn an_already_downloaded_line_with_a_cyrillic_name_is_attributed_too() {
+    // Ревью TL-130: имя файла несёт не только `Destination`. Строка
+    // `… has already been downloaded` ломалась бы на cp1251 ровно так же
+    // — и поток, уже лежащий на диске, снова стал бы незабранным.
+    const TITLE: &str = "Трейлер (Comedy Club), 18.09.2026";
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = request(streams(Some("18"), None));
+    req.title = TITLE.to_string();
+    let task = new_task(req);
+
+    let stream = format!("{}.f18.mp4", partial_base(TITLE, URL));
+    let already = format!(
+        "[download] {} has already been downloaded",
+        dir.path().join(&stream).display()
+    );
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::ok().creates(&stream).native_line(&already)],
+    );
+
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
+
+    let lines = &launcher.calls()[0].lines;
+    assert!(
+        lines.iter().all(|line| !line.contains('\u{FFFD}')),
+        "имя прочитано без потерь: {lines:?}"
+    );
+    assert!(
+        matches!(sink.last(), DownloadProgress::Done { .. }),
+        "уже скачанный поток обязан быть засчитан: {:?}",
+        sink.last()
+    );
+    assert_eq!(
+        dir_listing(dir.path()).len(),
+        1,
+        "остался ровно готовый файл: {:?}",
+        dir_listing(dir.path())
+    );
+}
+
+#[tokio::test]
+async fn a_failure_without_any_stream_on_disk_promises_nothing_kept() {
+    // Р-3 ревью TL-130: класс «потоков нет» не должен обещать
+    // сохранённые файлы, когда на диске пусто. Значение берётся не из
+    // класса, а из подчистки — поэтому пустая папка даёт
+    // `nothingCreated`, и экран не соврёт про «уже скачанное».
+    let dir = tempfile::tempdir().unwrap();
+    let task = new_task(request(streams(Some("133"), Some("139"))));
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    // Запуск кончился кодом 0, перечень форматов назвал, файлов не создал.
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::ok().line("[info] aqz-KE-bpKQ: Downloading 2 format(s): 133, 139")],
+    );
+
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
+
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("файлов нет — отказ: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::StreamsMissing);
+    assert_eq!(
+        error.partial_data,
+        PartialData::NothingCreated,
+        "на диске пусто — обещать сохранённое нельзя"
+    );
+    assert_eq!(ffmpeg.calls(), 0, "ffmpeg не запускался");
+    assert!(
+        dir_listing(dir.path()).is_empty(),
+        "{:?}",
+        dir_listing(dir.path())
+    );
+}
+
+#[tokio::test]
+async fn the_scan_finds_stream_files_the_output_never_named() {
+    // TL-130, причина (б): строки с именем файла в выводе не было вовсе
+    // — в полном логе владельца её и нет. Файлы на диске лежат, и
+    // находятся они по нашим же ASCII-меткам, а не по чужому тексту.
+    let dir = tempfile::tempdir().unwrap();
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let video = format!("{BASE}.f133.mp4");
+    let audio = format!("{BASE}.f139.m4a");
+
+    run_two_streams(
+        &dir,
+        &sink,
+        vec![Script::ok()
+            .line("[info] aqz-KE-bpKQ: Downloading 2 format(s): 133, 139")
+            .creates(&video)
+            .creates(&audio)],
+        &ffmpeg,
+    )
+    .await;
+
+    assert_eq!(
+        ffmpeg.last_input_names(),
+        (video, audio),
+        "оба потока найдены обходом папки"
+    );
+    assert!(
+        matches!(sink.last(), DownloadProgress::Done { .. }),
+        "{:?}",
+        sink.last()
+    );
+}
+
+#[tokio::test]
+async fn the_scan_finds_a_stream_file_whose_name_came_back_mangled() {
+    // TL-130, причина (а): имя в выводе испорчено (cp1251), и пусть даже
+    // `--encoding utf-8` не подействовал бы — файл всё равно находится.
+    const TITLE: &str = "Новый выпуск камеди клаб (Comedy Club), 18.09.2026";
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = request(streams(Some("133"), Some("139")));
+    req.title = TITLE.to_string();
+    let task = new_task(req);
+    let base = partial_base(TITLE, URL);
+    let video = format!("{base}.f133.mp4");
+    let audio = format!("{base}.f139.m4a");
+    let mangled = |name: &str| as_process_output(&[], &destination_line(dir.path(), name));
+
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let launcher = ScriptedLauncher::new(
+        dir.path(),
+        vec![Script::ok()
+            .line(&mangled(&video))
+            .creates(&video)
+            .line(&mangled(&audio))
+            .creates(&audio)],
+    );
+
+    run_task(&task, &launcher, &ffmpeg, &sink, dir.path()).await;
+
+    let calls = launcher.calls();
+    let named: Vec<&String> = calls[0]
+        .lines
+        .iter()
+        .filter(|line| line.contains('\u{FFFD}'))
+        .collect();
+    assert_eq!(named.len(), 2, "обе строки пришли испорченными: {named:?}");
+    assert_eq!(
+        ffmpeg.last_input_names(),
+        (video, audio),
+        "испорченный вывод не помешал найти файлы"
+    );
+    assert!(
+        matches!(sink.last(), DownloadProgress::Done { .. }),
+        "{:?}",
+        sink.last()
+    );
+}
+
+#[tokio::test]
+async fn the_scan_takes_no_file_of_another_video_another_format_or_a_partial() {
+    // TL-130: метки узкие. Чужой ролик, незаказанный формат и рабочий
+    // хвост `.part` файлами потока не считаются — задача честно падает
+    // «потоков нет», а чужое остаётся нетронутым.
+    let dir = tempfile::tempdir().unwrap();
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let video = format!("{BASE}.f133.mp4");
+    let strangers = [
+        "YE7VzlLtp-4.Big Buck Bunny.f139.m4a".to_string(),
+        format!("{BASE}.f251.webm"),
+        format!("{BASE}.f139.m4a.part"),
+    ];
+
+    let mut script = Script::ok()
+        .line("[info] aqz-KE-bpKQ: Downloading 2 format(s): 133, 139")
+        .line(&destination_line(dir.path(), &video))
+        .creates(&video);
+    for name in &strangers {
+        script = script.creates(name);
+    }
+    run_two_streams(&dir, &sink, vec![script], &ffmpeg).await;
+
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!("звука нет — отказ: {:?}", sink.last());
+    };
+    assert_eq!(error.kind, DownloadErrorKind::StreamsMissing);
+    assert_eq!(ffmpeg.calls(), 0, "склеивать нечем");
+    let listing = dir_listing(dir.path());
+    for name in &strangers {
+        assert!(listing.contains(name), "{name} пропал: {listing:?}");
+    }
+}
+
+#[tokio::test]
+async fn two_candidates_for_one_stream_are_not_guessed_between() {
+    // TL-130: два файла с нашим id и нашей меткой формата, и ни один не
+    // носит имя, построенное нашим `-o`. Какой из них наш — неизвестно;
+    // взять «поновее» значило бы склеить чужое, поэтому поток остаётся
+    // незабранным.
+    let dir = tempfile::tempdir().unwrap();
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let video = format!("{BASE}.f133.mp4");
+    let candidates = [
+        "aqz-KE-bpKQ.Другое название.f139.m4a".to_string(),
+        "aqz-KE-bpKQ.Третье название.f139.webm".to_string(),
+    ];
+
+    let mut script = Script::ok()
+        .line("[info] aqz-KE-bpKQ: Downloading 2 format(s): 133, 139")
+        .line(&destination_line(dir.path(), &video))
+        .creates(&video);
+    for name in &candidates {
+        script = script.creates(name);
+    }
+    run_two_streams(&dir, &sink, vec![script], &ffmpeg).await;
+
+    let DownloadProgress::Failed { error } = sink.last() else {
+        panic!(
+            "выбирать между кандидатами нельзя — отказ: {:?}",
+            sink.last()
+        );
+    };
+    assert_eq!(error.kind, DownloadErrorKind::StreamsMissing);
+    assert_eq!(ffmpeg.calls(), 0, "ни один кандидат не ушёл в склейку");
+    let listing = dir_listing(dir.path());
+    for name in &candidates {
+        assert!(listing.contains(name), "{name} пропал: {listing:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_name_our_template_built_wins_over_a_stranger_with_the_same_id_and_format() {
+    // Обратная сторона предыдущего: если среди кандидатов ровно один
+    // носит точное имя нашего `-o`, это не догадка — построить его было
+    // некому, кроме нашего же запуска.
+    let dir = tempfile::tempdir().unwrap();
+    let sink = RecordingSink::new();
+    let ffmpeg = ScriptedFfmpeg::merging();
+    let video = format!("{BASE}.f133.mp4");
+    let audio = format!("{BASE}.f139.m4a");
+    let stranger = "aqz-KE-bpKQ.Другое название.f139.webm".to_string();
+
+    run_two_streams(
+        &dir,
+        &sink,
+        vec![Script::ok()
+            .line("[info] aqz-KE-bpKQ: Downloading 2 format(s): 133, 139")
+            .line(&destination_line(dir.path(), &video))
+            .creates(&video)
+            .creates(&audio)
+            .creates(&stranger)],
+        &ffmpeg,
+    )
+    .await;
+
+    assert_eq!(
+        ffmpeg.last_input_names(),
+        (video, audio.clone()),
+        "в склейку ушло имя, построенное нашим шаблоном"
+    );
+    assert!(
+        matches!(sink.last(), DownloadProgress::Done { .. }),
+        "{:?}",
+        sink.last()
+    );
+}
+
+#[test]
+fn the_shortage_report_speaks_only_when_a_stream_is_left_without_a_file() {
+    // TL-130: строка диагностики нужна ровно тогда, когда поток остался
+    // без файла. На здоровой загрузке её быть не должно — иначе тот
+    // единственный случай, ради которого она заведена, утонет в логе.
+    let mut stats = StdoutStats {
+        total: 4,
+        destination: 1,
+        progress: 2,
+        ..StdoutStats::default()
+    };
+    let long = "я".repeat(DIAGNOSTIC_LINE_MAX_CHARS + 50);
+    stats.other += 1;
+    stats.sample(&long);
+    for index in 0..DIAGNOSTIC_SAMPLES + 3 {
+        stats.sample(&format!("строка {index}"));
+    }
+
+    assert_eq!(
+        shortage_report(&stats, &[]),
+        None,
+        "файлы есть у всех потоков — молчим"
+    );
+
+    let report = shortage_report(&stats, &["139"]).expect("недостача обязана попасть в лог");
+    assert!(report.contains("139"), "{report}");
+    assert!(report.contains("строк всего 4"), "{report}");
+    assert!(report.contains("Destination 1"), "{report}");
+    assert_eq!(
+        stats.samples.len(),
+        DIAGNOSTIC_SAMPLES,
+        "образцов не больше предела"
+    );
+    assert_eq!(
+        stats.samples[0].chars().count(),
+        DIAGNOSTIC_LINE_MAX_CHARS + 1,
+        "длинная строка обрезана и помечена многоточием"
+    );
+}
+
+#[test]
+fn the_scan_marks_only_our_id_and_our_format_marker() {
+    // Единица обхода — сам `scan_stream_files`: белый список меток
+    // проверяется без оркестрации, по файлам на диске.
+    let dir = tempfile::tempdir().unwrap();
+    let ours = format!("{BASE}.f133.mp4");
+    let renamed = "aqz-KE-bpKQ.Имя, изменённое санитизацией.f133.webm".to_string();
+    for name in [
+        ours.as_str(),
+        renamed.as_str(),
+        "aqz-KE-bpKQ.Big Buck Bunny.f133.mp4.part",
+        "aqz-KE-bpKQ.Big Buck Bunny.f139.m4a",
+        "YE7VzlLtp-4.Big Buck Bunny.f133.mp4",
+        "aqz-KE-bpKQ.Big Buck Bunny.f1330.mp4",
+    ] {
+        std::fs::write(dir.path().join(name), b"x").expect("файл создаётся");
+    }
+
+    let found = scan_stream_files(dir.path(), BASE, "133");
+    let names: Vec<String> = found
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        vec![ours, renamed],
+        "взяты только файлы нашего ролика с меткой .f133."
     );
 }
 
@@ -2507,8 +3025,18 @@ async fn a_selected_stream_whose_file_was_never_named_is_asked_for_again() {
     let DownloadProgress::Failed { error } = sink.last() else {
         panic!("без файла звука склеивать нечего: {:?}", sink.last());
     };
-    assert_eq!(error.kind, DownloadErrorKind::MergeFailed);
+    assert_eq!(
+        error.kind,
+        DownloadErrorKind::StreamsMissing,
+        "ffmpeg не запускался — это не отказ склейки (TL-130)"
+    );
     assert!(error.retryable);
+    assert!(
+        !error.message.contains("ffmpeg"),
+        "склеивать было нечего, ffmpeg не запускался — текст про его \
+         ошибку был бы неправдой (TL-130): «{}»",
+        error.message
+    );
 
     task.set_progress(DownloadProgress::Queued);
     let already = format!(
@@ -2661,6 +3189,23 @@ fn the_single_launch_fixtures_were_shot_with_the_arguments_of_the_app() {
                 }
             })
             .collect();
+        // TL-130: `--encoding utf-8` появился после съёмки набора.
+        // Переснимать набор ради него не нужно и нечем: флаг меняет
+        // только кодировку **байтов** вывода yt-dlp, а фикстуры хранят
+        // текст, снятый на UTF-8-локали, то есть ровно то же самое.
+        // Вырезается ровно эта пара и только если она на месте — любое
+        // другое расхождение argv тест по-прежнему ловит.
+        let encoding_at = expected
+            .iter()
+            .position(|arg| arg == "--encoding")
+            .expect("download_args обязан просить кодировку вывода (TL-130)");
+        assert_eq!(
+            expected.get(encoding_at + 1).map(String::as_str),
+            Some("utf-8"),
+            "{name}: у --encoding обязано быть значение"
+        );
+        expected.drain(encoding_at..=encoding_at + 1);
+
         let expected_tail = expected.split_off(expected.len() - 2);
         assert_eq!(expected_tail, ["--", URL]);
 
@@ -5766,8 +6311,16 @@ async fn a_stream_file_gone_between_the_download_and_the_merge_is_not_merged_and
     let DownloadProgress::Failed { error } = sink.last() else {
         panic!("склеивать нечего — отказ: {:?}", sink.last());
     };
-    assert_eq!(error.kind, DownloadErrorKind::MergeFailed);
-    assert_eq!(error.partial_data, PartialData::Kept);
+    assert_eq!(
+        error.kind,
+        DownloadErrorKind::StreamsMissing,
+        "файл потока пропал до склейки — ffmpeg не запускался (TL-130)"
+    );
+    assert_eq!(
+        error.partial_data,
+        PartialData::Kept,
+        "уцелевший поток остался на диске — это правда, а не обещание"
+    );
     assert!(error.retryable);
 
     task.set_progress(DownloadProgress::Queued);

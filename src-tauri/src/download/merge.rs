@@ -470,6 +470,8 @@ where
 
 /// Единственный класс отказа этого модуля (С-11).
 fn merge_failed(details: DownloadErrorDetails) -> DownloadFailure {
+    // Сюда приходят только исходы **запущенного** процесса склейки;
+    // «склеивать было нечего» — чужой класс `StreamsMissing` (TL-130).
     DownloadFailure::MergeFailed { details }
 }
 
