@@ -80,14 +80,27 @@ pub enum DownloadFailure {
     #[error("выбранный формат больше не доступен: данные разбора устарели")]
     StaleFormat { details: DownloadErrorDetails },
 
-    /// Потоки скачаны, ffmpeg завершился ошибкой (С-11).
+    /// Склеить не вышло (С-11).
     ///
     /// Класс отличим от сетевых сбоев ровно потому, что склейку ведёт
     /// отдельный процесс ffmpeg, запущенный ядром (решение дизайна по
     /// Ф-9): любая ошибка **этого** процесса и есть «не удалось склеить»,
     /// без текстовых эвристик поверх чужого stderr.
-    #[error("не удалось склеить видео и звук: ffmpeg завершился ошибкой")]
-    MergeFailed { details: DownloadErrorDetails },
+    ///
+    /// `reason` — почему именно, и он не украшение (TL-130). Под этим
+    /// классом живут два разных события: отказ ffmpeg и «файлов потоков к
+    /// склейке нет», где ffmpeg не запускался вовсе. Пока причина была
+    /// одна на двоих, второму случаю выдавался текст первого, и
+    /// пользователь на живой Windows читал про ошибку ffmpeg, которого не
+    /// было. Класс при этом общий намеренно: судьба частичного
+    /// ([`PartialData::Kept`]) и польза повтора у обоих совпадают, а
+    /// девятка классов Ф-10 от подпричины не растёт — как `reason` у
+    /// [`DownloadFailure::YtDlpFailure`].
+    #[error("не удалось склеить видео и звук: {reason}")]
+    MergeFailed {
+        reason: MergeFailedReason,
+        details: DownloadErrorDetails,
+    },
 
     /// Папка назначения недоступна: нет прав либо её не существует.
     ///
@@ -138,6 +151,27 @@ pub enum DownloadFailure {
         reason: YtDlpFailureReason,
         details: DownloadErrorDetails,
     },
+}
+
+/// Почему склейка не состоялась ([`DownloadFailure::MergeFailed`], TL-130).
+///
+/// Подпричина домена, а не контракта: границу она пересекает только
+/// текстом `message`, поле `reason` у [`crate::types::DownloadError`]
+/// остаётся за `ytDlpFailure`. Фронтенду различать эти два случая незачем
+/// — действия пользователя (повтор, «Подробнее») у них совпадают, — а вот
+/// говорить ему неправду про чужой процесс нельзя.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MergeFailedReason {
+    /// Процесс ffmpeg запускался и завершился ошибкой.
+    #[error("ffmpeg завершился ошибкой")]
+    FfmpegFailed,
+
+    /// Файлов потоков к склейке не нашлось: yt-dlp не назвал файл потока
+    /// либо названный файл пропал с диска до склейки. Склеивать было
+    /// нечего, **ffmpeg не запускался** — и упоминать его в тексте
+    /// значило бы отправить пользователя искать несуществующую поломку.
+    #[error("файлов скачанных потоков нет, склеивать было нечего")]
+    StreamsMissing,
 }
 
 #[allow(dead_code)]
@@ -208,7 +242,7 @@ impl DownloadFailure {
             Self::ConnectionLost { details, .. }
             | Self::DiskFull { details }
             | Self::StaleFormat { details }
-            | Self::MergeFailed { details }
+            | Self::MergeFailed { details, .. }
             | Self::DestinationUnavailable { details, .. }
             | Self::VideoUnavailable { details }
             | Self::SignInRequired { details }
@@ -252,7 +286,10 @@ mod tests {
                 PartialData::Removed,
             ),
             (
-                DownloadFailure::MergeFailed { details: details() },
+                DownloadFailure::MergeFailed {
+                    reason: MergeFailedReason::FfmpegFailed,
+                    details: details(),
+                },
                 DownloadErrorKind::MergeFailed,
                 PartialData::Kept,
             ),
@@ -361,8 +398,11 @@ mod tests {
 
     #[test]
     fn passes_stderr_tail_and_exit_code_through_to_the_contract() {
-        let contract =
-            DownloadFailure::MergeFailed { details: details() }.to_contract(PartialData::Kept);
+        let contract = DownloadFailure::MergeFailed {
+            reason: MergeFailedReason::FfmpegFailed,
+            details: details(),
+        }
+        .to_contract(PartialData::Kept);
 
         assert_eq!(contract.details, Some(details()));
     }
@@ -389,6 +429,43 @@ mod tests {
     }
 
     #[test]
+    fn the_merge_failure_without_streams_does_not_blame_ffmpeg() {
+        // TL-130, дефект живой Windows (#137): «файлов потоков к склейке
+        // нет» выдавалось текстом «ffmpeg завершился ошибкой», хотя ffmpeg
+        // не запускался. Класс у двух причин общий, текст — нет.
+        let missing = DownloadFailure::MergeFailed {
+            reason: MergeFailedReason::StreamsMissing,
+            details: details(),
+        }
+        .to_contract(PartialData::Kept);
+        let ffmpeg = DownloadFailure::MergeFailed {
+            reason: MergeFailedReason::FfmpegFailed,
+            details: details(),
+        }
+        .to_contract(PartialData::Kept);
+
+        assert!(
+            !missing.message.contains("ffmpeg"),
+            "ffmpeg не запускался, а текст про него: «{}»",
+            missing.message
+        );
+        assert!(
+            ffmpeg.message.contains("ffmpeg"),
+            "отказ самого ffmpeg обязан его называть: «{}»",
+            ffmpeg.message
+        );
+        assert_ne!(
+            missing.message, ffmpeg.message,
+            "две причины — два текста, иначе различать их незачем"
+        );
+        assert_eq!(
+            (missing.kind, missing.retryable, missing.partial_data),
+            (ffmpeg.kind, ffmpeg.retryable, ffmpeg.partial_data),
+            "класс, повторяемость и судьба частичного у причин общие"
+        );
+    }
+
+    #[test]
     fn no_message_leaks_a_rust_identifier_to_the_user() {
         // `message` виден в «Подробнее» (Н-4): в нём не должно быть имён
         // вариантов и типов Rust — класс едет отдельным полем `kind`.
@@ -410,6 +487,9 @@ mod tests {
                 "Generic",
                 "Outdated",
                 "YtDlpFailureReason",
+                "MergeFailedReason",
+                "FfmpegFailed",
+                "StreamsMissing",
             ] {
                 assert!(
                     !message.contains(identifier),

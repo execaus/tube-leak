@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use super::error::DownloadFailure;
+use super::error::{DownloadFailure, MergeFailedReason};
 use crate::sidecar::{
     run_cancellable, stderr_tail, ChildRegistry, RunHandle, RunOutput, SidecarError,
 };
@@ -470,7 +470,12 @@ where
 
 /// Единственный класс отказа этого модуля (С-11).
 fn merge_failed(details: DownloadErrorDetails) -> DownloadFailure {
-    DownloadFailure::MergeFailed { details }
+    // Причина именно ffmpeg-овая: сюда приходят только исходы запущенного
+    // процесса склейки (TL-130).
+    DownloadFailure::MergeFailed {
+        reason: MergeFailedReason::FfmpegFailed,
+        details,
+    }
 }
 
 /// Технические детали для «Подробнее» (Н-4) — тот же хвост, что у разбора

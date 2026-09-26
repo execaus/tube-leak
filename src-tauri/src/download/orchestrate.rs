@@ -189,7 +189,7 @@ use std::time::{Duration, Instant};
 
 use super::aggregate::{ProgressAggregator, SampleOutcome};
 use super::classify::{classify_attempt, AttemptOutcome, AttemptVerdict};
-use super::error::{DownloadCommandRejection, DownloadFailure};
+use super::error::{DownloadCommandRejection, DownloadFailure, MergeFailedReason};
 use super::filename::{finalize_in_dir, sanitized_stem};
 use super::merge::{
     container_for, merge_streams, working_file_name, FfmpegLauncher, MergeContainer, MergeRequest,
@@ -362,7 +362,7 @@ const SOCKET_TIMEOUT_ARG: &str = "10";
 /// рантайме, и ставит их вместе с окружением deno запускатель
 /// ([`SidecarDownloader`]) — перед этим набором, то есть заведомо до `--`.
 /// Фикстуры одного запуска сняты без рантайма; переснятие — после v0.1.
-const DOWNLOAD_ARGS: [&str; 8] = [
+const DOWNLOAD_ARGS: [&str; 10] = [
     "--no-playlist",
     "--newline",
     "--progress-template",
@@ -371,6 +371,25 @@ const DOWNLOAD_ARGS: [&str; 8] = [
     PROGRESS_DELTA_ARG,
     "--socket-timeout",
     SOCKET_TIMEOUT_ARG,
+    // Кодировка вывода yt-dlp, прибитая к UTF-8 (TL-130). Без неё имя
+    // файла потока не читается на локали, которая не UTF-8, и это не
+    // гипотеза, а замер: yt-dlp кодирует **весь** свой текст
+    // `enc = encoding or out.encoding or preferredencoding()`
+    // (`utils/write_string`), то есть при выводе в канал — кодировкой
+    // локали. На русской Windows это cp1251, и кириллица в строке
+    // `[download] Destination: …` приходит байтами, которые UTF-8 не
+    // являются; чтение вывода (`String::from_utf8_lossy`) меняет их на
+    // U+FFFD, имя перестаёт совпадать с нашим `-o`, поток считается
+    // незабранным и склейка не начинается (#137, живая Windows).
+    //
+    // Почему флагом, а не окружением: `PYTHONIOENCODING` этот бинарник
+    // не читает вовсе — он собран PyInstaller-ом, и замер показал, что
+    // даже заведомо битое значение (`PYTHONIOENCODING=totally-bogus-
+    // encoding`) не роняет запуск, а `=ascii` не меняет байтов вывода.
+    // `--encoding` же меняет: с `cp1251` вывод воспроизводимо ломается,
+    // с `utf-8` остаётся UTF-8 при любой локали.
+    "--encoding",
+    "utf-8",
 ];
 
 /// Полный argv одной попытки.
@@ -1839,7 +1858,11 @@ async fn execute(
                     .map(|job| job.format_id.as_str())
                     .collect();
                 eprintln!("download: файлов потоков {unnamed:?} к склейке нет — склеивать нечего");
+                // Класс тот же, а причина — своя: ffmpeg здесь не
+                // запускался, и текст про его ошибку был бы неправдой
+                // (TL-130).
                 return TaskEnd::Failed(DownloadFailure::MergeFailed {
+                    reason: MergeFailedReason::StreamsMissing,
                     details: no_details(),
                 });
             };
