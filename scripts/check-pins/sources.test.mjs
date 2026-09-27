@@ -1,8 +1,11 @@
+import { spawn } from 'node:child_process'
+import { join } from 'node:path'
+
 import { describe, expect, it } from 'vitest'
 
 import { loadPin } from '../fetch-binaries/pin.mjs'
 import { KNOWN_TARGETS } from '../fetch-binaries/targets.mjs'
-import { checkAll, checkUrl, hostCanary, judge, parseArgs, planAll } from './index.mjs'
+import { checkAll, checkUrl, hostCanary, judge, parseArgs, planAll, run } from './index.mjs'
 import {
   canaryUrlFor,
   collectAllUrls,
@@ -16,6 +19,7 @@ import {
   PIN_PATH,
   planProbe,
   readDocs,
+  REPO_ROOT,
 } from './sources.mjs'
 
 // Сети здесь нет и быть не может (правило проекта): всё, что ходит
@@ -162,14 +166,31 @@ describe('planProbe: что проверяется, что заменяется,
     expect(planProbe('https://svn.xvid.org/trunk/xvidcore').reason).toContain('401')
   })
 
-  it('пропускает issues нашего приватного репозитория, но не зеркало ассета', () => {
-    expect(planProbe('https://github.com/execaus/tube-leak/issues/14').kind).toBe('skip')
+  it('адреса открытого репозитория кода проверяет без всяких оговорок', () => {
+    // Прежде здесь стоял безусловный пропуск по хосту и пути, а
+    // комментарий рядом обещал, что пропуск исчезнет сам при открытии
+    // репозитория. Сам он не исчез бы никогда. Репозиторий кода открыт —
+    // 404 по любому его адресу теперь настоящая пропажа.
     for (const url of [
+      'https://github.com/execaus/tube-leak/issues/14',
+      'https://github.com/execaus/tube-leak/issues',
       'https://github.com/execaus/tube-leak/releases/download/v0.1.1/ffmpeg.zip',
-      'https://github.com/execaus/tube-leak-docs/blob/main/epics/E1.md',
     ]) {
-      expect(planProbe(url).kind).toBe('check')
+      expect(planProbe(url)).toStrictEqual({ kind: 'check', probeUrl: url, why: null })
     }
+  })
+
+  it('пропускает приватный репозиторий документов — и различает его от репозитория кода', () => {
+    // `tube-leak-docs` начинается с `tube-leak`: проверка префиксом
+    // накрыла бы оба репозитория разом и снова спрятала бы адреса
+    // открытого репозитория кода, включая будущее зеркало ассета.
+    const plan = planProbe('https://github.com/execaus/tube-leak-docs/blob/main/epics/E1.md')
+
+    expect(plan.kind).toBe('skip')
+    expect(plan.reason).toContain('tube-leak-docs')
+    expect(plan.reason).toContain('§6d')
+    // Тот же префикс, но репозиторий кода — проверяется.
+    expect(planProbe('https://github.com/execaus/tube-leak/issues/14').kind).toBe('check')
   })
 })
 
@@ -199,6 +220,22 @@ describe('происхождение адреса и строгость', () => 
     expect(alive.map((r) => r.url)).toStrictEqual(['https://a.invalid/live'])
     expect(fatal.map((r) => r.url)).toStrictEqual(['https://a.invalid/pin', 'https://a.invalid/gone'])
     expect(tolerated.map((r) => r.url)).toStrictEqual(['https://a.invalid/doc'])
+  })
+
+  it('класс, которого в приговоре ещё нет, зелёным не проходит нигде', () => {
+    // Белый список зелёного, а не чёрный список бед: пропущенный адрес
+    // пина не попадал ни в одну из трёх корзин и потому был невидим
+    // (#142). Новый класс обязан краснеть, а не исчезать.
+    const results = [
+      { ...entry('https://a.invalid/pin', ['pin']), kind: 'новый-класс' },
+      { ...entry('https://a.invalid/doc', ['docs']), kind: 'новый-класс' },
+    ]
+
+    const { alive, fatal, tolerated } = judge(results)
+
+    expect(alive).toStrictEqual([])
+    expect(tolerated).toStrictEqual([])
+    expect(fatal).toHaveLength(2)
   })
 
   it('тот же всегда-500 у документов гейт не валит, но и живым не считается', async () => {
@@ -233,6 +270,48 @@ describe('происхождение адреса и строгость', () => 
     expect(alive).toHaveLength(0)
     expect(tolerated).toHaveLength(0)
     expect(fatal).toHaveLength(entries.length)
+  })
+})
+
+describe('адреса нашего репозитория кода после открытия', () => {
+  const checkOnly = async (item, fetchImpl) =>
+    checkAll(planAll([item]).checked, { fetchImpl, sleepImpl: noSleep })
+
+  it('404 у адреса нашего репозитория — смерть и отказ гейта, укрытий нет', async () => {
+    // Репозиторий кода открыт, значит анонимный 404 по его адресу больше
+    // ничем не оправдан: это удалённый issue или переехавший ассет.
+    for (const url of [
+      'https://github.com/execaus/tube-leak/issues/14',
+      'https://github.com/execaus/tube-leak/releases/download/v0.1.1/ffmpeg.zip',
+    ]) {
+      const results = await checkOnly(entry(url, ['docs']), async () => response(404))
+
+      expect(results[0].kind).toBe('dead')
+      expect(judge(results).fatal).toHaveLength(1)
+    }
+  })
+
+  it('живой issue — обычный «жив», без особых пометок', async () => {
+    const fetchImpl = async (url) =>
+      url.includes('canary-does-not-exist') ? response(404) : response(200, { 'content-length': '27484' })
+
+    const results = await checkOnly(
+      entry('https://github.com/execaus/tube-leak/issues', ['docs']),
+      fetchImpl,
+    )
+
+    expect(results[0].kind).toBe('ok')
+    expect(judge(results).fatal).toStrictEqual([])
+  })
+
+  it('адрес приватного репозитория документов до проверки не доходит', async () => {
+    const { checked, skipped } = planAll([
+      entry('https://github.com/execaus/tube-leak-docs/blob/main/specs/x.md', ['docs']),
+    ])
+
+    expect(checked).toStrictEqual([])
+    expect(skipped).toHaveLength(1)
+    expect(skipped[0].reason).toContain('tube-leak-docs')
   })
 })
 
@@ -323,8 +402,15 @@ describe('collectAllUrls', () => {
   it('оставляет под охраной подавляющее большинство адресов', async () => {
     const { checked, skipped } = planAll(await collectAllUrls())
 
-    expect(skipped.length).toBeLessThanOrEqual(5)
+    expect(skipped.length).toBeLessThanOrEqual(2)
     expect(checked.length).toBeGreaterThan(100)
+    // Правило пропуска для репозитория КОДА снято (TL-133): он открыт, и
+    // его адреса проверяются, а не исчезают из проверки. Пропуск остался
+    // только у приватного репозитория документов, а его адресов в
+    // документах §6d нет ни одного.
+    expect(
+      skipped.some((item) => item.url.startsWith('https://github.com/execaus/tube-leak/')),
+    ).toBe(false)
   })
 })
 
@@ -369,12 +455,15 @@ describe('crossCheckDocs', () => {
   })
 })
 
+/** Адрес, на который сегодня заведомо срабатывает правило пропуска. */
+const SKIPPED_URL = 'https://svn.xvid.org/trunk/xvidcore'
+
 describe('planAll', () => {
   it('делит адреса на проверяемые (в т.ч. по замене) и пропускаемые', () => {
-    const { checked, skipped } = planAll([
+    const { checked, skipped, refused } = planAll([
       entry('https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz', ['docs']),
       entry('https://git.code.sf.net/p/soxr/code', ['docs']),
-      entry('https://svn.xvid.org/trunk/xvidcore', ['docs']),
+      entry(SKIPPED_URL, ['docs']),
     ])
 
     expect(checked.map((item) => item.probeUrl)).toStrictEqual([
@@ -383,6 +472,96 @@ describe('planAll', () => {
     ])
     expect(skipped).toHaveLength(1)
     expect(skipped[0].reason).toContain('401')
+    expect(refused).toStrictEqual([])
+  })
+
+  it('адрес ПИНА, подошедший под правило пропуска, — отказ, а не тихий зелёный (#142)', () => {
+    const { checked, skipped, refused } = planAll([entry(SKIPPED_URL, ['pin'])])
+
+    // Главное здесь — что его НЕТ в пропущенных: оттуда приговор его не
+    // видит вовсе, и адрес пина оставался зелёным без единой проверки.
+    expect(skipped).toStrictEqual([])
+    expect(checked).toStrictEqual([])
+    expect(refused).toHaveLength(1)
+    expect(refused[0].detail).toContain('адрес ПИНА')
+    expect(refused[0].detail).toContain('401')
+    expect(judge(refused).fatal).toHaveLength(1)
+  })
+
+  it('тот же адрес, названный только документом, остаётся пропуском', () => {
+    const { skipped, refused } = planAll([entry(SKIPPED_URL, ['docs'])])
+
+    expect(refused).toStrictEqual([])
+    expect(skipped).toHaveLength(1)
+    expect(skipped[0].reason).toContain('401')
+  })
+
+  it('адрес, названный и пином, и документами, судится по пину', () => {
+    const { skipped, refused } = planAll([entry(SKIPPED_URL, ['docs', 'pin'])])
+
+    expect(skipped).toStrictEqual([])
+    expect(refused).toHaveLength(1)
+  })
+
+  it('на настоящем списке адресов отказов плана сегодня нет', async () => {
+    // Класс закрыт на будущее: хосты пина под действующие правила не
+    // подходят, и гейт от этой правки не краснеет.
+    expect(planAll(await collectAllUrls()).refused).toStrictEqual([])
+  })
+})
+
+/**
+ * Запускает саму команду. Сети не касается: разбор аргументов падает до
+ * первого запроса.
+ */
+function runCli(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [join(REPO_ROOT, 'scripts', 'check-pins', 'index.mjs'), ...args],
+      { stdio: ['ignore', 'ignore', 'pipe'] },
+    )
+    let stderr = ''
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk
+    })
+    child.on('error', reject)
+    child.on('close', (code) => resolve({ code, stderr }))
+  })
+}
+
+describe('run: приговор решает код возврата', () => {
+  const silent = () => {}
+  // Если сторож полезет в сеть за адресом, который решено не проверять,
+  // тест это увидит, а не примет молча.
+  const noNetwork = () => {
+    throw new Error('запрос к адресу, который проверять не собирались')
+  }
+
+  it('адрес ПИНА под правилом пропуска валит гейт, не сходив в сеть (EXIT=1)', async () => {
+    await expect(
+      run([entry(SKIPPED_URL, ['pin'])], { log: silent, fetchImpl: noNetwork, sleepImpl: noSleep }),
+    ).rejects.toThrow(/из них адресов пина — 1/)
+  })
+
+  it('тот же адрес от документа гейт не валит (EXIT=0)', async () => {
+    const verdict = await run([entry(SKIPPED_URL, ['docs'])], {
+      log: silent,
+      fetchImpl: noNetwork,
+      sleepImpl: noSleep,
+    })
+
+    expect(verdict.fatal).toStrictEqual([])
+    expect(verdict.skipped).toHaveLength(1)
+  })
+
+  it('отказ run — это EXIT=1 у самой команды, а не только исключение', async () => {
+    // Связь «throw → код возврата» лежит в хвосте index.mjs, и без этого
+    // теста «EXIT=1» выше был бы утверждением о непроверенном.
+    const { code, stderr } = await runCli(['--no-such-flag'])
+
+    expect(code).toBe(1)
+    expect(stderr).toContain('unknown argument')
   })
 })
 

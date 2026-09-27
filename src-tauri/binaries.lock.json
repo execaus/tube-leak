@@ -24,7 +24,10 @@
     "совпадает со скачанным (извлечён из архива). Доставка сверяет с ней",
     "извлечённый файл, src-tauri/build.rs — файл в binaries/ на каждой сборке:",
     "в профиле release несовпадение (например, заглушка scripts/ci/stub-binaries.mjs)",
-    "обрывает сборку. У deno поле обязательно (его требует build.rs)."
+    "обрывает сборку. Поле обязательно у КАЖДОЙ записи с archive (то есть у deno",
+    "и у ffmpeg, TL-134): сумма скачанного архива после извлечения уже ничего не",
+    "охраняет. У deno сумму публикует апстрим, у ffmpeg она снята нашей доставкой",
+    "— см. ffmpeg._note."
   ],
   "ytDlp": {
     "version": "2026.08.19",
@@ -68,10 +71,12 @@
   "ffmpeg": {
     "version": "9.0.1",
     "_source": "Смешанные официальные/полу-официальные статические сборки — версия 9.0.1 согласована по всем таргетам. Все четыре собраны с --enable-gpl --enable-version3, то есть GPLv3 (см. THIRD-PARTY-LICENSES.md). См. per-target _source/_note.",
+    "_note": "binarySha256 (TL-134, #141) — НАШ ЗАМЕР, а не заявление сборщика: суммы распакованного ffmpeg сборщики не публикуют вовсе (в отличие от deno, где это апстримный ассет .sha256sum). Все четыре сняты живой доставкой 2026-09-27 тем же scripts/fetch-binaries/install.mjs, который кладёт файл в binaries/: архив скачан, его sha256 сверена с полем sha256 этой же записи, из архива извлечён archive.member, и сумма снята с извлечённого файла. Догадок и переносов из чужих таблиц нет; размер извлечённого — windows 102 856 192, macos-amd64 94 671 040, macos-arm64 66 334 032, linux 145 852 304 байта. Зачем поле: sha256 архива охраняет только момент доставки, а подмену уже распакованного binaries/ffmpeg-* между доставкой и сборкой не ловил никто. Теперь сверяют и доставка (install.mjs), и src-tauri/build.rs на каждой сборке — в профиле release несовпадение обрывает сборку. Перепиновка адреса обязана обновлять ОБА поля: sha256 архива и binarySha256 извлечённого.",
     "targets": {
       "x86_64-pc-windows-msvc": {
         "url": "https://github.com/GyanD/codexffmpeg/releases/download/9.0.1/ffmpeg-9.0.1-essentials_build.zip",
         "sha256": "fec81ae03971d9dd4be3ebe02e263bd2ec1d789483f931bdba5f5715e65da2e9",
+        "binarySha256": "72a489eccd008c2ec2c0a5856c5c75bc3d8bbfa90166c4566865c246445e6aa3",
         "archive": { "type": "zip", "member": "ffmpeg.exe" },
         "binaryName": "ffmpeg-x86_64-pc-windows-msvc.exe",
         "_source": "GyanD/codexffmpeg — GitHub-зеркало сборщика gyan.dev, объявленное им самим (страница https://www.gyan.dev/ffmpeg/builds/ называет его «complete archive @ mirror»); адрес — неподвижный версионный тег релиза 9.0.1, тот же класс источника, что у yt-dlp и deno. Сборка рекомендована официальной ffmpeg.org Download-страницей, лицензия GPL v3 — по заявлению самого пакета (README.txt внутри архива), версии 41 вложенной библиотеки — оттуда же, см. SOURCES-FFMPEG.md.",
@@ -80,6 +85,7 @@
       "x86_64-apple-darwin": {
         "url": "https://ffmpeg.martin-riedl.de/download/macos/amd64/1787081194_9.0.1/ffmpeg.zip",
         "sha256": "5bdead62ff504ab9b447cc72b212c4fb481e3f7de5877d427a51bee8136dda40",
+        "binarySha256": "56f4a0478fff60fa549ab7aa03759d7ab116dadcdf63dba4d466ebfba1280b2f",
         "archive": { "type": "zip", "member": "ffmpeg" },
         "binaryName": "ffmpeg-x86_64-apple-darwin",
         "_source": "ffmpeg.martin-riedl.de — тот же публичный build-сервер и тот же пайплайн, что у aarch64-apple-darwin (build-script открыт: https://git.martin-riedl.de/ffmpeg/build-script). URL версионирован и неизменяем в том же формате (download/macos/amd64/<unix-ts>_<version>/ffmpeg.zip); история релизных сборок на сервере ведётся с января 2022 года. sha256 взята из ffmpeg.zip.sha256, публикуемого рядом с архивом, и подтверждена фактическим скачиванием. Точные версии вложенных библиотек — в versions.txt рядом с архивом. Configure содержит --enable-gpl и --enable-version3 — GPLv3, лицензия не меняется (Р-3).",
@@ -88,6 +94,7 @@
       "aarch64-apple-darwin": {
         "url": "https://ffmpeg.martin-riedl.de/download/macos/arm64/1787073674_9.0.1/ffmpeg.zip",
         "sha256": "8287a1b2229e05eb41859f073e18e6c52c60a778f2f5e6881070fe51b79407fe",
+        "binarySha256": "393e4c395020a1cb7cbd77fbe00599ce69d1c6466fee0dbd59d13f86a81a1611",
         "archive": { "type": "zip", "member": "ffmpeg" },
         "binaryName": "ffmpeg-aarch64-apple-darwin",
         "_source": "ffmpeg.martin-riedl.de — публичный build-сервер (build-script открыт: https://git.martin-riedl.de/ffmpeg/build-script), единственный из просмотренных, кто публикует НАТИВНУЮ arm64-сборку именно релиза 9.0.1. URL версионирован и неизменяем (download/macos/arm64/<unix-ts>_<version>/ffmpeg.zip); история сборок на сервере хранится с 2022 года. sha256 взята из ffmpeg.zip.sha256, публикуемого рядом с архивом, и подтверждена локально после скачивания. Configure содержит --enable-gpl и --enable-version3 — лицензия GPLv3, та же, что у остальных трёх таргетов (Р-3 не меняется). Бинарник подписан Developer ID Application: Martin Riedl (KU3N25YGLU) с hardened runtime.",
@@ -96,6 +103,7 @@
       "x86_64-unknown-linux-gnu": {
         "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-31-13-27/ffmpeg-n9.0.1-11-ge47273f4d9-linux64-gpl-9.0.tar.xz",
         "sha256": "182c1b509720e939bb47bfb47dc29cc0c298640401128e3dce8627d10707eb5a",
+        "binarySha256": "771831e48242e0dfb9640a73dabbf29c6d2188bcf217f65909c9e2567696e180",
         "archive": { "type": "tar.xz", "member": "ffmpeg" },
         "binaryName": "ffmpeg-x86_64-unknown-linux-gnu",
         "_source": "BtbN/FFmpeg-Builds — статическая сборка ffmpeg 9.0.1 (ветка release/9.0, коммит e47273f4d9) из автоматических билдов на GitHub Actions; sha256 — поле digest GitHub API ассета, ту же сумму сборщик публикует в checksums.sha256 того же релиза. Вариант gpl, не nonfree: на коммите тега (8267213e26c1031621e6e1210fe3aa4867214f6a) scripts.d/50-fdk-aac.sh включается только при VARIANT==nonfree*, а x264/x265 выключены только при lgpl* — лицензия GPLv3, как у остальных трёх таргетов, Р-3 не меняется. Тег настоящий git-тег, поэтому точные ревизии исходников каждой вложенной библиотеки читаются из SCRIPT_COMMIT в scripts.d/*.sh на нём — они выписаны в SOURCES-FFMPEG.md (#136).",

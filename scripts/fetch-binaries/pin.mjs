@@ -148,6 +148,19 @@ function validateEntry(entry, label, pinPath) {
         `pin file ${pinPath}: "${label}.archive.member" must be the basename of the file to extract`,
       )
     }
+
+    // Запись, у которой итоговый файл ИЗВЛЕКАЕТСЯ из скачанного, обязана
+    // нести сумму извлечённого (TL-134, #141). Сумма архива к этому
+    // моменту уже проверена и больше ничего не охраняет: подмену
+    // распакованного файла между доставкой и сборкой ловит только
+    // binarySha256 — ею сверяют install.mjs и src-tauri/build.rs. Правило
+    // по устройству записи, а не список разделов: новый sidecar,
+    // извлекаемый из архива, не сможет приехать без этой суммы молча.
+    if (entry.binarySha256 === undefined) {
+      throw new Error(
+        `pin file ${pinPath}: "${label}.binarySha256" is required whenever the delivered file is extracted from an archive ("archive" is set): the archive sha256 no longer covers the file that ends up in src-tauri/binaries/`,
+      )
+    }
   }
 }
 

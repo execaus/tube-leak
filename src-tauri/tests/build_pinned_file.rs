@@ -1,7 +1,7 @@
 //! Сторож сверки sidecar-файлов с пином на сборке (TL-112).
 //!
-//! `build.rs` отказывает сборке, если под именем deno или архива yt-dlp в
-//! `binaries/` лежит не то, что закреплено в `binaries.lock.json`, и в
+//! `build.rs` отказывает сборке, если под именем deno, ffmpeg или архива
+//! yt-dlp в `binaries/` лежит не то, что закреплено в `binaries.lock.json`, и в
 //! профиле `release` не принимает для этого никаких форточек. Сам
 //! билд-скрипт `cargo test` не видит, поэтому решение вынесено в
 //! `build_support/pinned_file.rs` и подключено сюда тем же `#[path]`, что и
@@ -12,7 +12,7 @@
 //! форточку и передаёт значения как есть, а политику несёт каждая сверка.
 //! Проводку — что `build.rs` зовёт обе сверки из плана и политику не
 //! трогает — тест не исполняет, а сверяет по исходнику
-//! (`build_rs_wires_both_checks_from_the_plan_and_never_touches_the_policy`).
+//! (`build_rs_wires_every_check_from_the_plan_and_never_touches_the_policy`).
 //! Проводку целиком по-прежнему доказывает только живая сборка в
 //! release-профиле с заглушкой на месте deno (отчёт TL-112).
 
@@ -38,6 +38,13 @@ const STUB_SHA256: &str = "16f9c25e72a528d4667009d2d87d057d11aa2ae0d99e4b70748a7
 /// `deno-aarch64-apple-darwin.sha256sum` релиза v2.9.6.
 const DENO_AARCH64_DARWIN_SHA256: &str =
     "b3ac3bd206e48c26026cadd80c1367e96c149f9c66130952382a642b09fa8a71";
+
+/// Сумма настоящего `ffmpeg-aarch64-apple-darwin` 9.0.1 (TL-134): снята
+/// `shasum -a 256` с файла, который положила доставка, а не кодом под
+/// тестом. Подтвердить её апстримом нельзя — сборщики ffmpeg сумм
+/// распакованного не публикуют (см. `ffmpeg._note` в пине); это наш замер.
+const FFMPEG_AARCH64_DARWIN_SHA256: &str =
+    "393e4c395020a1cb7cbd77fbe00599ce69d1c6466fee0dbd59d13f86a81a1611";
 
 /// Опубликованные векторы SHA-256 (FIPS 180-2): «abc» и миллион «a». Второй
 /// длиннее буфера потокового чтения, то есть проходит через его границы.
@@ -265,6 +272,50 @@ fn the_repository_pin_carries_the_unpacked_deno_sum_for_every_target() {
     );
 }
 
+/// TL-134 (#141): у ffmpeg сумма распакованного тоже есть, и она своя на
+/// каждую тройку. До этой задачи поля не было вовсе — подмену файла в
+/// `binaries/` между доставкой и сборкой не ловил никто, тогда как у
+/// соседнего deno ловил `build.rs`.
+#[test]
+fn the_repository_pin_carries_the_unpacked_ffmpeg_sum_for_every_target() {
+    let raw = repo_pin();
+    let json: serde_json::Value = serde_json::from_str(&raw).expect("pin is JSON");
+    let mut sums = HashSet::new();
+
+    for target in KNOWN_TARGETS {
+        let PinnedBinary {
+            binary_name,
+            binary_sha256,
+        } = pinned_binary(&raw, "ffmpeg", target).unwrap_or_else(|err| panic!("{target}: {err}"));
+
+        let exe = if target.contains("-windows-") {
+            ".exe"
+        } else {
+            ""
+        };
+        assert_eq!(binary_name, format!("ffmpeg-{target}{exe}"));
+
+        // Сумма распакованного — не сумма архива: перепутанное поле
+        // пропустило бы любой файл, кроме настоящего.
+        let archive_sha256 = json["ffmpeg"]["targets"][target]["sha256"]
+            .as_str()
+            .expect("archive sha256");
+        assert_ne!(binary_sha256, archive_sha256, "{target}");
+        // И не сумма соседней тройки: четыре разные сборки.
+        assert!(
+            sums.insert(binary_sha256),
+            "{target}: duplicate binarySha256"
+        );
+    }
+
+    assert_eq!(
+        pinned_binary(&raw, "ffmpeg", "aarch64-apple-darwin")
+            .expect("aarch64 ffmpeg")
+            .binary_sha256,
+        FFMPEG_AARCH64_DARWIN_SHA256
+    );
+}
+
 #[test]
 fn pinned_binary_refuses_an_entry_it_could_not_check() {
     let entry = |binary_name: &str, binary_sha256: Option<&str>| {
@@ -321,18 +372,20 @@ fn pinned_binary_refuses_an_entry_it_could_not_check() {
 const PLAN_TARGET: &str = "aarch64-apple-darwin";
 
 /// Замечание 1 ревью TL-112: при `PROFILE=release` форточка `=1` не
-/// открывает ни одну из двух сверок, и обе берут записи своей тройки.
+/// открывает ни одну из сверок, и все берут записи своей тройки.
 #[test]
-fn the_release_profile_keeps_both_checks_closed_even_with_the_stub_window() {
+fn the_release_profile_keeps_every_check_closed_even_with_the_stub_window() {
     let raw = repo_pin();
     let json: serde_json::Value = serde_json::from_str(&raw).expect("pin is JSON");
     let BuildChecks {
         yt_dlp_archive,
         deno,
+        ffmpeg,
     } = plan_build_checks(&raw, PLAN_TARGET, Some("release"), Some("1")).expect("plan");
 
     assert_eq!(yt_dlp_archive.policy, RELEASE_WITH_WINDOW, "yt-dlp");
     assert_eq!(deno.policy, RELEASE_WITH_WINDOW, "deno");
+    assert_eq!(ffmpeg.policy, RELEASE_WITH_WINDOW, "ffmpeg");
 
     assert_eq!(yt_dlp_archive.tool, "yt-dlp");
     assert_eq!(
@@ -346,11 +399,20 @@ fn the_release_profile_keeps_both_checks_closed_even_with_the_stub_window() {
     assert_eq!(deno.tool, "deno");
     assert_eq!(deno.file_name, format!("deno-{PLAN_TARGET}"));
     assert_eq!(deno.expected_sha256, DENO_AARCH64_DARWIN_SHA256);
+    assert_eq!(ffmpeg.tool, "ffmpeg");
+    assert_eq!(ffmpeg.file_name, format!("ffmpeg-{PLAN_TARGET}"));
+    assert_eq!(ffmpeg.expected_sha256, FFMPEG_AARCH64_DARWIN_SHA256);
+    // Сверяется сумма РАСПАКОВАННОГО, а не архива: взятое не из того поля
+    // приняло бы в `binaries/` что угодно, кроме настоящего бинарника.
+    assert_ne!(
+        Some(ffmpeg.expected_sha256.as_str()),
+        json["ffmpeg"]["targets"][PLAN_TARGET]["sha256"].as_str()
+    );
 
     // Поведением, а не только полем: заглушка под именем каждого файла —
     // отказ, и отказ называет проигнорированную форточку.
     let dir = tempfile::tempdir().expect("tempdir");
-    for check in [&yt_dlp_archive, &deno] {
+    for check in [&yt_dlp_archive, &deno, &ffmpeg] {
         let path = check.path_in(dir.path());
         fs::write(&path, STUB_CONTENT).expect("write stub");
         let refusal = check
@@ -390,8 +452,12 @@ fn the_policy_is_taken_from_exact_environment_values() {
     for (profile, window, expected) in cases {
         let checks = plan_build_checks(&raw, PLAN_TARGET, profile, window).expect("plan");
         assert_eq!(
-            (checks.yt_dlp_archive.policy, checks.deno.policy),
-            (expected, expected),
+            (
+                checks.yt_dlp_archive.policy,
+                checks.deno.policy,
+                checks.ffmpeg.policy
+            ),
+            (expected, expected, expected),
             "PROFILE={profile:?} {ALLOW_STUB_ENV}={window:?}"
         );
     }
@@ -402,7 +468,7 @@ fn the_plan_refuses_a_pin_it_could_not_check() {
     let raw = repo_pin();
     let json: serde_json::Value = serde_json::from_str(&raw).expect("pin is JSON");
 
-    for section in ["ytDlp", "deno"] {
+    for section in ["ytDlp", "deno", "ffmpeg"] {
         let mut broken = json.clone();
         broken[section]["targets"]
             .as_object_mut()
@@ -433,13 +499,13 @@ fn the_plan_refuses_a_pin_it_could_not_check() {
 ///   `PlannedCheck { … }`, `..` поверх сверки и сверки в обход плана
 ///   (`verify_pinned_file`, `PinnedFile`, `pinned_binary`), нет и `#[cfg`.
 /// - Окружение читается ровно раз и уходит в план как есть.
-/// - Обе сверки зовутся ровно раз на верхнем уровне `main` (отступ 4 — не
-///   под `if`), в `main` нет `return` и `exit(`, отказ сверки — паника.
+/// - Все три сверки зовутся ровно раз на верхнем уровне `main` (отступ 4 —
+///   не под `if`), в `main` нет `return` и `exit(`, отказ сверки — паника.
 ///
 /// Не видит: выход из `main` паникой или бесконечным циклом до вызовов и
 /// вызов, собранный макросом.
 #[test]
-fn build_rs_wires_both_checks_from_the_plan_and_never_touches_the_policy() {
+fn build_rs_wires_every_check_from_the_plan_and_never_touches_the_policy() {
     let code: Vec<(usize, &str)> = include_str!("../build.rs")
         .lines()
         .filter(|line| {
@@ -494,6 +560,10 @@ fn build_rs_wires_both_checks_from_the_plan_and_never_touches_the_policy() {
         ),
         (
             4,
+            "check_pinned_file(&binaries, &checks.ffmpeg, FFMPEG_CONSEQUENCE);",
+        ),
+        (
+            4,
             "if !check_pinned_file(binaries, check, YTDLP_CONSEQUENCE) {",
         ),
         (4, "match check.verify(binaries, consequence) {"),
@@ -510,7 +580,8 @@ fn build_rs_wires_both_checks_from_the_plan_and_never_touches_the_policy() {
         ("env::var(ALLOW_STUB_ENV)", 1),
         ("plan_build_checks(", 1),
         ("checks.deno", 1),
-        ("check_pinned_file(", 3),
+        ("checks.ffmpeg", 1),
+        ("check_pinned_file(", 4),
         ("place_archive(", 2),
     ] {
         assert_eq!(containing(needle), expected, "build.rs: {needle:?}");

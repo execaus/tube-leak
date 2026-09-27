@@ -127,10 +127,26 @@ describe('loadPin', () => {
     const pin = makeValidPin()
     pin.ffmpeg.targets['x86_64-pc-windows-msvc'] = makeEntry({
       archive: { type: 'zip', member: 'ffmpeg.exe' },
+      binarySha256: 'b'.repeat(64),
     })
     const path = await writePin(pin)
 
     await expect(loadPin(path)).resolves.toStrictEqual(pin)
+  })
+
+  it('rejects an extracted entry without binarySha256 — nothing would cover the placed file', async () => {
+    // TL-134 (#141): sha256 архива после извлечения не охраняет ничего, и
+    // подмену распакованного файла между доставкой и сборкой без этой
+    // суммы не ловит никто.
+    const pin = makeValidPin()
+    pin.ffmpeg.targets['x86_64-pc-windows-msvc'] = makeEntry({
+      archive: { type: 'zip', member: 'ffmpeg.exe' },
+    })
+    const path = await writePin(pin)
+
+    await expect(loadPin(path)).rejects.toThrow(
+      /ffmpeg\.targets\.x86_64-pc-windows-msvc\.binarySha256.* is required whenever the delivered file is extracted/,
+    )
   })
 
   it('rejects an entry with an unknown kind', async () => {
@@ -225,6 +241,29 @@ describe('the real repository pin', () => {
         if (entryKind(entry) === 'archive') expect(entry.executableMember).toBeTruthy()
       }
     }
+  })
+
+  it('carries the unpacked ffmpeg sum for every target (TL-134)', async () => {
+    const pin = await loadPin(parseArgs([]).pinPath)
+    const sums = new Set()
+
+    for (const target of KNOWN_TARGETS) {
+      const entry = pin.ffmpeg.targets[target]
+      expect(entry.binarySha256).toMatch(/^[0-9a-f]{64}$/)
+      // Сумма распакованного — не сумма архива: перепутанное поле
+      // пропустило бы в binaries/ любой файл, кроме настоящего.
+      expect(entry.binarySha256).not.toBe(entry.sha256)
+      sums.add(entry.binarySha256)
+    }
+    // Четыре разные сборки — четыре разные суммы; скопированное поле
+    // охраняло бы чужую тройку.
+    expect(sums.size).toBe(KNOWN_TARGETS.length)
+
+    // Снято `shasum -a 256` с файла, доставленного на этой машине, а не
+    // кодом под тестом.
+    expect(pin.ffmpeg.targets['aarch64-apple-darwin'].binarySha256).toBe(
+      '393e4c395020a1cb7cbd77fbe00599ce69d1c6466fee0dbd59d13f86a81a1611',
+    )
   })
 })
 
