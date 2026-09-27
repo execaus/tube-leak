@@ -31,6 +31,7 @@
 import { storeToRefs } from 'pinia'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 
+import AboutScreen from '@/components/AboutScreen.vue'
 import ExitConfirmDialog from '@/components/ExitConfirmDialog.vue'
 import HistoryScreen from '@/components/HistoryScreen.vue'
 import ProbeSection from '@/components/ProbeSection.vue'
@@ -250,13 +251,20 @@ function onDownloadRequested(payload: {
  * его подписки на события живут на верхнем уровне этого `<script setup>`
  * независимо от того, что сейчас показано — переключение вкладки их не
  * касается вовсе, `v-show`/`v-if` здесь ничего не меняет.
+ *
+ * Четвёртая вкладка «О программе» (TL-128, issue #135, doc-комментарий
+ * `AboutScreen.vue`, «Почему четвёртая вкладка») добавлена этим же
+ * приёмом: `AboutScreen` статичен и не зависит от готовности sidecar, как
+ * «История»/«Настройки», и ничего сверх уже готового `tablist` ему не
+ * нужно.
  */
-type TabId = 'main' | 'history' | 'settings'
+type TabId = 'main' | 'history' | 'settings' | 'about'
 
 const TABS: { id: TabId; label: string }[] = [
   { id: 'main', label: 'Главный' },
   { id: 'history', label: 'История' },
   { id: 'settings', label: 'Настройки' },
+  { id: 'about', label: 'О программе' },
 ]
 
 const activeTab = ref<TabId>('main')
@@ -264,6 +272,7 @@ const activeTab = ref<TabId>('main')
 const mainHeadingEl = ref<HTMLHeadingElement | null>(null)
 const historyHeadingEl = ref<HTMLHeadingElement | null>(null)
 const settingsHeadingEl = ref<HTMLHeadingElement | null>(null)
+const aboutHeadingEl = ref<HTMLHeadingElement | null>(null)
 // Контейнер `tablist` (правки ревью TL-92, Б-1) — нужен, чтобы найти DOM-узел
 // только что выбранной кнопки-вкладки после клавиатурной активации (см.
 // {@link activateTabFromKeyboard}); заголовки панелей уже держат
@@ -284,6 +293,8 @@ function headingElFor(tab: TabId): HTMLHeadingElement | null {
       return historyHeadingEl.value
     case 'settings':
       return settingsHeadingEl.value
+    case 'about':
+      return aboutHeadingEl.value
     default:
       return assertNever(tab)
   }
@@ -916,6 +927,31 @@ watch(activeTab, (tab) => {
         Настройки
       </h2>
       <SettingsScreen :active="activeTab === 'settings'" />
+    </section>
+
+    <!--
+      Экран «О программе» (TL-128, issue #135) — заголовок и его
+      фокус-цель остаются здесь (К-14, тот же приём, что у «Истории»/
+      «Настроек»); содержимое несёт `AboutScreen`, не зависит от
+      готовности sidecar (сам экран статичен, версии sidecar в нём —
+      подсказка «что стоит сейчас», а не условие доступности вкладки).
+    -->
+    <section
+      v-show="activeTab === 'about'"
+      id="tabpanel-about"
+      role="tabpanel"
+      aria-labelledby="tab-about"
+    >
+      <h2
+        ref="aboutHeadingEl"
+        tabindex="-1"
+      >
+        О программе
+      </h2>
+      <AboutScreen
+        :app-version="APP_VERSION"
+        :report="report"
+      />
     </section>
   </main>
 </template>
