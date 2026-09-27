@@ -16,12 +16,14 @@
 //! - yt-dlp — архив `binaries/yt-dlp-<тройка>.zip` с `sha256` записи пина
 //!   (TL-25): архив кладётся в бандл как есть, и сумма скачанного — это и
 //!   есть сумма лежащего.
-//! - deno — распакованный `binaries/deno-<тройка>[.exe]` с отдельным полем
-//!   `binarySha256` (TL-112). `sha256` записи deno — сумма zip-архива, из
-//!   которого бинарник извлекается, и с итоговым файлом её сравнить нечем;
-//!   сумму самого бинарника апстрим публикует отдельным ассетом
-//!   `deno-<тройка>.sha256sum`.
-//! - ffmpeg не сверяется: его сборщики публикуют только суммы архивов.
+//! - deno и ffmpeg — распакованный `binaries/<инструмент>-<тройка>[.exe]` с
+//!   отдельным полем `binarySha256` (deno — TL-112, ffmpeg — TL-134).
+//!   `sha256` этих записей — сумма архива, из которого файл извлекается, и
+//!   с итоговым файлом её сравнить нечем: после извлечения она не
+//!   охраняет ничего. Разница только в происхождении суммы: у deno её
+//!   публикует апстрим ассетом `deno-<тройка>.sha256sum`, у ffmpeg её не
+//!   публикует никто, и она снята нашей доставкой (см. `ffmpeg._note`
+//!   в пине). Для этого модуля разницы нет: сумма либо совпала, либо нет.
 //!
 //! Политика одна на всех: несовпадение — отказ; вне профиля `release`
 //! отказ превращается в предупреждение, если задано
@@ -157,8 +159,9 @@ pub fn pinned_binary(pin_json: &str, section: &str, target: &str) -> Result<Pinn
         section,
         target,
         "binarySha256",
-        "the unpacked binary (upstream publishes it as a separate .sha256sum asset) — without it \
-         a release build cannot tell the binary from a stub",
+        "the unpacked binary (deno: published upstream as a separate .sha256sum asset; ffmpeg: \
+         measured by our own delivery, see ffmpeg._note in the pin) — without it a release build \
+         cannot tell the binary from a stub",
     )
 }
 
@@ -275,8 +278,8 @@ impl PlannedCheck {
 }
 
 /// Все сверки сборки. Поля, а не список: архив yt-dlp после сверки
-/// копируется в ресурсы, deno только сверяется, и `build.rs` зовёт их
-/// по-разному.
+/// копируется в ресурсы, deno и ffmpeg только сверяются, и `build.rs`
+/// зовёт их по-разному.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildChecks {
     /// Onedir-архив yt-dlp: `ytDlp.targets.<тройка>`, поля `binaryName` и
@@ -285,6 +288,9 @@ pub struct BuildChecks {
     /// Распакованный deno: `deno.targets.<тройка>`, поля `binaryName` и
     /// `binarySha256`.
     pub deno: PlannedCheck,
+    /// Распакованный ffmpeg: `ffmpeg.targets.<тройка>`, поля `binaryName`
+    /// и `binarySha256` (TL-134).
+    pub ffmpeg: PlannedCheck,
 }
 
 /// Решение сборки о сверках: политика из значений окружения и записи пина
@@ -311,6 +317,7 @@ pub fn plan_build_checks(
     };
     let archive = pinned_archive(pin_json, target)?;
     let deno = pinned_binary(pin_json, "deno", target)?;
+    let ffmpeg = pinned_binary(pin_json, "ffmpeg", target)?;
 
     Ok(BuildChecks {
         yt_dlp_archive: PlannedCheck {
@@ -323,6 +330,12 @@ pub fn plan_build_checks(
             tool: "deno",
             file_name: deno.binary_name,
             expected_sha256: deno.binary_sha256,
+            policy,
+        },
+        ffmpeg: PlannedCheck {
+            tool: "ffmpeg",
+            file_name: ffmpeg.binary_name,
+            expected_sha256: ffmpeg.binary_sha256,
             policy,
         },
     })

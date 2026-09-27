@@ -146,6 +146,9 @@ describe('run — end to end against a temporary pin file (real repo pin is neve
           [forTarget]: {
             url: 'https://example.invalid/ffmpeg.zip',
             sha256: ffmpegSha256 ?? sha256Of(archives.ffmpeg.bytes),
+            // Сумма извлечённого обязательна у любой записи с archive
+            // (TL-134): после распаковки сумма архива не охраняет ничего.
+            binarySha256: sha256Of(archives.ffmpeg.member),
             binaryName: `ffmpeg-${forTarget}`,
             archive: { type: 'zip', member: 'ffmpeg' },
           },
@@ -158,6 +161,7 @@ describe('run — end to end against a temporary pin file (real repo pin is neve
           [forTarget]: {
             url: 'https://example.invalid/deno.zip',
             sha256: denoSha256 ?? sha256Of(archives.deno.bytes),
+            binarySha256: sha256Of(archives.deno.member),
             binaryName: `deno-${forTarget}`,
             archive: { type: 'zip', member: 'deno' },
           },
