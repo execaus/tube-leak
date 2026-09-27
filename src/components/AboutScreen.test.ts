@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-import { mount } from '@vue/test-utils'
+import { type VueWrapper, mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
 
 import type { SidecarCheckReport } from '@/types/generated/sidecar'
@@ -19,7 +19,7 @@ import AboutScreen from './AboutScreen.vue'
  * а не захардкожены — мутация «подставь другую версию в отчёт» обязана
  * менять текст на экране.
  *
- * Правки ревью (возврат TL-128): Б1 — файлы называются лежащими рядом с
+ * Правки первого возврата: Б1 — файлы называются лежащими рядом с
  * приложением, не «в репозитории» (репозиторий приватный, получателю
  * недоступен); Б2 — список компонентов не выдаёт себя за полный; М1 —
  * позитивная проверка на GPL v3 дополнена отрицательной на LGPL (иначе
@@ -27,6 +27,19 @@ import AboutScreen from './AboutScreen.vue'
  * подмену и получил зелёный прогон); М2 — версия ffmpeg в тексте сверяется
  * с пином `src-tauri/binaries.lock.json`, а не только сама с собой; М4 —
  * прямая ссылка на архив помечена как источник только macOS-сборки.
+ *
+ * Правки второго возврата: Б3 — фраза «остальное — пермиссивные
+ * MIT/Apache-2.0» из Б2 оказалась неправдой (измерение `Cargo.lock`,
+ * doc-комментарий `AboutScreen.vue`, «Список компонентов… не обобщаются»):
+ * лицензии остальных библиотек на экране больше не называются и не
+ * обобщаются вовсе, только отсылка к файлу; Н1 — проверка Б1 сузилась до
+ * per-file (раньше позитив/негатив читали `wrapper.text()` целиком и не
+ * заметили бы регресс ровно одного из двух абзацев — воспроизведено и
+ * проверено при этой правке); Н2 — сторож М2 сужен до секций
+ * «Компоненты и лицензии»/«Исходный код ffmpeg», не всего экрана, чтобы
+ * будущее слияние `<dt>`/`<dd>` в блоке «Что установлено сейчас» в одну
+ * строку не превратило законное расхождение живой версии sidecar с пином
+ * в ложное падение этого теста.
  */
 const report: SidecarCheckReport = {
   ytDlp: { name: 'yt-dlp', path: '/opt/tube-leak/bin/yt-dlp', status: 'ok', version: '2026.08.20' },
@@ -44,6 +57,18 @@ const report: SidecarCheckReport = {
  */
 const pin = JSON.parse(readFileSync(resolve(process.cwd(), 'src-tauri/binaries.lock.json'), 'utf8')) as {
   ffmpeg: { version: string }
+}
+
+/**
+ * Секция экрана по заголовку `<h3>` (Н2) — узкий доступ к разметке вместо
+ * `wrapper.text()` целиком, нужен там, где сторож обязан не дотягиваться
+ * до соседних секций (версии sidecar в «Что установлено сейчас» —
+ * законно другие числа, не расхождение с пином).
+ */
+function sectionByHeading(wrapper: VueWrapper, heading: string) {
+  const section = wrapper.findAll('.about-screen__section').find((s) => s.get('h3').text() === heading)
+  if (!section) throw new Error(`section not found: ${heading}`)
+  return section
 }
 
 describe('AboutScreen', () => {
@@ -79,17 +104,23 @@ describe('AboutScreen', () => {
     expect(text).toContain('Public Domain')
   })
 
-  it('does not present the four named components as the full list (Б2) — points to THIRD-PARTY-LICENSES.md for the rest', () => {
+  it('does not present the four named components as the full list, and does not name or generalise the licences of the rest (Б2, tightened by Б3) — points to THIRD-PARTY-LICENSES.md instead', () => {
     const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report } })
     const text = wrapper.text()
 
     expect(text).toContain('THIRD-PARTY-LICENSES.md')
-    // Формулировка честно называет остальные компоненты пермиссивными, а
-    // не выдаёт список из четырёх пунктов за исчерпывающий (ревью Б2:
-    // THIRD-PARTY-LICENSES.md документирует ещё tauri-plugin-dialog, rfd,
-    // tauri-plugin-fs, windows-sys/windows-targets и раздел «Прочие
-    // зависимости» — придумывать их точный список в UI не нужно).
-    expect(text).toMatch(/MIT.*Apache-2\.0|Apache-2\.0.*MIT/)
+
+    // Б3 (блокер второго возврата): «остальное — пермиссивные
+    // MIT/Apache-2.0» было неправдой — измерение `Cargo.lock` нашло
+    // MPL-2.0 (слабый copyleft) и другие лицензии в релизном графе. Экран
+    // не вправе обобщать то, что не проверял и что наш собственный
+    // THIRD-PARTY-LICENSES.md сам называет лишь «преимущественно»
+    // MIT/Apache-2.0. Проверяется явный запрет обобщающих слов ОБО ВСЕХ
+    // компонентах сразу — не только замена самого текста Б2 на дословно
+    // то же самое.
+    expect(text).not.toMatch(/пермиссивн/i)
+    expect(text).not.toMatch(/MIT.*Apache-2\.0|Apache-2\.0.*MIT/)
+    expect(text).not.toMatch(/все.*лицензи/i)
   })
 
   it('gives a plain, retypeable pointer to the ffmpeg sources, and points at files installed next to the app (Б1) — not the private repository', () => {
@@ -97,18 +128,26 @@ describe('AboutScreen', () => {
     const text = wrapper.text()
 
     expect(text).toContain('https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.bz2')
-    expect(text).toContain('SOURCES-FFMPEG.md')
-    expect(text).toContain('THIRD-PARTY-LICENSES.md')
 
-    // Б1: файлы названы лежащими рядом с установленным приложением — не
-    // «репозитория проекта» как единственного места. Доступ к репозиторию
-    // упомянут отдельно, не как единственный способ их получить. Регекс
-    // узкий и намеренно: он ловит именно старую формулировку («в файле
-    // ИМЯ.md репозитория проекта», слова впритык), а не любое упоминание
-    // слова «репозиторий» рядом — оно и так есть в фразе про тех, у кого
-    // есть к нему доступ.
-    expect(text).toMatch(/ставится вместе с этим приложением/)
-    expect(text).not.toMatch(/\.md репозитория проекта/)
+    // Н1 (заметка первого возврата): проверка идёт ОТДЕЛЬНО на каждый из
+    // двух `.md`-указателей, не на `wrapper.text()` целиком — первая
+    // версия этого теста требовала «фраза где-то в тексте» и «старая
+    // фраза нигде», и обе стороны выполнялись, даже когда только ВТОРОЙ
+    // абзац (SOURCES-FFMPEG.md) откатился на «который лежит в
+    // репозитории проекта»: первый абзац (THIRD-PARTY-LICENSES.md)
+    // по-прежнему нёс правильную фразу и закрывал позитивную проверку, а
+    // старая формулировка негативной проверки не совпадала с новым
+    // текстом отката дословно. Здесь для каждого файла проверяется
+    // ровно та фраза, что стоит сразу после его имени в разметке.
+    const mdPointers = ['SOURCES-FFMPEG.md', 'THIRD-PARTY-LICENSES.md']
+    expect(mdPointers).toHaveLength(2)
+    for (const file of mdPointers) {
+      const marker = `${file}, который`
+      const idx = text.indexOf(marker)
+      expect(idx, `expected "${marker}" to appear in the screen text`).toBeGreaterThan(-1)
+      const after = text.slice(idx + marker.length, idx + marker.length + 60)
+      expect(after).toMatch(/^\s*ставится вместе с этим приложением/)
+    }
 
     // Ссылки — читаемый текст, не `<a href>` (задача TL-128: репозиторий
     // приватный, у получателя сборки он не откроется, обещать рабочую
@@ -129,21 +168,37 @@ describe('AboutScreen', () => {
     expect(text).toContain('Linux')
   })
 
-  it('every ffmpeg version named on screen matches the pinned build version (mutation guard, М2)', () => {
+  it('every ffmpeg version named in the licence sections matches the pinned build version (mutation guard, М2)', () => {
     const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report } })
-    const text = wrapper.text()
 
     expect(pin.ffmpeg.version).toMatch(/^\d+\.\d+(\.\d+)?$/)
+
+    // Н2 (заметка первого возврата): область сужена до секций
+    // «Компоненты и лицензии»/«Исходный код ffmpeg» — не всего экрана.
+    // Полный текст экрана включает и «Что установлено сейчас», где та же
+    // подстрока `ffmpeg<версия>` — ЖИВАЯ версия из отчёта проверки
+    // (`report.ffmpeg.version`), и её расхождение с пином ЗАКОННО (doc
+    // `AboutScreen.vue`, «Два разных источника версии ffmpeg»): сборка на
+    // машине пользователя может отставать от актуального пина. Раньше
+    // регэксп её не задевал только по случайности вёрстки (`<dt>`/`<dd>`
+    // на разных строках не оставляют пробела между «ffmpeg» и версией в
+    // отрендеренном тексте) — сузил явно, а не полагаюсь на этот побочный
+    // эффект переноса строк.
+    const licenceSectionsText = [
+      sectionByHeading(wrapper, 'Компоненты и лицензии').text(),
+      sectionByHeading(wrapper, 'Исходный код ffmpeg').text(),
+    ].join(' ')
 
     // Не `toContain` одного вхождения (первая версия этого теста прошла
     // мимо мутации `9.0.1` → `9.0.2` в самой лицензионной строке: URL и
     // абзац «Исходный код ffmpeg» по-прежнему называли старую версию
     // отдельной константой `FFMPEG_SOURCES_URL`, и `toContain('ffmpeg
     // 9.0.1')` оставался истинным за их счёт). Здесь собраны ВСЕ версии,
-    // упомянутые рядом со словом «ffmpeg» на экране (лицензионная строка,
-    // абзац про сборку, имя файла в ссылке на исходники), и каждая обязана
-    // совпасть с пином — расхождение в любом из трёх мест красит тест.
-    const namedVersions = [...text.matchAll(/ffmpeg[ -](\d+\.\d+\.\d+)/gi)].map((m) => m[1])
+    // упомянутые рядом со словом «ffmpeg» в этих двух секциях
+    // (лицензионная строка, абзац про сборку, имя файла в ссылке на
+    // исходники), и каждая обязана совпасть с пином — расхождение в
+    // любом из трёх мест красит тест.
+    const namedVersions = [...licenceSectionsText.matchAll(/ffmpeg[ -](\d+\.\d+\.\d+)/gi)].map((m) => m[1])
     expect(namedVersions.length).toBeGreaterThanOrEqual(3)
     for (const version of namedVersions) {
       expect(version).toBe(pin.ffmpeg.version)
