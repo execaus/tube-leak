@@ -166,13 +166,34 @@ describe('planProbe: что проверяется, что заменяется,
     expect(planProbe('https://svn.xvid.org/trunk/xvidcore').reason).toContain('401')
   })
 
-  it('пропускает issues нашего приватного репозитория, но не зеркало ассета', () => {
-    expect(planProbe('https://github.com/execaus/tube-leak/issues/14').kind).toBe('skip')
+  it('адреса нашего репозитория проверяет, а не пропускает — с оговоркой про 404', () => {
+    // Прежде здесь стоял безусловный пропуск по хосту и пути: адрес не
+    // проверялся вовсе, а комментарий рядом обещал, что пропуск исчезнет
+    // сам при открытии репозитория. Сам он не исчез бы никогда.
+    for (const url of [
+      'https://github.com/execaus/tube-leak/issues/14',
+      'https://github.com/execaus/tube-leak/issues',
+    ]) {
+      const plan = planProbe(url)
+
+      expect(plan.kind).toBe('check')
+      expect(plan.probeUrl).toBe(url)
+      expect(plan.notFoundMeans).toContain('приватный')
+    }
+  })
+
+  it('оговорка про 404 не накрывает ни зеркало ассета, ни соседний репозиторий', () => {
+    // Сужение по замечанию Н1: в день собственного зеркала ассета ffmpeg
+    // 404 по такому адресу обязан остаться СМЕРТЬЮ, иначе главный
+    // охраняемый адрес перестанет охраняться.
     for (const url of [
       'https://github.com/execaus/tube-leak/releases/download/v0.1.1/ffmpeg.zip',
       'https://github.com/execaus/tube-leak-docs/blob/main/epics/E1.md',
     ]) {
-      expect(planProbe(url).kind).toBe('check')
+      const plan = planProbe(url)
+
+      expect(plan.kind).toBe('check')
+      expect(plan.notFoundMeans).toBeUndefined()
     }
   })
 })
@@ -253,6 +274,49 @@ describe('происхождение адреса и строгость', () => 
     expect(alive).toHaveLength(0)
     expect(tolerated).toHaveLength(0)
     expect(fatal).toHaveLength(entries.length)
+  })
+})
+
+describe('404 нашего приватного репозитория', () => {
+  const OWN_ISSUE = 'https://github.com/execaus/tube-leak/issues/14'
+
+  const checkOnly = async (item, fetchImpl) =>
+    checkAll(planAll([item]).checked, { fetchImpl, sleepImpl: noSleep })
+
+  it('у адреса документа — «не подтверждён» с причиной, и гейт не краснеет', async () => {
+    const results = await checkOnly(entry(OWN_ISSUE, ['docs']), async () => response(404))
+
+    expect(results[0].kind).toBe('warn')
+    expect(results[0].detail).toContain('приватный')
+    const { alive, fatal, tolerated } = judge(results)
+    expect(fatal).toStrictEqual([])
+    expect(alive).toStrictEqual([])
+    expect(tolerated).toHaveLength(1)
+  })
+
+  it('тот же 404 у адреса ПИНА остаётся отказом — оговорка пин не открывает', async () => {
+    const results = await checkOnly(entry(OWN_ISSUE, ['pin']), async () => response(404))
+
+    expect(judge(results).fatal).toHaveLength(1)
+  })
+
+  it('после открытия репозитория оговорка не срабатывает: 200 — просто живой', async () => {
+    const fetchImpl = async (url) =>
+      url.includes('canary-does-not-exist') ? response(404) : response(200)
+
+    const results = await checkOnly(entry(OWN_ISSUE, ['docs']), fetchImpl)
+
+    expect(results[0].kind).toBe('ok')
+    expect(results[0].detail).not.toContain('приватный')
+  })
+
+  it('404 другого адреса того же репозитория остаётся смертью', async () => {
+    const mirror = 'https://github.com/execaus/tube-leak/releases/download/v0.1.1/ffmpeg.zip'
+
+    const results = await checkOnly(entry(mirror, ['docs']), async () => response(404))
+
+    expect(results[0].kind).toBe('dead')
+    expect(judge(results).fatal).toHaveLength(1)
   })
 })
 
@@ -343,8 +407,11 @@ describe('collectAllUrls', () => {
   it('оставляет под охраной подавляющее большинство адресов', async () => {
     const { checked, skipped } = planAll(await collectAllUrls())
 
-    expect(skipped.length).toBeLessThanOrEqual(5)
+    expect(skipped.length).toBeLessThanOrEqual(2)
     expect(checked.length).toBeGreaterThan(100)
+    // Правило пропуска для нашего репозитория снято (TL-133): эти адреса
+    // теперь проверяются, а не исчезают из проверки.
+    expect(skipped.some((item) => item.url.includes('execaus/tube-leak'))).toBe(false)
   })
 })
 
