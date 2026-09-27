@@ -223,14 +223,16 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
     const wrapper = await mountReady()
 
     const tabs = wrapper.findAll('[role="tab"]')
-    expect(tabs.map((t) => t.text())).toStrictEqual(['Главный', 'История', 'Настройки'])
+    expect(tabs.map((t) => t.text())).toStrictEqual(['Главный', 'История', 'Настройки', 'О программе'])
     expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('true')
     expect(tabButton(wrapper, 'История').attributes('aria-selected')).toBe('false')
     expect(tabButton(wrapper, 'Настройки').attributes('aria-selected')).toBe('false')
+    expect(tabButton(wrapper, 'О программе').attributes('aria-selected')).toBe('false')
 
     expect(tabPanel(wrapper, 'tabpanel-main').isVisible()).toBe(true)
     expect(tabPanel(wrapper, 'tabpanel-history').isVisible()).toBe(false)
     expect(tabPanel(wrapper, 'tabpanel-settings').isVisible()).toBe(false)
+    expect(tabPanel(wrapper, 'tabpanel-about').isVisible()).toBe(false)
 
     // «Главный» показывает ровно то, что показывал бы без вкладок (дизайн,
     // пункт 1): версия и все три строки sidecar видны сразу, как в E1
@@ -255,7 +257,7 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
 
     // Всё ещё идёт подготовка — «Главный» показывает служебный экран
     // (Ф-9/Н-6), а вкладки уже на месте и переключаются.
-    expect(wrapper.findAll('[role="tab"]')).toHaveLength(3)
+    expect(wrapper.findAll('[role="tab"]')).toHaveLength(4)
 
     await tabButton(wrapper, 'История').trigger('click')
     await wrapper.vm.$nextTick()
@@ -300,6 +302,36 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
     expect(wrapper.text()).toContain('Число попыток')
 
     const heading = tabPanel(wrapper, 'tabpanel-settings').get('h2')
+    expect(document.activeElement).toBe(heading.element)
+  })
+
+  it('clicking «О программе» switches to its panel and moves focus to its heading (TL-128)', async () => {
+    const wrapper = await mountReady()
+
+    await tabButton(wrapper, 'О программе').trigger('click')
+    await wrapper.vm.$nextTick()
+    await flushPromises()
+
+    expect(tabButton(wrapper, 'О программе').attributes('aria-selected')).toBe('true')
+    const aboutPanel = tabPanel(wrapper, 'tabpanel-about')
+    expect(aboutPanel.isVisible()).toBe(true)
+    // Содержимое экрана — `AboutScreen`: версия приложения, компоненты с
+    // лицензиями (ffmpeg — обязательно GPL v3) и версии sidecar из уже
+    // выполненного отчёта проверки, а не захардкоженные (см.
+    // `AboutScreen.test.ts` для покрытия мутацией).
+    //
+    // Текст читается со скоупом на саму панель «О программе», не с
+    // `wrapper.text()` целиком (правка ревью, М3): «Главный» остаётся в
+    // DOM (`v-show`, К-14) и печатает ровно ту же версию `2026.08.20`
+    // своей строкой `SidecarStatusRow` — `wrapper.text()` остался бы
+    // зелёным, даже если бы `App.vue` вовсе не прокинул `:report` в
+    // `AboutScreen` (воспроизведено и проверено этим же прогоном при
+    // ревью: убрать проп — тест на нескоупленном тексте не заметил бы).
+    expect(aboutPanel.text()).toContain('tube-leak 0.1.1')
+    expect(aboutPanel.text()).toContain('GPL v3')
+    expect(aboutPanel.text()).toContain('2026.08.20')
+
+    const heading = aboutPanel.get('h2')
     expect(document.activeElement).toBe(heading.element)
   })
 
@@ -354,8 +386,8 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
  * событие уходит с `document.activeElement` и должно дойти до `tablist`
  * всплытием, как в реальном взаимодействии.
  */
-describe('App — клавиатура вкладок: стрелки, Home/End (TL-92, правки ревью, Б-1)', () => {
-  it('three ArrowRight presses in a row cycle Главный → История → Настройки → Главный, each delivered to the newly focused tab (обязательный тест Б-1)', async () => {
+describe('App — клавиатура вкладок: стрелки, Home/End (TL-92, правки ревью, Б-1; порядок обновлён TL-128 — четвёртая вкладка «О программе»)', () => {
+  it('four ArrowRight presses in a row cycle Главный → История → Настройки → О программе → Главный, each delivered to the newly focused tab (обязательный тест Б-1)', async () => {
     const wrapper = await mountReady()
     focusTab(wrapper, 'main')
 
@@ -368,26 +400,30 @@ describe('App — клавиатура вкладок: стрелки, Home/End 
     expect(document.activeElement).toBe(wrapper.get('#tab-settings').element)
 
     await pressOnFocused('ArrowRight')
+    expect(tabButton(wrapper, 'О программе').attributes('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(wrapper.get('#tab-about').element)
+
+    await pressOnFocused('ArrowRight')
     expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('true')
     expect(document.activeElement).toBe(wrapper.get('#tab-main').element)
   })
 
-  it('ArrowLeft from «Главный» wraps around to «Настройки» and moves focus there', async () => {
+  it('ArrowLeft from «Главный» wraps around to «О программе» (now the last tab) and moves focus there', async () => {
     const wrapper = await mountReady()
     focusTab(wrapper, 'main')
 
     await pressOnFocused('ArrowLeft')
-    expect(tabButton(wrapper, 'Настройки').attributes('aria-selected')).toBe('true')
-    expect(document.activeElement).toBe(wrapper.get('#tab-settings').element)
+    expect(tabButton(wrapper, 'О программе').attributes('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(wrapper.get('#tab-about').element)
   })
 
-  it('End jumps to «Настройки», Home jumps back to «Главный», focus follows both times', async () => {
+  it('End jumps to «О программе» (now the last tab), Home jumps back to «Главный», focus follows both times', async () => {
     const wrapper = await mountReady()
     focusTab(wrapper, 'main')
 
     await pressOnFocused('End')
-    expect(tabButton(wrapper, 'Настройки').attributes('aria-selected')).toBe('true')
-    expect(document.activeElement).toBe(wrapper.get('#tab-settings').element)
+    expect(tabButton(wrapper, 'О программе').attributes('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(wrapper.get('#tab-about').element)
 
     await pressOnFocused('Home')
     expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('true')
@@ -400,9 +436,9 @@ describe('App — клавиатура вкладок: стрелки, Home/End 
 
     await pressOnFocused('End')
 
-    const heading = tabPanel(wrapper, 'tabpanel-settings').get('h2').element
+    const heading = tabPanel(wrapper, 'tabpanel-about').get('h2').element
     expect(document.activeElement).not.toBe(heading)
-    expect(document.activeElement).toBe(wrapper.get('#tab-settings').element)
+    expect(document.activeElement).toBe(wrapper.get('#tab-about').element)
   })
 
   it('unrelated keys (e.g. Tab) are ignored by the tablist handler', async () => {
@@ -1384,12 +1420,13 @@ describe('App — диалог подтверждения выхода с нег
  * клавиатуры выше). Каждый тест снимает ровно один атрибут — мутация
  * «удалить атрибут» роняет соответствующий тест и никакой другой.
  */
-describe('App — атрибуты ARIA панели вкладок (TL-92, правки ревью, С-2)', () => {
-  it('roving tabindex: the active tab is 0, the other two are -1, and it moves with the selection', async () => {
+describe('App — атрибуты ARIA панели вкладок (TL-92, правки ревью, С-2; четвёртая вкладка добавлена TL-128)', () => {
+  it('roving tabindex: the active tab is 0, the other three are -1, and it moves with the selection', async () => {
     const wrapper = await mountReady()
     expect(tabButton(wrapper, 'Главный').attributes('tabindex')).toBe('0')
     expect(tabButton(wrapper, 'История').attributes('tabindex')).toBe('-1')
     expect(tabButton(wrapper, 'Настройки').attributes('tabindex')).toBe('-1')
+    expect(tabButton(wrapper, 'О программе').attributes('tabindex')).toBe('-1')
 
     await tabButton(wrapper, 'История').trigger('click')
     await wrapper.vm.$nextTick()
@@ -1397,9 +1434,10 @@ describe('App — атрибуты ARIA панели вкладок (TL-92, пр
     expect(tabButton(wrapper, 'Главный').attributes('tabindex')).toBe('-1')
     expect(tabButton(wrapper, 'История').attributes('tabindex')).toBe('0')
     expect(tabButton(wrapper, 'Настройки').attributes('tabindex')).toBe('-1')
+    expect(tabButton(wrapper, 'О программе').attributes('tabindex')).toBe('-1')
   })
 
-  it('aria-selected is "true" for exactly the active tab and "false" for the other two', async () => {
+  it('aria-selected is "true" for exactly the active tab and "false" for the other three', async () => {
     const wrapper = await mountReady()
     await tabButton(wrapper, 'Настройки').trigger('click')
     await wrapper.vm.$nextTick()
@@ -1407,6 +1445,7 @@ describe('App — атрибуты ARIA панели вкладок (TL-92, пр
     expect(tabButton(wrapper, 'Главный').attributes('aria-selected')).toBe('false')
     expect(tabButton(wrapper, 'История').attributes('aria-selected')).toBe('false')
     expect(tabButton(wrapper, 'Настройки').attributes('aria-selected')).toBe('true')
+    expect(tabButton(wrapper, 'О программе').attributes('aria-selected')).toBe('false')
   })
 
   it('aria-controls on each tab is exactly the id of its own panel', async () => {
@@ -1414,8 +1453,9 @@ describe('App — атрибуты ARIA панели вкладок (TL-92, пр
     expect(tabButton(wrapper, 'Главный').attributes('aria-controls')).toBe('tabpanel-main')
     expect(tabButton(wrapper, 'История').attributes('aria-controls')).toBe('tabpanel-history')
     expect(tabButton(wrapper, 'Настройки').attributes('aria-controls')).toBe('tabpanel-settings')
+    expect(tabButton(wrapper, 'О программе').attributes('aria-controls')).toBe('tabpanel-about')
 
-    for (const tabId of ['main', 'history', 'settings']) {
+    for (const tabId of ['main', 'history', 'settings', 'about']) {
       const controls = wrapper.get(`#tab-${tabId}`).attributes('aria-controls')
       expect(wrapper.find(`#${controls}`).exists()).toBe(true)
     }
@@ -1426,6 +1466,7 @@ describe('App — атрибуты ARIA панели вкладок (TL-92, пр
     expect(tabPanel(wrapper, 'tabpanel-main').attributes('aria-labelledby')).toBe('tab-main')
     expect(tabPanel(wrapper, 'tabpanel-history').attributes('aria-labelledby')).toBe('tab-history')
     expect(tabPanel(wrapper, 'tabpanel-settings').attributes('aria-labelledby')).toBe('tab-settings')
+    expect(tabPanel(wrapper, 'tabpanel-about').attributes('aria-labelledby')).toBe('tab-about')
   })
 })
 
