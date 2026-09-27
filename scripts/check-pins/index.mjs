@@ -198,12 +198,7 @@ export function planAll(entries) {
   for (const entry of entries) {
     const plan = planProbe(entry.url)
     if (plan.kind !== 'skip') {
-      checked.push({
-        ...entry,
-        probeUrl: plan.probeUrl,
-        why: plan.why,
-        notFoundMeans: plan.notFoundMeans,
-      })
+      checked.push({ ...entry, probeUrl: plan.probeUrl, why: plan.why })
       continue
     }
     if (isPinAddress(entry)) {
@@ -242,16 +237,6 @@ export async function checkAll(entries, deps = {}) {
       const probeUrl = entry.probeUrl ?? entry.url
       const verdict = await checkUrl(probeUrl, withCache)
       let { kind, detail } = verdict
-
-      // Оговорка про 404 (см. planProbe): есть адреса, по которым 404
-      // отсутствия не доказывает — наш приватный репозиторий отвечает им
-      // и на существующий issue. Тогда это «не подтверждён», а не
-      // «мёртв». Пину оговорка не помогает: у него «не подтверждён» —
-      // тоже отказ, и это правильно.
-      if (kind === 'dead' && verdict.status === 404 && entry.notFoundMeans) {
-        kind = 'warn'
-        detail = `${detail} — ${entry.notFoundMeans}`
-      }
 
       // «Жив» засчитывается только у хоста, который умеет отвечать
       // отказом. Иначе 200 не отличает существующее от выдуманного.

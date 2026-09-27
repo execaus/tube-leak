@@ -166,35 +166,31 @@ describe('planProbe: что проверяется, что заменяется,
     expect(planProbe('https://svn.xvid.org/trunk/xvidcore').reason).toContain('401')
   })
 
-  it('адреса нашего репозитория проверяет, а не пропускает — с оговоркой про 404', () => {
-    // Прежде здесь стоял безусловный пропуск по хосту и пути: адрес не
-    // проверялся вовсе, а комментарий рядом обещал, что пропуск исчезнет
-    // сам при открытии репозитория. Сам он не исчез бы никогда.
+  it('адреса открытого репозитория кода проверяет без всяких оговорок', () => {
+    // Прежде здесь стоял безусловный пропуск по хосту и пути, а
+    // комментарий рядом обещал, что пропуск исчезнет сам при открытии
+    // репозитория. Сам он не исчез бы никогда. Репозиторий кода открыт —
+    // 404 по любому его адресу теперь настоящая пропажа.
     for (const url of [
       'https://github.com/execaus/tube-leak/issues/14',
       'https://github.com/execaus/tube-leak/issues',
+      'https://github.com/execaus/tube-leak/releases/download/v0.1.1/ffmpeg.zip',
     ]) {
-      const plan = planProbe(url)
-
-      expect(plan.kind).toBe('check')
-      expect(plan.probeUrl).toBe(url)
-      expect(plan.notFoundMeans).toContain('приватный')
+      expect(planProbe(url)).toStrictEqual({ kind: 'check', probeUrl: url, why: null })
     }
   })
 
-  it('оговорка про 404 не накрывает ни зеркало ассета, ни соседний репозиторий', () => {
-    // Сужение по замечанию Н1: в день собственного зеркала ассета ffmpeg
-    // 404 по такому адресу обязан остаться СМЕРТЬЮ, иначе главный
-    // охраняемый адрес перестанет охраняться.
-    for (const url of [
-      'https://github.com/execaus/tube-leak/releases/download/v0.1.1/ffmpeg.zip',
-      'https://github.com/execaus/tube-leak-docs/blob/main/epics/E1.md',
-    ]) {
-      const plan = planProbe(url)
+  it('пропускает приватный репозиторий документов — и различает его от репозитория кода', () => {
+    // `tube-leak-docs` начинается с `tube-leak`: проверка префиксом
+    // накрыла бы оба репозитория разом и снова спрятала бы адреса
+    // открытого репозитория кода, включая будущее зеркало ассета.
+    const plan = planProbe('https://github.com/execaus/tube-leak-docs/blob/main/epics/E1.md')
 
-      expect(plan.kind).toBe('check')
-      expect(plan.notFoundMeans).toBeUndefined()
-    }
+    expect(plan.kind).toBe('skip')
+    expect(plan.reason).toContain('tube-leak-docs')
+    expect(plan.reason).toContain('§6d')
+    // Тот же префикс, но репозиторий кода — проверяется.
+    expect(planProbe('https://github.com/execaus/tube-leak/issues/14').kind).toBe('check')
   })
 })
 
@@ -277,46 +273,45 @@ describe('происхождение адреса и строгость', () => 
   })
 })
 
-describe('404 нашего приватного репозитория', () => {
-  const OWN_ISSUE = 'https://github.com/execaus/tube-leak/issues/14'
-
+describe('адреса нашего репозитория кода после открытия', () => {
   const checkOnly = async (item, fetchImpl) =>
     checkAll(planAll([item]).checked, { fetchImpl, sleepImpl: noSleep })
 
-  it('у адреса документа — «не подтверждён» с причиной, и гейт не краснеет', async () => {
-    const results = await checkOnly(entry(OWN_ISSUE, ['docs']), async () => response(404))
+  it('404 у адреса нашего репозитория — смерть и отказ гейта, укрытий нет', async () => {
+    // Репозиторий кода открыт, значит анонимный 404 по его адресу больше
+    // ничем не оправдан: это удалённый issue или переехавший ассет.
+    for (const url of [
+      'https://github.com/execaus/tube-leak/issues/14',
+      'https://github.com/execaus/tube-leak/releases/download/v0.1.1/ffmpeg.zip',
+    ]) {
+      const results = await checkOnly(entry(url, ['docs']), async () => response(404))
 
-    expect(results[0].kind).toBe('warn')
-    expect(results[0].detail).toContain('приватный')
-    const { alive, fatal, tolerated } = judge(results)
-    expect(fatal).toStrictEqual([])
-    expect(alive).toStrictEqual([])
-    expect(tolerated).toHaveLength(1)
+      expect(results[0].kind).toBe('dead')
+      expect(judge(results).fatal).toHaveLength(1)
+    }
   })
 
-  it('тот же 404 у адреса ПИНА остаётся отказом — оговорка пин не открывает', async () => {
-    const results = await checkOnly(entry(OWN_ISSUE, ['pin']), async () => response(404))
-
-    expect(judge(results).fatal).toHaveLength(1)
-  })
-
-  it('после открытия репозитория оговорка не срабатывает: 200 — просто живой', async () => {
+  it('живой issue — обычный «жив», без особых пометок', async () => {
     const fetchImpl = async (url) =>
-      url.includes('canary-does-not-exist') ? response(404) : response(200)
+      url.includes('canary-does-not-exist') ? response(404) : response(200, { 'content-length': '27484' })
 
-    const results = await checkOnly(entry(OWN_ISSUE, ['docs']), fetchImpl)
+    const results = await checkOnly(
+      entry('https://github.com/execaus/tube-leak/issues', ['docs']),
+      fetchImpl,
+    )
 
     expect(results[0].kind).toBe('ok')
-    expect(results[0].detail).not.toContain('приватный')
+    expect(judge(results).fatal).toStrictEqual([])
   })
 
-  it('404 другого адреса того же репозитория остаётся смертью', async () => {
-    const mirror = 'https://github.com/execaus/tube-leak/releases/download/v0.1.1/ffmpeg.zip'
+  it('адрес приватного репозитория документов до проверки не доходит', async () => {
+    const { checked, skipped } = planAll([
+      entry('https://github.com/execaus/tube-leak-docs/blob/main/specs/x.md', ['docs']),
+    ])
 
-    const results = await checkOnly(entry(mirror, ['docs']), async () => response(404))
-
-    expect(results[0].kind).toBe('dead')
-    expect(judge(results).fatal).toHaveLength(1)
+    expect(checked).toStrictEqual([])
+    expect(skipped).toHaveLength(1)
+    expect(skipped[0].reason).toContain('tube-leak-docs')
   })
 })
 
@@ -409,9 +404,13 @@ describe('collectAllUrls', () => {
 
     expect(skipped.length).toBeLessThanOrEqual(2)
     expect(checked.length).toBeGreaterThan(100)
-    // Правило пропуска для нашего репозитория снято (TL-133): эти адреса
-    // теперь проверяются, а не исчезают из проверки.
-    expect(skipped.some((item) => item.url.includes('execaus/tube-leak'))).toBe(false)
+    // Правило пропуска для репозитория КОДА снято (TL-133): он открыт, и
+    // его адреса проверяются, а не исчезают из проверки. Пропуск остался
+    // только у приватного репозитория документов, а его адресов в
+    // документах §6d нет ни одного.
+    expect(
+      skipped.some((item) => item.url.startsWith('https://github.com/execaus/tube-leak/')),
+    ).toBe(false)
   })
 })
 
