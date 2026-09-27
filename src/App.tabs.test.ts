@@ -313,16 +313,25 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
     await flushPromises()
 
     expect(tabButton(wrapper, 'О программе').attributes('aria-selected')).toBe('true')
-    expect(tabPanel(wrapper, 'tabpanel-about').isVisible()).toBe(true)
+    const aboutPanel = tabPanel(wrapper, 'tabpanel-about')
+    expect(aboutPanel.isVisible()).toBe(true)
     // Содержимое экрана — `AboutScreen`: версия приложения, компоненты с
     // лицензиями (ffmpeg — обязательно GPL v3) и версии sidecar из уже
     // выполненного отчёта проверки, а не захардкоженные (см.
     // `AboutScreen.test.ts` для покрытия мутацией).
-    expect(wrapper.text()).toContain('tube-leak 0.1.1')
-    expect(wrapper.text()).toContain('GPL v3')
-    expect(wrapper.text()).toContain('2026.08.20')
+    //
+    // Текст читается со скоупом на саму панель «О программе», не с
+    // `wrapper.text()` целиком (правка ревью, М3): «Главный» остаётся в
+    // DOM (`v-show`, К-14) и печатает ровно ту же версию `2026.08.20`
+    // своей строкой `SidecarStatusRow` — `wrapper.text()` остался бы
+    // зелёным, даже если бы `App.vue` вовсе не прокинул `:report` в
+    // `AboutScreen` (воспроизведено и проверено этим же прогоном при
+    // ревью: убрать проп — тест на нескоупленном тексте не заметил бы).
+    expect(aboutPanel.text()).toContain('tube-leak 0.1.1')
+    expect(aboutPanel.text()).toContain('GPL v3')
+    expect(aboutPanel.text()).toContain('2026.08.20')
 
-    const heading = tabPanel(wrapper, 'tabpanel-about').get('h2')
+    const heading = aboutPanel.get('h2')
     expect(document.activeElement).toBe(heading.element)
   })
 
