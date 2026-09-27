@@ -1,8 +1,11 @@
+import { spawn } from 'node:child_process'
+import { join } from 'node:path'
+
 import { describe, expect, it } from 'vitest'
 
 import { loadPin } from '../fetch-binaries/pin.mjs'
 import { KNOWN_TARGETS } from '../fetch-binaries/targets.mjs'
-import { checkAll, checkUrl, hostCanary, judge, parseArgs, planAll } from './index.mjs'
+import { checkAll, checkUrl, hostCanary, judge, parseArgs, planAll, run } from './index.mjs'
 import {
   canaryUrlFor,
   collectAllUrls,
@@ -16,6 +19,7 @@ import {
   PIN_PATH,
   planProbe,
   readDocs,
+  REPO_ROOT,
 } from './sources.mjs'
 
 // Сети здесь нет и быть не может (правило проекта): всё, что ходит
@@ -201,6 +205,22 @@ describe('происхождение адреса и строгость', () => 
     expect(tolerated.map((r) => r.url)).toStrictEqual(['https://a.invalid/doc'])
   })
 
+  it('класс, которого в приговоре ещё нет, зелёным не проходит нигде', () => {
+    // Белый список зелёного, а не чёрный список бед: пропущенный адрес
+    // пина не попадал ни в одну из трёх корзин и потому был невидим
+    // (#142). Новый класс обязан краснеть, а не исчезать.
+    const results = [
+      { ...entry('https://a.invalid/pin', ['pin']), kind: 'новый-класс' },
+      { ...entry('https://a.invalid/doc', ['docs']), kind: 'новый-класс' },
+    ]
+
+    const { alive, fatal, tolerated } = judge(results)
+
+    expect(alive).toStrictEqual([])
+    expect(tolerated).toStrictEqual([])
+    expect(fatal).toHaveLength(2)
+  })
+
   it('тот же всегда-500 у документов гейт не валит, но и живым не считается', async () => {
     // Зеркало предыдущего теста: разница строгости обязана быть видна на
     // одном и том же стенде, иначе разделение пин/документы формально.
@@ -369,12 +389,15 @@ describe('crossCheckDocs', () => {
   })
 })
 
+/** Адрес, на который сегодня заведомо срабатывает правило пропуска. */
+const SKIPPED_URL = 'https://svn.xvid.org/trunk/xvidcore'
+
 describe('planAll', () => {
   it('делит адреса на проверяемые (в т.ч. по замене) и пропускаемые', () => {
-    const { checked, skipped } = planAll([
+    const { checked, skipped, refused } = planAll([
       entry('https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz', ['docs']),
       entry('https://git.code.sf.net/p/soxr/code', ['docs']),
-      entry('https://svn.xvid.org/trunk/xvidcore', ['docs']),
+      entry(SKIPPED_URL, ['docs']),
     ])
 
     expect(checked.map((item) => item.probeUrl)).toStrictEqual([
@@ -383,6 +406,96 @@ describe('planAll', () => {
     ])
     expect(skipped).toHaveLength(1)
     expect(skipped[0].reason).toContain('401')
+    expect(refused).toStrictEqual([])
+  })
+
+  it('адрес ПИНА, подошедший под правило пропуска, — отказ, а не тихий зелёный (#142)', () => {
+    const { checked, skipped, refused } = planAll([entry(SKIPPED_URL, ['pin'])])
+
+    // Главное здесь — что его НЕТ в пропущенных: оттуда приговор его не
+    // видит вовсе, и адрес пина оставался зелёным без единой проверки.
+    expect(skipped).toStrictEqual([])
+    expect(checked).toStrictEqual([])
+    expect(refused).toHaveLength(1)
+    expect(refused[0].detail).toContain('адрес ПИНА')
+    expect(refused[0].detail).toContain('401')
+    expect(judge(refused).fatal).toHaveLength(1)
+  })
+
+  it('тот же адрес, названный только документом, остаётся пропуском', () => {
+    const { skipped, refused } = planAll([entry(SKIPPED_URL, ['docs'])])
+
+    expect(refused).toStrictEqual([])
+    expect(skipped).toHaveLength(1)
+    expect(skipped[0].reason).toContain('401')
+  })
+
+  it('адрес, названный и пином, и документами, судится по пину', () => {
+    const { skipped, refused } = planAll([entry(SKIPPED_URL, ['docs', 'pin'])])
+
+    expect(skipped).toStrictEqual([])
+    expect(refused).toHaveLength(1)
+  })
+
+  it('на настоящем списке адресов отказов плана сегодня нет', async () => {
+    // Класс закрыт на будущее: хосты пина под действующие правила не
+    // подходят, и гейт от этой правки не краснеет.
+    expect(planAll(await collectAllUrls()).refused).toStrictEqual([])
+  })
+})
+
+/**
+ * Запускает саму команду. Сети не касается: разбор аргументов падает до
+ * первого запроса.
+ */
+function runCli(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [join(REPO_ROOT, 'scripts', 'check-pins', 'index.mjs'), ...args],
+      { stdio: ['ignore', 'ignore', 'pipe'] },
+    )
+    let stderr = ''
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk
+    })
+    child.on('error', reject)
+    child.on('close', (code) => resolve({ code, stderr }))
+  })
+}
+
+describe('run: приговор решает код возврата', () => {
+  const silent = () => {}
+  // Если сторож полезет в сеть за адресом, который решено не проверять,
+  // тест это увидит, а не примет молча.
+  const noNetwork = () => {
+    throw new Error('запрос к адресу, который проверять не собирались')
+  }
+
+  it('адрес ПИНА под правилом пропуска валит гейт, не сходив в сеть (EXIT=1)', async () => {
+    await expect(
+      run([entry(SKIPPED_URL, ['pin'])], { log: silent, fetchImpl: noNetwork, sleepImpl: noSleep }),
+    ).rejects.toThrow(/из них адресов пина — 1/)
+  })
+
+  it('тот же адрес от документа гейт не валит (EXIT=0)', async () => {
+    const verdict = await run([entry(SKIPPED_URL, ['docs'])], {
+      log: silent,
+      fetchImpl: noNetwork,
+      sleepImpl: noSleep,
+    })
+
+    expect(verdict.fatal).toStrictEqual([])
+    expect(verdict.skipped).toHaveLength(1)
+  })
+
+  it('отказ run — это EXIT=1 у самой команды, а не только исключение', async () => {
+    // Связь «throw → код возврата» лежит в хвосте index.mjs, и без этого
+    // теста «EXIT=1» выше был бы утверждением о непроверенном.
+    const { code, stderr } = await runCli(['--no-such-flag'])
+
+    expect(code).toBe(1)
+    expect(stderr).toContain('unknown argument')
   })
 })
 

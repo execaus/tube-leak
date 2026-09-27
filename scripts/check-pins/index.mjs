@@ -173,20 +173,49 @@ export function hostCanary(url, deps = {}) {
 }
 
 /**
- * Делит адреса на проверяемые (возможно, по адресу-замене) и
- * пропускаемые с названной причиной — см. planProbe.
+ * Делит адреса на три списка: проверяемые (возможно, по адресу-замене),
+ * пропускаемые с названной причиной (см. planProbe) и ОТКАЗЫ — адреса
+ * пина, на которые сработало правило пропуска.
+ *
+ * Третий список — не формальность (#142). Пропущенный адрес до judge() не
+ * доходит вовсе: судятся только проверенные. Значит правило «у пина нет
+ * права на непроверенность» имело дыру ровно в одном классе — адрес ПИНА,
+ * подошедший под правило пропуска, молча оставался зелёным. Сегодня хосты
+ * пина под действующие правила не подходят, но правила будут меняться: в
+ * день, когда ассет ffmpeg переедет на наше зеркало (§2.4 исследования),
+ * пропуск накрыл бы главный охраняемый адрес — и сторож промолчал бы.
+ *
+ * Пропуск — это частный случай «не подтверждён», и прав на него у пина
+ * нет: отказ приходит сюда тем же классом `warn`, каким приходит упорный
+ * 5xx, и становится фатальным тем же правилом judge(), а не вторым.
  *
  * @param {Array<{ url: string; where: string[]; origins: string[] }>} entries
  */
 export function planAll(entries) {
   const checked = []
   const skipped = []
+  const refused = []
   for (const entry of entries) {
     const plan = planProbe(entry.url)
-    if (plan.kind === 'skip') skipped.push({ ...entry, reason: plan.reason })
-    else checked.push({ ...entry, probeUrl: plan.probeUrl, why: plan.why })
+    if (plan.kind !== 'skip') {
+      checked.push({ ...entry, probeUrl: plan.probeUrl, why: plan.why })
+      continue
+    }
+    if (isPinAddress(entry)) {
+      refused.push({
+        ...entry,
+        kind: 'warn',
+        detail:
+          `не проверялся: сработало правило пропуска (${plan.reason}) — ` +
+          'но это адрес ПИНА, который доставка скачивает на сборке, ' +
+          'и «не проверен» для него то же самое, что «не подтверждён». ' +
+          'Сузить правило пропуска или перепиновать источник на адрес, отвечающий по HTTP',
+      })
+      continue
+    }
+    skipped.push({ ...entry, reason: plan.reason })
   }
-  return { checked, skipped }
+  return { checked, skipped, refused }
 }
 
 /**
@@ -233,16 +262,26 @@ export async function checkAll(entries, deps = {}) {
  * Приговор по строгости происхождения: у пина «не подтверждён» —
  * это отказ, у документов — терпимая оговорка (Б4 ревью).
  *
+ * Зелёное перечислено белым списком, отказ — всё остальное. Чёрный
+ * список («отказ — это dead или warn у пина») давал классу, которого в
+ * нём нет, тихий зелёный: ровно так адрес пина, не дошедший до проверки,
+ * не попадал ни в один список (#142).
+ *
+ * Класс, которого здесь ещё нет, становится ОТКАЗОМ и у пина, и у
+ * документа — терпимость заслуживает только явно названный «не
+ * подтверждён». Это намеренно строже нужного: новый класс у документа
+ * покраснеет и потребует решения, а не промолчит. Молчание и было
+ * дефектом.
+ *
  * @param {Array<{ kind: string; origins: string[] }>} results
  */
 export function judge(results) {
   const alive = results.filter((result) => result.kind === 'ok')
-  const fatal = results.filter(
-    (result) => result.kind === 'dead' || (result.kind === 'warn' && isPinAddress(result)),
-  )
   const tolerated = results.filter(
     (result) => result.kind === 'warn' && !isPinAddress(result),
   )
+  const green = new Set([...alive, ...tolerated])
+  const fatal = results.filter((result) => !green.has(result))
   return { alive, fatal, tolerated }
 }
 
@@ -261,48 +300,62 @@ export function parseArgs(argv) {
   return { pinOnly }
 }
 
-function report(title, results) {
-  console.log(`\n── ${title} ──`)
+function report(log, title, results) {
+  log(`\n── ${title} ──`)
   if (results.length === 0) {
-    console.log('  (пусто)')
+    log('  (пусто)')
     return
   }
   const mark = { ok: 'OK   ', warn: 'WARN ', dead: 'DEAD ' }
   for (const result of results) {
-    console.log(`${mark[result.kind]} ${result.detail}`)
-    console.log(`      ${result.url}`)
-    if (result.why) console.log(`      проверено заменой: ${result.probeUrl} — ${result.why}`)
-    if (result.kind !== 'ok') console.log(`      назван в: ${result.where.join(', ')}`)
+    log(`${mark[result.kind] ?? `${result.kind}?`} ${result.detail}`)
+    log(`      ${result.url}`)
+    if (result.why) log(`      проверено заменой: ${result.probeUrl} — ${result.why}`)
+    if (result.kind !== 'ok') log(`      назван в: ${result.where.join(', ')}`)
   }
 }
 
-async function main() {
-  const { pinOnly } = parseArgs(process.argv.slice(2))
-  const entries = pinOnly ? mergeByUrl(collectPinUrls(await loadPin(PIN_PATH))) : await collectAllUrls()
-  const { checked, skipped } = planAll(entries)
+/**
+ * Весь прогон над готовым списком адресов: план, проверка, печать,
+ * приговор. Вынесен из `main` отдельной функцией затем, что строгость
+ * решает судьбу кода возврата, а проверять её надо ровно там, где она
+ * решает: `throw` отсюда — это EXIT=1 (обработчик в хвосте файла), а
+ * `main` только собирает список адресов.
+ *
+ * @param {Array<{ url: string; where: string[]; origins: string[] }>} entries
+ * @param {{ log?: (line: string) => void; label?: string; fetchImpl?: typeof fetch; sleepImpl?: (ms: number) => Promise<void>; canaryCache?: Map<string, object> }} [options]
+ */
+export async function run(entries, { log = console.log, label = '', ...deps } = {}) {
+  const { checked, skipped, refused } = planAll(entries)
 
-  console.log(
-    `check-pins: ${entries.length} адресов${pinOnly ? ' (только пин)' : ''}, ` +
-      `проверяем ${checked.length}, пропускаем ${skipped.length}`,
+  log(
+    `check-pins: ${entries.length} адресов${label}, ` +
+      `проверяем ${checked.length}, пропускаем ${skipped.length}` +
+      (refused.length > 0
+        ? `, отказано без проверки ${refused.length} (адреса пина под правилом пропуска)`
+        : ''),
   )
 
-  const results = await checkAll(checked)
+  // Отказы плана идут в ОБЩИЙ список результатов, а не мимо него: они
+  // печатаются и судятся наравне с проверенными. Мимо списка они и были
+  // невидимы (#142).
+  const results = [...(await checkAll(checked, deps)), ...refused]
 
   // Пин и документы печатаются врозь: у них разная строгость, и
   // сваливать их в один список — значит прятать, что именно упало.
-  report('адреса пина (обязаны быть подтверждены живыми)', results.filter(isPinAddress))
-  report('адреса документов §6d', results.filter((result) => !isPinAddress(result)))
+  report(log, 'адреса пина (обязаны быть подтверждены живыми)', results.filter(isPinAddress))
+  report(log, 'адреса документов §6d', results.filter((result) => !isPinAddress(result)))
 
   if (skipped.length > 0) {
-    console.log('\n── пропущено (причина названа, адрес не проверялся) ──')
+    log('\n── пропущено (причина названа, адрес не проверялся) ──')
     for (const entry of skipped) {
-      console.log(`SKIP  ${entry.reason}`)
-      console.log(`      ${entry.url}`)
+      log(`SKIP  ${entry.reason}`)
+      log(`      ${entry.url}`)
     }
   }
 
   const { alive, fatal, tolerated } = judge(results)
-  console.log(
+  log(
     `\nИтог: подтверждено живыми ${alive.length}, ` +
       `терпимо не подтверждено ${tolerated.length} (только документы), ` +
       `отказов ${fatal.length}, пропущено ${skipped.length}.`,
@@ -316,6 +369,15 @@ async function main() {
         'THIRD-PARTY-LICENSES.md) той же задачей',
     )
   }
+
+  return { alive, fatal, tolerated, skipped, refused }
+}
+
+async function main() {
+  const { pinOnly } = parseArgs(process.argv.slice(2))
+  const entries = pinOnly ? mergeByUrl(collectPinUrls(await loadPin(PIN_PATH))) : await collectAllUrls()
+
+  await run(entries, { label: pinOnly ? ' (только пин)' : '' })
 }
 
 const isMainModule = process.argv[1] === fileURLToPath(import.meta.url)
