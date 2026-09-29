@@ -57,6 +57,23 @@ import AboutScreen from './AboutScreen.vue'
  * лицензий вообще в тексте именно этого абзаца, не три фразы. Н3 —
  * маркер Н1 нормализует пробелы перед поиском, чтобы перенос строки
  * внутри `<code>…</code>` в шаблоне не красил тест на ровном месте.
+ *
+ * Четвёртый возврат (TL-139): тот же промах Б4 нашёлся в соседней секции
+ * «Исходный код ffmpeg» («полный перечень влинкованных библиотек» про
+ * `SOURCES-FFMPEG.md`) — сторож Б4 молчал, потому что был сужен ровно до
+ * секции «Компоненты и лицензии» (приём Н2, применённый там, где он не
+ * нужен: у слова «полный» нет причины жить только в одной секции). Слово
+ * убрано из шаблона, а сторож Б4 расширен на обе секции сразу (join, как
+ * в тесте М2) — реального регресса вёрстки это не создаёт, потому что
+ * запрет применяется к смыслу текста, а не к его расположению.
+ *
+ * Добавка к тому же возврату: репозиторий кода открыт публично
+ * 2026-09-27 (решение владельца), и оговорка «у кого есть доступ к
+ * репозиторию проекта, тот же файл лежит там же» устарела — доступ
+ * теперь у всех. Заменена на прямой адрес репозитория (работающий
+ * указатель §6d). Новый тест проверяет: старой оговорки нигде нет, адрес
+ * назван дважды (по одному разу на каждый файловый указатель), а
+ * закрытый репозиторий документов `tube-leak-docs` не назван нигде.
  */
 const report: SidecarCheckReport = {
   ytDlp: { name: 'yt-dlp', path: '/opt/tube-leak/bin/yt-dlp', status: 'ok', version: '2026.08.20' },
@@ -174,7 +191,7 @@ describe('AboutScreen', () => {
     expect(licenceIdentifiersOrCharacteristics.some((pattern) => pattern.test(reviewerMutation))).toBe(true)
   })
 
-  it('never claims THIRD-PARTY-LICENSES.md is a complete or exhaustive list, tied to what the file itself admits (Б4, mutation guard)', () => {
+  it('never claims completeness of what a linked file contains, anywhere on the screen — not just in Компоненты и лицензии (Б4, extended screen-wide by TL-139, mutation guard)', () => {
     // Сторож читает настоящий файл рядом (в тестах — локальный файл,
     // сети нет), а не запоминает формулировку экрана: связь с фактом, а
     // не с текстом. Если раздел «Прочие зависимости» когда-нибудь
@@ -194,16 +211,31 @@ describe('AboutScreen', () => {
     ).toMatch(/получить локально/)
 
     const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report } })
-    const componentsSection = sectionByHeading(wrapper, 'Компоненты и лицензии').text()
 
-    // Пока файл сам признаёт список неполным, экран не вправе называть
-    // его «полным перечнем», «полными текстами» или «исчерпывающим» —
-    // ни этими словами, ни другими с тем же смыслом (regex по корню
-    // «полн» и отдельно «исчерпыв», а не по одной запомненной фразе Б2).
-    expect(componentsSection).not.toMatch(/полн\p{L}*\s+перечень/iu)
-    expect(componentsSection).not.toMatch(/полн\p{L}*\s+текст/iu)
-    expect(componentsSection).not.toMatch(/полн\p{L}*\s+список/iu)
-    expect(componentsSection).not.toMatch(/исчерпыв/i)
+    // TL-139 (четвёртый случай того же класса): прежняя версия этого
+    // теста читала только секцию «Компоненты и лицензии» — точно тот же
+    // приём сужения, что и в тесте М2 ниже, и по той же причине (не
+    // опираться на побочный эффект вёрстки соседних секций). Но здесь
+    // сужение стало слепотой: слово «полный» осталось в соседней секции
+    // «Исходный код ffmpeg» (про SOURCES-FFMPEG.md) и сторож молчал.
+    // Приём М2 — join нескольких секций вместо одной — применён и тут.
+    const screenSourcesText = [
+      sectionByHeading(wrapper, 'Компоненты и лицензии').text(),
+      sectionByHeading(wrapper, 'Исходный код ffmpeg').text(),
+    ].join(' ')
+
+    // Пока файлы сами не заявляют себя полными (THIRD-PARTY-LICENSES.md —
+    // см. проверку выше; SOURCES-FFMPEG.md — core-ветка прямо документирует
+    // пробелы комплекта: ревизия x264 физически не существует, версия
+    // liblzma для Windows не привязана), экран не вправе называть их
+    // содержимое «полным перечнем», «полными текстами», «полным списком»
+    // или «исчерпывающим» — ни этими словами, ни другими с тем же смыслом
+    // (regex по корню «полн» и отдельно «исчерпыв», а не по одной
+    // запомненной фразе Б2), и не важно, в какой из двух секций.
+    expect(screenSourcesText).not.toMatch(/полн\p{L}*\s+перечень/iu)
+    expect(screenSourcesText).not.toMatch(/полн\p{L}*\s+текст/iu)
+    expect(screenSourcesText).not.toMatch(/полн\p{L}*\s+список/iu)
+    expect(screenSourcesText).not.toMatch(/исчерпыв/i)
   })
 
   it('gives a plain, retypeable pointer to the ffmpeg sources, and points at files installed next to the app (Б1) — not the private repository', () => {
@@ -248,6 +280,28 @@ describe('AboutScreen', () => {
     // приватный, у получателя сборки он не откроется, обещать рабочую
     // ссылку на него нельзя; см. doc-комментарий SOURCES-FFMPEG.md).
     expect(wrapper.findAll('a')).toHaveLength(0)
+  })
+
+  it('points at THIRD-PARTY-LICENSES.md/SOURCES-FFMPEG.md with a direct URL to the now-public repository, not a stale access caveat (TL-139, repo opened 2026-09-27)', () => {
+    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report } })
+    const text = wrapper.text()
+
+    // Репозиторий кода открыт публично 2026-09-27 (решение владельца) —
+    // «у кого есть доступ к репозиторию проекта» было правдой до этого
+    // и стало устаревшей оговоркой о привилегии, которой больше нет.
+    // Экран не вправе её воспроизводить в каком бы то ни было месте.
+    expect(text).not.toMatch(/у кого есть доступ/i)
+
+    // Прямой рабочий адрес — по одному на каждый из двух файловых
+    // указателей (THIRD-PARTY-LICENSES.md и SOURCES-FFMPEG.md).
+    const repoUrlMatches = text.match(/https:\/\/github\.com\/execaus\/tube-leak\b/g)
+    expect(repoUrlMatches).not.toBeNull()
+    expect(repoUrlMatches).toHaveLength(2)
+
+    // Репозиторий документов остаётся закрытым (решение ведущего,
+    // `SOURCES-FFMPEG.md`, «Репозиторий документов… остаётся закрытым») —
+    // экран не должен ссылаться на него ни в каком виде.
+    expect(text).not.toMatch(/tube-leak-docs/)
   })
 
   it('marks the direct ffmpeg archive link as the macOS build source, and points elsewhere for Windows/Linux (М4)', () => {
