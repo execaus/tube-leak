@@ -6,53 +6,57 @@
 // и/или Apache-2.0)». Измерение релизного графа показало в нём MPL-2.0
 // (слабый copyleft), `Apache-2.0 AND ISC`, CDLA-Permissive-2.0,
 // Unicode-3.0, Zlib и BSD — ни одной строки о них в документе не было.
-// Утверждение о полноте оказалось неправдой; это третий случай того же
-// класса за сессию.
 //
-// Устройство сторожа — две части, разнесённые по цене, как у check-pins:
+// Устройство сторожа — две части, и ГРАНИЦА МЕЖДУ НИМИ ВАЖНА:
 //
-// 1. ОФЛАЙН (этот модуль + licenses.test.mjs, идёт в `npm test`):
-//    сверяет снимок `licenses.lock.json` с тем, что лежит в
-//    репозитории, и с разделами документа. Сети и cargo не требует.
-// 2. ИЗМЕРЕНИЕ (`npm run check-licenses`, scripts/check-licenses/index.mjs):
-//    заново строит граф через `cargo tree -e normal` по четырём тройкам
-//    и через node_modules, и сверяет с снимком. Требует cargo — поэтому
-//    отдельной командой, а не тестом.
+// 1. ОФЛАЙН (этот модуль, идёт в `npm test` без cargo): сверяет снимок
+//    `licenses.lock.json` с тем, что лежит в репозитории, и с разделами
+//    документа. Ловит появление и пропажу ПАКЕТОВ (через Cargo.lock и
+//    package-lock.json), пропажу РАЗДЕЛА и расхождение таблицы
+//    «лицензия → раздел».
+// 2. ИЗМЕРЕНИЕ (`measure()` из index.mjs, требует cargo): заново строит
+//    граф по четырём тройкам и сверяет с снимком целиком, включая
+//    РАСПРЕДЕЛЕНИЕ ПАКЕТОВ ПО ВЁДРАМ.
 //
-// Почему офлайн-части хватает, чтобы снимок не протух молча. Лицензия
-// пары «имя + версия» на crates.io неизменна, а любой новый крейт или
-// смена версии МЕНЯЮТ `Cargo.lock`. Поэтому офлайн-проверка требует,
-// чтобы КАЖДЫЙ пакет `Cargo.lock` был назван в снимке — в одном из
-// четырёх вёдер (поставляется / наш собственный крейт / proc-macro /
-// не в релизном графе). Новая
-// зависимость с новой лицензией не может появиться, не покраснев здесь:
-// её нет ни в одном ведре. То же для npm через `package-lock.json`.
+// Чего офлайн-часть НЕ умеет и почему это не оговорка, а устройство.
+// Перенос пакета из `shipped` в `notInReleaseGraph` меняет обе стороны
+// сверки согласованно: пакет по-прежнему назван снимком, Cargo.lock
+// по-прежнему сходится. Офлайн отличить такой перенос от правды нечем —
+// нужен сам граф. Ревью воспроизвело это мутацией: четыре MPL-крейта
+// уехали в `notInReleaseGraph`, строка ушла из таблицы, раздел вырезан
+// из документа — офлайн-часть вернула ноль проблем.
 //
-// Чего сторож НЕ проверяет и не притворяется, что проверяет:
-// - правильность поля `license` у самого апстрима (мы верим метаданным
-//   crates.io/npm — иного машиночитаемого источника нет);
-// - что раздел документа СОДЕРЖАТЕЛЬНО верен: проверяется наличие
-//   раздела под лицензию, а не качество его текста;
-// - долю пакетов npm, реально попадающую в бандл Vite: снимок берёт
-//   весь production-замыкание `package-lock.json`, то есть НАДМНОЖЕСТВО
-//   (Vite вырезает неиспользованное). Для лицензий это безопасная
-//   сторона ошибки: разделов получается больше, чем строго нужно.
+// Поэтому измерение больше НЕ отдельная команда «на всякий случай»:
+// оно вызывается из `npm test` (licenses.test.mjs) и обязано сойтись.
+// Цена названа прямо: `npm test` теперь требует cargo в PATH. Для этого
+// репозитория это не новое требование — `cargo test` и так в обычном
+// прогоне, — но сторож, который «никогда не запускается автоматически»,
+// охраняет ровно ничего, и прежний комментарий здесь утверждал обратное.
+//
+// Чего сторож не проверяет и не притворяется, что проверяет:
+// - правильность поля `license` у апстрима (иного машиночитаемого
+//   источника нет);
+// - содержательную верность раздела: проверяется, что раздел есть и что
+//   он настоящий заголовок нужного уровня, а не качество его текста;
+// - долю пакетов npm, реально попадающую в бандл Vite: берётся всё
+//   production-замыкание, то есть НАДМНОЖЕСТВО.
 
 import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { noticeHeading, noticeHeadingPattern } from './notices.mjs'
 import { effectiveLicenses } from './spdx.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 export const REPO_ROOT = resolve(__dirname, '..', '..')
 export const SNAPSHOT_PATH = join(REPO_ROOT, 'licenses.lock.json')
 export const LICENSES_DOC = 'THIRD-PARTY-LICENSES.md'
+export const NOTICES_DOC = 'NOTICES.md'
 
 /**
  * Тройки, по которым снимается релизный граф. Наборы крейтов у них
- * РАЗНЫЕ (windows-*, gtk-*, objc2-*), поэтому одной тройки мало: так
- * прятался дефект `flate2`, невидимый на macOS.
+ * РАЗНЫЕ (windows-*, gtk-*, objc2-*), поэтому одной тройки мало.
  */
 export const TARGETS = Object.freeze([
   'aarch64-apple-darwin',
@@ -62,32 +66,86 @@ export const TARGETS = Object.freeze([
 ])
 
 /**
- * Заголовок раздела документа, который закрывает лицензию.
+ * Уровень заголовка, на котором обязан стоять раздел лицензии.
+ * Разделы лицензий — второго уровня, вровень с остальными разделами
+ * документа.
+ */
+export const SECTION_LEVEL = 2
+
+/**
+ * Заголовок раздела, который закрывает лицензию, — ТОЛЬКО НАЗВАНИЕ,
+ * без решёток.
  *
- * Это НЕ список известных лицензий и не белый список: отсутствие
- * лицензии в этой таблице — красное (сторож не знает, чем её закрыть), и
- * наличие строки тоже ничего не доказывает, пока такого заголовка нет в
- * самом файле. Проверяются обе стороны.
+ * Решётки убраны по замечанию ревью: раньше здесь лежала строка
+ * `'## BSD-3-Clause'`, а наличие проверялось `doc.includes(...)`.
+ * Подстрока `## BSD-3-Clause` содержится и в `#### BSD-3-Clause`,
+ * поэтому раздел можно было «спрятать», понизив уровень заголовка, —
+ * сторож этого не замечал. Теперь уровень задан отдельно и проверяется
+ * настоящим заголовком (см. `hasSection`).
  */
 export const SECTION_BY_LICENSE = Object.freeze({
-  'MIT': '## MIT',
-  'Apache-2.0': '## Apache-2.0',
-  'ISC': '## ISC',
-  'BSD-2-Clause': '## BSD-2-Clause',
-  'BSD-3-Clause': '## BSD-3-Clause',
-  'MPL-2.0': '## MPL-2.0',
-  'CDLA-Permissive-2.0': '## CDLA-Permissive-2.0',
-  'Unicode-3.0': '## Unicode-3.0',
-  'Zlib': '## Zlib',
+  'MIT': 'MIT',
+  'Apache-2.0': 'Apache-2.0',
+  'ISC': 'ISC',
+  'BSD-2-Clause': 'BSD-2-Clause',
+  'BSD-3-Clause': 'BSD-3-Clause',
+  'MPL-2.0': 'MPL-2.0',
+  'CDLA-Permissive-2.0': 'CDLA-Permissive-2.0',
+  'Unicode-3.0': 'Unicode-3.0',
+  'Zlib': 'Zlib',
 })
+
+/**
+ * @param {string} text
+ * @returns {string}
+ */
+function escapeRegExp(text) {
+  return text.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Регулярное выражение настоящего заголовка нужного уровня.
+ *
+ * Именно заголовка, а не подстроки: строка должна начинаться ровно с
+ * `SECTION_LEVEL` решёток (ни больше, ни меньше), дальше пробел,
+ * название и конец строки.
+ *
+ * @param {string} title
+ * @param {number} [level]
+ * @returns {RegExp}
+ */
+export function headingPattern(title, level = SECTION_LEVEL) {
+  return new RegExp(`^#{${level}} ${escapeRegExp(title)}[ \\t]*$`, 'm')
+}
+
+/**
+ * Есть ли в документе раздел с таким названием на нужном уровне.
+ *
+ * @param {string} doc
+ * @param {string} title
+ * @returns {boolean}
+ */
+export function hasSection(doc, title) {
+  return headingPattern(title).test(doc)
+}
+
+/**
+ * Смещение заголовка раздела или -1.
+ *
+ * @param {string} doc
+ * @param {string} title
+ * @returns {number}
+ */
+export function sectionIndex(doc, title) {
+  return doc.search(headingPattern(title))
+}
 
 /**
  * Пакеты `Cargo.lock` по парам «имя версия».
  *
- * Разбор регулярным выражением, а не TOML-парсером: зависимость ради
- * трёх полей не нужна, а формат `[[package]]` у cargo стабилен и
- * генерируется им самим (файл помечен «not intended for manual
- * editing»). Порядок полей внутри записи cargo тоже пишет сам.
+ * Разбор регулярным выражением, а не TOML-парсером: формат
+ * `[[package]]` генерирует сам cargo, файл помечен «not intended for
+ * manual editing».
  *
  * @param {string} text содержимое Cargo.lock
  * @returns {string[]} отсортированный список «имя версия»
@@ -99,9 +157,6 @@ export function parseCargoLock(text) {
 
 /**
  * Production-замыкание `package-lock.json` по парам «имя версия».
- *
- * Записи с `dev: true` — только сборочный инструмент (vite, vitest,
- * eslint), в дистрибутив они не едут.
  *
  * @param {string} text содержимое package-lock.json
  * @returns {string[]} отсортированный список «имя версия»
@@ -137,6 +192,22 @@ export function packagesNamedBy(section) {
 }
 
 /**
+ * Пакеты, которые едут в поставку, — из обоих разделов снимка.
+ *
+ * @param {object} snapshot
+ * @returns {string[]}
+ */
+export function shippedPackages(snapshot) {
+  const found = new Set()
+  for (const section of [snapshot.rust, snapshot.npm]) {
+    for (const packages of Object.values(section.shipped ?? {})) {
+      for (const entry of packages) found.add(entry)
+    }
+  }
+  return [...found].sort()
+}
+
+/**
  * Лицензии, под которые снимок требует раздела.
  *
  * @param {object} snapshot
@@ -151,7 +222,7 @@ export function licensesRequiringSection(snapshot) {
 }
 
 /**
- * Расхождения снимка с репозиторием и с документом. Пустой список —
+ * Расхождения снимка с репозиторием и с документами. Пустой список —
  * всё сошлось.
  *
  * @param {object} options
@@ -159,9 +230,10 @@ export function licensesRequiringSection(snapshot) {
  * @param {string} options.cargoLock содержимое Cargo.lock
  * @param {string} options.npmLock содержимое package-lock.json
  * @param {string} options.doc содержимое THIRD-PARTY-LICENSES.md
+ * @param {string} options.notices содержимое NOTICES.md
  * @returns {string[]} человекочитаемые расхождения
  */
-export function checkSnapshot({ snapshot, cargoLock, npmLock, doc }) {
+export function checkSnapshot({ snapshot, cargoLock, npmLock, doc, notices }) {
   const problems = []
 
   problems.push(
@@ -169,7 +241,6 @@ export function checkSnapshot({ snapshot, cargoLock, npmLock, doc }) {
       what: 'Cargo.lock',
       all: parseCargoLock(cargoLock),
       named: packagesNamedBy(snapshot.rust),
-      regenerate: 'npm run check-licenses -- --write',
     }),
   )
   problems.push(
@@ -177,13 +248,12 @@ export function checkSnapshot({ snapshot, cargoLock, npmLock, doc }) {
       what: 'package-lock.json (production)',
       all: parseNpmLock(npmLock),
       named: packagesNamedBy(snapshot.npm),
-      regenerate: 'npm run check-licenses -- --write',
     }),
   )
 
   for (const license of licensesRequiringSection(snapshot)) {
-    const heading = SECTION_BY_LICENSE[license]
-    if (heading === undefined) {
+    const title = SECTION_BY_LICENSE[license]
+    if (title === undefined) {
       problems.push(
         `${license}: лицензия есть в релизном графе, но сторож не знает, каким разделом ` +
           `${LICENSES_DOC} она закрывается. Заведи раздел и назови его в SECTION_BY_LICENSE — ` +
@@ -191,36 +261,91 @@ export function checkSnapshot({ snapshot, cargoLock, npmLock, doc }) {
       )
       continue
     }
-    if (!doc.includes(heading)) {
+    if (!hasSection(doc, title)) {
       problems.push(
-        `${license}: SECTION_BY_LICENSE обещает раздел «${heading}», но в ${LICENSES_DOC} его нет. ` +
-          'Либо раздел переименовали, либо его не завели вовсе.',
+        `${license}: в ${LICENSES_DOC} нет раздела «${title}» заголовком ${SECTION_LEVEL}-го уровня. ` +
+          'Проверяется именно заголовок: понижённый уровень (#### вместо ##) прячет раздел от ' +
+          'читателя и от оглавления, а подстрокой такая подмена не ловится.',
       )
     }
   }
 
-  for (const [license, heading] of Object.entries(SECTION_BY_LICENSE)) {
-    if (!doc.includes(heading)) {
+  for (const [license, title] of Object.entries(SECTION_BY_LICENSE)) {
+    if (!hasSection(doc, title)) {
       problems.push(
-        `${license}: раздел «${heading}» назван сторожем, но в ${LICENSES_DOC} отсутствует. ` +
-          'Сторож обязан краснеть и на собственной устаревшей таблице, не только на графе.',
+        `${license}: раздел «${title}» назван сторожем, но в ${LICENSES_DOC} его нет ` +
+          `заголовком ${SECTION_LEVEL}-го уровня. Сторож обязан краснеть и на собственной ` +
+          'устаревшей таблице, не только на графе.',
       )
     }
   }
 
+  problems.push(...checkNotices({ snapshot, notices }))
+  problems.push(...checkSourceUrls({ snapshot, doc }))
+
+  return problems
+}
+
+/**
+ * Адреса исходников по §3.2 MPL обязаны стоять и в снимке, и в
+ * документе — дословно.
+ *
+ * Снимок читает `npm run check-pins` (он ходит по этим адресам), а
+ * документ читает получатель. Разойдись они — получатель пошёл бы по
+ * непроверяемому адресу, а проверялся бы адрес, которого он не видит.
+ *
+ * @param {{ snapshot: object; doc: string }} options
+ * @returns {string[]}
+ */
+export function checkSourceUrls({ snapshot, doc }) {
+  const problems = []
+  for (const { package: pkg, url } of snapshot.rust?.sourceUrls ?? []) {
+    if (!doc.includes(url)) {
+      problems.push(
+        `${LICENSES_DOC}: нет адреса исходников ${pkg} (${url}), названного снимком. ` +
+          'По §3.2 MPL это наше обязательство перед получателем, и текст с проверяемым ' +
+          'списком расходиться не вправе.',
+      )
+    }
+  }
+  return problems
+}
+
+/**
+ * Каждый пакет, который едет в поставку, обязан иметь запись в
+ * NOTICES.md.
+ *
+ * Зачем (замечание Б1 ревью). MIT, BSD, ISC и Zlib требуют СОХРАНЯТЬ
+ * уведомление об авторских правах — это условие гранта. Документ
+ * обещал, что уведомление «лежит в самом пакете», а у 19 пакетов ведра
+ * `shipped` файла лицензии нет вовсе: обещан был путь, которого не
+ * существует. Теперь уведомления собраны машинно, и их полнота
+ * охраняется здесь.
+ *
+ * @param {{ snapshot: object; notices: string }} options
+ * @returns {string[]}
+ */
+export function checkNotices({ snapshot, notices }) {
+  if (notices === undefined) return []
+  const problems = []
+  const missing = shippedPackages(snapshot).filter((entry) => !noticeHeadingPattern(entry).test(notices))
+  if (missing.length > 0) {
+    problems.push(
+      `${NOTICES_DOC}: ${missing.length} пакет(ов) едут в поставку, но записи об авторских ` +
+        `правах у них нет — ${preview(missing)}. Сохранение уведомления — условие гранта MIT/BSD/ISC/Zlib, ` +
+        'а не оформление. Пересобери: npm run check-licenses -- --write',
+    )
+  }
   return problems
 }
 
 /**
  * Каждый пакет репозитория обязан быть назван снимком, и наоборот.
  *
- * Обе стороны, а не одна: пропавший пакет — это снимок, описывающий
- * несуществующий граф, и такой снимок так же лжёт, как и неполный.
- *
- * @param {{ what: string; all: string[]; named: Set<string>; regenerate: string }} options
+ * @param {{ what: string; all: string[]; named: Set<string> }} options
  * @returns {string[]}
  */
-function accountedFor({ what, all, named, regenerate }) {
+function accountedFor({ what, all, named }) {
   const problems = []
   const missing = all.filter((entry) => !named.has(entry))
   const extra = [...named].filter((entry) => !all.includes(entry)).sort()
@@ -228,13 +353,14 @@ function accountedFor({ what, all, named, regenerate }) {
   if (missing.length > 0) {
     problems.push(
       `${what}: ${missing.length} пакет(ов) не названы в licenses.lock.json ни одним ведром — ` +
-        `${preview(missing)}. Новая зависимость приносит и новую лицензию; пересними снимок: ${regenerate}`,
+        `${preview(missing)}. Новая зависимость приносит и новую лицензию; ` +
+        'пересними снимок: npm run check-licenses -- --write',
     )
   }
   if (extra.length > 0) {
     problems.push(
       `${what}: снимок называет ${extra.length} пакет(ов), которых в нём больше нет — ` +
-        `${preview(extra)}. Пересними снимок: ${regenerate}`,
+        `${preview(extra)}. Пересними снимок: npm run check-licenses -- --write`,
     )
   }
   return problems
@@ -250,8 +376,8 @@ function preview(entries) {
 }
 
 /**
- * Лицензии пакета по его выражению — тонкая обёртка, чтобы правило
- * выбора жило в одном месте и у измерения, и у проверки.
+ * Лицензии пакета по его выражению — обёртка, чтобы правило выбора
+ * жило в одном месте и у измерения, и у проверки.
  *
  * @param {string} expression
  * @returns {string[]}
@@ -262,14 +388,17 @@ export function licensesOf(expression) {
 
 /**
  * @param {string} [repoRoot]
- * @returns {Promise<{ snapshot: object; cargoLock: string; npmLock: string; doc: string }>}
+ * @returns {Promise<{ snapshot: object; cargoLock: string; npmLock: string; doc: string; notices: string }>}
  */
 export async function readInputs(repoRoot = REPO_ROOT) {
-  const [snapshot, cargoLock, npmLock, doc] = await Promise.all([
+  const [snapshot, cargoLock, npmLock, doc, notices] = await Promise.all([
     readFile(join(repoRoot, 'licenses.lock.json'), 'utf8'),
     readFile(join(repoRoot, 'src-tauri', 'Cargo.lock'), 'utf8'),
     readFile(join(repoRoot, 'package-lock.json'), 'utf8'),
     readFile(join(repoRoot, LICENSES_DOC), 'utf8'),
+    readFile(join(repoRoot, NOTICES_DOC), 'utf8'),
   ])
-  return { snapshot: JSON.parse(snapshot), cargoLock, npmLock, doc }
+  return { snapshot: JSON.parse(snapshot), cargoLock, npmLock, doc, notices }
 }
+
+export { noticeHeading }

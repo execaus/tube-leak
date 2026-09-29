@@ -44,6 +44,23 @@ export const PIN_PATH = join(REPO_ROOT, 'src-tauri', 'binaries.lock.json')
 export const DOC_FILES = Object.freeze(['SOURCES-FFMPEG.md', 'THIRD-PARTY-LICENSES.md'])
 
 /**
+ * Документы, которые обязаны ехать в бандл рядом с приложением.
+ *
+ * Шире, чем DOC_FILES, и список отдельный намеренно: DOC_FILES — это
+ * указатели §6d, и каждый из них обязан называть адреса сборок ffmpeg
+ * (crossCheckDocs). У NOTICES.md такой обязанности нет — он про
+ * уведомления об авторских правах, — и попади он в DOC_FILES, сверка
+ * потребовала бы от него ffmpeg-адресов, которых там взяться неоткуда.
+ */
+export const BUNDLED_DOCS = Object.freeze([...DOC_FILES, 'NOTICES.md'])
+
+/**
+ * Снимок лицензионного состава: из него берутся адреса исходников
+ * MPL-крейтов (TL-136, замечание Н6 ревью).
+ */
+export const LICENSE_SNAPSHOT_FILE = 'licenses.lock.json'
+
+/**
  * Раздел пина, ссылки которого обязаны дословно присутствовать в
  * документах. Только ffmpeg: указатель §6d заведён под GPL-компонент, а
  * yt-dlp (Unlicense) и deno (MIT) в нём адресами не перечисляются.
@@ -359,7 +376,45 @@ export function mergeByUrl(entries) {
  */
 export async function collectAllUrls({ pinPath = PIN_PATH, repoRoot = REPO_ROOT } = {}) {
   const pin = await loadPin(pinPath)
-  return mergeByUrl([...collectPinUrls(pin), ...(await collectDocUrls(repoRoot))])
+  return mergeByUrl([
+    ...collectPinUrls(pin),
+    ...(await collectDocUrls(repoRoot)),
+    ...(await collectLicenseSourceUrls(repoRoot)),
+  ])
+}
+
+/**
+ * Адреса исходников MPL-крейтов из снимка лицензий.
+ *
+ * Зачем отдельный источник, а не текст документа (замечание Н6 ревью).
+ * Эти четыре адреса стоят в THIRD-PARTY-LICENSES.md НИЖЕ границы
+ * «нашего текста» (первого заголовка «Полный текст …»), потому что
+ * соседствуют с дословными текстами чужих лицензий. Граница законна и
+ * ломать её нельзя — но эти адреса не чужое обещание, а НАШЕ
+ * обязательство по §3.2 MPL: по ним получатель забирает исходный код
+ * покрытых файлов. Обещание, которое никто никогда не проверяет, —
+ * ровно тот класс дыры, что уже дважды ловился в этом стороже.
+ *
+ * Поэтому адреса берутся из машиночитаемого снимка, а не вычитываются
+ * из markdown: тогда проверка не зависит от того, по какую сторону
+ * границы они оказались в тексте. Что текст и снимок не разошлись,
+ * проверяет офлайн-сторож лицензий отдельно.
+ *
+ * @param {string} [repoRoot]
+ * @returns {Promise<Array<{ url: string; where: string; origin: string }>>}
+ */
+export async function collectLicenseSourceUrls(repoRoot = REPO_ROOT) {
+  let snapshot
+  try {
+    snapshot = JSON.parse(await readFile(join(repoRoot, LICENSE_SNAPSHOT_FILE), 'utf8'))
+  } catch {
+    return []
+  }
+  return (snapshot.rust?.sourceUrls ?? []).map(({ package: pkg, url }) => ({
+    url,
+    where: `${LICENSE_SNAPSHOT_FILE} (исходники ${pkg} по §3.2 MPL)`,
+    origin: 'licenses',
+  }))
 }
 
 /**

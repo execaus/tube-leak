@@ -12,6 +12,24 @@
     "Выбор из дизъюнкции (MIT OR Apache-2.0) сделан правилом, а не вручную: см. spdx.mjs."
   ],
   "rust": {
+    "sourceUrls": [
+      {
+        "package": "cssparser 0.36.0",
+        "url": "https://crates.io/crates/cssparser/0.36.0"
+      },
+      {
+        "package": "dtoa-short 0.3.5",
+        "url": "https://crates.io/crates/dtoa-short/0.3.5"
+      },
+      {
+        "package": "option-ext 0.2.0",
+        "url": "https://crates.io/crates/option-ext/0.2.0"
+      },
+      {
+        "package": "selectors 0.36.1",
+        "url": "https://crates.io/crates/selectors/0.36.1"
+      }
+    ],
     "_measuredBy": "cargo tree --locked -e normal по тройкам: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu",
     "targets": [
       "aarch64-apple-darwin",

@@ -28,6 +28,7 @@ import { promisify } from 'node:util'
 import {
   checkSnapshot,
   licensesOf,
+  NOTICES_DOC,
   packagesNamedBy,
   parseCargoLock,
   parseNpmLock,
@@ -35,6 +36,7 @@ import {
   SNAPSHOT_PATH,
   TARGETS,
 } from './licenses.mjs'
+import { crateLicenseTexts, noticeFrom, npmLicenseTexts, renderNotices } from './notices.mjs'
 
 const run = promisify(execFile)
 const CARGO_DIR = join(REPO_ROOT, 'src-tauri')
@@ -62,6 +64,39 @@ export function cargoFailure(error) {
 }
 
 /**
+ * Места, где в этом окружении лежит cargo, когда его нет в PATH.
+ *
+ * Зачем список, а не требование «экспортируй PATH сам». Измерение графа
+ * вызывается из `npm test` (иначе оно не вызывается никогда — см. Н4), а
+ * cargo в этом окружении вне PATH по умолчанию: так записано в CLAUDE.md
+ * проекта. Без поиска обычный `npm test` краснел бы не от дефекта, а от
+ * переменной окружения — ровно тот ложный красный, который в этом
+ * проекте неотличим от настоящей поломки и потому запрещён.
+ *
+ * Пропускать измерение при отсутствии cargo нельзя: пропуск вернул бы
+ * слепое пятно, ради закрытия которого измерение сюда и переехало.
+ * Поэтому не «тише», а «надёжнее»: сначала ищем, и только не найдя —
+ * отказываем с названной причиной.
+ */
+const CARGO_FALLBACK_DIRS = Object.freeze([
+  '/opt/homebrew/opt/rustup/bin',
+  join(process.env.HOME ?? '', '.cargo', 'bin'),
+])
+
+/**
+ * Окружение с cargo в PATH, если он там ещё не оказался.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function cargoEnv(env = process.env) {
+  const parts = (env.PATH ?? '').split(':')
+  const missing = CARGO_FALLBACK_DIRS.filter((dir) => dir !== '' && !parts.includes(dir))
+  if (missing.length === 0) return env
+  return { ...env, PATH: [...parts, ...missing].filter((part) => part !== '').join(':') }
+}
+
+/**
  * @param {string[]} args
  * @param {object} options
  * @returns {Promise<{ stdout: string }>}
@@ -70,7 +105,12 @@ async function cargo(args, options) {
   try {
     return await run('cargo', args, options)
   } catch (error) {
-    throw cargoFailure(error)
+    if (error?.code !== 'ENOENT') throw error
+    try {
+      return await run('cargo', args, { ...options, env: cargoEnv() })
+    } catch (retried) {
+      throw cargoFailure(retried)
+    }
   }
 }
 
@@ -82,12 +122,18 @@ export function parseArgs(argv) {
   return { write: argv.includes('--write') }
 }
 
+/** @type {Map<string, object> | null} */
+let metadataCache = null
+
 /**
- * Метаданные пакетов: лицензия и признак proc-macro.
+ * Метаданные пакетов: лицензия, авторы, репозиторий и признак
+ * proc-macro. Авторы нужны для NOTICES.md — у части крейтов файла
+ * лицензии нет вовсе, и уведомление берётся отсюда.
  *
- * @returns {Promise<Map<string, { license: string; procMacro: boolean }>>}
+ * @returns {Promise<Map<string, { license: string; procMacro: boolean; authors: string[]; repository: string | null }>>}
  */
 async function readMetadata() {
+  if (metadataCache !== null) return metadataCache
   const { stdout } = await cargo(['metadata', '--locked', '--format-version', '1'], {
     cwd: CARGO_DIR,
     maxBuffer: 256 * 1024 * 1024,
@@ -98,8 +144,11 @@ async function readMetadata() {
     byPackage.set(`${pkg.name} ${pkg.version}`, {
       license: pkg.license ?? '',
       procMacro: pkg.targets.some((target) => target.kind.includes('proc-macro')),
+      authors: pkg.authors ?? [],
+      repository: pkg.repository ?? null,
     })
   }
+  metadataCache = byPackage
   return byPackage
 }
 
@@ -157,7 +206,17 @@ async function measureRust() {
   }
 
   const notInReleaseGraph = allPackages.filter((pkg) => !inGraph.has(pkg) && pkg !== root)
+
+  // Адреса исходников по §3.2 MPL. Только MPL: у пермиссивных лицензий
+  // обязательства предоставить исходник нет, и раздувать проверяемый
+  // список нечем. Версия в адресе — та самая, что влинкована.
+  const sourceUrls = (shipped['MPL-2.0'] ?? []).map((entry) => {
+    const [name, version] = entry.split(' ')
+    return { package: entry, url: `https://crates.io/crates/${name}/${version}` }
+  })
+
   return {
+    sourceUrls,
     _measuredBy: `cargo tree --locked -e normal по тройкам: ${TARGETS.join(', ')}`,
     targets: TARGETS,
     shipped: sortValues(shipped),
@@ -209,6 +268,55 @@ async function measureNpm() {
 }
 
 /**
+ * Уведомления об авторских правах для всего, что едет в поставку.
+ *
+ * Читает файлы лицензий из локального кэша cargo и из node_modules;
+ * где файла нет — берёт авторов из метаданных, и запись об этом
+ * говорит прямо (см. notices.mjs).
+ *
+ * @param {object} snapshot
+ * @returns {Promise<{ rust: object[]; npm: object[] }>}
+ */
+async function collectNoticesData(snapshot) {
+  const metadata = await readMetadata()
+
+  const rust = []
+  for (const entry of [...new Set(Object.values(snapshot.rust.shipped).flat())].sort()) {
+    const [name, version] = entry.split(' ')
+    const info = metadata.get(entry) ?? { license: '', authors: [], repository: null }
+    rust.push({
+      entry,
+      license: info.license === '' ? 'лицензия не указана в метаданных' : info.license,
+      notice: noticeFrom({ licenseTexts: crateLicenseTexts(name, version), authors: info.authors }),
+      repository: info.repository,
+    })
+  }
+
+  const npm = []
+  for (const entry of [...new Set(Object.values(snapshot.npm.shipped).flat())].sort()) {
+    const name = entry.slice(0, entry.lastIndexOf(' '))
+    const dir = join(REPO_ROOT, 'node_modules', name)
+    const manifest = JSON.parse(await readFile(join(dir, 'package.json'), 'utf8'))
+    const authors = [manifest.author, ...(manifest.contributors ?? [])]
+      .filter((author) => author !== undefined && author !== null)
+      .map((author) =>
+        typeof author === 'string'
+          ? author
+          : `${author.name ?? ''}${author.email === undefined ? '' : ` <${author.email}>`}`.trim(),
+      )
+    npm.push({
+      entry,
+      license: manifest.license ?? 'лицензия не указана в манифесте',
+      notice: noticeFrom({ licenseTexts: npmLicenseTexts(dir), authors }),
+      repository:
+        typeof manifest.repository === 'string' ? manifest.repository : (manifest.repository?.url ?? null),
+    })
+  }
+
+  return { rust, npm }
+}
+
+/**
  * @param {Record<string, string[]>} groups
  * @returns {Record<string, string[]>}
  */
@@ -251,14 +359,19 @@ export async function main(argv) {
 
   if (write) {
     await writeFile(SNAPSHOT_PATH, `${JSON.stringify(measured, null, 2)}\n`, 'utf8')
+    const notices = renderNotices(await collectNoticesData(measured))
+    await writeFile(join(REPO_ROOT, NOTICES_DOC), notices, 'utf8')
+
     const rustCount = packagesNamedBy(measured.rust).size
     const npmCount = packagesNamedBy(measured.npm).size
     console.log(`licenses.lock.json переписан: rust ${rustCount} пакетов, npm ${npmCount}.`)
     console.log(`лицензии поставки: ${Object.keys(measured.rust.shipped).join(', ')}`)
+    console.log(`${NOTICES_DOC} пересобран: ${notices.split('\n### ').length - 1} записей.`)
     return 0
   }
 
   const stored = JSON.parse(await readFile(SNAPSHOT_PATH, 'utf8'))
+  const storedNotices = await readFile(join(REPO_ROOT, NOTICES_DOC), 'utf8')
   const problems = []
   if (JSON.stringify(stored.rust) !== JSON.stringify(measured.rust)) {
     problems.push('раздел rust снимка разошёлся с измерением графа')
@@ -266,12 +379,18 @@ export async function main(argv) {
   if (JSON.stringify(stored.npm) !== JSON.stringify(measured.npm)) {
     problems.push('раздел npm снимка разошёлся с измерением')
   }
+  if (storedNotices !== renderNotices(await collectNoticesData(stored))) {
+    problems.push(
+      `${NOTICES_DOC} разошёлся с тем, что собирается из пакетов (правка руками либо устаревший файл)`,
+    )
+  }
   problems.push(
     ...checkSnapshot({
       snapshot: stored,
       cargoLock: await readFile(join(CARGO_DIR, 'Cargo.lock'), 'utf8'),
       npmLock: await readFile(join(REPO_ROOT, 'package-lock.json'), 'utf8'),
       doc: await readFile(join(REPO_ROOT, 'THIRD-PARTY-LICENSES.md'), 'utf8'),
+      notices: storedNotices,
     }),
   )
 
