@@ -107,12 +107,12 @@ function sectionByHeading(wrapper: VueWrapper, heading: string) {
 
 describe('AboutScreen', () => {
   it('shows the app version passed by prop', () => {
-    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report } })
-    expect(wrapper.text()).toContain('0.1.1')
+    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.2', report } })
+    expect(wrapper.text()).toContain('0.1.2')
   })
 
   it('names every distributed component with its licence, ffmpeg naming GPL v3 explicitly — and never LGPL (mutation guard, М1)', () => {
-    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report } })
+    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.2', report } })
     const text = wrapper.text()
 
     expect(text).toContain('ffmpeg')
@@ -139,7 +139,7 @@ describe('AboutScreen', () => {
   })
 
   it('does not present the four named components as the full list, and does not name or generalise the licences of the rest (Б2, tightened by Б3, whitened by Н4) — points to THIRD-PARTY-LICENSES.md instead', () => {
-    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report } })
+    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.2', report } })
     const text = wrapper.text()
 
     expect(text).toContain('THIRD-PARTY-LICENSES.md')
@@ -210,7 +210,7 @@ describe('AboutScreen', () => {
       'expected the file to still admit the transitive-dependency list is obtained locally, not shipped in full',
     ).toMatch(/получить локально/)
 
-    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report } })
+    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.2', report } })
 
     // TL-139 (четвёртый случай того же класса): прежняя версия этого
     // теста читала только секцию «Компоненты и лицензии» — точно тот же
@@ -239,7 +239,7 @@ describe('AboutScreen', () => {
   })
 
   it('gives a plain, retypeable pointer to the ffmpeg sources, and points at files installed next to the app (Б1) — not the private repository', () => {
-    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report } })
+    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.2', report } })
     const text = wrapper.text()
 
     expect(text).toContain('https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.bz2')
@@ -283,7 +283,7 @@ describe('AboutScreen', () => {
   })
 
   it('points at THIRD-PARTY-LICENSES.md/SOURCES-FFMPEG.md with a direct URL to the now-public repository, not a stale access caveat (TL-139, repo opened 2026-09-27)', () => {
-    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report } })
+    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.2', report } })
     const text = wrapper.text()
 
     // Репозиторий кода открыт публично 2026-09-27 (решение владельца) —
@@ -305,7 +305,7 @@ describe('AboutScreen', () => {
   })
 
   it('marks the direct ffmpeg archive link as the macOS build source, and points elsewhere for Windows/Linux (М4)', () => {
-    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report } })
+    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.2', report } })
     const text = wrapper.text()
 
     // М4: неточность SOURCES-FFMPEG.md («один источник на все платформы»)
@@ -318,7 +318,7 @@ describe('AboutScreen', () => {
   })
 
   it('every ffmpeg version named in the licence sections matches the pinned build version (mutation guard, М2)', () => {
-    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report } })
+    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.2', report } })
 
     expect(pin.ffmpeg.version).toMatch(/^\d+\.\d+(\.\d+)?$/)
 
@@ -355,7 +355,7 @@ describe('AboutScreen', () => {
   })
 
   it('reads sidecar versions from the report prop, not from a hardcoded constant (mutation guard)', () => {
-    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report } })
+    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.2', report } })
     expect(wrapper.text()).toContain('2026.08.20')
     expect(wrapper.text()).toContain('9.0.1')
     expect(wrapper.text()).toContain('2.9.6')
@@ -365,7 +365,7 @@ describe('AboutScreen', () => {
       ffmpeg: { ...report.ffmpeg, version: '99.9.9' },
       deno: { ...report.deno, version: '9.9.9' },
     }
-    const changedWrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report: changedReport } })
+    const changedWrapper = mount(AboutScreen, { props: { appVersion: '0.1.2', report: changedReport } })
     const text = changedWrapper.text()
     expect(text).toContain('2099.01.01')
     expect(text).toContain('99.9.9')
@@ -374,7 +374,7 @@ describe('AboutScreen', () => {
   })
 
   it('shows a neutral placeholder while the sidecar report has not arrived yet', () => {
-    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1' } })
+    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.2' } })
     expect(wrapper.text()).toContain('проверяется')
   })
 
@@ -384,7 +384,7 @@ describe('AboutScreen', () => {
       ffmpeg: report.ffmpeg,
       deno: report.deno,
     }
-    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.1', report: failedReport } })
+    const wrapper = mount(AboutScreen, { props: { appVersion: '0.1.2', report: failedReport } })
     expect(wrapper.text()).not.toContain('undefined')
   })
 })

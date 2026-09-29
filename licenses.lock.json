@@ -355,7 +355,7 @@
       ]
     },
     "self": [
-      "tube-leak 0.1.1"
+      "tube-leak 0.1.2"
     ],
     "procMacro": [
       "cssparser-macros 0.6.1",

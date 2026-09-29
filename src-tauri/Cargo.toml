@@ -1,6 +1,6 @@
 [package]
 name = "tube-leak"
-version = "0.1.1"
+version = "0.1.2"
 description = "Кросс-платформенное десктопное приложение для скачивания видео с YouTube"
 edition = "2021"
 # 1.83, а не 1.77: поле и до TL-18 говорило неправду — `Option::is_none_or`

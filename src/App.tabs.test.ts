@@ -237,7 +237,7 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
     // «Главный» показывает ровно то, что показывал бы без вкладок (дизайн,
     // пункт 1): версия и все три строки sidecar видны сразу, как в E1
     // (deno — с TL-111).
-    expect(wrapper.text()).toContain('версия 0.1.1')
+    expect(wrapper.text()).toContain('версия 0.1.2')
     expect(wrapper.text()).toContain('2026.08.20')
     expect(wrapper.text()).toContain('7.1')
     expect(wrapper.text()).toContain('2.9.6')
@@ -327,7 +327,7 @@ describe('App — панель вкладок (TL-92, дизайн E5 «Нави
     // зелёным, даже если бы `App.vue` вовсе не прокинул `:report` в
     // `AboutScreen` (воспроизведено и проверено этим же прогоном при
     // ревью: убрать проп — тест на нескоупленном тексте не заметил бы).
-    expect(aboutPanel.text()).toContain('tube-leak 0.1.1')
+    expect(aboutPanel.text()).toContain('tube-leak 0.1.2')
     expect(aboutPanel.text()).toContain('GPL v3')
     expect(aboutPanel.text()).toContain('2026.08.20')
 

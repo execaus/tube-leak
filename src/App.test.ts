@@ -275,7 +275,7 @@ describe('App — warm start (no prepare events)', () => {
     const wrapper = mount(App)
     await flushPromises()
 
-    expect(wrapper.text()).toContain('версия 0.1.1')
+    expect(wrapper.text()).toContain('версия 0.1.2')
     expect(wrapper.text()).toContain('2026.08.20')
     expect(wrapper.text()).toContain('7.1')
     expect(wrapper.text()).toContain('2.9.6')
@@ -305,7 +305,7 @@ describe('App — first-run preparation (unpacking → warmingUp → ready)', ()
     // До первого события — не пустое окно: версия и все три строки sidecar
     // видны сразу (Ф-9/Н-6), check_sidecar при этом ещё не вызван (см.
     // блок «order of calls»).
-    expect(wrapper.text()).toContain('версия 0.1.1')
+    expect(wrapper.text()).toContain('версия 0.1.2')
     expect(wrapper.text().match(/Проверяем…/g)).toHaveLength(3)
 
     capturedHandler?.({ payload: { stage: 'unpacking', percent: 4, etaSecs: 1 } })
@@ -314,7 +314,7 @@ describe('App — first-run preparation (unpacking → warmingUp → ready)', ()
     expect(wrapper.text()).toContain('4%')
     // Версия остаётся видимой даже во время экрана подготовки (ревью TL-17,
     // #18, «Версия приложения — всегда в шапке»).
-    expect(wrapper.text()).toContain('версия 0.1.1')
+    expect(wrapper.text()).toContain('версия 0.1.2')
 
     capturedHandler?.({ payload: { stage: 'warmingUp', percent: 60, etaSecs: 14 } })
     await wrapper.vm.$nextTick()
@@ -331,14 +331,14 @@ describe('App — first-run preparation (unpacking → warmingUp → ready)', ()
     // Версия по-прежнему видна — и на экране подготовки её не прячут
     // (ревью TL-17, #18), и заодно не мигает служебным экраном раньше
     // времени из-за события `ready`, пришедшего раньше промиса.
-    expect(wrapper.text()).toContain('версия 0.1.1')
+    expect(wrapper.text()).toContain('версия 0.1.2')
 
     resolvePrepare(preparedCold)
     await flushPromises()
 
     expect(wrapper.text()).not.toContain('Распаковываем')
     expect(wrapper.text()).not.toContain('Готовим yt-dlp')
-    expect(wrapper.text()).toContain('версия 0.1.1')
+    expect(wrapper.text()).toContain('версия 0.1.2')
     expect(wrapper.text()).toContain('2026.08.20')
   })
 
@@ -402,7 +402,7 @@ describe('App — preparation failure', () => {
     await flushPromises()
 
     expect(wrapper.text()).not.toContain('Не удалось подготовить yt-dlp')
-    expect(wrapper.text()).toContain('версия 0.1.1')
+    expect(wrapper.text()).toContain('версия 0.1.2')
     expect(wrapper.text()).toContain('2026.08.20')
   })
 
