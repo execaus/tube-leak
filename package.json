@@ -13,7 +13,8 @@
     "lint": "eslint .",
     "tauri": "tauri",
     "fetch-binaries": "node scripts/fetch-binaries/index.mjs",
-    "check-pins": "node scripts/check-pins/index.mjs"
+    "check-pins": "node scripts/check-pins/index.mjs",
+    "check-licenses": "node scripts/check-licenses/index.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

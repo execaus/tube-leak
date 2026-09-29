@@ -1924,21 +1924,1015 @@ npm-часть плагина, `@tauri-apps/plugin-dialog` 2.7.3 (MIT OR Apache-
 
 ## Прочие зависимости (Rust-крейты и npm-пакеты)
 
-Остальной код приложения (Rust-крейты `tauri`, `serde`, `thiserror`,
-`tokio` и npm-пакеты `vue`, `pinia`, `@tauri-apps/api`,
-`@tauri-apps/plugin-dialog` (MIT OR Apache-2.0) и их
-транзитивные зависимости — см. `src-tauri/Cargo.toml` и
-`package.json`) распространяются под пермиссивными лицензиями
-(преимущественно MIT и/или Apache-2.0), которые не требуют включения
-полного текста лицензии в этот файл сверх стандартного указания
-авторства в самих пакетах. Полный список транзитивных зависимостей со
-своими лицензиями можно получить локально:
+Остальной код приложения — Rust-крейты (`tauri`, `serde`, `thiserror`,
+`tokio` и их транзитивные зависимости) и npm-пакеты (`vue`, `pinia`,
+`@tauri-apps/api`, `@tauri-apps/plugin-dialog`) — разобран по лицензиям
+в разделах ниже, по одному разделу на лицензию.
+
+**Прежняя формулировка этого раздела была неправдой, и это измерено
+(TL-136, #143).** Здесь стояло, что прочие зависимости
+«распространяются под пермиссивными лицензиями (преимущественно MIT
+и/или Apache-2.0)». В релизном графе нашлись **MPL-2.0** — слабый
+copyleft, а не пермиссивная лицензия, — а также `Apache-2.0 AND ISC`
+у `ring`, **CDLA-Permissive-2.0** у `webpki-roots`, **Unicode-3.0**,
+**Zlib** и **BSD**. Ни одна из них здесь названа не была, хотя этот же
+раздел требовал заводить отдельный раздел на всё «с более строгими
+условиями»: файл нарушал собственное правило.
+
+Поимённый список пакетов с лицензиями лежит в `licenses.lock.json` в
+корне репозитория. Тот же список можно получить локально:
 
 ```bash
-cd src-tauri && cargo tree --format "{p} {l}" 2>/dev/null
-npm ls --all
+cd src-tauri && cargo tree -e normal --format "{p} {l}"
+npm ls --omit=dev --all
 ```
 
-Если в будущем в дистрибутив попадёт зависимость с более строгими
-условиями (GPL/LGPL/AGPL или требующая явного NOTICE) — она должна быть
-добавлена в этот файл отдельным разделом до релиза.
+**Чего в этом файле по-прежнему нет.** Уведомлений об авторских правах
+для каждого MIT-пакета по отдельности: правообладатели у них разные,
+уведомление каждого лежит в самом пакете, а текст лицензии приведён
+здесь один раз. Это признанный предел файла, а не упущение, о котором
+он молчит.
+
+Новая зависимость с лицензией, у которой нет раздела ниже, доехать до
+поставки молча не может: набор лицензий релизного графа сверяется с
+перечнем разделов на каждом прогоне (`scripts/check-licenses/`).
+
+### Как снят состав
+
+Разделы ниже перечисляют лицензии **библиотек нашего собственного
+исполняемого файла** — Rust-крейтов, статически влинкованных в
+`tube-leak`, и npm-пакетов, попадающих в бандл фронтенда. Sidecar
+(ffmpeg, yt-dlp, deno) к ним не относятся: они поставляются отдельными
+файлами и описаны выше.
+
+Состав снят по **всем четырём** целевым тройкам, а не по одной.
+
+- Rust: `cargo tree --locked -e normal --target <тройка>` по каждой из
+  четырёх целевых троек — `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`.
+  Рёбра только обычных зависимостей: dev-зависимостей в релизе нет вовсе,
+  build-зависимости исполняются на сборке и в бинарник не попадают.
+  Мерить одну тройку нельзя: наборы у них разные (`windows-*`, `gtk-*`,
+  `objc2-*`), и расхождение по таргетам уже пряталось от нас однажды.
+- Лицензия каждого пакета взята из его метаданных
+  (`cargo metadata`, поле `license`), а не из общего знания.
+- npm: production-замыкание `package-lock.json` плюс поле `license`
+  каждого пакета. Это **надмножество**: Vite кладёт в бандл только
+  импортированное, а замыкание содержит и то, что оказалось
+  невостребованным. Для лицензий это безопасная сторона ошибки —
+  разделов получается больше, чем строго требуется.
+
+Измеренный результат записан в `licenses.lock.json` в корне
+репозитория и охраняется: у каждой лицензии из ведра `shipped` обязан
+быть раздел ниже, а каждый пакет `Cargo.lock` и `package-lock.json`
+обязан быть назван снимком. Новая зависимость с новой лицензией не может
+доехать до поставки, не покрасив прогон — см.
+`scripts/check-licenses/`. Перемер: `npm run check-licenses -- --write`.
+
+**Где выбор сделали мы.** Значительная часть пакетов предлагается «на
+выбор» (`MIT OR Apache-2.0` и подобное). Из таких дизъюнкций мы берём
+MIT, а если его не предложено — Apache-2.0; правило записано в
+`scripts/check-licenses/spdx.mjs`, чтобы выбор документа и выбор сторожа
+не разошлись. Там, где в выражении стоит `AND` (`Apache-2.0 AND ISC` у
+`ring`, `BSD-3-Clause AND MIT` у `brotli`), выбора нет: выполняются оба
+условия, и оба названы ниже.
+
+## MIT
+
+Под MIT распространяется большая часть графа: **266 Rust-крейтов**
+и **30 npm-пакетов** (включая `vue`, `pinia`, `tokio`,
+`rusqlite`, `rfd`). Полный поимённый список — в `licenses.lock.json`,
+раздел `shipped.MIT`.
+
+MIT требует, чтобы вместе с программой распространялись уведомление об
+авторских правах и текст разрешения. Владельцы прав у этих пакетов
+**разные** — единого уведомления на всех не существует, и приводить
+здесь 296 копий одного текста с разными строками Copyright
+бессмысленно. Уведомление каждого пакета лежит в самом пакете (файл
+`LICENSE` в его исходниках); как получить их локально — сказано в
+разделе «Прочие зависимости».
+
+Текст лицензии одинаков у всех; ниже он приведён в том виде, в каком его
+публикует `vue` — один из пакетов, которые физически едут в бандл.
+
+```
+The MIT License (MIT)
+
+Copyright (c) 2018-present, Yuxi (Evan) You
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+## Apache-2.0
+
+Под Apache-2.0 едут 4 крейта — `dpi 0.1.2`, `dunce 1.0.5`, `ring 0.17.14`, `tao 0.35.3`:
+
+- `tao` — оконный слой Tauri, у него Apache-2.0 и без вариантов;
+- `ring` — лицензия `Apache-2.0 AND ISC`, это `AND`, поэтому крейт
+  назван и здесь, и в разделе ISC;
+- `dpi` — лицензия `Apache-2.0 AND MIT`, тот же случай, назван и в
+  разделе MIT;
+- `dunce` — лицензия `CC0-1.0 OR MIT-0 OR Apache-2.0`; MIT здесь **не**
+  предложен (`MIT-0` — другая лицензия, без требования об указании
+  авторства), поэтому по нашему правилу выбран Apache-2.0.
+
+Остальные пакеты, предлагающие Apache-2.0 **на выбор** с MIT, учтены как
+MIT — см. правило выбора выше. Полный список — `licenses.lock.json`,
+раздел `shipped.Apache-2.0`.
+
+**Полный текст Apache License 2.0 уже приведён в этом файле** — в
+разделе «TypeScript 6.0.3 — Apache-2.0» выше. Второй копии здесь нет
+намеренно: текст лицензии один и тот же, а дублирование только
+увеличивает шанс, что две копии разойдутся.
+
+**Про NOTICE (§4(d)).** Apache-2.0 требует воспроизводить файл `NOTICE`,
+**если он есть в распространяемой работе**. Проверено в исходниках
+пакета: у `ring` файла `NOTICE` нет (в корне лежат `LICENSE`,
+`LICENSE-BoringSSL`, `LICENSE-other-bits`; поиск `find … -iname
+'NOTICE*'` пуст), у `tao` и `dpi` — тоже. Требование §4(d) к нам,
+таким образом, не возникает. Это результат осмотра, а не предположение
+по типу лицензии.
+
+## ISC
+
+Под ISC едут 3 Rust-крейта — `ring 0.17.14`, `rustls-webpki 0.103.15`, `untrusted 0.9.0` — и npm-пакет
+`picocolors 1.1.1`.
+
+Сюда же относится **вторая половина `ring`**: его лицензия записана как
+`Apache-2.0 AND ISC` — это `AND`, а не выбор, поэтому выполняются оба
+условия сразу. `ring` — часть контура TLS (`ureq` → `rustls`), которым
+приложение ходит за обновлениями.
+
+ISC требует сохранять уведомление об авторских правах и текст
+разрешения. Владельцы прав здесь разные, поэтому уведомления приведены
+по отдельности.
+
+### untrusted, rustls-webpki, ring (ISC-часть)
+
+Текст `untrusted`:
+
+```
+// Copyright 2015-2016 Brian Smith.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHORS DISCLAIM ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR
+// ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+// ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+// OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+```
+
+Текст `rustls-webpki`:
+
+```
+Except as otherwise noted, this project is licensed under the following
+(ISC-style) terms:
+
+Copyright 2015 Brian Smith.
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHORS DISCLAIM ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+The files under third-party/chromium are licensed as described in
+third-party/chromium/LICENSE.
+```
+
+ISC-часть `ring` (файл `LICENSE-other-bits` пакета):
+
+```
+Copyright 2015-2025 Brian Smith.
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+```
+
+Собственный файл `LICENSE` пакета `ring` объясняет, какая часть кода под
+какой лицензией:
+
+```
+*ring* uses an "ISC" license, like BoringSSL used to use, for new code
+files. See LICENSE-other-bits for the text of that license.
+
+See LICENSE-BoringSSL for code that was sourced from BoringSSL under the
+Apache 2.0 license. Some code that was sourced from BoringSSL under the ISC
+license. In each case, the license info is at the top of the file.
+
+See src/polyfill/once_cell/LICENSE-APACHE and src/polyfill/once_cell/LICENSE-MIT
+for the license to code that was sourced from the once_cell project.
+```
+
+### picocolors (npm)
+
+```
+ISC License
+
+Copyright (c) 2021-2024 Oleksii Raspopov, Kostiantyn Denysov, Anton Verinov
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+```
+
+## BSD-2-Clause
+
+Под BSD-2-Clause едет npm-пакет `entities 7.0.1` (разбор
+HTML-сущностей, приходит через компилятор шаблонов Vue).
+
+```
+Copyright (c) Felix Böhm
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+THIS IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS,
+EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## BSD-3-Clause
+
+Под BSD-3-Clause едут 4 Rust-крейта — `alloc-no-stdlib 2.0.4`, `alloc-stdlib 0.2.4`, `brotli 8.0.4`, `subtle 2.6.1` —
+и npm-пакет `source-map-js 1.2.1`.
+
+У `brotli` лицензия записана как `BSD-3-Clause AND MIT`: выполняются оба
+условия, поэтому он назван и здесь, и в разделе MIT.
+
+Третий пункт BSD-3-Clause запрещает использовать имена правообладателей
+для продвижения производных продуктов; мы их и не используем.
+
+### subtle
+
+```
+Copyright (c) 2016-2017 Isis Agora Lovecruft, Henry de Valence. All rights reserved.
+Copyright (c) 2016-2024 Isis Agora Lovecruft. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+1. Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### alloc-no-stdlib, alloc-stdlib, brotli (BSD-часть)
+
+Один и тот же текст и правообладатель у всех трёх:
+
+```
+Copyright (c) 2016 Dropbox, Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+MIT-часть `brotli`:
+
+```
+Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+### source-map-js (npm)
+
+```
+
+Copyright (c) 2009-2011, Mozilla Foundation and contributors
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the names of the Mozilla Foundation nor the names of project
+  contributors may be used to endorse or promote products derived from this
+  software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## MPL-2.0
+
+**Единственная лицензия в поставке, которая не является пермиссивной.**
+MPL-2.0 — слабый copyleft: она оставляет наш собственный код под нашими
+условиями, но накладывает обязательство на сами файлы, покрытые ею.
+
+Под MPL-2.0 в поставку едут 4 Rust-крейта:
+
+- `cssparser 0.36.0`;
+- `dtoa-short 0.3.5`;
+- `option-ext 0.2.0`;
+- `selectors 0.36.1`;
+
+Все четыре присутствуют **во всех четырёх целевых тройках** — это не
+платформенная особенность. Приходят они транзитивно: `cssparser`,
+`selectors` и `dtoa-short` — через `dom_query` (разбор HTML в
+`tauri-utils`/`wry`), `option-ext` — через `dirs-sys` → `dirs`
+(поиск системных каталогов).
+
+Пятый крейт того же семейства, `cssparser-macros 0.6.1`, тоже под
+MPL-2.0, но в поставку **не входит**: это процедурный макрос, его
+исполняет компилятор, и в исполняемый файл он не попадает. Названо здесь
+намеренно — чтобы разница между «под MPL-2.0 в графе» и «под MPL-2.0 в
+поставке» была видна, а не выглядела пропажей. Признак proc-macro взят
+из метаданных пакета, а не из его имени.
+
+**Обязательство §3.2 и как оно выполнено.** MPL требует, чтобы
+получателю исполняемого файла был доступен исходный код файлов,
+покрытых лицензией (Source Code Form), — в том числе всех внесённых в
+них изменений. **Мы эти крейты не изменяли**: они берутся с crates.io
+в том виде, в каком их опубликовал автор, версии зафиксированы в
+`src-tauri/Cargo.lock`, никаких патчей, `[patch]`-секций или
+вендоринга в репозитории нет. Поэтому исходный код, соответствующий
+нашей сборке, — это в точности опубликованные апстримом архивы:
+
+- `cssparser 0.36.0` — https://crates.io/crates/cssparser/0.36.0 (вкладка Source / `cargo vendor`);
+- `dtoa-short 0.3.5` — https://crates.io/crates/dtoa-short/0.3.5 (вкладка Source / `cargo vendor`);
+- `option-ext 0.2.0` — https://crates.io/crates/option-ext/0.2.0 (вкладка Source / `cargo vendor`);
+- `selectors 0.36.1` — https://crates.io/crates/selectors/0.36.1 (вкладка Source / `cargo vendor`);
+
+Каждый из этих адресов отдаёт ровно ту версию, которая влинкована в наш
+бинарник; сверить можно по контрольным суммам в `src-tauri/Cargo.lock`.
+
+**§3.3 (сборка с кодом под другой лицензией) выполняется тем же
+устройством:** MPL прямо разрешает распространять исполняемый файл,
+собранный из MPL-кода вместе с кодом под другими условиями, если условия
+самой MPL для покрытых файлов соблюдены — что и сделано выше.
+
+### Полный текст Mozilla Public License 2.0
+
+Текст одинаков у всех пяти крейтов (сверено: файлы `LICENSE` пакетов
+совпадают). Приведён в том виде, в каком его публикует `cssparser`.
+
+```
+Mozilla Public License Version 2.0
+==================================
+
+1. Definitions
+--------------
+
+1.1. "Contributor"
+    means each individual or legal entity that creates, contributes to
+    the creation of, or owns Covered Software.
+
+1.2. "Contributor Version"
+    means the combination of the Contributions of others (if any) used
+    by a Contributor and that particular Contributor's Contribution.
+
+1.3. "Contribution"
+    means Covered Software of a particular Contributor.
+
+1.4. "Covered Software"
+    means Source Code Form to which the initial Contributor has attached
+    the notice in Exhibit A, the Executable Form of such Source Code
+    Form, and Modifications of such Source Code Form, in each case
+    including portions thereof.
+
+1.5. "Incompatible With Secondary Licenses"
+    means
+
+    (a) that the initial Contributor has attached the notice described
+        in Exhibit B to the Covered Software; or
+
+    (b) that the Covered Software was made available under the terms of
+        version 1.1 or earlier of the License, but not also under the
+        terms of a Secondary License.
+
+1.6. "Executable Form"
+    means any form of the work other than Source Code Form.
+
+1.7. "Larger Work"
+    means a work that combines Covered Software with other material, in 
+    a separate file or files, that is not Covered Software.
+
+1.8. "License"
+    means this document.
+
+1.9. "Licensable"
+    means having the right to grant, to the maximum extent possible,
+    whether at the time of the initial grant or subsequently, any and
+    all of the rights conveyed by this License.
+
+1.10. "Modifications"
+    means any of the following:
+
+    (a) any file in Source Code Form that results from an addition to,
+        deletion from, or modification of the contents of Covered
+        Software; or
+
+    (b) any new file in Source Code Form that contains any Covered
+        Software.
+
+1.11. "Patent Claims" of a Contributor
+    means any patent claim(s), including without limitation, method,
+    process, and apparatus claims, in any patent Licensable by such
+    Contributor that would be infringed, but for the grant of the
+    License, by the making, using, selling, offering for sale, having
+    made, import, or transfer of either its Contributions or its
+    Contributor Version.
+
+1.12. "Secondary License"
+    means either the GNU General Public License, Version 2.0, the GNU
+    Lesser General Public License, Version 2.1, the GNU Affero General
+    Public License, Version 3.0, or any later versions of those
+    licenses.
+
+1.13. "Source Code Form"
+    means the form of the work preferred for making modifications.
+
+1.14. "You" (or "Your")
+    means an individual or a legal entity exercising rights under this
+    License. For legal entities, "You" includes any entity that
+    controls, is controlled by, or is under common control with You. For
+    purposes of this definition, "control" means (a) the power, direct
+    or indirect, to cause the direction or management of such entity,
+    whether by contract or otherwise, or (b) ownership of more than
+    fifty percent (50%) of the outstanding shares or beneficial
+    ownership of such entity.
+
+2. License Grants and Conditions
+--------------------------------
+
+2.1. Grants
+
+Each Contributor hereby grants You a world-wide, royalty-free,
+non-exclusive license:
+
+(a) under intellectual property rights (other than patent or trademark)
+    Licensable by such Contributor to use, reproduce, make available,
+    modify, display, perform, distribute, and otherwise exploit its
+    Contributions, either on an unmodified basis, with Modifications, or
+    as part of a Larger Work; and
+
+(b) under Patent Claims of such Contributor to make, use, sell, offer
+    for sale, have made, import, and otherwise transfer either its
+    Contributions or its Contributor Version.
+
+2.2. Effective Date
+
+The licenses granted in Section 2.1 with respect to any Contribution
+become effective for each Contribution on the date the Contributor first
+distributes such Contribution.
+
+2.3. Limitations on Grant Scope
+
+The licenses granted in this Section 2 are the only rights granted under
+this License. No additional rights or licenses will be implied from the
+distribution or licensing of Covered Software under this License.
+Notwithstanding Section 2.1(b) above, no patent license is granted by a
+Contributor:
+
+(a) for any code that a Contributor has removed from Covered Software;
+    or
+
+(b) for infringements caused by: (i) Your and any other third party's
+    modifications of Covered Software, or (ii) the combination of its
+    Contributions with other software (except as part of its Contributor
+    Version); or
+
+(c) under Patent Claims infringed by Covered Software in the absence of
+    its Contributions.
+
+This License does not grant any rights in the trademarks, service marks,
+or logos of any Contributor (except as may be necessary to comply with
+the notice requirements in Section 3.4).
+
+2.4. Subsequent Licenses
+
+No Contributor makes additional grants as a result of Your choice to
+distribute the Covered Software under a subsequent version of this
+License (see Section 10.2) or under the terms of a Secondary License (if
+permitted under the terms of Section 3.3).
+
+2.5. Representation
+
+Each Contributor represents that the Contributor believes its
+Contributions are its original creation(s) or it has sufficient rights
+to grant the rights to its Contributions conveyed by this License.
+
+2.6. Fair Use
+
+This License is not intended to limit any rights You have under
+applicable copyright doctrines of fair use, fair dealing, or other
+equivalents.
+
+2.7. Conditions
+
+Sections 3.1, 3.2, 3.3, and 3.4 are conditions of the licenses granted
+in Section 2.1.
+
+3. Responsibilities
+-------------------
+
+3.1. Distribution of Source Form
+
+All distribution of Covered Software in Source Code Form, including any
+Modifications that You create or to which You contribute, must be under
+the terms of this License. You must inform recipients that the Source
+Code Form of the Covered Software is governed by the terms of this
+License, and how they can obtain a copy of this License. You may not
+attempt to alter or restrict the recipients' rights in the Source Code
+Form.
+
+3.2. Distribution of Executable Form
+
+If You distribute Covered Software in Executable Form then:
+
+(a) such Covered Software must also be made available in Source Code
+    Form, as described in Section 3.1, and You must inform recipients of
+    the Executable Form how they can obtain a copy of such Source Code
+    Form by reasonable means in a timely manner, at a charge no more
+    than the cost of distribution to the recipient; and
+
+(b) You may distribute such Executable Form under the terms of this
+    License, or sublicense it under different terms, provided that the
+    license for the Executable Form does not attempt to limit or alter
+    the recipients' rights in the Source Code Form under this License.
+
+3.3. Distribution of a Larger Work
+
+You may create and distribute a Larger Work under terms of Your choice,
+provided that You also comply with the requirements of this License for
+the Covered Software. If the Larger Work is a combination of Covered
+Software with a work governed by one or more Secondary Licenses, and the
+Covered Software is not Incompatible With Secondary Licenses, this
+License permits You to additionally distribute such Covered Software
+under the terms of such Secondary License(s), so that the recipient of
+the Larger Work may, at their option, further distribute the Covered
+Software under the terms of either this License or such Secondary
+License(s).
+
+3.4. Notices
+
+You may not remove or alter the substance of any license notices
+(including copyright notices, patent notices, disclaimers of warranty,
+or limitations of liability) contained within the Source Code Form of
+the Covered Software, except that You may alter any license notices to
+the extent required to remedy known factual inaccuracies.
+
+3.5. Application of Additional Terms
+
+You may choose to offer, and to charge a fee for, warranty, support,
+indemnity or liability obligations to one or more recipients of Covered
+Software. However, You may do so only on Your own behalf, and not on
+behalf of any Contributor. You must make it absolutely clear that any
+such warranty, support, indemnity, or liability obligation is offered by
+You alone, and You hereby agree to indemnify every Contributor for any
+liability incurred by such Contributor as a result of warranty, support,
+indemnity or liability terms You offer. You may include additional
+disclaimers of warranty and limitations of liability specific to any
+jurisdiction.
+
+4. Inability to Comply Due to Statute or Regulation
+---------------------------------------------------
+
+If it is impossible for You to comply with any of the terms of this
+License with respect to some or all of the Covered Software due to
+statute, judicial order, or regulation then You must: (a) comply with
+the terms of this License to the maximum extent possible; and (b)
+describe the limitations and the code they affect. Such description must
+be placed in a text file included with all distributions of the Covered
+Software under this License. Except to the extent prohibited by statute
+or regulation, such description must be sufficiently detailed for a
+recipient of ordinary skill to be able to understand it.
+
+5. Termination
+--------------
+
+5.1. The rights granted under this License will terminate automatically
+if You fail to comply with any of its terms. However, if You become
+compliant, then the rights granted under this License from a particular
+Contributor are reinstated (a) provisionally, unless and until such
+Contributor explicitly and finally terminates Your grants, and (b) on an
+ongoing basis, if such Contributor fails to notify You of the
+non-compliance by some reasonable means prior to 60 days after You have
+come back into compliance. Moreover, Your grants from a particular
+Contributor are reinstated on an ongoing basis if such Contributor
+notifies You of the non-compliance by some reasonable means, this is the
+first time You have received notice of non-compliance with this License
+from such Contributor, and You become compliant prior to 30 days after
+Your receipt of the notice.
+
+5.2. If You initiate litigation against any entity by asserting a patent
+infringement claim (excluding declaratory judgment actions,
+counter-claims, and cross-claims) alleging that a Contributor Version
+directly or indirectly infringes any patent, then the rights granted to
+You by any and all Contributors for the Covered Software under Section
+2.1 of this License shall terminate.
+
+5.3. In the event of termination under Sections 5.1 or 5.2 above, all
+end user license agreements (excluding distributors and resellers) which
+have been validly granted by You or Your distributors under this License
+prior to termination shall survive termination.
+
+************************************************************************
+*                                                                      *
+*  6. Disclaimer of Warranty                                           *
+*  -------------------------                                           *
+*                                                                      *
+*  Covered Software is provided under this License on an "as is"       *
+*  basis, without warranty of any kind, either expressed, implied, or  *
+*  statutory, including, without limitation, warranties that the       *
+*  Covered Software is free of defects, merchantable, fit for a        *
+*  particular purpose or non-infringing. The entire risk as to the     *
+*  quality and performance of the Covered Software is with You.        *
+*  Should any Covered Software prove defective in any respect, You     *
+*  (not any Contributor) assume the cost of any necessary servicing,   *
+*  repair, or correction. This disclaimer of warranty constitutes an   *
+*  essential part of this License. No use of any Covered Software is   *
+*  authorized under this License except under this disclaimer.         *
+*                                                                      *
+************************************************************************
+
+************************************************************************
+*                                                                      *
+*  7. Limitation of Liability                                          *
+*  --------------------------                                          *
+*                                                                      *
+*  Under no circumstances and under no legal theory, whether tort      *
+*  (including negligence), contract, or otherwise, shall any           *
+*  Contributor, or anyone who distributes Covered Software as          *
+*  permitted above, be liable to You for any direct, indirect,         *
+*  special, incidental, or consequential damages of any character      *
+*  including, without limitation, damages for lost profits, loss of    *
+*  goodwill, work stoppage, computer failure or malfunction, or any    *
+*  and all other commercial damages or losses, even if such party      *
+*  shall have been informed of the possibility of such damages. This   *
+*  limitation of liability shall not apply to liability for death or   *
+*  personal injury resulting from such party's negligence to the       *
+*  extent applicable law prohibits such limitation. Some               *
+*  jurisdictions do not allow the exclusion or limitation of           *
+*  incidental or consequential damages, so this exclusion and          *
+*  limitation may not apply to You.                                    *
+*                                                                      *
+************************************************************************
+
+8. Litigation
+-------------
+
+Any litigation relating to this License may be brought only in the
+courts of a jurisdiction where the defendant maintains its principal
+place of business and such litigation shall be governed by laws of that
+jurisdiction, without reference to its conflict-of-law provisions.
+Nothing in this Section shall prevent a party's ability to bring
+cross-claims or counter-claims.
+
+9. Miscellaneous
+----------------
+
+This License represents the complete agreement concerning the subject
+matter hereof. If any provision of this License is held to be
+unenforceable, such provision shall be reformed only to the extent
+necessary to make it enforceable. Any law or regulation which provides
+that the language of a contract shall be construed against the drafter
+shall not be used to construe this License against a Contributor.
+
+10. Versions of the License
+---------------------------
+
+10.1. New Versions
+
+Mozilla Foundation is the license steward. Except as provided in Section
+10.3, no one other than the license steward has the right to modify or
+publish new versions of this License. Each version will be given a
+distinguishing version number.
+
+10.2. Effect of New Versions
+
+You may distribute the Covered Software under the terms of the version
+of the License under which You originally received the Covered Software,
+or under the terms of any subsequent version published by the license
+steward.
+
+10.3. Modified Versions
+
+If you create software not governed by this License, and you want to
+create a new license for such software, you may create and use a
+modified version of this License if you rename the license and remove
+any references to the name of the license steward (except to note that
+such modified license differs from this License).
+
+10.4. Distributing Source Code Form that is Incompatible With Secondary
+Licenses
+
+If You choose to distribute Source Code Form that is Incompatible With
+Secondary Licenses under the terms of this version of the License, the
+notice described in Exhibit B of this License must be attached.
+
+Exhibit A - Source Code Form License Notice
+-------------------------------------------
+
+  This Source Code Form is subject to the terms of the Mozilla Public
+  License, v. 2.0. If a copy of the MPL was not distributed with this
+  file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+If it is not possible or desirable to put the notice in a particular
+file, then You may include the notice in a location (such as a LICENSE
+file in a relevant directory) where a recipient would be likely to look
+for such a notice.
+
+You may add additional accurate notices of copyright ownership.
+
+Exhibit B - "Incompatible With Secondary Licenses" Notice
+---------------------------------------------------------
+
+  This Source Code Form is "Incompatible With Secondary Licenses", as
+  defined by the Mozilla Public License, v. 2.0.
+```
+
+## CDLA-Permissive-2.0
+
+Под Community Data License Agreement — Permissive 2.0 едет
+`webpki-roots 1.0.9` — набор корневых сертификатов
+удостоверяющих центров, которым `rustls` проверяет TLS-соединение
+контура обновления.
+
+Это лицензия на **данные**, а не на код, и требование у неё одно
+(п. 2.1): распространяя данные, нужно сделать доступным текст самого
+соглашения. Он приведён целиком ниже. Данные мы не изменяли.
+
+### Полный текст CDLA-Permissive-2.0
+
+```
+# Community Data License Agreement - Permissive - Version 2.0
+
+This is the Community Data License Agreement - Permissive, Version
+2.0 (the "agreement"). Data Provider(s) and Data Recipient(s) agree
+as follows:
+
+## 1. Provision of the Data
+
+1.1. A Data Recipient may use, modify, and share the Data made
+available by Data Provider(s) under this agreement if that Data
+Recipient follows the terms of this agreement.
+
+1.2. This agreement does not impose any restriction on a Data
+Recipient's use, modification, or sharing of any portions of the
+Data that are in the public domain or that may be used, modified,
+or shared under any other legal exception or limitation.
+
+## 2. Conditions for Sharing Data
+
+2.1. A Data Recipient may share Data, with or without modifications, so
+long as the Data Recipient makes available the text of this agreement
+with the shared Data.
+
+## 3. No Restrictions on Results
+
+3.1. This agreement does not impose any restriction or obligations
+with respect to the use, modification, or sharing of Results.
+
+## 4. No Warranty; Limitation of Liability
+
+4.1. All Data Recipients receive the Data subject to the following
+terms:
+
+THE DATA IS PROVIDED ON AN "AS IS" BASIS, WITHOUT REPRESENTATIONS,
+WARRANTIES OR CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED
+INCLUDING, WITHOUT LIMITATION, ANY WARRANTIES OR CONDITIONS OF TITLE,
+NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+
+NO DATA PROVIDER SHALL HAVE ANY LIABILITY FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING
+WITHOUT LIMITATION LOST PROFITS), HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE DATA OR RESULTS,
+EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+## 5. Definitions
+
+5.1. "Data" means the material received by a Data Recipient under
+this agreement.
+
+5.2. "Data Provider" means any person who is the source of Data
+provided under this agreement and in reliance on a Data Recipient's
+agreement to its terms.
+
+5.3. "Data Recipient" means any person who receives Data directly
+or indirectly from a Data Provider and agrees to the terms of this
+agreement.
+
+5.4. "Results" means any outcome obtained by computational analysis
+of Data, including for example machine learning models and models'
+insights.
+```
+
+## Unicode-3.0
+
+Под Unicode License v3 в поставку едут 16 крейтов семейства ICU4X
+(`icu_*`, `zerovec`, `yoke`, `tinystr`, `litemap`, `writeable`,
+`potential_utf`, `zerotrie`, `zerofrom`) — они приходят через `idna`
+← `url` и отвечают за разбор интернационализованных доменных имён.
+
+Сюда же относится вторая половина `unicode-ident 1.0.24`, чья лицензия
+записана как `(MIT OR Apache-2.0) AND Unicode-3.0`: часть с `AND`
+обязательна независимо от того, что выбрано в скобках, поэтому этот
+крейт назван и здесь, и в разделе MIT. Разбор «по первому OR» потерял бы
+это условие целиком.
+
+Ещё три крейта того же семейства — `yoke-derive`, `zerofrom-derive`,
+`zerovec-derive` — тоже под Unicode-3.0, но в поставку не входят:
+процедурные макросы исполняет компилятор.
+
+Полный список — `licenses.lock.json`, раздел `shipped.Unicode-3.0`.
+
+**Это не тот же файл, что у ICU 77.1 внутри deno** (раздел «ICU 77.1 —
+Unicode License v3» выше): там лицензия ICU4C с собственным перечнем
+сторонних уведомлений, здесь — ICU4X, другой проект и другая строка
+Copyright. Поэтому текст приведён отдельно, а не ссылкой на тот раздел.
+
+### Полный текст Unicode License v3 (в редакции пакетов ICU4X)
+
+Тексты у всех 16 крейтов совпадают; приведён файл `LICENSE`
+пакета `zerovec`.
+
+```
+UNICODE LICENSE V3
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright © 2020-2024 Unicode, Inc.
+
+NOTICE TO USER: Carefully read the following legal agreement. BY
+DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of data files and any associated documentation (the "Data Files") or
+software and any associated documentation (the "Software") to deal in the
+Data Files or Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, and/or sell
+copies of the Data Files or Software, and to permit persons to whom the
+Data Files or Software are furnished to do so, provided that either (a)
+this copyright and permission notice appear with all copies of the Data
+Files or Software, or (b) this copyright and permission notice appear in
+associated Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+THIRD PARTY RIGHTS.
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+FILES OR SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall
+not be used in advertising or otherwise to promote the sale, use or other
+dealings in these Data Files or Software without prior written
+authorization of the copyright holder.
+
+SPDX-License-Identifier: Unicode-3.0
+
+—
+
+Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
+```
+
+## Zlib
+
+Под лицензией zlib едет `foldhash 0.2.0` — хеш-функция, которую
+использует `hashbrown` (реализация словарей в стандартной библиотеке
+и в графе Tauri).
+
+Лицензия zlib пермиссивная; из трёх её условий к нам относится
+третье — уведомление нельзя удалять, что и выполняется приведением его
+здесь. Исходный код мы не изменяли, поэтому второе условие («изменённые
+версии должны быть помечены») не возникает.
+
+```
+Copyright (c) 2024 Orson Peters
+
+This software is provided 'as-is', without any express or implied warranty. In
+no event will the authors be held liable for any damages arising from the use of
+this software.
+
+Permission is granted to anyone to use this software for any purpose, including
+commercial applications, and to alter it and redistribute it freely, subject to
+the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not claim
+    that you wrote the original software. If you use this software in a product,
+    an acknowledgment in the product documentation would be appreciated but is
+    not required.
+
+2. Altered source versions must be plainly marked as such, and must not be
+    misrepresented as being the original software.
+
+3. This notice may not be removed or altered from any source distribution.
+```
+
