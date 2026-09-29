@@ -31,6 +31,7 @@
     ],
     "resources": [
       "../THIRD-PARTY-LICENSES.md",
+      "../NOTICES.md",
       "../SOURCES-FFMPEG.md",
       "../README.md",
       "resources/yt-dlp.zip"

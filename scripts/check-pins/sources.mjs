@@ -44,6 +44,23 @@ export const PIN_PATH = join(REPO_ROOT, 'src-tauri', 'binaries.lock.json')
 export const DOC_FILES = Object.freeze(['SOURCES-FFMPEG.md', 'THIRD-PARTY-LICENSES.md'])
 
 /**
+ * Документы, которые обязаны ехать в бандл рядом с приложением.
+ *
+ * Шире, чем DOC_FILES, и список отдельный намеренно: DOC_FILES — это
+ * указатели §6d, и каждый из них обязан называть адреса сборок ffmpeg
+ * (crossCheckDocs). У NOTICES.md такой обязанности нет — он про
+ * уведомления об авторских правах, — и попади он в DOC_FILES, сверка
+ * потребовала бы от него ffmpeg-адресов, которых там взяться неоткуда.
+ */
+export const BUNDLED_DOCS = Object.freeze([...DOC_FILES, 'NOTICES.md'])
+
+/**
+ * Снимок лицензионного состава: из него берутся адреса исходников
+ * MPL-крейтов (TL-136, замечание Н6 ревью).
+ */
+export const LICENSE_SNAPSHOT_FILE = 'licenses.lock.json'
+
+/**
  * Раздел пина, ссылки которого обязаны дословно присутствовать в
  * документах. Только ffmpeg: указатель §6d заведён под GPL-компонент, а
  * yt-dlp (Unlicense) и deno (MIT) в нём адресами не перечисляются.
@@ -192,6 +209,32 @@ export function planProbe(url) {
     return {
       kind: 'skip',
       reason: 'git-эндпоинт SourceForge неизвестной формы: HTTP-статус о наличии исходников не говорит',
+    }
+  }
+
+  // crates.io: отвечает 403 ЛЮБОМУ не-браузерному клиенту. Измерено
+  // 2026-09-29 тем же клиентом, которым ходит сторож: 403 и на реальный
+  // крейт (`/crates/cssparser/0.36.0`), и на API (`/api/v1/...`), и на
+  // канарейку — на заведомо несуществующий крейт ответ тот же 403.
+  //
+  // По действующему правилу проекта это и есть приговор: хост, который
+  // не умеет сказать «нет», не может подтвердить и «да». Значит живое
+  // подтверждение этих адресов по HTTP невозможно в принципе, и держать
+  // их в списке «терпимо не подтверждено» — значит называть НАШЕ
+  // обязательство по §3.2 чужим обещанием из документа.
+  //
+  // Проверка у них есть, просто не сетевая: офлайн-сторож лицензий
+  // требует, чтобы каждый адрес снимка стоял дословно в
+  // THIRD-PARTY-LICENSES.md, а число адресов совпадало с числом
+  // MPL-крейтов (checkSourceUrls, collectLicenseSourceUrls).
+  if (parsed.hostname === 'crates.io') {
+    return {
+      kind: 'skip',
+      reason:
+        'crates.io отвечает 403 любому не-браузерному клиенту — измерено и на настоящий крейт, ' +
+        'и на канарейку, то есть хост не различает существующее и выдуманное; подтвердить адрес ' +
+        'по HTTP нельзя. Это наше обязательство по §3.2 MPL, и оно проверяется офлайн: адрес ' +
+        'обязан дословно стоять в THIRD-PARTY-LICENSES.md (npm test)',
     }
   }
 
@@ -359,7 +402,77 @@ export function mergeByUrl(entries) {
  */
 export async function collectAllUrls({ pinPath = PIN_PATH, repoRoot = REPO_ROOT } = {}) {
   const pin = await loadPin(pinPath)
-  return mergeByUrl([...collectPinUrls(pin), ...(await collectDocUrls(repoRoot))])
+  return mergeByUrl([
+    ...collectPinUrls(pin),
+    ...(await collectDocUrls(repoRoot)),
+    ...(await collectLicenseSourceUrls(repoRoot)),
+  ])
+}
+
+/**
+ * Адреса исходников MPL-крейтов из снимка лицензий.
+ *
+ * Зачем отдельный источник, а не текст документа (замечание Н6 ревью).
+ * Эти четыре адреса стоят в THIRD-PARTY-LICENSES.md НИЖЕ границы
+ * «нашего текста» (первого заголовка «Полный текст …»), потому что
+ * соседствуют с дословными текстами чужих лицензий. Граница законна и
+ * ломать её нельзя — но эти адреса не чужое обещание, а НАШЕ
+ * обязательство по §3.2 MPL: по ним получатель забирает исходный код
+ * покрытых файлов. Обещание, которое никто никогда не проверяет, —
+ * ровно тот класс дыры, что уже дважды ловился в этом стороже.
+ *
+ * Поэтому адреса берутся из машиночитаемого снимка, а не вычитываются
+ * из markdown: тогда проверка не зависит от того, по какую сторону
+ * границы они оказались в тексте. Что текст и снимок не разошлись,
+ * проверяет офлайн-сторож лицензий отдельно.
+ *
+ * @param {string} [repoRoot]
+ * @returns {Promise<Array<{ url: string; where: string; origin: string }>>}
+ */
+export async function collectLicenseSourceUrls(repoRoot = REPO_ROOT) {
+  // Прежняя версия глотала всё: `catch { return [] }` и
+  // `sourceUrls ?? []`. Измерено — переименование ключа или порча JSON
+  // превращали четыре адреса в ноль без единой жалобы и с нулевым кодом
+  // возврата. Сторож, заведённый против «обещания, которое никто не
+  // проверяет», отключался от опечатки в имени поля.
+  let raw
+  try {
+    raw = await readFile(join(repoRoot, LICENSE_SNAPSHOT_FILE), 'utf8')
+  } catch (error) {
+    throw new Error(
+      `${LICENSE_SNAPSHOT_FILE} не прочитан (${error.message}). В нём лежат адреса исходников ` +
+        'MPL-крейтов — наше обязательство по §3.2. Пересобрать: npm run check-licenses -- --write',
+    )
+  }
+
+  let snapshot
+  try {
+    snapshot = JSON.parse(raw)
+  } catch (error) {
+    throw new Error(`${LICENSE_SNAPSHOT_FILE} не разобран как JSON (${error.message}).`)
+  }
+
+  const urls = snapshot.rust?.sourceUrls
+  if (!Array.isArray(urls)) {
+    throw new Error(
+      `${LICENSE_SNAPSHOT_FILE}: нет массива rust.sourceUrls. Это адреса, по которым получатель ` +
+        'забирает исходный код MPL-крейтов (§3.2). Пропасть молча они не вправе.',
+    )
+  }
+
+  const mpl = snapshot.rust?.shipped?.['MPL-2.0'] ?? []
+  if (urls.length !== mpl.length) {
+    throw new Error(
+      `${LICENSE_SNAPSHOT_FILE}: адресов исходников ${urls.length}, а MPL-крейтов в поставке ` +
+        `${mpl.length}. У каждого обязан быть свой адрес.`,
+    )
+  }
+
+  return urls.map(({ package: pkg, url }) => ({
+    url,
+    where: `${LICENSE_SNAPSHOT_FILE} (исходники ${pkg} по §3.2 MPL)`,
+    origin: 'licenses',
+  }))
 }
 
 /**

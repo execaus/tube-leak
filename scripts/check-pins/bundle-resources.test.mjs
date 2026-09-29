@@ -31,7 +31,7 @@ import { join } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
 
-import { DOC_FILES, REPO_ROOT } from './sources.mjs'
+import { BUNDLED_DOCS, DOC_FILES, REPO_ROOT } from './sources.mjs'
 
 describe('документы §6d едут в бандл', () => {
   it('каждый документ §6d перечислен в bundle.resources', async () => {
@@ -41,6 +41,24 @@ describe('документы §6d едут в бандл', () => {
 
     for (const name of DOC_FILES) {
       expect(config.bundle.resources).toContain(`../${name}`)
+    }
+  })
+
+  it('NOTICES.md тоже едет в бандл (TL-136, Б1)', async () => {
+    // Уведомления об авторских правах обязаны лежать РЯДОМ С
+    // ПРИЛОЖЕНИЕМ, а не только в репозитории: сохранение уведомления —
+    // условие гранта MIT/BSD/ISC/Zlib для того, кто получил бинарник.
+    // Список отдельный от DOC_FILES намеренно: DOC_FILES — документы
+    // §6d, и каждый из них обязан называть адреса сборок ffmpeg
+    // (crossCheckDocs). У NOTICES.md такой обязанности нет, и попади он
+    // в DOC_FILES — сверка потребовала бы от него ffmpeg-адресов.
+    const config = JSON.parse(
+      await readFile(join(REPO_ROOT, 'src-tauri', 'tauri.conf.json'), 'utf8'),
+    )
+
+    expect(BUNDLED_DOCS).toContain('NOTICES.md')
+    for (const name of BUNDLED_DOCS) {
+      expect(config.bundle.resources, `${name} не едет в бандл`).toContain(`../${name}`)
     }
   })
 

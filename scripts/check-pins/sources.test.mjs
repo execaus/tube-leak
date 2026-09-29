@@ -9,6 +9,7 @@ import { checkAll, checkUrl, hostCanary, judge, parseArgs, planAll, run } from '
 import {
   canaryUrlFor,
   collectAllUrls,
+  collectLicenseSourceUrls,
   collectPinUrls,
   crossCheckDocs,
   DOC_FILES,
@@ -399,11 +400,32 @@ describe('collectAllUrls', () => {
     expect(all.some((item) => item.url.includes('chasen.aist-nara.ac.jp'))).toBe(false)
   })
 
-  it('оставляет под охраной подавляющее большинство адресов', async () => {
+  it('оставляет под охраной подавляющее большинство адресов, а пропуски называет поимённо', async () => {
     const { checked, skipped } = planAll(await collectAllUrls())
 
-    expect(skipped.length).toBeLessThanOrEqual(2)
     expect(checked.length).toBeGreaterThan(100)
+
+    // Прежде здесь стоял потолок «не больше двух пропусков». Он ловил
+    // разрастание списка числом — и числом же лечился: добавив правило,
+    // потолок поднимали, и смысл проверки утекал. Теперь пропуски
+    // перечислены ПО ХОСТАМ: правило пропуска для любого нового хоста
+    // краснеет независимо от количества, а расширение уже названного
+    // ловится сверкой количеств ниже.
+    const byHost = {}
+    for (const item of skipped) {
+      const { hostname } = new URL(item.url)
+      byHost[hostname] = (byHost[hostname] ?? 0) + 1
+    }
+    expect(Object.keys(byHost).sort()).toStrictEqual(['bitbucket.org', 'crates.io', 'svn.xvid.org'])
+
+    // crates.io пропускается ровно по числу адресов §3.2 MPL и ни на
+    // один больше: хост отвечает 403 и на настоящий крейт, и на
+    // канарейку (измерено), то есть подтвердить существование по HTTP
+    // нельзя в принципе. Их проверка офлайновая — checkSourceUrls в
+    // `npm test` требует, чтобы каждый адрес стоял в документе дословно.
+    expect(byHost['crates.io']).toBe((await collectLicenseSourceUrls()).length)
+    expect(byHost['bitbucket.org']).toBe(1)
+    expect(byHost['svn.xvid.org']).toBe(1)
     // Правило пропуска для репозитория КОДА снято (TL-133): он открыт, и
     // его адреса проверяются, а не исчезают из проверки. Пропуск остался
     // только у приватного репозитория документов, а его адресов в

@@ -355,10 +355,17 @@ export async function run(entries, { log = console.log, label = '', ...deps } = 
   }
 
   const { alive, fatal, tolerated } = judge(results)
+  // Происхождение терпимых называется, а не подразумевается. Прежняя
+  // строка говорила «только документы» безусловно — и называла чужим
+  // обещанием из документа то, что на деле было нашим обязательством
+  // по §3.2 MPL. Формулировка считается из данных, поэтому соврать о
+  // составе она больше не может.
+  const toleratedOrigins = [...new Set(tolerated.flatMap((result) => result.origins))].sort()
   log(
     `\nИтог: подтверждено живыми ${alive.length}, ` +
-      `терпимо не подтверждено ${tolerated.length} (только документы), ` +
-      `отказов ${fatal.length}, пропущено ${skipped.length}.`,
+      `терпимо не подтверждено ${tolerated.length}` +
+      (tolerated.length > 0 ? ` (происхождение: ${toleratedOrigins.join(', ')})` : '') +
+      `, отказов ${fatal.length}, пропущено ${skipped.length}.`,
   )
 
   if (fatal.length > 0) {
