@@ -40,6 +40,41 @@ const run = promisify(execFile)
 const CARGO_DIR = join(REPO_ROOT, 'src-tauri')
 
 /**
+ * Понятная причина вместо пустого объекта ошибки.
+ *
+ * Измерено на себе: запуск без `export PATH=…/rustup/bin:$PATH` валит
+ * команду выводом `{ stdout: '', stderr: '' }` — по нему нельзя понять
+ * ни что упало, ни что делать. Сторож, отказывающий неразборчиво, —
+ * сторож, которому перестают верить; в этом проекте это уже случалось.
+ *
+ * @param {NodeJS.ErrnoException} error
+ * @returns {Error} исходная ошибка либо названная причина
+ */
+export function cargoFailure(error) {
+  if (error?.code !== 'ENOENT') return error
+  return new Error(
+    'cargo не найден в PATH, поэтому релизный граф измерить нечем. ' +
+      'В этом окружении cargo лежит вне PATH по умолчанию: ' +
+      'export PATH="/opt/homebrew/opt/rustup/bin:$PATH". ' +
+      'Офлайн-часть сторожа (npm test) cargo не требует — она сверяет снимок ' +
+      'licenses.lock.json с Cargo.lock, package-lock.json и разделами документа.',
+  )
+}
+
+/**
+ * @param {string[]} args
+ * @param {object} options
+ * @returns {Promise<{ stdout: string }>}
+ */
+async function cargo(args, options) {
+  try {
+    return await run('cargo', args, options)
+  } catch (error) {
+    throw cargoFailure(error)
+  }
+}
+
+/**
  * @param {string[]} argv
  * @returns {{ write: boolean }}
  */
@@ -53,7 +88,7 @@ export function parseArgs(argv) {
  * @returns {Promise<Map<string, { license: string; procMacro: boolean }>>}
  */
 async function readMetadata() {
-  const { stdout } = await run('cargo', ['metadata', '--locked', '--format-version', '1'], {
+  const { stdout } = await cargo(['metadata', '--locked', '--format-version', '1'], {
     cwd: CARGO_DIR,
     maxBuffer: 256 * 1024 * 1024,
   })
@@ -75,8 +110,7 @@ async function readMetadata() {
  * @returns {Promise<string[]>} пакеты «имя версия»
  */
 async function releaseGraphOf(target) {
-  const { stdout } = await run(
-    'cargo',
+  const { stdout } = await cargo(
     ['tree', '--locked', '--offline', '-e', 'normal', '--target', target, '--prefix', 'none', '--format', '{p}'],
     { cwd: CARGO_DIR, maxBuffer: 64 * 1024 * 1024 },
   )

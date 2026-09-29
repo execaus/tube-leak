@@ -27,7 +27,25 @@ import {
   SECTION_BY_LICENSE,
   TARGETS,
 } from './licenses.mjs'
+import { cargoFailure } from './index.mjs'
 import { choose, effectiveLicenses, parseSpdx } from './spdx.mjs'
+
+describe('отказ измерения', () => {
+  it('называет причину, когда cargo нет в PATH', () => {
+    // Воспроизведено на себе: без экспорта PATH команда падала выводом
+    // `{ stdout: '', stderr: '' }` — ни причины, ни что делать.
+    const failure = cargoFailure(Object.assign(new Error('spawn cargo ENOENT'), { code: 'ENOENT' }))
+    expect(failure.message).toMatch(/cargo не найден в PATH/)
+    expect(failure.message).toMatch(/rustup/)
+  })
+
+  it('чужую ошибку не подменяет своей', () => {
+    // Иначе настоящий отказ cargo (несошедшийся --locked, битый
+    // Cargo.toml) выглядел бы как «нет cargo» и увёл бы в сторону.
+    const original = Object.assign(new Error('bang'), { code: 'EACCES' })
+    expect(cargoFailure(original)).toBe(original)
+  })
+})
 
 describe('разбор SPDX', () => {
   it('складывает конъюнкты и выбирает одну альтернативу из дизъюнкции', () => {
