@@ -29,7 +29,7 @@
 // незачем; уведомления же у каждого пакета свои, и вот они здесь.
 
 import { execFileSync } from 'node:child_process'
-import { readdirSync, readFileSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
 /**
@@ -58,13 +58,50 @@ const LICENSE_FILE = /^(licen[cs]e|copying|notice)/i
 // Developers` и подобные: записей «из файла пакета» стало 241 вместо
 // 276, а 35 пакетов уехали в восстановленные из метаданных. Регистр
 // разделяет эти два случая точно, а год — нет.
-const COPYRIGHT_LINE = /^\s*(?:\/\/|#|\*)?\s*(?:Copyright\b|©|\(c\)\s*\d)/
+const COPYRIGHT_AT_START = /^\s*(?:\/\/|#|\*)?\s*(?:Copyright\b|©|\(c\)\s*\d)/
+
+/**
+ * Поле SPDX-документа. Часть пакетов не кладёт текст лицензии вовсе, а
+ * поставляет `LICENSE.spdx`, и правообладатель назван там именно так:
+ * `@tauri-apps/plugin-dialog` — `PackageCopyrightText: 2019-2022, The
+ * Tauri Programme in the Commons Conservancy`. Правило «строка
+ * начинается словом Copyright» такую строку теряло, и пакет уходил в
+ * «уведомление недоступно» — ложное утверждение перед получателем и
+ * невыполненное условие гранта MIT.
+ */
+const COPYRIGHT_SPDX = /^\s*PackageCopyrightText:\s*\S/
+
+/**
+ * Знак копирайта с годом ГДЕ УГОДНО в строке, не только в начале.
+ *
+ * Правообладатель бывает назван не первым словом: в файлах ICU4X рядом
+ * с `Copyright © 2020-2024 Unicode, Inc.` стоит `ICU 1.8.1 to ICU 57.1 ©
+ * 1995-2016 International Business Machines Corporation and others.` —
+ * это ДРУГОЕ лицо, и для Unicode-3.0 сохранение его уведомления такое же
+ * условие гранта. Привязка к началу строки теряла его у 15 крейтов.
+ */
+const COPYRIGHT_INLINE = /(?:©|\(c\))\s*\d{4}/i
 
 /**
  * Строка вида `Copyright notice…` / `Copyright license…` — это всё ещё
  * проза лицензии, просто начатая с заглавной.
  */
 const COPYRIGHT_PROSE = /^Copyright\s+(?:notice|license|holder|owner)\b/i
+
+/**
+ * SPDX-заглушка: поле есть, а правообладатель в нём не назван.
+ */
+const SPDX_UNKNOWN = /^PackageCopyrightText:\s*(?:NOASSERTION|NONE)\s*$/i
+
+/**
+ * Похожа ли строка на уведомление об авторских правах.
+ *
+ * @param {string} raw строка как есть
+ * @returns {boolean}
+ */
+function looksLikeCopyright(raw) {
+  return COPYRIGHT_AT_START.test(raw) || COPYRIGHT_SPDX.test(raw) || COPYRIGHT_INLINE.test(raw)
+}
 
 /**
  * Шаблонная строка из «как применять эту лицензию», а не уведомление.
@@ -109,8 +146,9 @@ export function copyrightLinesOf(text) {
   for (const raw of text.split('\n')) {
     const line = raw.replace(/^\s*(?:\/\/|#|\*)\s?/, '').trim()
     if (line === '') continue
-    if (!COPYRIGHT_LINE.test(raw)) continue
+    if (!looksLikeCopyright(raw)) continue
     if (COPYRIGHT_PROSE.test(line)) continue
+    if (SPDX_UNKNOWN.test(line)) continue
     if (line.length > 300) continue
     if (PLACEHOLDER.test(line)) continue
     if (!found.includes(line)) found.push(line)
@@ -121,8 +159,8 @@ export function copyrightLinesOf(text) {
 /**
  * Уведомление одного пакета и ОТКУДА оно взято.
  *
- * @param {{ licenseText: string | null; authors: string[] }} input
- * @returns {{ source: 'file' | 'metadata' | 'none'; lines: string[] }}
+ * @param {{ licenseTexts?: Array<string | null>; authors: string[] }} input
+ * @returns {{ source: 'file' | 'metadata' | 'none'; lines: string[]; hadFiles: boolean }}
  */
 export function noticeFrom({ licenseTexts = [], authors }) {
   // Файлов у пакета может быть несколько, и уведомление лежит не всегда
@@ -180,7 +218,7 @@ export function crateLicenseTexts(name, version) {
     } catch {
       continue
     }
-    return licenseFilesIn(entries).map((file) => readFileSync(join(dir, file), 'utf8'))
+    return licenseFilesIn(dir, entries).map((file) => readFileSync(join(dir, file), 'utf8'))
   }
   for (const root of registryRoots('cache')) {
     const archive = join(root, `${crate}.crate`)
@@ -194,14 +232,19 @@ export function crateLicenseTexts(name, version) {
       .split('\n')
       .map((entry) => entry.replace(`${crate}/`, ''))
       .filter((entry) => entry !== '' && !entry.includes('/'))
-    return licenseFilesIn(members).map((file) =>
+    return licenseFilesIn(null, members).map((file) =>
       execFileSync('tar', ['xzfO', archive, `${crate}/${file}`], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
       }),
     )
   }
-  return []
+  // Крейта нет НИ В ОДНОМ месте кэша — это не то же самое, что «пакет не
+  // поставляет файла лицензии», и путать их нельзя: при пустом кэше все
+  // 295 крейтов получили бы пометку «файла лицензии нет вовсе», и
+  // `--write` записал бы её получателю молча как факт. `null` заставляет
+  // вызывающего отказать (см. index.mjs).
+  return null
 }
 
 /**
@@ -213,9 +256,9 @@ export function npmLicenseTexts(pkgDir) {
   try {
     entries = readdirSync(pkgDir)
   } catch {
-    return []
+    return null
   }
-  return licenseFilesIn(entries).map((file) => readFileSync(join(pkgDir, file), 'utf8'))
+  return licenseFilesIn(pkgDir, entries).map((file) => readFileSync(join(pkgDir, file), 'utf8'))
 }
 
 /**
@@ -226,10 +269,29 @@ export function npmLicenseTexts(pkgDir) {
  * @param {string[]} entries
  * @returns {string[]}
  */
-function licenseFilesIn(entries) {
-  const candidates = entries.filter((entry) => LICENSE_FILE.test(entry)).sort()
+function licenseFilesIn(dir, entries) {
+  const candidates = entries
+    .filter((entry) => LICENSE_FILE.test(entry))
+    // Каталог с именем `licenses/` подходит под ту же маску, и
+    // readFileSync на нём падает EISDIR. Проверяем, что это файл, когда
+    // есть что проверять (у членов архива каталога нет — там имена уже
+    // отфильтрованы по отсутствию `/`).
+    .filter((entry) => dir === null || isFile(join(dir, entry)))
+    .sort()
   const plain = candidates.filter((entry) => /^licen[cs]e(\.(txt|md))?$/i.test(entry))
   return [...plain, ...candidates.filter((entry) => !plain.includes(entry))]
+}
+
+/**
+ * @param {string} path
+ * @returns {boolean}
+ */
+function isFile(path) {
+  try {
+    return statSync(path).isFile()
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -255,6 +317,35 @@ function registryRoots(kind) {
  */
 export function noticeHeading(entry) {
   return `### ${entry}`
+}
+
+/**
+ * Разбирает NOTICES.md обратно в записи.
+ *
+ * Нужен стороже, который сверяет СОДЕРЖИМОЕ записи с файлом пакета, а не
+ * только наличие заголовка. Без него охранялся лишь заголовок: удаление
+ * строки копирайта ВНУТРИ записи проходило через `npm test` зелёным.
+ *
+ * @param {string} text содержимое NOTICES.md
+ * @returns {Map<string, { license: string; lines: string[]; body: string }>}
+ */
+export function parseNotices(text) {
+  const records = new Map()
+  for (const part of text.split(/^### /m).slice(1)) {
+    const newline = part.indexOf('\n')
+    if (newline === -1) continue
+    const head = part.slice(0, newline).trim()
+    const dash = head.indexOf(' — ')
+    const entry = dash === -1 ? head : head.slice(0, dash)
+    const body = part.slice(newline + 1)
+    const block = /```\n([\s\S]*?)\n```/.exec(body)
+    records.set(entry, {
+      license: dash === -1 ? '' : head.slice(dash + ' — '.length),
+      lines: block === null ? [] : block[1].split('\n').filter((line) => line !== ''),
+      body,
+    })
+  }
+  return records
 }
 
 /**

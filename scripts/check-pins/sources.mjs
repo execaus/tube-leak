@@ -212,6 +212,32 @@ export function planProbe(url) {
     }
   }
 
+  // crates.io: отвечает 403 ЛЮБОМУ не-браузерному клиенту. Измерено
+  // 2026-09-29 тем же клиентом, которым ходит сторож: 403 и на реальный
+  // крейт (`/crates/cssparser/0.36.0`), и на API (`/api/v1/...`), и на
+  // канарейку — на заведомо несуществующий крейт ответ тот же 403.
+  //
+  // По действующему правилу проекта это и есть приговор: хост, который
+  // не умеет сказать «нет», не может подтвердить и «да». Значит живое
+  // подтверждение этих адресов по HTTP невозможно в принципе, и держать
+  // их в списке «терпимо не подтверждено» — значит называть НАШЕ
+  // обязательство по §3.2 чужим обещанием из документа.
+  //
+  // Проверка у них есть, просто не сетевая: офлайн-сторож лицензий
+  // требует, чтобы каждый адрес снимка стоял дословно в
+  // THIRD-PARTY-LICENSES.md, а число адресов совпадало с числом
+  // MPL-крейтов (checkSourceUrls, collectLicenseSourceUrls).
+  if (parsed.hostname === 'crates.io') {
+    return {
+      kind: 'skip',
+      reason:
+        'crates.io отвечает 403 любому не-браузерному клиенту — измерено и на настоящий крейт, ' +
+        'и на канарейку, то есть хост не различает существующее и выдуманное; подтвердить адрес ' +
+        'по HTTP нельзя. Это наше обязательство по §3.2 MPL, и оно проверяется офлайн: адрес ' +
+        'обязан дословно стоять в THIRD-PARTY-LICENSES.md (npm test)',
+    }
+  }
+
   // Bitbucket: 404 анонимно и на `.git`, и на страницу репозитория
   // (измерено 2026-09-26 на x265_git) — заменить нечем.
   if (parsed.hostname === 'bitbucket.org' && parsed.pathname.endsWith('.git')) {
@@ -404,13 +430,45 @@ export async function collectAllUrls({ pinPath = PIN_PATH, repoRoot = REPO_ROOT 
  * @returns {Promise<Array<{ url: string; where: string; origin: string }>>}
  */
 export async function collectLicenseSourceUrls(repoRoot = REPO_ROOT) {
+  // Прежняя версия глотала всё: `catch { return [] }` и
+  // `sourceUrls ?? []`. Измерено — переименование ключа или порча JSON
+  // превращали четыре адреса в ноль без единой жалобы и с нулевым кодом
+  // возврата. Сторож, заведённый против «обещания, которое никто не
+  // проверяет», отключался от опечатки в имени поля.
+  let raw
+  try {
+    raw = await readFile(join(repoRoot, LICENSE_SNAPSHOT_FILE), 'utf8')
+  } catch (error) {
+    throw new Error(
+      `${LICENSE_SNAPSHOT_FILE} не прочитан (${error.message}). В нём лежат адреса исходников ` +
+        'MPL-крейтов — наше обязательство по §3.2. Пересобрать: npm run check-licenses -- --write',
+    )
+  }
+
   let snapshot
   try {
-    snapshot = JSON.parse(await readFile(join(repoRoot, LICENSE_SNAPSHOT_FILE), 'utf8'))
-  } catch {
-    return []
+    snapshot = JSON.parse(raw)
+  } catch (error) {
+    throw new Error(`${LICENSE_SNAPSHOT_FILE} не разобран как JSON (${error.message}).`)
   }
-  return (snapshot.rust?.sourceUrls ?? []).map(({ package: pkg, url }) => ({
+
+  const urls = snapshot.rust?.sourceUrls
+  if (!Array.isArray(urls)) {
+    throw new Error(
+      `${LICENSE_SNAPSHOT_FILE}: нет массива rust.sourceUrls. Это адреса, по которым получатель ` +
+        'забирает исходный код MPL-крейтов (§3.2). Пропасть молча они не вправе.',
+    )
+  }
+
+  const mpl = snapshot.rust?.shipped?.['MPL-2.0'] ?? []
+  if (urls.length !== mpl.length) {
+    throw new Error(
+      `${LICENSE_SNAPSHOT_FILE}: адресов исходников ${urls.length}, а MPL-крейтов в поставке ` +
+        `${mpl.length}. У каждого обязан быть свой адрес.`,
+    )
+  }
+
+  return urls.map(({ package: pkg, url }) => ({
     url,
     where: `${LICENSE_SNAPSHOT_FILE} (исходники ${pkg} по §3.2 MPL)`,
     origin: 'licenses',

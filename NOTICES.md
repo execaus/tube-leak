@@ -17,8 +17,8 @@
 Не редактировать руками: пересборка — `npm run check-licenses -- --write`.
 
 Итог этой сборки: всего записей 328, из них из файла пакета
-244, восстановлено из метаданных 72,
-недоступно ни одним способом 12.
+245, восстановлено из метаданных 72,
+недоступно ни одним способом 11.
 
 ## Rust-крейты
 
@@ -750,42 +750,49 @@ Copyright (c) 2018 Matthew D. Steele
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### icu_locale_core 2.3.0 — Unicode-3.0
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### icu_normalizer 2.3.0 — Unicode-3.0
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### icu_normalizer_data 2.3.0 — Unicode-3.0
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### icu_properties 2.3.0 — Unicode-3.0
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### icu_properties_data 2.3.0 — Unicode-3.0
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### icu_provider 2.3.1 — Unicode-3.0
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### ident_case 1.0.1 — MIT/Apache-2.0
@@ -898,6 +905,7 @@ Dan Gohman <dev@sunfishcode.online>
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### lock_api 0.4.14 — MIT OR Apache-2.0
@@ -956,6 +964,7 @@ Copyright (c) 2014 Carl Lerche and other MIO contributors
 
 ```
 Copyright (c) 2022-2022 Tauri Programme within The Commons Conservancy
+PackageCopyrightText: 2020-2022, The Tauri Programme in the Commons Conservancy
 ```
 
 ### new_debug_unreachable 1.0.6 — MIT
@@ -1104,6 +1113,7 @@ Copyright (c) 2015 nwin
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### powerfmt 0.2.0 — MIT OR Apache-2.0
@@ -1484,6 +1494,7 @@ Copyright 2016 Nika Layzell
 
 ```
 Copyright {yyyy} {name of copyright owner}
+PackageCopyrightText: 2021-2023, The Tauri Programme in the Commons Conservancy
 ```
 
 ### tauri 2.11.5 — Apache-2.0 OR MIT
@@ -1501,12 +1512,14 @@ Copyright (c) 2017 - Present Tauri Apps Contributors
 ### tauri-plugin-dialog 2.7.3 — Apache-2.0 OR MIT
 
 ```
+PackageCopyrightText: 2019-2022, The Tauri Programme in the Commons Conservancy
 Copyright (c) 2017 - Present Tauri Apps Contributors
 ```
 
 ### tauri-plugin-fs 2.5.2 — Apache-2.0 OR MIT
 
 ```
+PackageCopyrightText: 2019-2022, The Tauri Programme in the Commons Conservancy
 Copyright (c) 2017 - Present Tauri Apps Contributors
 ```
 
@@ -1566,6 +1579,7 @@ Copyright (c) Jacob Pratt et al.
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### tokio 1.53.1 — MIT
@@ -1801,6 +1815,7 @@ Copyright (c) 2017 Andrew Gallant
 
 ```
 Copyright (c) 2020-2022 Tauri Programme within The Commons Conservancy
+PackageCopyrightText: 2020-2022, The Tauri Programme in the Commons Conservancy
 ```
 
 ### windows 0.61.3 — MIT OR Apache-2.0
@@ -1923,12 +1938,14 @@ Copyright (c) Microsoft Corporation.
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### wry 0.55.1 — Apache-2.0 OR MIT
 
 ```
 Copyright (c) 2020-2023 Ngo Iok Ui & Tauri Programme within The Commons Conservancy
+PackageCopyrightText: 2020-2023, The Tauri Programme in the Commons Conservancy
 ```
 
 ### x11 2.21.0 — MIT
@@ -1955,12 +1972,14 @@ AltF02 <contact@altf2.dev>
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### zerofrom 0.1.8 — Unicode-3.0
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### zeroize 1.9.0 — Apache-2.0 OR MIT
@@ -1973,12 +1992,14 @@ Copyright (c) 2018-2026 The RustCrypto Project Developers
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### zerovec 0.11.8 — Unicode-3.0
 
 ```
 Copyright © 2020-2024 Unicode, Inc.
+ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### zip 4.6.1 — MIT
@@ -2035,7 +2056,9 @@ Copyright (c) 2017 - Present Tauri Apps Contributors
 
 ### @tauri-apps/plugin-dialog 2.7.3 — MIT OR Apache-2.0
 
-Уведомление недоступно: файл лицензии в пакете есть, но строки с уведомлением об авторских правах в нём нет, и авторы в метаданных не указаны. Репозиторий: https://github.com/tauri-apps/plugins-workspace.
+```
+PackageCopyrightText: 2019-2022, The Tauri Programme in the Commons Conservancy
+```
 
 ### @vue/compiler-core 3.5.41 — MIT
 
@@ -2215,4 +2238,3 @@ Copyright (c) 2018-present, Yuxi (Evan) You
 - `webview2-com-sys 0.38.2` (MIT) — файла лицензии нет вовсе; https://github.com/wravery/webview2-rs
 - `winnow 0.5.40` (MIT) — файл лицензии есть, копирайта в нём нет; https://github.com/winnow-rs/winnow
 - `winnow 1.0.4` (MIT) — файл лицензии есть, копирайта в нём нет; https://github.com/winnow-rs/winnow
-- `@tauri-apps/plugin-dialog 2.7.3` (MIT OR Apache-2.0) — файл лицензии есть, копирайта в нём нет; https://github.com/tauri-apps/plugins-workspace

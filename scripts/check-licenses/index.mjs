@@ -284,10 +284,22 @@ async function collectNoticesData(snapshot) {
   for (const entry of [...new Set(Object.values(snapshot.rust.shipped).flat())].sort()) {
     const [name, version] = entry.split(' ')
     const info = metadata.get(entry) ?? { license: '', authors: [], repository: null }
+    const licenseTexts = crateLicenseTexts(name, version)
+    // `null` — крейта нет в кэше cargo. Промах кэша НЕ ДОЛЖЕН молча
+    // превращаться в «у пакета нет файла лицензии»: при пустом кэше эту
+    // пометку получили бы все 295 крейтов, и `--write` записал бы её
+    // получателю как установленный факт.
+    if (licenseTexts === null) {
+      throw new Error(
+        `${entry}: исходников нет ни в registry/src, ни в registry/cache — уведомление собрать не из чего. ` +
+          'Это промах кэша, а не отсутствие файла лицензии у пакета, и записывать его в NOTICES.md как ' +
+          'факт нельзя. Наполни кэш: cd src-tauri && cargo fetch --locked',
+      )
+    }
     rust.push({
       entry,
       license: info.license === '' ? 'лицензия не указана в метаданных' : info.license,
-      notice: noticeFrom({ licenseTexts: crateLicenseTexts(name, version), authors: info.authors }),
+      notice: noticeFrom({ licenseTexts, authors: info.authors }),
       repository: info.repository,
     })
   }
@@ -304,10 +316,17 @@ async function collectNoticesData(snapshot) {
           ? author
           : `${author.name ?? ''}${author.email === undefined ? '' : ` <${author.email}>`}`.trim(),
       )
+    const licenseTexts = npmLicenseTexts(dir)
+    if (licenseTexts === null) {
+      throw new Error(
+        `${entry}: каталога ${dir} нет — уведомление собрать не из чего. Это отсутствие установки, ` +
+          'а не отсутствие файла лицензии у пакета. Выполни npm ci',
+      )
+    }
     npm.push({
       entry,
       license: manifest.license ?? 'лицензия не указана в манифесте',
-      notice: noticeFrom({ licenseTexts: npmLicenseTexts(dir), authors }),
+      notice: noticeFrom({ licenseTexts, authors }),
       repository:
         typeof manifest.repository === 'string' ? manifest.repository : (manifest.repository?.url ?? null),
     })

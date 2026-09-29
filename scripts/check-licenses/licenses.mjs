@@ -326,7 +326,18 @@ export function checkSourceUrls({ snapshot, doc }) {
  * @returns {string[]}
  */
 export function checkNotices({ snapshot, notices }) {
-  if (notices === undefined) return []
+  // Не передали — это НЕ повод промолчать. Прежняя версия возвращала
+  // пустой список, и `checkSnapshot` без этого поля не говорил про
+  // NOTICES.md ни слова: проверка отключалась забытым аргументом, ровно
+  // тот молчаливый пропуск, против которого написан соседний комментарий
+  // про поиск cargo.
+  if (notices === undefined) {
+    return [
+      `${NOTICES_DOC} не передан на проверку: вызывающий забыл поле notices. ` +
+        'Пропустить проверку уведомлений молча нельзя — сохранение уведомления ' +
+        'есть условие гранта MIT/BSD/ISC/Zlib.',
+    ]
+  }
   const problems = []
   const missing = shippedPackages(snapshot).filter((entry) => !noticeHeadingPattern(entry).test(notices))
   if (missing.length > 0) {

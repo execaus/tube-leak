@@ -21,7 +21,8 @@
 // репозитория это не новое требование (`cargo test` и так в обычном
 // прогоне), а отказ будет назван причиной, а не пустой ошибкой.
 
-import { readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { beforeAll, describe, expect, it } from 'vitest'
@@ -44,7 +45,15 @@ import {
   shippedPackages,
   TARGETS,
 } from './licenses.mjs'
-import { copyrightLinesOf, noticeFrom, noticeHeadingPattern } from './notices.mjs'
+import {
+  copyrightLinesOf,
+  crateLicenseTexts,
+  noticeFrom,
+  noticeHeadingPattern,
+  npmLicenseTexts,
+  parseNotices,
+} from './notices.mjs'
+import { collectLicenseSourceUrls } from '../check-pins/sources.mjs'
 import { choose, effectiveLicenses, parseSpdx } from './spdx.mjs'
 
 const MEASURE_TIMEOUT = 300_000
@@ -192,6 +201,15 @@ describe('уведомления об авторских правах (Б1)', ()
     expect(checkNotices({ snapshot, notices })).toStrictEqual([])
   })
 
+  it('не молчит, когда NOTICES.md не передан на проверку (М3)', async () => {
+    // Прежняя версия возвращала пустой список, и checkSnapshot без
+    // этого поля про NOTICES.md не говорил ни слова: проверка
+    // отключалась забытым аргументом.
+    const { snapshot } = await readInputs()
+    expect(checkNotices({ snapshot, notices: undefined })).not.toStrictEqual([])
+    expect(checkNotices({ snapshot, notices: undefined }).join('\n')).toMatch(/не передан/)
+  })
+
   it('краснеет, когда у пакета поставки записи нет (мутация)', async () => {
     const { snapshot, notices } = await readInputs()
     const victim = shippedPackages(snapshot)[0]
@@ -294,6 +312,93 @@ describe('уведомления об авторских правах (Б1)', ()
   })
 })
 
+/**
+ * Строки копирайта, взятые ПРЯМО ИЗ ФАЙЛОВ пакета — независимо от того,
+ * что записано в NOTICES.md.
+ *
+ * @param {string} entry «имя версия»
+ * @param {boolean} isNpm
+ * @returns {string[]}
+ */
+function noticeLinesFromPackage(entry, isNpm) {
+  const texts = isNpm
+    ? npmLicenseTexts(join(REPO_ROOT, 'node_modules', entry.slice(0, entry.lastIndexOf(' '))))
+    : crateLicenseTexts(...entry.split(' '))
+  if (texts === null) {
+    throw new Error(`${entry}: исходников нет в кэше — сверять запись не с чем (cargo fetch / npm ci)`)
+  }
+  const lines = []
+  for (const text of texts) {
+    for (const line of copyrightLinesOf(text)) if (!lines.includes(line)) lines.push(line)
+  }
+  return lines
+}
+
+describe('содержимое записей сверяется с файлами пакетов (Б1, М2)', () => {
+  it('каждая запись NOTICES.md совпадает с тем, что лежит в самом пакете', async () => {
+    // Охраняется СОДЕРЖИМОЕ, а не заголовок. До этого сторожа удаление
+    // строки копирайта внутри записи (мутация ревьюера на `ring`)
+    // проходило `npm test` зелёным: заголовок-то на месте.
+    const { snapshot, notices } = await readInputs()
+    const records = parseNotices(notices)
+    const npmShipped = new Set(Object.values(snapshot.npm.shipped).flat())
+
+    const problems = []
+    for (const entry of shippedPackages(snapshot)) {
+      const record = records.get(entry)
+      if (record === undefined) {
+        problems.push(`${entry}: записи нет вовсе`)
+        continue
+      }
+      const fromPackage = noticeLinesFromPackage(entry, npmShipped.has(entry))
+      const restored = /восстановлено из метаданных|Уведомление недоступно/.test(record.body)
+
+      if (restored) {
+        // Уйти к метаданным можно ТОЛЬКО когда в файлах пакета
+        // уведомления действительно нет. Иначе это потерянный
+        // правообладатель, выданный за отсутствующего, — ровно дефект Б1.
+        if (fromPackage.length > 0) {
+          problems.push(`${entry}: в файлах пакета есть ${fromPackage.length} строк(и), а запись их не несёт`)
+        }
+        continue
+      }
+      if (record.lines.join('\n') !== fromPackage.join('\n')) {
+        problems.push(`${entry}: запись разошлась с файлами пакета`)
+      }
+    }
+    expect(problems).toStrictEqual([])
+  })
+
+  it('узнаёт уведомление, названное не первым словом строки (Б1)', () => {
+    // Два случая, на которых правило «строка начинается словом
+    // Copyright» теряло правообладателей у 22 пакетов.
+    expect(
+      copyrightLinesOf('PackageCopyrightText: 2019-2022, The Tauri Programme in the Commons Conservancy'),
+    ).toStrictEqual(['PackageCopyrightText: 2019-2022, The Tauri Programme in the Commons Conservancy'])
+
+    // IBM — не то же лицо, что Unicode, и его уведомление обязано
+    // сохраняться наравне.
+    const icu = [
+      'Copyright © 2020-2024 Unicode, Inc.',
+      'ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.',
+    ].join('\n')
+    expect(copyrightLinesOf(icu)).toStrictEqual([
+      'Copyright © 2020-2024 Unicode, Inc.',
+      'ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.',
+    ])
+
+    // А поле SPDX без правообладателя — не уведомление.
+    expect(copyrightLinesOf('PackageCopyrightText: NOASSERTION')).toStrictEqual([])
+  })
+
+  it('промах кэша не выдаёт себя за «у пакета нет файла лицензии» (М1)', () => {
+    // Иначе при пустом кэше все 295 крейтов получили бы пометку «файла
+    // лицензии нет вовсе», и --write записал бы её получателю как факт.
+    expect(crateLicenseTexts('заведомо-нет-такого-крейта', '9.9.9')).toBeNull()
+    expect(npmLicenseTexts(join(REPO_ROOT, 'node_modules', 'заведомо-нет-такого-пакета'))).toBeNull()
+  })
+})
+
 describe('адреса исходников по §3.2 MPL (Н6)', () => {
   it('снимок называет адрес на каждый MPL-крейт, и все они есть в документе', async () => {
     const { snapshot, doc } = await readInputs()
@@ -310,6 +415,29 @@ describe('адреса исходников по §3.2 MPL (Н6)', () => {
     const without = doc.replaceAll(url, 'https://example.invalid/подменено')
 
     expect(checkSourceUrls({ snapshot, doc: without }).join('\n')).toMatch(/§3\.2/)
+  })
+
+  it('не исчезает молча от переименованного ключа или порчи снимка (М4)', async () => {
+    // Измерено на прежней версии: переименование ключа превращало
+    // четыре адреса в ноль без жалобы и с нулевым кодом возврата.
+    const dir = await mkdtemp(join(tmpdir(), 'tube-leak-licenses-'))
+    const snapshot = { rust: { shipped: { 'MPL-2.0': ['a 1.0.0'] }, sourceUrls: [{ package: 'a 1.0.0', url: 'https://example.invalid/a' }] } }
+
+    await writeFile(join(dir, 'licenses.lock.json'), JSON.stringify(snapshot), 'utf8')
+    await expect(collectLicenseSourceUrls(dir)).resolves.toHaveLength(1)
+
+    const renamed = structuredClone(snapshot)
+    renamed.rust.sourceURLs = renamed.rust.sourceUrls
+    delete renamed.rust.sourceUrls
+    await writeFile(join(dir, 'licenses.lock.json'), JSON.stringify(renamed), 'utf8')
+    await expect(collectLicenseSourceUrls(dir)).rejects.toThrow(/rust\.sourceUrls/)
+
+    await writeFile(join(dir, 'licenses.lock.json'), '{ это не json', 'utf8')
+    await expect(collectLicenseSourceUrls(dir)).rejects.toThrow(/JSON/)
+
+    await rm(join(dir, 'licenses.lock.json'))
+    await expect(collectLicenseSourceUrls(dir)).rejects.toThrow(/не прочитан/)
+    await rm(dir, { recursive: true, force: true })
   })
 })
 
