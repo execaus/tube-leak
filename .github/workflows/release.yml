@@ -11,7 +11,7 @@ jobs:
   build:
     strategy:
       fail-fast: false
-      # tauri-action updates one latest.json asset on the draft release.
+      # Keep uploads serial so each job sees the same draft release.
       max-parallel: 1
       matrix:
         include:
@@ -54,9 +54,10 @@ jobs:
           releaseBody: |
             Проверка и установка подписанных обновлений доступны в настройках приложения.
             На Windows исправлено распознавание скачанных потоков в папках с кириллицей.
-            Для перехода с версий до 0.1.3 требуется один раз установить этот выпуск вручную.
+            Для перехода с версий до 0.1.4 требуется один раз установить этот выпуск вручную.
           releaseDraft: true
-          uploadUpdaterJson: true
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: true
           updaterJsonPreferNsis: true
           releaseAssetNamePattern: '[name]_[version]_[platform]_[arch][setup][ext]'
           args: --target ${{ matrix.target }}
@@ -66,12 +67,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify the complete updater manifest
+      - name: Build and verify the complete updater manifest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release download "${GITHUB_REF_NAME}" -p latest.json -D /tmp/tube-leak-release
+          mkdir -p /tmp/tube-leak-release
+          gh release download "${GITHUB_REF_NAME}" -p '*.sig' -D /tmp/tube-leak-release
+          gh api "repos/${GITHUB_REPOSITORY}/releases" > /tmp/tube-leak-release/releases.json
+          node scripts/release/build-manifest.mjs /tmp/tube-leak-release /tmp/tube-leak-release/releases.json "${GITHUB_REF_NAME}"
           node scripts/release/check-manifest.mjs /tmp/tube-leak-release/latest.json "${GITHUB_REF_NAME}"
+          gh release upload "${GITHUB_REF_NAME}" /tmp/tube-leak-release/latest.json
       - name: Publish the verified release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
