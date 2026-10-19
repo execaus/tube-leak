@@ -74,7 +74,7 @@ import {
 // пропустили, и он остался на 0.1.0 до следующего выпуска.
 // Расхождение ловится лишь частично: сторож лицензий заметит рассинхрон
 // `Cargo.lock` со снимком, но экран и имя установщика он не сверяет.
-const APP_VERSION = '0.1.2'
+const APP_VERSION = '0.1.3'
 
 const {
   stage,
@@ -931,7 +931,11 @@ watch(activeTab, (tab) => {
       >
         Настройки
       </h2>
-      <SettingsScreen :active="activeTab === 'settings'" />
+      <SettingsScreen
+        :active="activeTab === 'settings'"
+        :app-version="APP_VERSION"
+        :queue-busy="!!exitConfirmActiveTask || exitConfirmWaitingCount > 0"
+      />
     </section>
 
     <!--

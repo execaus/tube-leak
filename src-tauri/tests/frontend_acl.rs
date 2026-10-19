@@ -436,6 +436,8 @@ const PLUGIN_PACKAGE_PREFIX: &str = "@tauri-apps/plugin-";
 
 /// Единственная команда плагина диалога, выданная фронтенду (Р-3 эпика E5).
 const DIALOG_OPEN: &str = "plugin:dialog|open";
+const UPDATER_CHECK: &str = "plugin:updater|check";
+const UPDATER_DOWNLOAD_AND_INSTALL: &str = "plugin:updater|download_and_install";
 
 /// Что вызывает по IPC привязка из npm-пакета плагина.
 ///
@@ -449,6 +451,10 @@ const DIALOG_OPEN: &str = "plugin:dialog|open";
 fn plugin_commands_of(plugin: &str, binding: &str) -> Option<&'static [&'static str]> {
     match (plugin, binding) {
         ("dialog", "open") => Some(&[DIALOG_OPEN]),
+        // `check()` возвращает Update; единственный используемый метод
+        // этого объекта — downloadAndInstall(), поэтому импорт требует оба
+        // разрешения. Остальные методы Update остаются закрытыми.
+        ("updater", "check") => Some(&[UPDATER_CHECK, UPDATER_DOWNLOAD_AND_INSTALL]),
         _ => None,
     }
 }
@@ -2112,7 +2118,11 @@ fn the_event_permission_still_carries_no_scope_of_its_own() {
 /// `dialog:default` (это ещё `save` и `message`), `dialog:allow-save`,
 /// любое `fs:*`. `tauri-plugin-fs` приходит с диалогом транзитивно, и его
 /// команды фронтенду не выдаются.
-const PLUGIN_PERMISSIONS: &[&str] = &["dialog:allow-open"];
+const PLUGIN_PERMISSIONS: &[&str] = &[
+    "dialog:allow-open",
+    "updater:allow-check",
+    "updater:allow-download-and-install",
+];
 
 /// Идентификаторы разрешений capability, не принадлежащие `core:`.
 ///
