@@ -53,7 +53,7 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -108,7 +108,7 @@ jobs:
         run: node scripts/fetch-binaries/index.mjs --target ${{ matrix.target }}
 
       - name: Build installer
-        run: npm run tauri build -- --target ${{ matrix.target }}
+        run: npm run tauri build -- --target ${{ matrix.target }} --config .github/ci-tauri-config.json
 
   # Проверки, которые до TL-25 не запускались в CI вообще: vitest, cargo
   # test (включая сторож tests/frontend_acl.rs), clippy, fmt, type-check и
@@ -170,6 +170,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # Сторож лицензий читает исходники всех crates из Cargo.lock,
+      # включая чужие платформы. Пустой кэш раннера их ещё не содержит.
+      - name: Fetch Rust sources for license tests
+        run: cargo fetch --locked
+        working-directory: src-tauri
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2

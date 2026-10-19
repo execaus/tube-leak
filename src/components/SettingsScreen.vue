@@ -20,6 +20,7 @@
  * (тот же приём, что и у `HistoryScreen.vue`, doc-класс там же).
  */
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import AppUpdateBlock from '@/components/AppUpdateBlock.vue'
 
 import { pickDestinationFolder } from '@/composables/usePickFolder'
 import { useSettingsStore } from '@/stores/settings'
@@ -35,7 +36,11 @@ import {
   PREVIEW_UNAVAILABLE_TEXT,
 } from '@/utils/settingsFieldTexts'
 
-const props = withDefaults(defineProps<{ active?: boolean }>(), { active: false })
+const props = withDefaults(defineProps<{ active?: boolean; appVersion?: string; queueBusy?: boolean }>(), {
+  active: false,
+  appVersion: '',
+  queueBusy: false,
+})
 
 const store = useSettingsStore()
 
@@ -537,6 +542,10 @@ async function onResetAttempts(): Promise<void> {
         </p>
       </section>
     </template>
+    <AppUpdateBlock
+      :current-version="appVersion"
+      :queue-busy="queueBusy"
+    />
   </div>
 </template>
 

@@ -16,9 +16,9 @@
 
 Не редактировать руками: пересборка — `npm run check-licenses -- --write`.
 
-Итог этой сборки: всего записей 328, из них из файла пакета
-245, восстановлено из метаданных 72,
-недоступно ни одним способом 11.
+Итог этой сборки: всего записей 367, из них из файла пакета
+282, восстановлено из метаданных 73,
+недоступно ни одним способом 12.
 
 ## Rust-крейты
 
@@ -70,6 +70,13 @@ The gtk-rs Project Developers
 
 ```
 The gtk-rs Project Developers
+```
+
+### atomic-waker 1.1.2 — Apache-2.0 OR MIT
+
+```
+Copyright (c) 2016 Alex Crichton
+Copyright (c) 2017 The Tokio Authors
 ```
 
 ### base64 0.21.7 — MIT OR Apache-2.0
@@ -214,6 +221,12 @@ Copyright (c) 2014 Alex Crichton
 ```
 
 ### core-foundation 0.10.1 — MIT OR Apache-2.0
+
+```
+Copyright (c) 2012-2013 Mozilla Foundation
+```
+
+### core-foundation 0.9.4 — MIT OR Apache-2.0
 
 ```
 Copyright (c) 2012-2013 Mozilla Foundation
@@ -466,6 +479,12 @@ The image-rs Developers
 Copyright (c) 2016-2021 Diggory Blake, and other contributors.
 ```
 
+### filetime 0.2.29 — MIT/Apache-2.0
+
+```
+Copyright (c) 2014 Alex Crichton
+```
+
 ### flate2 1.1.9 — MIT OR Apache-2.0
 
 ```
@@ -532,6 +551,13 @@ Copyright (c) 2017 The Tokio Authors
 ```
 
 ### futures-io 0.3.34 — MIT OR Apache-2.0
+
+```
+Copyright (c) 2016 Alex Crichton
+Copyright (c) 2017 The Tokio Authors
+```
+
+### futures-sink 0.3.34 — MIT OR Apache-2.0
 
 ```
 Copyright (c) 2016 Alex Crichton
@@ -734,10 +760,41 @@ Copyright 2017 http-rs authors
 Copyright (c) 2017 http-rs authors
 ```
 
+### http-body 1.1.0 — MIT
+
+```
+Copyright (c) 2019-2026 Sean McArthur & Hyper Contributors
+```
+
+### http-body-util 0.1.5 — MIT
+
+```
+Copyright (c) 2019-2026 Sean McArthur & Hyper Contributors
+```
+
 ### httparse 1.10.1 — MIT OR Apache-2.0
 
 ```
 Copyright (c) 2015-2025 Sean McArthur
+```
+
+### hyper 1.11.0 — MIT
+
+```
+Copyright (c) 2014-2026 Sean McArthur
+```
+
+### hyper-rustls 0.27.10 — Apache-2.0 OR ISC OR MIT
+
+```
+Copyright (c) 2016, Joseph Birr-Pixton <jpixton@gmail.com>
+Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
+```
+
+### hyper-util 0.1.20 — MIT
+
+```
+Copyright (c) 2023-2025 Sean McArthur
 ```
 
 ### ico 0.5.0 — MIT
@@ -831,6 +888,12 @@ Copyright (c) 2016--2017
 
 ```
 Copyright (c) 2019 Bojan
+```
+
+### ipnet 2.12.1 — MIT OR Apache-2.0
+
+```
+Copyright 2017 Juniper Networks, Inc.
 ```
 
 ### itoa 1.0.18 — MIT OR Apache-2.0
@@ -944,6 +1007,14 @@ Copyright (c) 2017 Gilad Naaman
 Copyright (c) 2014 Sean McArthur
 ```
 
+### minisign-verify 0.2.5 — MIT
+
+```
+Copyright (c) 2019-2025 Frank Denis
+Copyright (c) 2006-2009 Graydon Hoare
+Copyright (c) 2009-2013 Mozilla Foundation
+```
+
 ### miniz_oxide 0.8.9 — MIT OR Zlib OR Apache-2.0
 
 ```
@@ -1015,6 +1086,10 @@ Mads Marquart <mads@marquart.dk>
 
 Уведомление недоступно: апстрим не поставляет ни файла лицензии, ни авторов в метаданных. Репозиторий: https://github.com/madsmtm/objc2.
 
+### objc2-osa-kit 0.3.2 — Zlib OR Apache-2.0 OR MIT
+
+Уведомление недоступно: апстрим не поставляет ни файла лицензии, ни авторов в метаданных. Репозиторий: https://github.com/madsmtm/objc2.
+
 ### objc2-web-kit 0.3.2 — Zlib OR Apache-2.0 OR MIT
 
 Уведомление недоступно: апстрим не поставляет ни файла лицензии, ни авторов в метаданных. Репозиторий: https://github.com/madsmtm/objc2.
@@ -1027,12 +1102,24 @@ Mads Marquart <mads@marquart.dk>
 Aleksey Kladov <aleksey.kladov@gmail.com>
 ```
 
+### openssl-probe 0.2.1 — MIT OR Apache-2.0
+
+```
+Copyright (c) 2014 Alex Crichton
+```
+
 ### option-ext 0.2.0 — MPL-2.0
 
 Уведомление восстановлено из метаданных пакета — апстрим файла лицензии не поставляет.
 
 ```
 Simon Ochsenreither <simon@ochsenreither.de>
+```
+
+### osakit 0.3.1 — MIT OR Apache-2.0
+
+```
+Copyright (c) 2024 Marat Dulin
 ```
 
 ### pango 0.18.3 — MIT
@@ -1200,6 +1287,13 @@ Copyright (c) 2014 The Rust Project Developers
 Copyright (c) 2014 The Rust Project Developers
 ```
 
+### reqwest 0.13.4 — MIT OR Apache-2.0
+
+```
+Copyright 2016 Sean McArthur
+Copyright (c) 2016-2026 Sean McArthur
+```
+
 ### rfd 0.16.0 — MIT
 
 ```
@@ -1244,11 +1338,24 @@ Copyright (c) 2016, Joseph Birr-Pixton <jpixton@gmail.com>
 Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
 ```
 
+### rustls-native-certs 0.8.5 — Apache-2.0 OR ISC OR MIT
+
+```
+Copyright (c) 2016, Joseph Birr-Pixton <jpixton@gmail.com>
+Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
+```
+
 ### rustls-pki-types 1.15.1 — MIT OR Apache-2.0
 
 ```
 Copyright 2023 Dirkjan Ochtman
 Copyright (c) 2023 Dirkjan Ochtman <dirkjan@ochtman.nl>
+```
+
+### rustls-platform-verifier 0.7.1 — MIT OR Apache-2.0
+
+```
+Copyright (c) 2022 1Password
 ```
 
 ### rustls-webpki 0.103.15 — ISC
@@ -1273,6 +1380,18 @@ Copyright (c) 2019 Graham Esau
 
 ```
 Copyright (c) 2016-2019 Ulrik Sverdrup "bluss" and scopeguard developers
+```
+
+### security-framework 3.7.0 — MIT OR Apache-2.0
+
+```
+Copyright (c) 2015 Steven Fackler
+```
+
+### security-framework-sys 2.17.0 — MIT OR Apache-2.0
+
+```
+Copyright (c) 2015 Steven Fackler
 ```
 
 ### selectors 0.36.1 — MPL-2.0
@@ -1408,6 +1527,12 @@ Copyright (c) 2019 Carl Lerche
 Copyright (c) 2018 The Servo Project Developers
 ```
 
+### socket2 0.6.5 — MIT OR Apache-2.0
+
+```
+Copyright (c) 2014 Alex Crichton
+```
+
 ### softbuffer 0.4.8 — MIT OR Apache-2.0
 
 ```
@@ -1484,10 +1609,30 @@ David Tolnay <dtolnay@gmail.com>
 David Tolnay <dtolnay@gmail.com>
 ```
 
+### sync_wrapper 1.0.2 — Apache-2.0
+
+Уведомление восстановлено из метаданных пакета — апстрим файла лицензии не поставляет.
+
+```
+Actyx AG <developer@actyx.io>
+```
+
 ### synstructure 0.13.2 — MIT
 
 ```
 Copyright 2016 Nika Layzell
+```
+
+### system-configuration 0.7.0 — MIT OR Apache-2.0
+
+```
+Copyright (c) 2024 Mullvad VPN AB
+```
+
+### system-configuration-sys 0.6.0 — MIT OR Apache-2.0
+
+```
+Copyright (c) 2024 Mullvad VPN AB
 ```
 
 ### tao 0.35.3 — Apache-2.0
@@ -1495,6 +1640,12 @@ Copyright 2016 Nika Layzell
 ```
 Copyright {yyyy} {name of copyright owner}
 PackageCopyrightText: 2021-2023, The Tauri Programme in the Commons Conservancy
+```
+
+### tar 0.4.46 — MIT OR Apache-2.0
+
+```
+Copyright (c) The tar-rs Project Contributors
 ```
 
 ### tauri 2.11.5 — Apache-2.0 OR MIT
@@ -1523,6 +1674,13 @@ PackageCopyrightText: 2019-2022, The Tauri Programme in the Commons Conservancy
 Copyright (c) 2017 - Present Tauri Apps Contributors
 ```
 
+### tauri-plugin-updater 2.12.0 — Apache-2.0 OR MIT
+
+```
+PackageCopyrightText: 2019-2022, The Tauri Programme in the Commons Conservancy
+Copyright (c) 2017 - Present Tauri Apps Contributors
+```
+
 ### tauri-runtime 2.11.3 — Apache-2.0 OR MIT
 
 ```
@@ -1539,6 +1697,12 @@ Copyright (c) 2017 - Present Tauri Apps Contributors
 
 ```
 Copyright (c) 2017 - Present Tauri Apps Contributors
+```
+
+### tempfile 3.27.0 — MIT OR Apache-2.0
+
+```
+Copyright (c) 2015 Steven Allen
 ```
 
 ### tendril 0.5.1 — MIT OR Apache-2.0
@@ -1583,6 +1747,19 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 ```
 
 ### tokio 1.53.1 — MIT
+
+```
+Copyright (c) Tokio Contributors
+```
+
+### tokio-rustls 0.26.6 — MIT OR Apache-2.0
+
+```
+Copyright 2017 quininer kel
+Copyright (c) 2017 quininer kel
+```
+
+### tokio-util 0.7.19 — MIT
 
 ```
 Copyright (c) Tokio Contributors
@@ -1636,6 +1813,30 @@ Copyright {yyyy} {name of copyright owner}
 Copyright (c) Individual contributors
 ```
 
+### tower 0.5.3 — MIT
+
+```
+Copyright (c) 2019 Tower Contributors
+```
+
+### tower-http 0.6.11 — MIT
+
+```
+Copyright (c) 2019-2021 Tower Contributors
+```
+
+### tower-layer 0.3.3 — MIT
+
+```
+Copyright (c) 2019 Tower Contributors
+```
+
+### tower-service 0.3.3 — MIT
+
+```
+Copyright (c) 2019 Tower Contributors
+```
+
 ### tracing 0.1.44 — MIT
 
 ```
@@ -1646,6 +1847,13 @@ Copyright (c) 2019 Tokio Contributors
 
 ```
 Copyright (c) 2019 Tokio Contributors
+```
+
+### try-lock 0.2.5 — MIT
+
+```
+Copyright (c) 2018-2023 Sean McArthur
+Copyright (c) 2016 Alex Crichton
 ```
 
 ### typeid 1.0.3 — MIT OR Apache-2.0
@@ -1773,6 +1981,12 @@ Copyright (c) 2018 Ashley Mannix, Christopher Armstrong, Dylan DPC, Hunar Roop K
 Copyright (c) 2015 Andrew Gallant
 ```
 
+### want 0.3.1 — MIT
+
+```
+Copyright (c) 2018-2019 Sean McArthur
+```
+
 ### web_atoms 0.2.6 — MIT OR Apache-2.0
 
 ```
@@ -1860,13 +2074,31 @@ Copyright (c) Microsoft Corporation.
 Copyright (c) Microsoft Corporation.
 ```
 
+### windows-registry 0.6.1 — MIT OR Apache-2.0
+
+```
+Copyright (c) Microsoft Corporation.
+```
+
 ### windows-result 0.3.4 — MIT OR Apache-2.0
 
 ```
 Copyright (c) Microsoft Corporation.
 ```
 
+### windows-result 0.4.1 — MIT OR Apache-2.0
+
+```
+Copyright (c) Microsoft Corporation.
+```
+
 ### windows-strings 0.4.2 — MIT OR Apache-2.0
+
+```
+Copyright (c) Microsoft Corporation.
+```
+
+### windows-strings 0.5.1 — MIT OR Apache-2.0
 
 ```
 Copyright (c) Microsoft Corporation.
@@ -1968,6 +2200,12 @@ Erle Pereira <erle@erlepereira.com>
 AltF02 <contact@altf2.dev>
 ```
 
+### xattr 1.6.1 — MIT OR Apache-2.0
+
+```
+Copyright (c) 2015 Steven Allen
+```
+
 ### yoke 0.8.3 — Unicode-3.0
 
 ```
@@ -2060,25 +2298,31 @@ Copyright (c) 2017 - Present Tauri Apps Contributors
 PackageCopyrightText: 2019-2022, The Tauri Programme in the Commons Conservancy
 ```
 
-### @vue/compiler-core 3.5.41 — MIT
+### @tauri-apps/plugin-updater 2.12.0 — MIT OR Apache-2.0
+
+```
+PackageCopyrightText: 2019-2022, The Tauri Programme in the Commons Conservancy
+```
+
+### @vue/compiler-core 3.5.42 — MIT
 
 ```
 Copyright (c) 2018-present, Yuxi (Evan) You
 ```
 
-### @vue/compiler-dom 3.5.41 — MIT
+### @vue/compiler-dom 3.5.42 — MIT
 
 ```
 Copyright (c) 2018-present, Yuxi (Evan) You
 ```
 
-### @vue/compiler-sfc 3.5.41 — MIT
+### @vue/compiler-sfc 3.5.42 — MIT
 
 ```
 Copyright (c) 2018-present, Yuxi (Evan) You
 ```
 
-### @vue/compiler-ssr 3.5.41 — MIT
+### @vue/compiler-ssr 3.5.42 — MIT
 
 ```
 Copyright (c) 2018-present, Yuxi (Evan) You
@@ -2102,31 +2346,31 @@ Copyright (c) 2023 webfansplz
 Copyright (c) 2023 webfansplz
 ```
 
-### @vue/reactivity 3.5.41 — MIT
+### @vue/reactivity 3.5.42 — MIT
 
 ```
 Copyright (c) 2018-present, Yuxi (Evan) You
 ```
 
-### @vue/runtime-core 3.5.41 — MIT
+### @vue/runtime-core 3.5.42 — MIT
 
 ```
 Copyright (c) 2018-present, Yuxi (Evan) You
 ```
 
-### @vue/runtime-dom 3.5.41 — MIT
+### @vue/runtime-dom 3.5.42 — MIT
 
 ```
 Copyright (c) 2018-present, Yuxi (Evan) You
 ```
 
-### @vue/server-renderer 3.5.41 — MIT
+### @vue/server-renderer 3.5.42 — MIT
 
 ```
 Copyright (c) 2018-present, Yuxi (Evan) You
 ```
 
-### @vue/shared 3.5.41 — MIT
+### @vue/shared 3.5.42 — MIT
 
 ```
 Copyright (c) 2018-present, Yuxi (Evan) You
@@ -2204,13 +2448,13 @@ Copyright (c) 2019-present Eduardo San Martin Morote
 Copyright 2013 Andrey Sitnik <andrey@sitnik.es>
 ```
 
-### source-map-js 1.2.1 — BSD-3-Clause
+### source-map-js 1.2.2 — BSD-3-Clause
 
 ```
 Copyright (c) 2009-2011, Mozilla Foundation and contributors
 ```
 
-### vue 3.5.41 — MIT
+### vue 3.5.42 — MIT
 
 ```
 Copyright (c) 2018-present, Yuxi (Evan) You
@@ -2231,6 +2475,7 @@ Copyright (c) 2018-present, Yuxi (Evan) You
 - `objc2-app-kit 0.3.2` (Zlib OR Apache-2.0 OR MIT) — файла лицензии нет вовсе; https://github.com/madsmtm/objc2
 - `objc2-core-foundation 0.3.2` (Zlib OR Apache-2.0 OR MIT) — файла лицензии нет вовсе; https://github.com/madsmtm/objc2
 - `objc2-foundation 0.3.2` (MIT) — файла лицензии нет вовсе; https://github.com/madsmtm/objc2
+- `objc2-osa-kit 0.3.2` (Zlib OR Apache-2.0 OR MIT) — файла лицензии нет вовсе; https://github.com/madsmtm/objc2
 - `objc2-web-kit 0.3.2` (Zlib OR Apache-2.0 OR MIT) — файла лицензии нет вовсе; https://github.com/madsmtm/objc2
 - `pin-project-lite 0.2.17` (Apache-2.0 OR MIT) — файл лицензии есть, копирайта в нём нет; https://github.com/taiki-e/pin-project-lite
 - `webpki-roots 1.0.9` (CDLA-Permissive-2.0) — файл лицензии есть, копирайта в нём нет; https://github.com/rustls/webpki-roots

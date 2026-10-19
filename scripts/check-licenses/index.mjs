@@ -160,7 +160,7 @@ async function readMetadata() {
  */
 async function releaseGraphOf(target) {
   const { stdout } = await cargo(
-    ['tree', '--locked', '--offline', '-e', 'normal', '--target', target, '--prefix', 'none', '--format', '{p}'],
+    ['tree', '--locked', '--offline', '--color', 'never', '-e', 'normal', '--target', target, '--prefix', 'none', '--format', '{p}'],
     { cwd: CARGO_DIR, maxBuffer: 64 * 1024 * 1024 },
   )
   const packages = stdout

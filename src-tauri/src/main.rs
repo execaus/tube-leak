@@ -144,6 +144,7 @@ fn main() {
         // транзитивный `tauri-plugin-fs` не регистрируется и не разрешается
         // (сторож — `tests/frontend_acl.rs`).
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             cancel_download,
             cancel_probe,
